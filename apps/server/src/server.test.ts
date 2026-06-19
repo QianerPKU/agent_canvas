@@ -98,6 +98,18 @@ describe("HTTP server", () => {
     expect(r.status).toBe(202);
   });
 
+  it("fork 缺 anchorUuid → 400", async () => {
+    const c = await request(port, "POST", "/api/agents");
+    const r = await request(port, "POST", `/api/agents/${c.json.id}/fork`, {});
+    expect(r.status).toBe(400);
+  });
+
+  it("源会话未建立时 fork → 409", async () => {
+    const c = await request(port, "POST", "/api/agents");
+    const r = await request(port, "POST", `/api/agents/${c.json.id}/fork`, { anchorUuid: "u" });
+    expect(r.status).toBe(409);
+  });
+
   it("未知路由 → 404", async () => {
     const r = await request(port, "GET", "/nope");
     expect(r.status).toBe(404);

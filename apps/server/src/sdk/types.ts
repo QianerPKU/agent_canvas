@@ -55,6 +55,7 @@ export interface SdkAssistantMessage {
   type: "assistant";
   message: SdkApiMessage;
   session_id: string;
+  uuid?: string; // SDKAssistantMessage.uuid —— fork 锚点
 }
 export interface SdkUserMessage {
   type: "user";
@@ -112,6 +113,8 @@ export interface QueryOptions {
   permissionMode?: string;
   maxTurns?: number;
   resume?: string;
+  resumeSessionAt?: string;
+  forkSession?: boolean;
   abortController?: AbortController;
   [k: string]: unknown;
 }

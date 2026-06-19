@@ -39,7 +39,13 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 | `POST /api/agents/:id/start` | body=`AgentStartConfig`，启动 |
 | `POST /api/agents/:id/send` | body=`{ text }`，中途追加指令 |
 | `POST /api/agents/:id/resume` | body=`{ sessionId, text }`，续接会话 |
+| `POST /api/agents/:id/fork` | body=`{ anchorUuid }`，从该 agent 某轮 fork 出新 agent，返回 `{ id, origin }` |
 | `POST /api/agents/:id/stop` | 中止 |
+
+## 多轮对话与 fork（对话历史分叉）
+
+- **多轮**：同一 agent = 同一 SDK session。每轮 = 一次用户输入 + 一次完整答复，以 `result` 事件收尾。每个 `result` 携带本轮最后一条 assistant 消息的 `anchorUuid`（fork 锚点）。
+- **fork**：`POST /:id/fork { anchorUuid }` → 用 SDK 的 `resume`(父会话) + `resumeSessionAt`(锚点 uuid) + `forkSession:true` 从某轮的对话状态分叉出一个**独立新 agent**（新 session）。`AgentManager` 记录其 `forkOrigin` 并在该 agent 首次 `start` 时合并 fork 配置。对话 fork 与 git 分支无关。
 
 ## WebSocket (`/ws`)
 

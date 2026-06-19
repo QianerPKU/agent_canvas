@@ -48,6 +48,7 @@ export class AgentRunner {
   private handle?: QueryHandle;
   private totalCostUsd?: number;
   private usage?: UsageInfo;
+  private lastAssistantUuid?: string; // 本轮最后一条 assistant 消息 uuid（fork 锚点）
   private readonly createdAt: number;
 
   constructor(id: string, deps: AgentRunnerDeps) {
@@ -90,6 +91,7 @@ export class AgentRunner {
     this.totalCostUsd = undefined;
     this.usage = undefined;
     this.sessionId = undefined;
+    this.lastAssistantUuid = undefined;
 
     this.abortController = new AbortController();
     this.inputQueue = new AsyncMessageQueue<SdkUserInput>();
@@ -105,7 +107,9 @@ export class AgentRunner {
       allowedTools: config.allowedTools,
       permissionMode: config.permissionMode,
       maxTurns: config.maxTurns,
-      resume: extra.resumeSessionId,
+      resume: config.resume ?? extra.resumeSessionId,
+      resumeSessionAt: config.resumeSessionAt,
+      forkSession: config.forkSession,
       abortController: this.abortController,
     };
 
@@ -167,13 +171,26 @@ export class AgentRunner {
         this.emit(event);
         this.setStatus("running");
         break;
-      case "result":
+      case "assistant_text":
+      case "tool_use":
+        if (event.messageUuid) this.lastAssistantUuid = event.messageUuid;
+        if (this.status === "starting") this.setStatus("running");
+        this.emit(event);
+        break;
+      case "result": {
         if (event.costUsd !== undefined) this.totalCostUsd = event.costUsd;
         if (event.usage) this.usage = event.usage;
-        this.emit(event);
+        // 用本轮最后一条 assistant 消息 uuid 作为 fork 锚点
+        const enriched: AgentEvent = {
+          ...event,
+          anchorUuid: event.anchorUuid ?? this.lastAssistantUuid,
+        };
+        this.lastAssistantUuid = undefined; // 下一轮重新累积
+        this.emit(enriched);
         // 一轮结束：输入流仍开则等待下一条指令，否则完成
         this.setStatus(this.inputQueue?.isClosed ? "done" : "waiting_input");
         break;
+      }
       default:
         // 收到实质内容却仍处于 starting，则补一个 running
         if (this.status === "starting") this.setStatus("running");

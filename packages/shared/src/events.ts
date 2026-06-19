@@ -44,8 +44,9 @@ export type AgentEvent =
       tools: string[];
       permissionMode?: string;
     }
-  | { kind: "assistant_text"; text: string }
-  | { kind: "tool_use"; toolUseId: string; name: string; input: unknown }
+  // messageUuid = 该 assistant 消息的 uuid，作为"从此轮 fork"的锚点
+  | { kind: "assistant_text"; text: string; messageUuid?: string }
+  | { kind: "tool_use"; toolUseId: string; name: string; input: unknown; messageUuid?: string }
   | { kind: "tool_result"; toolUseId: string; isError: boolean; content: unknown }
   | {
       kind: "result";
@@ -56,6 +57,8 @@ export type AgentEvent =
       durationMs?: number;
       numTurns?: number;
       sessionId?: string;
+      // 本轮最后一条 assistant 消息的 uuid —— 从该轮 fork 时的 resumeSessionAt 锚点
+      anchorUuid?: string;
     }
   | { kind: "error"; message: string };
 
@@ -85,6 +88,21 @@ export interface AgentStartConfig {
   maxTurns?: number;
   /** 该 agent 所属画布区域（=分支）的 id，M1 仅占位、暂不驱动隔离。 */
   zoneId?: string;
+
+  // ---- 续接 / fork（对话历史分叉）----
+  /** 要恢复/分叉的源会话 id。 */
+  resume?: string;
+  /** 只恢复到该 assistant 消息 uuid（含）为止 —— 用于从对话中间某轮 fork。 */
+  resumeSessionAt?: string;
+  /** true = 恢复时分叉成新会话（与 resume 配合），而非续接原会话。 */
+  forkSession?: boolean;
+}
+
+/** 一个 agent 的 fork 来源（用于前端画 fork 连线）。 */
+export interface ForkOrigin {
+  parentAgentId: string;
+  /** 从父 agent 第几轮（assistant uuid 锚点）分叉。 */
+  anchorUuid: string;
 }
 
 /** 客户端 → 服务端命令。 */
@@ -104,4 +122,6 @@ export interface AgentSnapshot {
   lastEventSeq: number;
   totalCostUsd?: number;
   usage?: UsageInfo;
+  /** 若该 agent 由 fork 产生，记录其来源（供前端画 fork 连线）。 */
+  forkOrigin?: ForkOrigin;
 }

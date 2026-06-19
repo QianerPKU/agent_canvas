@@ -43,6 +43,24 @@ describe("mapSdkMessage", () => {
     ]);
   });
 
+  it("捕获 assistant 消息 uuid 到 messageUuid", () => {
+    const msg: SdkMessage = {
+      type: "assistant",
+      session_id: "s1",
+      uuid: "u-123",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "答复" },
+          { type: "tool_use", id: "t1", name: "Read", input: {} },
+        ],
+      },
+    };
+    const events = mapSdkMessage(msg);
+    expect(events[0]).toMatchObject({ kind: "assistant_text", messageUuid: "u-123" });
+    expect(events[1]).toMatchObject({ kind: "tool_use", messageUuid: "u-123" });
+  });
+
   it("空白 text 块被跳过", () => {
     const msg: SdkMessage = {
       type: "assistant",

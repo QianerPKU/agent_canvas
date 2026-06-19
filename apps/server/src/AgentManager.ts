@@ -2,6 +2,8 @@ import type {
   AgentEvent,
   AgentEventEnvelope,
   AgentSnapshot,
+  AgentStartConfig,
+  ForkOrigin,
 } from "@agent-canvas/shared";
 import { AgentRunner } from "./AgentRunner.js";
 import type { QueryFn } from "./sdk/types.js";
@@ -23,6 +25,9 @@ export class AgentManager {
   private readonly seqs = new Map<string, number>();
   private readonly history = new Map<string, AgentEventEnvelope[]>();
   private readonly listeners = new Set<EnvelopeListener>();
+  // fork 产生的 agent：来源（展示用）与启动时要合并的 fork 配置
+  private readonly forkOrigins = new Map<string, ForkOrigin>();
+  private readonly forkConfigs = new Map<string, Partial<AgentStartConfig>>();
   private readonly query: QueryFn;
   private readonly now: () => number;
   private counter = 0;
@@ -51,6 +56,36 @@ export class AgentManager {
     return this.runners.get(id);
   }
 
+  /**
+   * 从某 agent 的某一轮（anchorUuid）fork 出一个新 agent。
+   * 记录其来源与启动时要合并的 fork 配置（resume/resumeSessionAt/forkSession）。
+   * 父会话尚未建立（无 sessionId）时返回 undefined。
+   */
+  fork(parentId: string, anchorUuid: string): { id: string; origin: ForkOrigin } | undefined {
+    const parent = this.runners.get(parentId);
+    if (!parent) return undefined;
+    const parentSession = parent.snapshot().sessionId;
+    if (!parentSession) return undefined;
+
+    const runner = this.create();
+    const origin: ForkOrigin = { parentAgentId: parentId, anchorUuid };
+    this.forkOrigins.set(runner.id, origin);
+    this.forkConfigs.set(runner.id, {
+      resume: parentSession,
+      resumeSessionAt: anchorUuid,
+      forkSession: true,
+    });
+    return { id: runner.id, origin };
+  }
+
+  /** 启动一个 agent；若它是 fork 产生的，合并其 fork 配置。 */
+  startAgent(id: string, config: AgentStartConfig): void {
+    const runner = this.runners.get(id);
+    if (!runner) throw new Error(`未知 agent: ${id}`);
+    const forkCfg = this.forkConfigs.get(id);
+    runner.start({ ...forkCfg, ...config });
+  }
+
   list(): AgentSnapshot[] {
     return [...this.runners.entries()].map(([id, runner]) => {
       const s = runner.snapshot();
@@ -63,6 +98,7 @@ export class AgentManager {
         lastEventSeq: this.seqs.get(id) ?? 0,
         totalCostUsd: s.totalCostUsd,
         usage: s.usage,
+        forkOrigin: this.forkOrigins.get(id),
       };
     });
   }

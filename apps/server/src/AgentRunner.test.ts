@@ -5,6 +5,7 @@ import { AsyncMessageQueue } from "./util/AsyncMessageQueue.js";
 import type {
   QueryFn,
   QueryHandle,
+  QueryOptions,
   SdkMessage,
   SdkUserInput,
 } from "./sdk/types.js";
@@ -36,8 +37,10 @@ function makeControllableQuery() {
   const out = new AsyncMessageQueue<SdkMessage>();
   const inputs: SdkUserInput[] = [];
   let interrupted = false;
+  let lastOptions: QueryOptions | undefined;
 
   const query: QueryFn = ({ prompt, options }) => {
+    lastOptions = options;
     options?.abortController?.signal.addEventListener("abort", () => out.close());
     if (typeof prompt !== "string") {
       void (async () => {
@@ -59,6 +62,7 @@ function makeControllableQuery() {
     finish: () => out.close(),
     inputs,
     wasInterrupted: () => interrupted,
+    getOptions: () => lastOptions,
   };
 }
 
@@ -163,5 +167,48 @@ describe("AgentRunner 生命周期", () => {
     const runner = new AgentRunner("a5", { query: ctl.query });
     runner.start({ prompt: "x" });
     expect(() => runner.start({ prompt: "y" })).toThrow();
+  });
+
+  it("result 携带本轮最后一条 assistant 的 uuid 作为 anchorUuid", async () => {
+    const ctl = makeControllableQuery();
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("a6", { query: ctl.query });
+    runner.on((e) => events.push(e));
+
+    runner.start({ prompt: "x" });
+    ctl.emit(SYSTEM_INIT);
+    ctl.emit({
+      type: "assistant",
+      session_id: "s1",
+      uuid: "u-1",
+      message: { role: "assistant", content: [{ type: "text", text: "第一段" }] },
+    });
+    ctl.emit({
+      type: "assistant",
+      session_id: "s1",
+      uuid: "u-2",
+      message: { role: "assistant", content: [{ type: "text", text: "最终答复" }] },
+    });
+    ctl.emit(resultMsg());
+    await flush();
+
+    const result = events.find((e) => e.kind === "result");
+    expect(result).toBeDefined();
+    expect(result && result.kind === "result" && result.anchorUuid).toBe("u-2");
+  });
+
+  it("fork 启动选项（resume/resumeSessionAt/forkSession）传透给 query", () => {
+    const ctl = makeControllableQuery();
+    const runner = new AgentRunner("a7", { query: ctl.query });
+    runner.start({
+      prompt: "继续",
+      resume: "src-session",
+      resumeSessionAt: "u-anchor",
+      forkSession: true,
+    });
+    const opts = ctl.getOptions();
+    expect(opts?.resume).toBe("src-session");
+    expect(opts?.resumeSessionAt).toBe("u-anchor");
+    expect(opts?.forkSession).toBe(true);
   });
 });

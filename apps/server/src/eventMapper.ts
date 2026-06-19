@@ -18,7 +18,10 @@ export function mapSdkMessage(msg: SdkMessage): AgentEvent[] {
     case "system":
       return mapSystem(msg);
     case "assistant":
-      return mapAssistant((msg as { message: SdkApiMessage }).message);
+      return mapAssistant(
+        (msg as { message: SdkApiMessage }).message,
+        (msg as { uuid?: string }).uuid,
+      );
     case "user":
       return mapUser((msg as { message: SdkApiMessage }).message);
     case "result":
@@ -51,18 +54,18 @@ function mapSystem(msg: SdkMessage): AgentEvent[] {
   ];
 }
 
-function mapAssistant(message: SdkApiMessage): AgentEvent[] {
+function mapAssistant(message: SdkApiMessage, uuid?: string): AgentEvent[] {
   // 少数情况下 content 直接是字符串
   if (typeof message?.content === "string") {
     return message.content.length > 0
-      ? [{ kind: "assistant_text", text: message.content }]
+      ? [{ kind: "assistant_text", text: message.content, messageUuid: uuid }]
       : [];
   }
   return forEachBlock(message, (block) => {
     if (block.type === "text" && typeof (block as { text?: unknown }).text === "string") {
       const text = (block as { text: string }).text;
       // 跳过空白文本块，减少噪声
-      return text.length > 0 ? { kind: "assistant_text", text } : null;
+      return text.length > 0 ? { kind: "assistant_text", text, messageUuid: uuid } : null;
     }
     if (block.type === "tool_use") {
       const b = block as { id?: string; name?: string; input?: unknown };
@@ -71,6 +74,7 @@ function mapAssistant(message: SdkApiMessage): AgentEvent[] {
         toolUseId: b.id ?? "",
         name: b.name ?? "",
         input: b.input,
+        messageUuid: uuid,
       };
     }
     return null;
