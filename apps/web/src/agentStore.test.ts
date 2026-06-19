@@ -4,8 +4,9 @@ import {
   applyEnvelope,
   applyHello,
   emptyMap,
-  MAX_LINES,
+  insertForked,
   newAgentView,
+  recordInput,
   type AgentMap,
   type AgentView,
 } from "./agentStore.js";
@@ -14,107 +15,118 @@ let seq = 0;
 function env(agentId: string, event: AgentEvent): AgentEventEnvelope {
   return { agentId, seq: ++seq, at: Date.now(), event };
 }
-
-/** 取出 a1（带断言，避免 noUncheckedIndexedAccess 噪声）。 */
-function a1(m: AgentMap): AgentView {
-  const v = m.a1;
-  if (!v) throw new Error("缺少 a1");
+function get(m: AgentMap, id = "a1"): AgentView {
+  const v = m[id];
+  if (!v) throw new Error(`缺少 ${id}`);
   return v;
 }
 
-describe("agentStore", () => {
-  it("applyHello 用快照重建表", () => {
-    const map = applyHello([
-      {
-        id: "a1",
-        status: "running",
-        sessionId: "s1",
-        config: { prompt: "x" },
-        createdAt: 1,
-        lastEventSeq: 7,
-        totalCostUsd: 0.5,
-      },
-    ]);
-    expect(a1(map).status).toBe("running");
-    expect(a1(map).lastSeq).toBe(7);
-    expect(a1(map).costUsd).toBe(0.5);
+const SYS: AgentEvent = {
+  kind: "system_init",
+  sessionId: "s1",
+  model: "haiku",
+  cwd: "/r",
+  tools: [],
+};
+
+describe("agentStore 轮次模型", () => {
+  it("新建 agent 有一个 idle 轮", () => {
+    const v = newAgentView("a1");
+    expect(v.turns).toHaveLength(1);
+    expect(v.turns[0]).toMatchObject({ index: 0, status: "idle" });
   });
 
-  it("status 事件更新状态", () => {
+  it("recordInput 把末尾轮置 running 并记录输入", () => {
     seq = 0;
     let map: AgentMap = { a1: newAgentView("a1") };
-    map = applyEnvelope(map, env("a1", { kind: "status", status: "running" }));
-    expect(a1(map).status).toBe("running");
+    map = recordInput(map, "a1", "写个 a+b");
+    const t0 = get(map).turns[0]!;
+    expect(t0.status).toBe("running");
+    expect(t0.userInput).toBe("写个 a+b");
   });
 
-  it("system_init 记录 session/model 并加一行", () => {
+  it("一轮以 result 收尾：定格 done + anchorUuid，并自动延伸新 idle 轮", () => {
     seq = 0;
-    let map = emptyMap();
+    let map: AgentMap = { a1: newAgentView("a1") };
+    map = recordInput(map, "a1", "做 x");
+    map = applyEnvelope(map, env("a1", SYS));
+    map = applyEnvelope(map, env("a1", { kind: "assistant_text", text: "好的", messageUuid: "u1" }));
     map = applyEnvelope(
       map,
-      env("a1", {
-        kind: "system_init",
-        sessionId: "s1",
-        model: "haiku",
-        cwd: "/r",
-        tools: [],
-      }),
+      env("a1", { kind: "result", subtype: "success", isError: false, costUsd: 0.01, anchorUuid: "u1" }),
     );
-    expect(a1(map).sessionId).toBe("s1");
-    expect(a1(map).model).toBe("haiku");
-    expect(a1(map).lines).toHaveLength(1);
-    expect(a1(map).lines[0]).toMatchObject({ kind: "system" });
+
+    const v = get(map);
+    expect(v.turns).toHaveLength(2);
+    const t0 = v.turns[0]!;
+    expect(t0.status).toBe("done");
+    expect(t0.anchorUuid).toBe("u1");
+    expect(t0.costUsd).toBe(0.01);
+    expect(t0.lines.some((l) => l.kind === "assistant")).toBe(true);
+    expect(v.turns[1]).toMatchObject({ index: 1, status: "idle" });
   });
 
-  it("assistant/tool_use/tool_result 累积成行", () => {
+  it("多轮：第二轮输入折叠进新轮，再 result 又延伸第三轮", () => {
     seq = 0;
-    let map = emptyMap();
-    map = applyEnvelope(map, env("a1", { kind: "assistant_text", text: "hi" }));
-    map = applyEnvelope(map, env("a1", { kind: "tool_use", toolUseId: "t", name: "Read", input: {} }));
-    map = applyEnvelope(map, env("a1", { kind: "tool_result", toolUseId: "t", isError: false, content: "ok" }));
-    expect(a1(map).lines.map((l) => l.kind)).toEqual(["assistant", "tool_use", "tool_result"]);
+    let map: AgentMap = { a1: newAgentView("a1") };
+    // 第一轮
+    map = recordInput(map, "a1", "t1");
+    map = applyEnvelope(map, env("a1", SYS));
+    map = applyEnvelope(map, env("a1", { kind: "result", subtype: "success", isError: false, anchorUuid: "u1" }));
+    // 第二轮
+    map = recordInput(map, "a1", "t2");
+    map = applyEnvelope(map, env("a1", { kind: "assistant_text", text: "第二轮答复", messageUuid: "u2" }));
+    map = applyEnvelope(map, env("a1", { kind: "result", subtype: "success", isError: false, anchorUuid: "u2" }));
+
+    const v = get(map);
+    expect(v.turns).toHaveLength(3);
+    expect(v.turns[1]!.userInput).toBe("t2");
+    expect(v.turns[1]!.status).toBe("done");
+    expect(v.turns[1]!.anchorUuid).toBe("u2");
+    expect(v.turns[2]!.status).toBe("idle");
   });
 
-  it("result 更新累计花费", () => {
+  it("status=stopped 把当前轮标记 stopped", () => {
     seq = 0;
-    let map = emptyMap();
-    map = applyEnvelope(
-      map,
-      env("a1", { kind: "result", subtype: "success", isError: false, costUsd: 0.0123 }),
-    );
-    expect(a1(map).costUsd).toBeCloseTo(0.0123);
-    expect(a1(map).lines[0]).toMatchObject({ kind: "result" });
+    let map: AgentMap = { a1: newAgentView("a1") };
+    map = recordInput(map, "a1", "x");
+    map = applyEnvelope(map, env("a1", SYS));
+    map = applyEnvelope(map, env("a1", { kind: "status", status: "stopped" }));
+    expect(get(map).turns[0]!.status).toBe("stopped");
+    expect(get(map).status).toBe("stopped");
   });
 
-  it("忽略已处理过的旧 seq", () => {
+  it("insertForked 插入带 forkOrigin 的新 agent", () => {
+    let map = emptyMap();
+    map = insertForked(map, "a2", { parentAgentId: "a1", anchorUuid: "u1" });
+    const v = get(map, "a2");
+    expect(v.forkOrigin).toEqual({ parentAgentId: "a1", anchorUuid: "u1" });
+    expect(v.turns).toHaveLength(1);
+    expect(v.turns[0]!.status).toBe("idle");
+  });
+
+  it("applyHello 携带 forkOrigin", () => {
+    const map = applyHello([
+      {
+        id: "a2",
+        status: "idle",
+        config: { prompt: "" },
+        createdAt: 1,
+        lastEventSeq: 0,
+        forkOrigin: { parentAgentId: "a1", anchorUuid: "u1" },
+      },
+    ]);
+    expect(get(map, "a2").forkOrigin).toEqual({ parentAgentId: "a1", anchorUuid: "u1" });
+  });
+
+  it("忽略旧 seq", () => {
     let map: AgentMap = { a1: newAgentView("a1", { lastSeq: 5 }) };
-    const stale: AgentEventEnvelope = {
+    map = applyEnvelope(map, {
       agentId: "a1",
       seq: 3,
       at: 0,
       event: { kind: "status", status: "running" },
-    };
-    map = applyEnvelope(map, stale);
-    expect(a1(map).status).toBe("idle"); // 未被旧事件改动
-  });
-
-  it("不可变更新：返回新引用", () => {
-    seq = 0;
-    const map: AgentMap = { a1: newAgentView("a1") };
-    const next = applyEnvelope(map, env("a1", { kind: "status", status: "done" }));
-    expect(next).not.toBe(map);
-    expect(a1(next)).not.toBe(a1(map));
-    expect(a1(map).status).toBe("idle"); // 原对象不变
-  });
-
-  it("输出行数封顶 MAX_LINES", () => {
-    seq = 0;
-    let map = emptyMap();
-    for (let i = 0; i < MAX_LINES + 50; i++) {
-      map = applyEnvelope(map, env("a1", { kind: "assistant_text", text: `${i}` }));
-    }
-    const lines = a1(map).lines;
-    expect(lines).toHaveLength(MAX_LINES);
-    expect(lines[lines.length - 1]).toMatchObject({ text: `${MAX_LINES + 49}` });
+    });
+    expect(get(map).status).toBe("idle");
   });
 });

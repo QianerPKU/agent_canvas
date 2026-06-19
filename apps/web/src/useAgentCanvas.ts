@@ -4,23 +4,28 @@
  *  - 暴露 create/start/stop/send/resume 动作
  *  - 自动断线重连
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { AgentStartConfig, ServerFrame } from "@agent-canvas/shared";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { ServerFrame } from "@agent-canvas/shared";
 import { api } from "./api.js";
 import {
   applyEnvelope,
   applyHello,
   emptyMap,
+  insertForked,
   newAgentView,
+  recordInput,
   type AgentMap,
 } from "./agentStore.js";
 
 export interface AgentActions {
+  /** 新建一个 agent（出现一个 idle 起始节点）。 */
   create: () => Promise<void>;
-  start: (id: string, config: AgentStartConfig) => Promise<void>;
-  stop: (id: string) => Promise<void>;
-  send: (id: string, text: string) => Promise<void>;
-  resume: (id: string, sessionId: string, text: string) => Promise<void>;
+  /** 在末尾 idle 轮提交输入：首轮→start，续轮→send（自动判断）。 */
+  submit: (agentId: string, text: string) => Promise<void>;
+  /** 中止 agent。 */
+  stop: (agentId: string) => Promise<void>;
+  /** 从某轮（anchorUuid）fork 出一个新 agent。 */
+  fork: (agentId: string, anchorUuid: string) => Promise<void>;
 }
 
 export interface UseAgentCanvas {
@@ -38,6 +43,9 @@ export function useAgentCanvas(): UseAgentCanvas {
   const [agents, setAgents] = useState<AgentMap>(emptyMap);
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
+  // 始终指向最新 agents，供 submit 判断 start/send（避免闭包过期）
+  const agentsRef = useRef(agents);
+  agentsRef.current = agents;
 
   useEffect(() => {
     let closed = false;
@@ -82,10 +90,21 @@ export function useAgentCanvas(): UseAgentCanvas {
         // 后端 create 不发事件，乐观插入一个 idle 节点
         setAgents((prev) => (prev[id] ? prev : { ...prev, [id]: newAgentView(id) }));
       },
-      start: (id, config) => api.start(id, config).then(() => undefined),
-      stop: (id) => api.stop(id).then(() => undefined),
-      send: (id, text) => api.send(id, text).then(() => undefined),
-      resume: (id, sessionId, text) => api.resume(id, sessionId, text).then(() => undefined),
+      submit: async (agentId, text) => {
+        const view = agentsRef.current[agentId];
+        setAgents((prev) => recordInput(prev, agentId, text)); // 乐观置 running
+        // 首轮（idle）用 start（fork 出来的 agent 由后端合并 fork 配置）；续轮用 send
+        if (!view || view.status === "idle") {
+          await api.start(agentId, { prompt: text });
+        } else {
+          await api.send(agentId, text);
+        }
+      },
+      stop: (agentId) => api.stop(agentId).then(() => undefined),
+      fork: async (agentId, anchorUuid) => {
+        const { id, origin } = await api.fork(agentId, anchorUuid);
+        setAgents((prev) => insertForked(prev, id, origin));
+      },
     }),
     [],
   );

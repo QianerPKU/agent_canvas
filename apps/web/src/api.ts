@@ -1,5 +1,5 @@
 /** 后端 REST 命令客户端。事件走 WebSocket，命令走这里。 */
-import type { AgentSnapshot, AgentStartConfig } from "@agent-canvas/shared";
+import type { AgentSnapshot, AgentStartConfig, ForkOrigin } from "@agent-canvas/shared";
 
 const BASE = "/api";
 
@@ -26,4 +26,9 @@ export const api = {
   stop: (id: string) => call(`/agents/${id}/stop`, { method: "POST" }),
   resume: (id: string, sessionId: string, text: string) =>
     call(`/agents/${id}/resume`, { method: "POST", body: JSON.stringify({ sessionId, text }) }),
+  fork: (id: string, anchorUuid: string) =>
+    call<{ id: string; origin: ForkOrigin }>(`/agents/${id}/fork`, {
+      method: "POST",
+      body: JSON.stringify({ anchorUuid }),
+    }),
 };
