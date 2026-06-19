@@ -200,7 +200,11 @@ export class AgentRunner {
 }
 
 function toUserInput(text: string): SdkUserInput {
-  return { type: "user", message: { role: "user", content: text } };
+  return {
+    type: "user",
+    message: { role: "user", content: text },
+    parent_tool_use_id: null,
+  };
 }
 
 function errorMessage(err: unknown): string {

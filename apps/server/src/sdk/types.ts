@@ -94,11 +94,11 @@ export type SdkMessage =
 
 // ---- query 的输入与函数签名（供依赖注入）----
 
-/** 流式输入模式下推给 SDK 的用户消息。 */
+/** 流式输入模式下推给 SDK 的用户消息（对齐 SDKUserMessage 必填字段）。 */
 export interface SdkUserInput {
   type: "user";
   message: { role: "user"; content: string | SdkContentBlock[] };
-  parent_tool_use_id?: string | null;
+  parent_tool_use_id: string | null; // SDK 要求必填，顶层用户消息填 null
   session_id?: string;
 }
 
