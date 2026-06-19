@@ -1,3 +1,30 @@
 CLAUDE.md
 MEMORY.md
 tmp
+.claude
+
+# deps
+node_modules/
+
+# build output
+dist/
+build/
+*.tsbuildinfo
+
+# logs
+*.log
+npm-debug.log*
+
+# env / secrets
+.env
+.env.*
+
+# local data (sqlite etc. — added in milestone 2)
+*.sqlite
+*.sqlite-journal
+data/
+
+# os / editor
+.DS_Store
+Thumbs.db
+.idea/

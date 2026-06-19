@@ -1,0 +1,48 @@
+# agent_canvas
+
+多 agent 并行开发 / 并行实验时的**可视化监控与操纵画布**。把不同 agent 做成画布上的模块，模块化管理各类 agent 的提示词，并支持提示词的 fork 与版本分支控制。底层通过 **Claude Agent SDK**（Claude Code 的程序化接口）驱动每个 agent。
+
+## 核心理念
+
+- **画布即控制台**：每个节点是一个 agent 模块（底层一个 Claude Code 会话），可实时监控（输出流 / 工具调用 / token 与花费 / 状态 / 产出 diff）并可干预（追加指令 / 停止 / 续跑）。
+- **区域 = 分支**：画布用背景色切分成若干**区域**，每个区域对应一个 git branch（背后一个 git worktree）。agent 模块可被拖动到不同区域，从而在对应分支里工作；纯做实验的 agent 不必各自占用分支。*(里程碑 2/3 实现)*
+- **提示词模块化 + fork/版本**：提示词按 agent 类型模块化管理，支持 fork 与版本分支。*(里程碑 2 实现)*
+
+## 技术栈
+
+| 层 | 选型 |
+| --- | --- |
+| 产品形态 | 本地 Web 应用（Node 本地服务 + 浏览器画布） |
+| 前端 | React + Vite + React Flow (`@xyflow/react`) |
+| 后端 | Node + TypeScript，WebSocket 推实时流 + REST |
+| 驱动 agent | `@anthropic-ai/claude-agent-sdk`（TS） |
+| 并行隔离 | git worktree（区域=分支） |
+| 持久化 | SQLite（里程碑 2 引入） |
+| 测试 | vitest |
+
+## 仓库结构（npm workspaces）
+
+```
+agent_canvas/
+├─ apps/
+│  ├─ server/   后端控制层：拉起/管理 agent 会话，WS/REST   →见 apps/server/README.md
+│  └─ web/      前端画布（里程碑 1 后段）                  →见 apps/web/README.md
+└─ packages/
+   └─ shared/   前后端共享类型（统一事件模型）              →见 packages/shared/README.md
+```
+
+## 里程碑
+
+- **M1（进行中）单 agent 端到端**：画布拉起 1 个 agent → 实时监控输出/状态 → 可停止 / 续跑 / 中途追加指令。先打通"拉起—监控—干预"主链路。
+- **M2 提示词模块 + fork/版本**：提示词模块化管理与分支；引入 SQLite 持久化。
+- **M3 多 agent 并行编排**：区域=分支的可视化隔离、并行调度与产出汇总对比。
+
+## 开发
+
+```bash
+npm install              # 安装全部 workspace 依赖
+npm test                 # 跑所有 workspace 测试
+npm run dev:server       # 启动后端开发服务
+```
+
+> 鉴权：Agent SDK 复用本机已登录的 Claude 凭据（或环境变量 `ANTHROPIC_API_KEY`），无需单独安装全局 `claude` 命令。

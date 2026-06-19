@@ -1,0 +1,167 @@
+import { describe, it, expect } from "vitest";
+import type { AgentEvent, AgentStatus } from "@agent-canvas/shared";
+import { AgentRunner } from "./AgentRunner.js";
+import { AsyncMessageQueue } from "./util/AsyncMessageQueue.js";
+import type {
+  QueryFn,
+  QueryHandle,
+  SdkMessage,
+  SdkUserInput,
+} from "./sdk/types.js";
+
+/** 让微任务与队列 resolver 跑完。 */
+const flush = () => new Promise((r) => setTimeout(r, 0));
+
+const SYSTEM_INIT: SdkMessage = {
+  type: "system",
+  subtype: "init",
+  session_id: "s1",
+  model: "claude-opus-4-8",
+  cwd: "/repo",
+  tools: ["Read"],
+};
+
+function resultMsg(extra: Partial<Record<string, unknown>> = {}): SdkMessage {
+  return {
+    type: "result",
+    subtype: "success",
+    is_error: false,
+    session_id: "s1",
+    ...extra,
+  };
+}
+
+/** 可手动驱动的假 query：emit 推消息，finish 关闭输出，记录收到的输入与 interrupt。 */
+function makeControllableQuery() {
+  const out = new AsyncMessageQueue<SdkMessage>();
+  const inputs: SdkUserInput[] = [];
+  let interrupted = false;
+
+  const query: QueryFn = ({ prompt, options }) => {
+    options?.abortController?.signal.addEventListener("abort", () => out.close());
+    if (typeof prompt !== "string") {
+      void (async () => {
+        for await (const inp of prompt) inputs.push(inp);
+      })();
+    }
+    const handle: QueryHandle = {
+      [Symbol.asyncIterator]: () => out[Symbol.asyncIterator](),
+      interrupt: async () => {
+        interrupted = true;
+      },
+    };
+    return handle;
+  };
+
+  return {
+    query,
+    emit: (m: SdkMessage) => out.push(m),
+    finish: () => out.close(),
+    inputs,
+    wasInterrupted: () => interrupted,
+  };
+}
+
+function collectStatuses(events: AgentEvent[]): AgentStatus[] {
+  return events
+    .filter((e): e is Extract<AgentEvent, { kind: "status" }> => e.kind === "status")
+    .map((e) => e.status);
+}
+
+describe("AgentRunner 生命周期", () => {
+  it("start→running→result→waiting_input，再 send 干预→running→result", async () => {
+    const ctl = makeControllableQuery();
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("a1", { query: ctl.query });
+    runner.on((e) => events.push(e));
+
+    runner.start({ prompt: "做 x" });
+    expect(runner.getStatus()).toBe("starting");
+
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+    expect(runner.getStatus()).toBe("running");
+    expect(runner.snapshot().sessionId).toBe("s1");
+
+    ctl.emit(resultMsg({ total_cost_usd: 0.01, usage: { input_tokens: 5 } }));
+    await flush();
+    expect(runner.getStatus()).toBe("waiting_input");
+    expect(runner.snapshot().totalCostUsd).toBe(0.01);
+
+    // 中途干预
+    runner.send("再做 y");
+    expect(runner.getStatus()).toBe("running");
+    await flush();
+
+    ctl.emit(resultMsg({ total_cost_usd: 0.02 }));
+    await flush();
+    expect(runner.getStatus()).toBe("waiting_input");
+    expect(runner.snapshot().totalCostUsd).toBe(0.02);
+
+    // 两条用户输入都被送进了 SDK
+    expect(ctl.inputs.map((i) => i.message.content)).toEqual(["做 x", "再做 y"]);
+
+    // 状态变迁序列
+    expect(collectStatuses(events)).toEqual([
+      "starting",
+      "running",
+      "waiting_input",
+      "running",
+      "waiting_input",
+    ]);
+
+    await runner.stop();
+  });
+
+  it("stop → stopped，调用 interrupt，且之后不可再 send", async () => {
+    const ctl = makeControllableQuery();
+    const runner = new AgentRunner("a2", { query: ctl.query });
+    runner.start({ prompt: "x" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+
+    await runner.stop();
+    expect(runner.getStatus()).toBe("stopped");
+    expect(ctl.wasInterrupted()).toBe(true);
+    expect(() => runner.send("y")).toThrow();
+  });
+
+  it("输入关闭后消息流自然结束 → done", async () => {
+    const ctl = makeControllableQuery();
+    const runner = new AgentRunner("a3", { query: ctl.query });
+    runner.start({ prompt: "x" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+
+    ctl.finish(); // SDK 消息流结束
+    await flush();
+    expect(runner.getStatus()).toBe("done");
+  });
+
+  it("消息流抛错 → error 事件 + error 状态", async () => {
+    const query: QueryFn = () => ({
+      // eslint-disable-next-line require-yield
+      async *[Symbol.asyncIterator]() {
+        throw new Error("boom");
+      },
+    });
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("a4", { query });
+    runner.on((e) => events.push(e));
+
+    runner.start({ prompt: "x" });
+    await flush();
+
+    expect(runner.getStatus()).toBe("error");
+    expect(
+      events.some((e) => e.kind === "error" && e.message === "boom"),
+    ).toBe(true);
+  });
+
+  it("运行中重复 start 抛错", () => {
+    const ctl = makeControllableQuery();
+    const runner = new AgentRunner("a5", { query: ctl.query });
+    runner.start({ prompt: "x" });
+    expect(() => runner.start({ prompt: "y" })).toThrow();
+  });
+});
