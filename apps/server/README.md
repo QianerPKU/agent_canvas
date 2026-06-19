@@ -60,4 +60,17 @@ npm test --workspace apps/server
 npm run dev --workspace apps/server      # tsx watch，监听 :4317
 ```
 
-> 鉴权：SDK 复用本机已登录 Claude 凭据或环境变量 `ANTHROPIC_API_KEY`。
+## 真机冒烟（会真实调用模型）
+
+`scripts/smoke.ts`：走真实后端链路（AgentManager→AgentRunner→realQuery→真 SDK），
+用安全参数（临时目录 + haiku + acceptEdits + maxTurns）跑通一次并打印事件流与产物。
+
+```bash
+npm run smoke --workspace apps/server
+```
+
+> 鉴权：SDK **自动复用本机已登录的 Claude 订阅凭据**（`~/.claude/.credentials.json` 的 `claudeAiOauth`），
+> 无需设置 `ANTHROPIC_API_KEY`；若想改走 API 计费再设该环境变量。已实测通过。
+>
+> ⚠️ 安全：实测发现 `allowedTools` 并不能阻止 agent 调用其他工具（如 PowerShell）。
+> 要"只读/禁止执行命令"，需用 `permissionMode='plan'` 或其他机制，不能依赖 `allowedTools`。
