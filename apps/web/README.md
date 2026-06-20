@@ -32,6 +32,7 @@
 
 - **命令走 REST，事件走 WS**，单向清晰。`submit` 自动判断首轮 start / 续轮 send。
 - 新建 / fork 后后端不发事件，前端**乐观插入**节点（fork 带 `forkOrigin` 以画连线）。
+- WebSocket 首次连接延迟到下一轮事件循环，兼容 React StrictMode 的开发期双重 effect 检查，避免 Vite 代理记录无害的 `ECONNABORTED`。
 - 节点只有头部可拖动（`.drag-handle`），控制区 `.nodrag`、日志区 `.nowheel`。
 
 ## 开发
@@ -52,4 +53,5 @@ npm test --workspace apps/web
 ```
 
 - `agentStore.test.ts`：事件折叠、不可变更新、旧 seq 去重、行数封顶（node 环境）
+- `useAgentCanvas.test.tsx`：StrictMode 下只建立一次 WebSocket
 - `nodes/AgentNode.test.tsx`：各状态徽标与控件交互（jsdom + Testing Library）

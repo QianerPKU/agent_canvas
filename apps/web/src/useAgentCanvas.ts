@@ -49,7 +49,7 @@ export function useAgentCanvas(): UseAgentCanvas {
 
   useEffect(() => {
     let closed = false;
-    let retry: ReturnType<typeof setTimeout> | undefined;
+    let connectTimer: ReturnType<typeof setTimeout> | undefined;
 
     const connect = () => {
       const ws = new WebSocket(wsUrl());
@@ -57,7 +57,7 @@ export function useAgentCanvas(): UseAgentCanvas {
       ws.onopen = () => setConnected(true);
       ws.onclose = () => {
         setConnected(false);
-        if (!closed) retry = setTimeout(connect, 1000);
+        scheduleConnect(1000);
       };
       ws.onerror = () => ws.close();
       ws.onmessage = (ev) => {
@@ -75,10 +75,21 @@ export function useAgentCanvas(): UseAgentCanvas {
       };
     };
 
-    connect();
+    const scheduleConnect = (delay: number) => {
+      if (closed) return;
+      if (connectTimer) clearTimeout(connectTimer);
+      connectTimer = setTimeout(() => {
+        connectTimer = undefined;
+        connect();
+      }, delay);
+    };
+
+    // React StrictMode 会在开发环境执行一次 setup→cleanup→setup。
+    // 延迟到下一轮事件循环，避免试探性 setup 建立后立刻中断 WebSocket。
+    scheduleConnect(0);
     return () => {
       closed = true;
-      if (retry) clearTimeout(retry);
+      if (connectTimer) clearTimeout(connectTimer);
       wsRef.current?.close();
     };
   }, []);
