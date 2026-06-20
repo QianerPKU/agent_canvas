@@ -7,16 +7,17 @@
 
 - 一个 agent = 一条**轮次链**。每轮 = 一次用户输入 + 一次完整答复，以 `result` 收尾。
 - 一轮完成后**自动延伸出一个 idle 轮**（"待输入"节点）；在它里面输入下一轮指令即续接。
+- 首轮 idle 节点可选择 provider：`Claude` 或 `Codex`；fork 子节点继承父 provider。
 - 每个**完成**轮上有 **⑂ fork 按钮** → 从该轮的对话状态分叉出一个独立新 agent（连一条 fork 线），形成对话树。fork 不绑定 git。
 
 ## 模块
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/agentStore.ts` | **纯函数**：把事件流折叠成对话树（`AgentView.turns: Turn[]`）。result 收尾本轮并延伸新 idle 轮；记录每轮 `anchorUuid`（fork 锚点）。无 React 依赖，单测主对象。 |
+| `src/agentStore.ts` | **纯函数**：把事件流折叠成对话树（`AgentView.turns: Turn[]`）。result 收尾本轮并延伸新 idle 轮；记录每轮 `anchorUuid`（fork 锚点）与 provider。无 React 依赖，单测主对象。 |
 | `src/api.ts` | REST 命令客户端（create/start/send/stop/fork/resume） |
 | `src/useAgentCanvas.ts` | React hook：订阅 `/ws`、折叠出 `agents` 表、暴露动作（create/submit/stop/fork）、断线自动重连 |
-| `src/nodes/TurnNode.tsx` | 自定义节点（一轮）：状态徽标 + 该轮用户输入 + 输出滚动区 + 控制区（idle→输入框；running→停止；done→fork） |
+| `src/nodes/TurnNode.tsx` | 自定义节点（一轮）：状态徽标 + provider 选择 + 该轮用户输入 + 输出滚动区 + 控制区（idle→输入框；running→停止；done→fork） |
 | `src/App.tsx` | 画布装配：对话树布局（每 agent 一列、轮次向下、fork 另起列对齐锚点轮）+ 轮链边 + fork 边 |
 
 ## 数据流

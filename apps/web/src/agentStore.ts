@@ -11,6 +11,7 @@
 import type {
   AgentEvent,
   AgentEventEnvelope,
+  AgentProvider,
   AgentSnapshot,
   AgentStatus,
   ForkOrigin,
@@ -39,6 +40,7 @@ export interface Turn {
 
 export interface AgentView {
   id: string;
+  provider?: AgentProvider;
   sessionId?: string;
   model?: string;
   status: AgentStatus;
@@ -69,6 +71,7 @@ export function applyHello(agents: AgentSnapshot[]): AgentMap {
   const map: AgentMap = {};
   for (const a of agents) {
     map[a.id] = newAgentView(a.id, {
+      provider: a.provider ?? a.config.provider,
       status: a.status,
       sessionId: a.sessionId,
       forkOrigin: a.forkOrigin,
@@ -82,14 +85,25 @@ export function applyHello(agents: AgentSnapshot[]): AgentMap {
 /** 乐观插入一个 fork 出来的新 agent。 */
 export function insertForked(map: AgentMap, id: string, origin: ForkOrigin): AgentMap {
   if (map[id]) return map;
-  return { ...map, [id]: newAgentView(id, { forkOrigin: origin }) };
+  return {
+    ...map,
+    [id]: newAgentView(id, {
+      provider: map[origin.parentAgentId]?.provider,
+      forkOrigin: origin,
+    }),
+  };
 }
 
 /** 用户在末尾 idle 轮提交输入：记录输入并把该轮置 running（乐观）。 */
-export function recordInput(map: AgentMap, agentId: string, text: string): AgentMap {
+export function recordInput(
+  map: AgentMap,
+  agentId: string,
+  text: string,
+  provider?: AgentProvider,
+): AgentMap {
   const prev = map[agentId] ?? newAgentView(agentId);
   const next = withLastTurn(prev, (t) => ({ ...t, userInput: text, status: "running" }));
-  return { ...map, [agentId]: next };
+  return { ...map, [agentId]: { ...next, provider: provider ?? prev.provider } };
 }
 
 /** 应用一条事件信封；旧/重复 seq 忽略。 */

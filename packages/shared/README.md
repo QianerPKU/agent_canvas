@@ -12,9 +12,10 @@
 | --- | --- |
 | `AgentStatus` | agent 运行状态机：`idle / starting / running / waiting_input / done / stopped / error` |
 | `isTerminalStatus()` / `TERMINAL_STATUSES` | 判断/列举终态（`done/stopped/error`） |
+| `AgentProvider` | 底层 agent 驱动：`claude / codex` |
 | `AgentEvent` | 归一化事件的可辨识联合（判别字段 `kind`）：`status / system_init / assistant_text / tool_use / tool_result / result / error` |
 | `AgentEventEnvelope` | 传输信封：`{ agentId, seq, at, event }`，带单调序号便于回放/补齐 |
-| `AgentStartConfig` | 启动 agent 的配置（prompt、cwd、model、权限模式、`zoneId` 占位等） |
+| `AgentStartConfig` | 启动 agent 的配置（provider、prompt、cwd、model、权限模式、`zoneId` 占位等） |
 | `ClientCommand` | 客户端→服务端命令：`start / stop / send / resume` |
 | `AgentSnapshot` | agent 当前快照（REST 列表、重连补齐） |
 
@@ -22,7 +23,7 @@
 
 - **事件单向、命令单向**：后端→前端只发 `AgentEvent`（包在 `AgentEventEnvelope` 里）；前端→后端只发 `ClientCommand`。
 - **seq 单调递增**：每个 agent 的事件带连续 `seq`，前端可据此判断丢包/排序，未来支持断线重连补齐。
-- **与 SDK 解耦**：前端不依赖 `@anthropic-ai/claude-agent-sdk` 的任何类型；SDK→统一事件的映射只发生在 `apps/server`。
+- **与 provider 解耦**：前端不依赖 Claude SDK 或 Codex app-server 的任何原始类型；provider→统一事件的映射只发生在 `apps/server`。
 
 ## 开发
 

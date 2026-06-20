@@ -63,4 +63,23 @@ describe("AgentManager fork", () => {
     const mgr = new AgentManager({ query });
     expect(mgr.fork("nope", "u")).toBeUndefined();
   });
+
+  it("fork 出来的 agent 继承父 provider", async () => {
+    const claude = makeQuery("claude-session");
+    const codex = makeQuery("codex-thread");
+    const mgr = new AgentManager({ query: claude.query, codexQuery: codex.query });
+
+    const parent = mgr.create();
+    mgr.startAgent(parent.id, { prompt: "p", provider: "codex" });
+    await flush();
+
+    const forked = mgr.fork(parent.id, "turn-anchor");
+    expect(forked).toBeDefined();
+
+    mgr.startAgent(forked!.id, { prompt: "go" });
+    await flush();
+
+    expect(claude.calls).toHaveLength(0);
+    expect(codex.calls).toHaveLength(2);
+  });
 });

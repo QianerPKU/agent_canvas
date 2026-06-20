@@ -1,6 +1,6 @@
 # @agent-canvas/server
 
-后端控制层：拉起 / 监控 / 操纵 agent。通过 **Claude Agent SDK** 驱动每个 agent 会话，把 SDK 的原始消息归一成 `@agent-canvas/shared` 的统一事件，经 WebSocket 实时推给前端画布；命令（启动/停止/干预）走 REST。
+后端控制层：拉起 / 监控 / 操纵 agent。支持 **Claude Agent SDK** 与 **Codex CLI app-server** 两种 provider，把底层原始消息归一成 `@agent-canvas/shared` 的统一事件，经 WebSocket 实时推给前端画布；命令（启动/停止/干预）走 REST。
 
 ## 模块
 
@@ -8,12 +8,14 @@
 | --- | --- |
 | `src/sdk/types.ts` | 对 Agent SDK 的**最小本地类型映射** + `QueryFn`（依赖注入点，便于单测注入假实现） |
 | `src/sdk/realQuery.ts` | 把真实 SDK 的 `query` 适配成 `QueryFn`（仅运行时引入） |
+| `src/sdk/codexAppServerQuery.ts` | 通过 `codex app-server --stdio` 驱动 Codex thread/turn/fork，并适配成 `QueryFn` |
+| `src/sdk/codexAppServerMapper.ts` | **纯函数**：Codex app-server JSON-RPC 通知 → SDK-like 消息 |
 | `src/eventMapper.ts` | **纯函数**：一条 SDK 消息 → 0..N 个统一 `AgentEvent` |
 | `src/util/AsyncMessageQueue.ts` | 可动态 push、可关闭的异步队列；作为流式输入源，实现"中途干预" |
 | `src/AgentRunner.ts` | 单 agent 生命周期 + 状态机（`idle→starting→running↔waiting_input→done/stopped/error`） |
 | `src/AgentManager.ts` | 多 agent 注册表：分配 id、维护单调 `seq`、包 `AgentEventEnvelope` 广播、内存事件历史 |
 | `src/server.ts` | HTTP(REST) + WebSocket 装配 |
-| `src/index.ts` | 入口：实例化 manager（注入 realQuery）并监听端口 |
+| `src/index.ts` | 入口：实例化 manager（注入 Claude/Codex query）并监听端口 |
 
 ## 状态机
 
@@ -25,7 +27,8 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
   running ──(消息流结束/抛错)──▶ done / error
 ```
 
-- **流式输入干预**：`AgentRunner` 用 `AsyncMessageQueue` 作为 SDK 的 `prompt` 源；首条任务入队即启动，运行中 `send()` 继续入队 = 中途追加指令；`stop()` 关闭队列 + abort + 尽力 `interrupt()`。
+- **流式输入干预**：`AgentRunner` 用 `AsyncMessageQueue` 作为 `prompt` 源；首条任务入队即启动，运行中 `send()` 继续入队。Claude SDK 原生消费流式输入；Codex app-server 按 thread 连续启动 turn，并用 `turn/interrupt` 尽力中止当前 turn。
+- **provider 选择**：`AgentStartConfig.provider` 可为 `claude` 或 `codex`，未指定时默认 `claude`。
 
 ## HTTP API
 
@@ -36,7 +39,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 | `POST /api/agents` | 新建 agent，返回 `{ id }` |
 | `GET /api/agents/:id` | 单个快照 |
 | `GET /api/agents/:id/history` | 该 agent 的事件历史（重连补齐） |
-| `POST /api/agents/:id/start` | body=`AgentStartConfig`，启动 |
+| `POST /api/agents/:id/start` | body=`AgentStartConfig`，启动；`provider` 可选 `claude/codex` |
 | `POST /api/agents/:id/send` | body=`{ text }`，中途追加指令 |
 | `POST /api/agents/:id/resume` | body=`{ sessionId, text }`，续接会话 |
 | `POST /api/agents/:id/fork` | body=`{ anchorUuid }`，从该 agent 某轮 fork 出新 agent，返回 `{ id, origin }` |
@@ -44,8 +47,8 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 
 ## 多轮对话与 fork（对话历史分叉）
 
-- **多轮**：同一 agent = 同一 SDK session。每轮 = 一次用户输入 + 一次完整答复，以 `result` 事件收尾。每个 `result` 携带本轮最后一条 assistant 消息的 `anchorUuid`（fork 锚点）。
-- **fork**：`POST /:id/fork { anchorUuid }` → 用 SDK 的 `resume`(父会话) + `resumeSessionAt`(锚点 uuid) + `forkSession:true` 从某轮的对话状态分叉出一个**独立新 agent**（新 session）。`AgentManager` 记录其 `forkOrigin` 并在该 agent 首次 `start` 时合并 fork 配置。对话 fork 与 git 分支无关。
+- **多轮**：同一 agent = 同一 provider 会话。每轮 = 一次用户输入 + 一次完整答复，以 `result` 事件收尾。每个 `result` 携带本轮最后一条 assistant 消息的 `anchorUuid`（fork UI 锚点）。
+- **fork**：`POST /:id/fork { anchorUuid }` 会创建独立新 agent 并继承父 provider。Claude 使用 `resume + resumeSessionAt + forkSession:true` 从指定 assistant uuid 分叉；Codex 使用 app-server `thread/fork` 从父 thread 分叉（Codex app-server 当前是 thread 级 fork，不是按某个 assistant uuid 回滚）。对话 fork 与 git 分支无关。
 
 ## WebSocket (`/ws`)
 
@@ -58,6 +61,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 `vitest`，全部离线（不触达真实模型）：注入可手动驱动的假 `query`。
 
 - `eventMapper.test.ts`：各类 SDK 消息 → 统一事件的映射
+- `sdk/codexAppServerMapper.test.ts`：Codex app-server 通知 → SDK-like 消息
 - `AgentRunner.test.ts`：start/running/waiting_input/send/stop/done/error 全状态流转 + 流式输入
 - `util/AsyncMessageQueue.test.ts`：队列的 push/wait/close 语义
 
@@ -75,8 +79,8 @@ npm run dev --workspace apps/server      # tsx watch，监听 :4317
 npm run smoke --workspace apps/server
 ```
 
-> 鉴权：SDK **自动复用本机已登录的 Claude 订阅凭据**（`~/.claude/.credentials.json` 的 `claudeAiOauth`），
-> 无需设置 `ANTHROPIC_API_KEY`；若想改走 API 计费再设该环境变量。已实测通过。
+> 鉴权：Claude SDK **自动复用本机已登录的 Claude 订阅凭据**（`~/.claude/.credentials.json` 的 `claudeAiOauth`），
+> 无需设置 `ANTHROPIC_API_KEY`；若想改走 API 计费再设该环境变量。Codex provider 复用本机 Codex CLI 登录状态（`codex login`）。
 >
 > ⚠️ 安全：实测发现 `allowedTools` 并不能阻止 agent 调用其他工具（如 PowerShell）。
 > 要"只读/禁止执行命令"，需用 `permissionMode='plan'` 或其他机制，不能依赖 `allowedTools`。

@@ -86,7 +86,14 @@ function buildNodes(agents: AgentMap, actions: AgentActions, cur: TurnNodeType[]
   for (const view of Object.values(agents)) {
     view.turns.forEach((turn, i) => {
       const id = nodeId(view.id, i);
-      const data = { agentId: view.id, turn, agentStatus: view.status, actions };
+      const data = {
+        agentId: view.id,
+        turn,
+        agentStatus: view.status,
+        provider: view.provider,
+        providerLocked: !!view.forkOrigin,
+        actions,
+      };
       const existing = byId.get(id);
       if (existing) {
         result.push({ ...existing, data }); // 保留已拖动位置，仅更新数据

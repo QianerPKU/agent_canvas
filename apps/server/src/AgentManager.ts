@@ -12,6 +12,7 @@ export type EnvelopeListener = (envelope: AgentEventEnvelope) => void;
 
 export interface AgentManagerDeps {
   query: QueryFn;
+  codexQuery?: QueryFn;
   now?: () => number;
 }
 
@@ -29,11 +30,13 @@ export class AgentManager {
   private readonly forkOrigins = new Map<string, ForkOrigin>();
   private readonly forkConfigs = new Map<string, Partial<AgentStartConfig>>();
   private readonly query: QueryFn;
+  private readonly codexQuery?: QueryFn;
   private readonly now: () => number;
   private counter = 0;
 
   constructor(deps: AgentManagerDeps) {
     this.query = deps.query;
+    this.codexQuery = deps.codexQuery;
     this.now = deps.now ?? Date.now;
   }
 
@@ -44,7 +47,11 @@ export class AgentManager {
 
   create(): AgentRunner {
     const id = `agent_${++this.counter}`;
-    const runner = new AgentRunner(id, { query: this.query, now: this.now });
+    const runner = new AgentRunner(id, {
+      query: this.query,
+      codexQuery: this.codexQuery,
+      now: this.now,
+    });
     this.runners.set(id, runner);
     this.seqs.set(id, 0);
     this.history.set(id, []);
@@ -66,11 +73,13 @@ export class AgentManager {
     if (!parent) return undefined;
     const parentSession = parent.snapshot().sessionId;
     if (!parentSession) return undefined;
+    const parentProvider = parent.snapshot().config?.provider;
 
     const runner = this.create();
     const origin: ForkOrigin = { parentAgentId: parentId, anchorUuid };
     this.forkOrigins.set(runner.id, origin);
     this.forkConfigs.set(runner.id, {
+      provider: parentProvider,
       resume: parentSession,
       resumeSessionAt: anchorUuid,
       forkSession: true,
@@ -83,7 +92,7 @@ export class AgentManager {
     const runner = this.runners.get(id);
     if (!runner) throw new Error(`未知 agent: ${id}`);
     const forkCfg = this.forkConfigs.get(id);
-    runner.start({ ...forkCfg, ...config });
+    runner.start(forkCfg ? { ...forkCfg, ...config, provider: forkCfg.provider } : config);
   }
 
   list(): AgentSnapshot[] {
@@ -91,6 +100,7 @@ export class AgentManager {
       const s = runner.snapshot();
       return {
         id,
+        provider: s.config?.provider,
         status: s.status,
         sessionId: s.sessionId,
         config: s.config ?? { prompt: "" },

@@ -38,7 +38,21 @@ describe("TurnNode", () => {
       target: { value: "写个 a+b" },
     });
     fireEvent.click(screen.getByText("▶ 启动"));
-    expect(actions.submit).toHaveBeenCalledWith("agent_1", "写个 a+b");
+    expect(actions.submit).toHaveBeenCalledWith("agent_1", "写个 a+b", "claude");
+  });
+
+  it("首轮可选择 Codex provider", () => {
+    const actions = makeActions();
+    renderTurn({ index: 0, status: "idle", lines: [] }, "idle", actions);
+
+    fireEvent.change(screen.getByLabelText("agent provider"), {
+      target: { value: "codex" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("输入任务/提示词…"), {
+      target: { value: "用 codex 跑" },
+    });
+    fireEvent.click(screen.getByText("▶ 启动"));
+    expect(actions.submit).toHaveBeenCalledWith("agent_1", "用 codex 跑", "codex");
   });
 
   it("续轮 idle（agent waiting_input）：发送本轮按钮", () => {
@@ -49,7 +63,7 @@ describe("TurnNode", () => {
       target: { value: "继续" },
     });
     fireEvent.click(screen.getByText("▶ 发送本轮"));
-    expect(actions.submit).toHaveBeenCalledWith("agent_1", "继续");
+    expect(actions.submit).toHaveBeenCalledWith("agent_1", "继续", undefined);
   });
 
   it("运行中：显示停止按钮", () => {

@@ -5,7 +5,7 @@
  *  - 自动断线重连
  */
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ServerFrame } from "@agent-canvas/shared";
+import type { AgentProvider, ServerFrame } from "@agent-canvas/shared";
 import { api } from "./api.js";
 import {
   applyEnvelope,
@@ -21,7 +21,7 @@ export interface AgentActions {
   /** 新建一个 agent（出现一个 idle 起始节点）。 */
   create: () => Promise<void>;
   /** 在末尾 idle 轮提交输入：首轮→start，续轮→send（自动判断）。 */
-  submit: (agentId: string, text: string) => Promise<void>;
+  submit: (agentId: string, text: string, provider?: AgentProvider) => Promise<void>;
   /** 中止 agent。 */
   stop: (agentId: string) => Promise<void>;
   /** 从某轮（anchorUuid）fork 出一个新 agent。 */
@@ -90,12 +90,13 @@ export function useAgentCanvas(): UseAgentCanvas {
         // 后端 create 不发事件，乐观插入一个 idle 节点
         setAgents((prev) => (prev[id] ? prev : { ...prev, [id]: newAgentView(id) }));
       },
-      submit: async (agentId, text) => {
+      submit: async (agentId, text, provider) => {
         const view = agentsRef.current[agentId];
-        setAgents((prev) => recordInput(prev, agentId, text)); // 乐观置 running
+        const startProvider = provider ?? view?.provider;
+        setAgents((prev) => recordInput(prev, agentId, text, startProvider)); // 乐观置 running
         // 首轮（idle）用 start（fork 出来的 agent 由后端合并 fork 配置）；续轮用 send
         if (!view || view.status === "idle") {
-          await api.start(agentId, { prompt: text });
+          await api.start(agentId, { prompt: text, provider: startProvider });
         } else {
           await api.send(agentId, text);
         }

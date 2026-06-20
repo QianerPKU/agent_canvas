@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import type { AgentEvent, AgentStatus } from "@agent-canvas/shared";
 import { AgentRunner } from "./AgentRunner.js";
 import { AsyncMessageQueue } from "./util/AsyncMessageQueue.js";
@@ -210,5 +210,29 @@ describe("AgentRunner 生命周期", () => {
     expect(opts?.resume).toBe("src-session");
     expect(opts?.resumeSessionAt).toBe("u-anchor");
     expect(opts?.forkSession).toBe(true);
+  });
+
+  it("按 provider 选择底层 query，默认 provider 为 claude", () => {
+    const claudeQuery: QueryFn = vi.fn(() => ({
+      async *[Symbol.asyncIterator]() {
+        // empty
+      },
+    }));
+    const codexQuery: QueryFn = vi.fn(() => ({
+      async *[Symbol.asyncIterator]() {
+        // empty
+      },
+    }));
+
+    const runner = new AgentRunner("a8", { query: claudeQuery, codexQuery });
+    runner.start({ prompt: "x", provider: "codex" });
+
+    expect(claudeQuery).not.toHaveBeenCalled();
+    expect(codexQuery).toHaveBeenCalledOnce();
+    expect(runner.snapshot().config?.provider).toBe("codex");
+
+    const runner2 = new AgentRunner("a9", { query: claudeQuery, codexQuery });
+    runner2.start({ prompt: "x" });
+    expect(runner2.snapshot().config?.provider).toBe("claude");
   });
 });

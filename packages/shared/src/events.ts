@@ -22,6 +22,9 @@ export function isTerminalStatus(s: AgentStatus): boolean {
   return TERMINAL_STATUSES.includes(s);
 }
 
+/** 底层 agent 驱动。未指定时保持向后兼容，默认 Claude。 */
+export type AgentProvider = "claude" | "codex";
+
 /** token 使用量（来自 SDK result.usage）。 */
 export interface UsageInfo {
   inputTokens?: number;
@@ -77,6 +80,8 @@ export type PermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "
 
 /** 启动一个 agent 所需的配置。 */
 export interface AgentStartConfig {
+  /** 底层 agent 驱动：Claude SDK 或 Codex CLI/app-server。 */
+  provider?: AgentProvider;
   /** 首条任务/提示词。 */
   prompt: string;
   /** 工作目录（M2 起由"区域=分支"的 worktree 决定）。 */
@@ -115,6 +120,7 @@ export type ClientCommand =
 /** agent 当前快照（REST 列表 / 重连补齐用）。 */
 export interface AgentSnapshot {
   id: string;
+  provider?: AgentProvider;
   status: AgentStatus;
   sessionId?: string;
   config: AgentStartConfig;

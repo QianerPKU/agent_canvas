@@ -1,5 +1,6 @@
 import type {
   AgentEvent,
+  AgentProvider,
   AgentStartConfig,
   AgentStatus,
   UsageInfo,
@@ -17,8 +18,10 @@ import type {
 export type AgentEventListener = (event: AgentEvent) => void;
 
 export interface AgentRunnerDeps {
-  /** 注入 query（默认用真实 SDK；测试注入假实现）。 */
+  /** 注入 Claude query（默认用真实 SDK；测试注入假实现）。 */
   query: QueryFn;
+  /** 注入 Codex query；未提供时复用 query，便于单测。 */
+  codexQuery?: QueryFn;
   now?: () => number;
 }
 
@@ -36,7 +39,7 @@ export interface StartExtra {
  */
 export class AgentRunner {
   readonly id: string;
-  private readonly queryFn: QueryFn;
+  private readonly queries: Record<AgentProvider, QueryFn>;
   private readonly now: () => number;
   private readonly listeners = new Set<AgentEventListener>();
 
@@ -46,6 +49,7 @@ export class AgentRunner {
   private abortController?: AbortController;
   private inputQueue?: AsyncMessageQueue<SdkUserInput>;
   private handle?: QueryHandle;
+  private activeProvider: AgentProvider = "claude";
   private totalCostUsd?: number;
   private usage?: UsageInfo;
   private lastAssistantUuid?: string; // 本轮最后一条 assistant 消息 uuid（fork 锚点）
@@ -53,7 +57,10 @@ export class AgentRunner {
 
   constructor(id: string, deps: AgentRunnerDeps) {
     this.id = id;
-    this.queryFn = deps.query;
+    this.queries = {
+      claude: deps.query,
+      codex: deps.codexQuery ?? deps.query,
+    };
     this.now = deps.now ?? Date.now;
     this.createdAt = this.now();
   }
@@ -87,7 +94,9 @@ export class AgentRunner {
     if (this.status === "starting" || this.status === "running" || this.status === "waiting_input") {
       throw new Error(`agent ${this.id} 已在运行（${this.status}），不能重复 start`);
     }
-    this.config = config;
+    const provider = normalizeProvider(config.provider);
+    this.activeProvider = provider;
+    this.config = { ...config, provider };
     this.totalCostUsd = undefined;
     this.usage = undefined;
     this.sessionId = undefined;
@@ -113,7 +122,7 @@ export class AgentRunner {
       abortController: this.abortController,
     };
 
-    this.handle = this.queryFn({ prompt: this.inputQueue, options });
+    this.handle = this.queries[provider]({ prompt: this.inputQueue, options });
     // 后台消费消息流（不阻塞调用方）
     void this.consume(this.handle);
   }
@@ -131,12 +140,12 @@ export class AgentRunner {
   async stop(): Promise<void> {
     if (isTerminalStatus(this.status) || this.status === "idle") return;
     this.inputQueue?.close();
+    this.abortController?.abort();
     try {
       await this.handle?.interrupt?.();
     } catch {
       // interrupt 尽力而为，忽略错误
     }
-    this.abortController?.abort();
     this.setStatus("stopped");
   }
 
@@ -214,6 +223,10 @@ export class AgentRunner {
       }
     }
   }
+}
+
+function normalizeProvider(provider: AgentProvider | undefined): AgentProvider {
+  return provider ?? "claude";
 }
 
 function toUserInput(text: string): SdkUserInput {

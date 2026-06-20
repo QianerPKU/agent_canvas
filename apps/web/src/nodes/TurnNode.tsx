@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
-import type { AgentStatus } from "@agent-canvas/shared";
+import type { AgentProvider, AgentStatus } from "@agent-canvas/shared";
 import type { OutputLine, Turn, TurnStatus } from "../agentStore.js";
 import type { AgentActions } from "../useAgentCanvas.js";
 
@@ -8,6 +8,8 @@ export interface TurnNodeData {
   agentId: string;
   turn: Turn;
   agentStatus: AgentStatus;
+  provider?: AgentProvider;
+  providerLocked?: boolean;
   actions: AgentActions;
   [key: string]: unknown;
 }
@@ -64,8 +66,9 @@ function renderLine(line: OutputLine): string {
 }
 
 export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement {
-  const { agentId, turn, agentStatus, actions } = data;
+  const { agentId, turn, agentStatus, provider: agentProvider, providerLocked, actions } = data;
   const [text, setText] = useState("");
+  const [provider, setProvider] = useState<AgentProvider>(agentProvider ?? "claude");
   const logRef = useRef<HTMLDivElement>(null);
 
   const meta = TURN_META[turn.status];
@@ -80,6 +83,10 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
     const el = logRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [turn.lines.length]);
+
+  useEffect(() => {
+    setProvider(agentProvider ?? "claude");
+  }, [agentProvider]);
 
   return (
     <div
@@ -169,6 +176,18 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
       <div className="nodrag" style={{ padding: 10, display: "flex", flexDirection: "column", gap: 6 }}>
         {isActiveInput ? (
           <>
+            {turn.index === 0 && (
+              <select
+                aria-label="agent provider"
+                value={provider}
+                disabled={providerLocked}
+                onChange={(e) => setProvider(e.target.value as AgentProvider)}
+                style={selectStyle}
+              >
+                <option value="claude">Claude</option>
+                <option value="codex">Codex</option>
+              </select>
+            )}
             <textarea
               value={text}
               onChange={(e) => setText(e.target.value)}
@@ -180,7 +199,7 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
               style={btn("#2563eb")}
               disabled={!text.trim()}
               onClick={() => {
-                void actions.submit(agentId, text.trim());
+                void actions.submit(agentId, text.trim(), turn.index === 0 ? provider : undefined);
                 setText("");
               }}
             >
@@ -219,6 +238,17 @@ const textareaStyle: React.CSSProperties = {
   border: "1px solid #d1d5db",
   borderRadius: 6,
   fontFamily: "inherit",
+};
+
+const selectStyle: React.CSSProperties = {
+  width: "100%",
+  boxSizing: "border-box",
+  fontSize: 12,
+  padding: 6,
+  border: "1px solid #d1d5db",
+  borderRadius: 6,
+  fontFamily: "inherit",
+  background: "#fff",
 };
 
 function btn(color: string): React.CSSProperties {
