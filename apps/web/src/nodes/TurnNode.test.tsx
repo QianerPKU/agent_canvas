@@ -105,7 +105,7 @@ describe("TurnNode", () => {
     expect(restoreButton.classList.contains("nodrag")).toBe(false);
   });
 
-  it("只有最新活跃轮次显示文件读写 Handle", () => {
+  it("只有最新活跃轮次显示资源读写 Handle", () => {
     const actions = makeActions();
     const { container, rerender } = render(
       <ReactFlowProvider>
@@ -124,8 +124,8 @@ describe("TurnNode", () => {
         />
       </ReactFlowProvider>,
     );
-    expect(container.querySelector('[data-handleid="file-read"]')).toBeTruthy();
-    expect(container.querySelector('[data-handleid="file-write"]')).toBeTruthy();
+    expect(container.querySelector('[data-handleid="resource-read"]')).toBeTruthy();
+    expect(container.querySelector('[data-handleid="resource-write"]')).toBeTruthy();
 
     rerender(
       <ReactFlowProvider>
@@ -144,8 +144,8 @@ describe("TurnNode", () => {
         />
       </ReactFlowProvider>,
     );
-    expect(container.querySelector('[data-handleid="file-read"]')).toBeNull();
-    expect(container.querySelector('[data-handleid="file-write"]')).toBeNull();
+    expect(container.querySelector('[data-handleid="resource-read"]')).toBeNull();
+    expect(container.querySelector('[data-handleid="resource-write"]')).toBeNull();
   });
 
   it("首轮 idle（可输入）：启动按钮 + submit 带 prompt", () => {

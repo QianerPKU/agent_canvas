@@ -36,6 +36,16 @@ describe("realQuery file access", () => {
         ],
         writableDirectories: ["C:/shared/first-output"],
       },
+      promptAccess: {
+        readablePrompts: [
+          { id: "prompt_1", name: "规则", content: "先写测试", kind: "shared" },
+          { id: "prompt_2", name: "风格", content: "保持简单", kind: "normal" },
+        ],
+        writablePrompts: [
+          { id: "prompt_3", name: "可更新规则", path: "C:/prompts/prompt_3.txt" },
+        ],
+        writableDirectories: ["C:/prompts"],
+      },
     });
 
     realQuery({ prompt, options: {} });
@@ -45,8 +55,12 @@ describe("realQuery file access", () => {
     const iterator = sdkArgs.prompt[Symbol.asyncIterator]();
     const first = await iterator.next();
 
-    expect(first.value?.message.content).toContain("@C:/shared/first.md");
-    expect(first.value?.message.content).toContain("C:/shared/first-output.md");
+    const firstContent = String(first.value?.message.content);
+    expect(firstContent.indexOf("先写测试")).toBeLessThan(firstContent.indexOf("检查第一轮文件"));
+    expect(firstContent.indexOf("保持简单")).toBeLessThan(firstContent.indexOf("检查第一轮文件"));
+    expect(firstContent).toContain("@C:/shared/first.md");
+    expect(firstContent).toContain("C:/shared/first-output.md");
+    expect(firstContent).toContain("C:/prompts/prompt_3.txt");
 
     prompt.push({
       type: "user",
@@ -59,13 +73,20 @@ describe("realQuery file access", () => {
         writableFiles: [],
         writableDirectories: [],
       },
+      promptAccess: {
+        readablePrompts: [],
+        writablePrompts: [],
+        writableDirectories: [],
+      },
     });
     const second = await iterator.next();
 
     expect(second.value?.message.content).toContain("@C:/shared/second.csv");
     expect(second.value?.message.content).not.toContain("@C:/shared/first.md");
     expect(sdk.applyFlagSettings).toHaveBeenNthCalledWith(1, {
-      permissions: { additionalDirectories: ["C:/shared/first-output"] },
+      permissions: {
+        additionalDirectories: ["C:/shared/first-output", "C:/prompts"],
+      },
     });
     expect(sdk.applyFlagSettings).toHaveBeenNthCalledWith(2, {
       permissions: { additionalDirectories: [] },

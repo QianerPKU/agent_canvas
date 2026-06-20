@@ -7,8 +7,6 @@ import type {
 } from "@agent-canvas/shared";
 import type { AgentMap } from "../agentStore.js";
 
-const EXTENSIONS = ["txt", "md", "csv", "json", "png", "jpg", "ts", "js", "py", ""];
-
 export function CreateFileDialog({
   agents,
   onCreate,
@@ -76,17 +74,12 @@ export function CreateFileDialog({
               placeholder="notes"
               onChange={(event) => setName(event.target.value)}
             />
-            <select
+            <input
               aria-label="新文件后缀"
               value={extension}
+              placeholder="txt"
               onChange={(event) => setExtension(event.target.value)}
-            >
-              {EXTENSIONS.map((candidate) => (
-                <option key={candidate || "none"} value={candidate}>
-                  {candidate ? `.${candidate}` : "无后缀"}
-                </option>
-              ))}
-            </select>
+            />
           </div>
         </label>
 

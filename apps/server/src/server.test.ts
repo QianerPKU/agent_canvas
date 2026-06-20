@@ -7,6 +7,7 @@ import path from "node:path";
 import { AgentManager } from "./AgentManager.js";
 import { createServer } from "./server.js";
 import { FileManager } from "./files/FileManager.js";
+import { PromptManager } from "./prompts/PromptManager.js";
 import type { QueryFn } from "./sdk/types.js";
 
 /** 立即结束消息流的假 query：足以测 HTTP 路由，不触达模型。 */
@@ -68,7 +69,14 @@ describe("HTTP server", () => {
       isolatedRoot: path.join(root, "isolated"),
       resolveAgentCwd: () => root,
     });
-    ({ httpServer: server } = createServer(manager, fileManager, { openFile }));
+    const promptManager = new PromptManager({
+      workspaceRoot: root,
+      promptRoot: path.join(root, "prompts"),
+    });
+    ({ httpServer: server } = createServer(manager, fileManager, {
+      openFile,
+      promptManager,
+    }));
     await new Promise<void>((r) => server.listen(0, r));
     port = (server.address() as AddressInfo).port;
   });
@@ -214,5 +222,46 @@ describe("HTTP server", () => {
       `/api/file-connections/${connection.json.connection.id}`,
     );
     expect(removed.status).toBe(204);
+  });
+
+  it("提示词节点 REST 支持创建、编辑、共享开关与普通连线", async () => {
+    const agent = await request(port, "POST", "/api/agents");
+    const normal = await request(port, "POST", "/api/prompts", {
+      name: "工程规范",
+      content: "先写测试",
+      kind: "normal",
+    });
+    expect(normal.status).toBe(201);
+
+    const updated = await request(port, "PATCH", `/api/prompts/${normal.json.prompt.id}`, {
+      content: "先写测试，再实现",
+    });
+    expect(updated.json.prompt.content).toBe("先写测试，再实现");
+
+    const connection = await request(port, "POST", "/api/prompt-connections", {
+      promptId: normal.json.prompt.id,
+      agentId: agent.json.id,
+      access: "read",
+    });
+    expect(connection.status).toBe(201);
+
+    const shared = await request(port, "POST", "/api/prompts", {
+      name: "共享规范",
+      content: "保持简洁",
+      kind: "shared",
+    });
+    const enabled = await request(port, "PATCH", `/api/prompts/${shared.json.prompt.id}`, {
+      sharedRead: true,
+      sharedWrite: true,
+    });
+    expect(enabled.json.prompt).toMatchObject({
+      sharedRead: true,
+      sharedWrite: true,
+    });
+
+    const listed = await request(port, "GET", "/api/prompts");
+    expect(listed.json.prompts).toHaveLength(2);
+    const connections = await request(port, "GET", "/api/prompt-connections");
+    expect(connections.json.connections).toContainEqual(connection.json.connection);
   });
 });

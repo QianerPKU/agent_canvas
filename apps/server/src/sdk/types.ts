@@ -124,6 +124,7 @@ export interface SdkUserInput {
   parent_tool_use_id: string | null; // SDK 要求必填，顶层用户消息填 null
   session_id?: string;
   fileAccess?: import("@agent-canvas/shared").AgentFileAccess;
+  promptAccess?: import("@agent-canvas/shared").AgentPromptAccess;
 }
 
 export type QueryPrompt = string | AsyncIterable<SdkUserInput>;
@@ -140,6 +141,7 @@ export interface QueryOptions {
   forkSession?: boolean;
   abortController?: AbortController;
   fileAccess?: import("@agent-canvas/shared").AgentFileAccess;
+  promptAccess?: import("@agent-canvas/shared").AgentPromptAccess;
   [k: string]: unknown;
 }
 

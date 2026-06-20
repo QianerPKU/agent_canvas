@@ -9,12 +9,14 @@ import type { SdkUserInput } from "./types.js";
 function userInput(
   text: string,
   fileAccess?: SdkUserInput["fileAccess"],
+  promptAccess?: SdkUserInput["promptAccess"],
 ): SdkUserInput {
   return {
     type: "user",
     message: { role: "user", content: text },
     parent_tool_use_id: null,
     fileAccess,
+    promptAccess,
   };
 }
 
@@ -148,34 +150,65 @@ describe("Codex app-server query", () => {
     const fake = makeFakeSpawn();
     const prompt = new AsyncMessageQueue<SdkUserInput>();
     prompt.push(
-      userInput("处理这些文件", {
-        readableFiles: [
-          { name: "notes.md", path: "C:/shared/notes.md", previewKind: "markdown" },
-          { name: "shot.png", path: "C:/shared/shot.png", previewKind: "image" },
-        ],
-        writableFiles: [
-          { name: "output.csv", path: "C:/shared/output/output.csv", previewKind: "csv" },
-        ],
-        writableDirectories: ["C:/shared/output"],
-      }),
+      userInput(
+        "处理这些文件",
+        {
+          readableFiles: [
+            { name: "notes.md", path: "C:/shared/notes.md", previewKind: "markdown" },
+            { name: "shot.png", path: "C:/shared/shot.png", previewKind: "image" },
+          ],
+          writableFiles: [
+            { name: "output.csv", path: "C:/shared/output/output.csv", previewKind: "csv" },
+          ],
+          writableDirectories: ["C:/shared/output"],
+        },
+        {
+          readablePrompts: [
+            { id: "prompt_1", name: "规则", content: "先写测试", kind: "shared" },
+          ],
+          writablePrompts: [
+            { id: "prompt_2", name: "可写规则", path: "C:/prompts/prompt_2.txt" },
+          ],
+          writableDirectories: ["C:/prompts"],
+        },
+      ),
     );
 
     const handle = createCodexAppServerQuery({ spawnFn: fake.spawnFn })({
       prompt,
-      options: { cwd: "C:/repo" },
+      options: {
+        cwd: "C:/repo",
+        promptAccess: {
+          readablePrompts: [
+            { id: "prompt_1", name: "规则", content: "先写测试", kind: "shared" },
+          ],
+          writablePrompts: [
+            { id: "prompt_2", name: "可写规则", path: "C:/prompts/prompt_2.txt" },
+          ],
+          writableDirectories: ["C:/prompts"],
+        },
+      },
     });
     const iterator = handle[Symbol.asyncIterator]();
     await iterator.next();
     await iterator.next();
 
     prompt.push(
-      userInput("处理下一轮文件", {
-        readableFiles: [
-          { name: "next.txt", path: "C:/shared/next.txt", previewKind: "text" },
-        ],
-        writableFiles: [],
-        writableDirectories: [],
-      }),
+      userInput(
+        "处理下一轮文件",
+        {
+          readableFiles: [
+            { name: "next.txt", path: "C:/shared/next.txt", previewKind: "text" },
+          ],
+          writableFiles: [],
+          writableDirectories: [],
+        },
+        {
+          readablePrompts: [],
+          writablePrompts: [],
+          writableDirectories: [],
+        },
+      ),
     );
     await iterator.next();
 
@@ -184,8 +217,9 @@ describe("Codex app-server query", () => {
       {
         type: "text",
         text:
-          "处理这些文件\n\n可写的画布文件（作为输出目标）：\n" +
-          "- C:/shared/output/output.csv",
+          "先写测试\n\n处理这些文件\n\n可写的画布文件（作为输出目标）：\n" +
+          "- C:/shared/output/output.csv\n\n可写的提示词节点（修改对应文本文件）：\n" +
+          "- 可写规则: C:/prompts/prompt_2.txt",
         text_elements: [],
       },
       { type: "mention", name: "notes.md", path: "C:/shared/notes.md" },
@@ -196,6 +230,7 @@ describe("Codex app-server query", () => {
       writableRoots: [
         expect.stringMatching(/C:[\\/]repo$/),
         expect.stringMatching(/C:[\\/]shared[\\/]output$/),
+        expect.stringMatching(/C:[\\/]prompts$/),
       ],
       networkAccess: false,
       excludeTmpdirEnvVar: false,

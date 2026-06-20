@@ -105,6 +105,15 @@ npm run smoke --workspace apps/server
 - `AgentRunner` 在首轮和每次 `send` 前重新解析文件权限；因此 Claude/Codex 的每个完整业务请求都会携带该轮最新的可读文件引用和可写目标。`compact` 是 CLI 控制指令，不附加业务文件引用。
 - 写权限是 CLI 的目录粒度，而且可写目录天然也可读；隔离文件采用单节点目录来缩小授权范围。读连线负责显式引用和画布层授权，不等同于操作系统级读取隔离。
 
+## 提示词节点
+
+- `src/prompts/PromptManager.ts` 管理纯文本提示词节点、普通读写连线、共享读写开关和内部可写文本载体。
+- `GET/POST /api/prompts` 列出/创建；`PATCH /api/prompts/:id` 编辑名称、文本或共享开关。
+- `GET/POST /api/prompt-connections` 与 `DELETE /api/prompt-connections/:id` 管理普通节点连线；fork 自动复制父 Agent 的提示词连线。
+- 可读提示词直接拼在用户输入之前，不传文件引用。顺序固定为共享优先、普通其次，同类按 UTF-8 字节序排列。
+- 注入时机仅为新建 Agent 的首轮，以及 compact 完成后的下一条业务输入；fork/resume 首轮继承已有上下文，不重复注入。
+- 写权限与文件节点一致，会授权 provider 修改提示词节点的内部文本文件；前端周期读取最新文本。
+
 官方参考：
 
 - https://developers.openai.com/codex/cli/slash-commands

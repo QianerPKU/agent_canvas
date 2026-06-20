@@ -36,3 +36,7 @@ npm test --workspace packages/shared        # vitest
 ## 文件节点模型
 
 `src/files.ts` 定义 `CanvasFileNode`、`CanvasFileConnection`、创建/更新输入，以及服务端解析后的 `AgentFileAccess`。普通节点通过 `read/write` 连线授权，共享节点通过全局读写开关授权。
+
+## 提示词节点模型
+
+`src/prompts.ts` 定义纯文本 `CanvasPromptNode`、普通节点连线、共享读写开关，以及服务端解析后的 `AgentPromptAccess`。读权限把文本直接拼接进 Agent 上下文，写权限授权 Agent 修改节点的内部文本载体；可读提示词已由服务端按稳定顺序排列。

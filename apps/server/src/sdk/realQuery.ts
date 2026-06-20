@@ -1,5 +1,9 @@
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
-import type { AgentFileAccess, AgentFileReference } from "@agent-canvas/shared";
+import type {
+  AgentFileAccess,
+  AgentFileReference,
+  AgentPromptAccess,
+} from "@agent-canvas/shared";
 import type { QueryFn, QueryPrompt, SdkUserInput } from "./types.js";
 
 /**
@@ -7,10 +11,10 @@ import type { QueryFn, QueryPrompt, SdkUserInput } from "./types.js";
  * 仅在服务运行时引入；单测改用注入的假实现，故不会触达真实模型/鉴权。
  */
 export const realQuery: QueryFn = (args) => {
-  const { fileAccess, ...options } = args.options ?? {};
-  const additionalDirectories = fileAccess?.writableDirectories;
+  const { fileAccess, promptAccess, ...options } = args.options ?? {};
+  const additionalDirectories = writableDirectories(fileAccess, promptAccess);
   let handle: ReturnType<typeof sdkQuery> | undefined;
-  const prompt = withFileReferences(args.prompt, async (directories) => {
+  const prompt = withContext(args.prompt, async (directories) => {
     if (!handle) return;
     await handle.applyFlagSettings({
       permissions: { additionalDirectories: directories },
@@ -29,7 +33,7 @@ export const realQuery: QueryFn = (args) => {
   return adaptQuery(handle);
 };
 
-async function* withFileReferences(
+async function* withContext(
   prompt: QueryPrompt,
   updateWritableDirectories: (directories: string[]) => Promise<void>,
 ): AsyncGenerator<SdkUserInput> {
@@ -38,7 +42,7 @@ async function* withFileReferences(
     return;
   }
   for await (const input of prompt) {
-    await updateWritableDirectories(input.fileAccess?.writableDirectories ?? []);
+    await updateWritableDirectories(writableDirectories(input.fileAccess, input.promptAccess));
     const content = input.message.content;
     const text =
       typeof content === "string"
@@ -51,9 +55,10 @@ async function* withFileReferences(
       ...input,
       message: {
         ...input.message,
-        content: appendFileContext(text, input.fileAccess),
+        content: appendContext(text, input.fileAccess, input.promptAccess),
       },
       fileAccess: undefined,
+      promptAccess: undefined,
     };
   }
 }
@@ -75,13 +80,42 @@ function appendReferences(text: string, references: AgentFileReference[]): strin
   return `${text}\n\n可读取的画布文件：\n${lines.join("\n")}`;
 }
 
-function appendFileContext(text: string, access: AgentFileAccess | undefined): string {
-  const withReadable = appendReferences(text, access?.readableFiles ?? []);
-  const writableFiles = access?.writableFiles ?? [];
-  if (writableFiles.length === 0) return withReadable;
-  return `${withReadable}\n\n可写的画布文件（作为输出目标）：\n${writableFiles
-    .map((file) => `- ${file.path}`)
+function appendContext(
+  text: string,
+  fileAccess: AgentFileAccess | undefined,
+  promptAccess: AgentPromptAccess | undefined,
+): string {
+  const withPrompts = prependPromptContext(text, promptAccess);
+  const withReadableFiles = appendReferences(withPrompts, fileAccess?.readableFiles ?? []);
+  const writableFiles = fileAccess?.writableFiles ?? [];
+  const withWritableFiles =
+    writableFiles.length === 0
+      ? withReadableFiles
+      : `${withReadableFiles}\n\n可写的画布文件（作为输出目标）：\n${writableFiles
+          .map((file) => `- ${file.path}`)
+          .join("\n")}`;
+  const writablePrompts = promptAccess?.writablePrompts ?? [];
+  if (writablePrompts.length === 0) return withWritableFiles;
+  return `${withWritableFiles}\n\n可写的提示词节点（修改对应文本文件）：\n${writablePrompts
+    .map((prompt) => `- ${prompt.name}: ${prompt.path}`)
     .join("\n")}`;
+}
+
+function prependPromptContext(text: string, access: AgentPromptAccess | undefined): string {
+  const prompts = access?.readablePrompts.map((prompt) => prompt.content) ?? [];
+  return prompts.length === 0 ? text : `${prompts.join("\n\n")}\n\n${text}`;
+}
+
+function writableDirectories(
+  fileAccess: AgentFileAccess | undefined,
+  promptAccess: AgentPromptAccess | undefined,
+): string[] {
+  return [
+    ...new Set([
+      ...(fileAccess?.writableDirectories ?? []),
+      ...(promptAccess?.writableDirectories ?? []),
+    ]),
+  ];
 }
 
 function adaptQuery(handle: ReturnType<typeof sdkQuery>): ReturnType<QueryFn> {

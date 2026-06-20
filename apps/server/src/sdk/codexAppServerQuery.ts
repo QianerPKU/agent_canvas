@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import path from "node:path";
 import readline from "node:readline";
-import type { AgentFileAccess } from "@agent-canvas/shared";
+import type { AgentFileAccess, AgentPromptAccess } from "@agent-canvas/shared";
 import { AsyncMessageQueue } from "../util/AsyncMessageQueue.js";
 import {
   createCodexAppServerMapState,
@@ -77,7 +77,7 @@ function createHandle(
           yield* client.readCompactMessages(threadId);
         } else {
           const started = await client.request("turn/start", {
-            ...turnOverrides(options, next.value.fileAccess),
+            ...turnOverrides(options, next.value.fileAccess, next.value.promptAccess),
             threadId,
             input: codexInputs(next.value),
           });
@@ -140,10 +140,17 @@ function threadParams(options: QueryOptions | undefined): Record<string, unknown
 function turnOverrides(
   options: QueryOptions | undefined,
   fileAccess: AgentFileAccess | undefined,
+  promptAccess: AgentPromptAccess | undefined,
 ): Record<string, unknown> {
   const params: Record<string, unknown> = {};
-  const writableDirectories =
-    fileAccess?.writableDirectories ?? options?.fileAccess?.writableDirectories ?? [];
+  const writableDirectories = [
+    ...new Set([
+      ...(fileAccess?.writableDirectories ?? options?.fileAccess?.writableDirectories ?? []),
+      ...(promptAccess?.writableDirectories ??
+        options?.promptAccess?.writableDirectories ??
+        []),
+    ]),
+  ];
   const approvalPolicy = approvalPolicyFor(
     options?.permissionMode,
     writableDirectories.length > 0,
@@ -188,6 +195,7 @@ function sandboxMode(permissionMode: unknown): string | undefined {
 interface PromptTurn {
   text: string;
   fileAccess?: AgentFileAccess;
+  promptAccess?: AgentPromptAccess;
 }
 
 async function* promptTurns(prompt: QueryPrompt): AsyncGenerator<PromptTurn> {
@@ -196,7 +204,11 @@ async function* promptTurns(prompt: QueryPrompt): AsyncGenerator<PromptTurn> {
     return;
   }
   for await (const input of prompt) {
-    yield { text: inputText(input), fileAccess: input.fileAccess };
+    yield {
+      text: inputText(input),
+      fileAccess: input.fileAccess,
+      promptAccess: input.promptAccess,
+    };
   }
 }
 
@@ -204,7 +216,11 @@ function codexInputs(turn: PromptTurn): Record<string, unknown>[] {
   const inputs: Record<string, unknown>[] = [
     {
       type: "text",
-      text: appendWritableTargets(turn.text, turn.fileAccess),
+      text: appendWritableTargets(
+        prependPromptContext(turn.text, turn.promptAccess),
+        turn.fileAccess,
+        turn.promptAccess,
+      ),
       text_elements: [],
     },
   ];
@@ -218,12 +234,28 @@ function codexInputs(turn: PromptTurn): Record<string, unknown>[] {
   return inputs;
 }
 
-function appendWritableTargets(text: string, fileAccess: AgentFileAccess | undefined): string {
+function appendWritableTargets(
+  text: string,
+  fileAccess: AgentFileAccess | undefined,
+  promptAccess: AgentPromptAccess | undefined,
+): string {
   const writableFiles = fileAccess?.writableFiles ?? [];
-  if (writableFiles.length === 0) return text;
-  return `${text}\n\n可写的画布文件（作为输出目标）：\n${writableFiles
-    .map((file) => `- ${file.path}`)
+  const withFiles =
+    writableFiles.length === 0
+      ? text
+      : `${text}\n\n可写的画布文件（作为输出目标）：\n${writableFiles
+          .map((file) => `- ${file.path}`)
+          .join("\n")}`;
+  const writablePrompts = promptAccess?.writablePrompts ?? [];
+  if (writablePrompts.length === 0) return withFiles;
+  return `${withFiles}\n\n可写的提示词节点（修改对应文本文件）：\n${writablePrompts
+    .map((prompt) => `- ${prompt.name}: ${prompt.path}`)
     .join("\n")}`;
+}
+
+function prependPromptContext(text: string, access: AgentPromptAccess | undefined): string {
+  const prompts = access?.readablePrompts.map((prompt) => prompt.content) ?? [];
+  return prompts.length === 0 ? text : `${prompts.join("\n\n")}\n\n${text}`;
 }
 
 function sandboxPolicyFor(

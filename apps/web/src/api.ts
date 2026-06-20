@@ -5,10 +5,15 @@ import type {
   AgentStartConfig,
   CanvasFileConnection,
   CanvasFileNode,
+  CanvasPromptConnection,
+  CanvasPromptNode,
   CreateCanvasFileInput,
+  CreateCanvasPromptInput,
   FileConnectionAccess,
   ForkOrigin,
+  PromptConnectionAccess,
   UpdateCanvasFileInput,
+  UpdateCanvasPromptInput,
 } from "@agent-canvas/shared";
 
 const BASE = "/api";
@@ -75,4 +80,31 @@ export const api = {
     }).then((r) => r.connection),
   disconnectFile: (id: string) =>
     call<void>(`/file-connections/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  listPrompts: () =>
+    call<{ prompts: CanvasPromptNode[] }>("/prompts").then((r) => r.prompts),
+  createPrompt: (input: CreateCanvasPromptInput) =>
+    call<{ prompt: CanvasPromptNode }>("/prompts", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }).then((r) => r.prompt),
+  updatePrompt: (id: string, input: UpdateCanvasPromptInput) =>
+    call<{ prompt: CanvasPromptNode }>(`/prompts/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }).then((r) => r.prompt),
+  listPromptConnections: () =>
+    call<{ connections: CanvasPromptConnection[] }>("/prompt-connections").then(
+      (r) => r.connections,
+    ),
+  connectPrompt: (
+    promptId: string,
+    agentId: string,
+    access: PromptConnectionAccess,
+  ) =>
+    call<{ connection: CanvasPromptConnection }>("/prompt-connections", {
+      method: "POST",
+      body: JSON.stringify({ promptId, agentId, access }),
+    }).then((r) => r.connection),
+  disconnectPrompt: (id: string) =>
+    call<void>(`/prompt-connections/${encodeURIComponent(id)}`, { method: "DELETE" }),
 };

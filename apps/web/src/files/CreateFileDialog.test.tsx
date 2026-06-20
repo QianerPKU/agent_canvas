@@ -19,7 +19,9 @@ describe("CreateFileDialog", () => {
     );
 
     fireEvent.change(screen.getByLabelText("新文件名"), { target: { value: "brief" } });
-    fireEvent.change(screen.getByLabelText("新文件后缀"), { target: { value: "md" } });
+    fireEvent.change(screen.getByLabelText("新文件后缀"), {
+      target: { value: "markdown" },
+    });
     fireEvent.click(screen.getByText("共享节点"));
     fireEvent.click(screen.getByText("Agent 工作目录"));
     fireEvent.click(screen.getByText("创建"));
@@ -27,7 +29,7 @@ describe("CreateFileDialog", () => {
     await waitFor(() =>
       expect(onCreate).toHaveBeenCalledWith({
         name: "brief",
-        extension: "md",
+        extension: "markdown",
         kind: "shared",
         storage: "agent",
         agentId: "agent_1",

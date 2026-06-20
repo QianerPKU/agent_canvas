@@ -9,10 +9,15 @@ import type {
   AgentProvider,
   CanvasFileConnection,
   CanvasFileNode,
+  CanvasPromptConnection,
+  CanvasPromptNode,
   CreateCanvasFileInput,
+  CreateCanvasPromptInput,
   FileConnectionAccess,
+  PromptConnectionAccess,
   ServerFrame,
   UpdateCanvasFileInput,
+  UpdateCanvasPromptInput,
 } from "@agent-canvas/shared";
 import { api } from "./api.js";
 import {
@@ -50,9 +55,12 @@ export interface UseAgentCanvas {
   agents: AgentMap;
   files: CanvasFileNode[];
   fileConnections: CanvasFileConnection[];
+  prompts: CanvasPromptNode[];
+  promptConnections: CanvasPromptConnection[];
   connected: boolean;
   actions: AgentActions;
   fileActions: FileActions;
+  promptActions: PromptActions;
 }
 
 export interface FileActions {
@@ -66,6 +74,17 @@ export interface FileActions {
   disconnect: (connectionId: string) => Promise<void>;
 }
 
+export interface PromptActions {
+  create: (input: CreateCanvasPromptInput) => Promise<CanvasPromptNode>;
+  update: (id: string, input: UpdateCanvasPromptInput) => Promise<void>;
+  connect: (
+    promptId: string,
+    agentId: string,
+    access: PromptConnectionAccess,
+  ) => Promise<void>;
+  disconnect: (connectionId: string) => Promise<void>;
+}
+
 function wsUrl(): string {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   return `${proto}://${location.host}/ws`;
@@ -75,6 +94,8 @@ export function useAgentCanvas(): UseAgentCanvas {
   const [agents, setAgents] = useState<AgentMap>(emptyMap);
   const [files, setFiles] = useState<CanvasFileNode[]>([]);
   const [fileConnections, setFileConnections] = useState<CanvasFileConnection[]>([]);
+  const [prompts, setPrompts] = useState<CanvasPromptNode[]>([]);
+  const [promptConnections, setPromptConnections] = useState<CanvasPromptConnection[]>([]);
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   // 始终指向最新 agents，供 submit 判断 start/send（避免闭包过期）
@@ -84,6 +105,7 @@ export function useAgentCanvas(): UseAgentCanvas {
   useEffect(() => {
     let closed = false;
     let connectTimer: ReturnType<typeof setTimeout> | undefined;
+    let promptTimer: number | undefined;
 
     const connect = () => {
       const ws = new WebSocket(wsUrl());
@@ -121,16 +143,38 @@ export function useAgentCanvas(): UseAgentCanvas {
     // React StrictMode 会在开发环境执行一次 setup→cleanup→setup。
     // 延迟到下一轮事件循环，避免试探性 setup 建立后立刻中断 WebSocket。
     scheduleConnect(0);
-    void Promise.all([api.listFiles(), api.listFileConnections()]).then(
-      ([nextFiles, nextConnections]) => {
+    void Promise.all([
+      api.listFiles(),
+      api.listFileConnections(),
+      api.listPrompts(),
+      api.listPromptConnections(),
+    ]).then(
+      ([nextFiles, nextConnections, nextPrompts, nextPromptConnections]) => {
         if (closed) return;
         setFiles(nextFiles);
         setFileConnections(nextConnections);
+        setPrompts(nextPrompts);
+        setPromptConnections(nextPromptConnections);
       },
       () => undefined,
     );
+    const refreshPrompts = () => {
+      void api
+        .listPrompts()
+        .then(
+          (nextPrompts) => {
+            if (!closed) setPrompts(nextPrompts);
+          },
+          () => undefined,
+        )
+        .finally(() => {
+          if (!closed) promptTimer = window.setTimeout(refreshPrompts, 2000);
+        });
+    };
+    promptTimer = window.setTimeout(refreshPrompts, 2000);
     return () => {
       closed = true;
+      if (promptTimer) window.clearTimeout(promptTimer);
       if (connectTimer) clearTimeout(connectTimer);
       wsRef.current?.close();
     };
@@ -168,7 +212,12 @@ export function useAgentCanvas(): UseAgentCanvas {
       fork: async (agentId, anchorUuid, model) => {
         const { id, origin } = await api.fork(agentId, anchorUuid, model);
         setAgents((prev) => insertForked(prev, id, origin, model));
-        setFileConnections(await api.listFileConnections());
+        const [nextFileConnections, nextPromptConnections] = await Promise.all([
+          api.listFileConnections(),
+          api.listPromptConnections(),
+        ]);
+        setFileConnections(nextFileConnections);
+        setPromptConnections(nextPromptConnections);
       },
     }),
     [],
@@ -203,5 +252,46 @@ export function useAgentCanvas(): UseAgentCanvas {
     [],
   );
 
-  return { agents, files, fileConnections, connected, actions, fileActions };
+  const promptActions = useMemo<PromptActions>(
+    () => ({
+      create: async (input) => {
+        const prompt = await api.createPrompt(input);
+        setPrompts((current) => [...current, prompt]);
+        return prompt;
+      },
+      update: async (id, input) => {
+        const prompt = await api.updatePrompt(id, input);
+        setPrompts((current) =>
+          current.map((candidate) => (candidate.id === id ? prompt : candidate)),
+        );
+      },
+      connect: async (promptId, agentId, access) => {
+        const connection = await api.connectPrompt(promptId, agentId, access);
+        setPromptConnections((current) =>
+          current.some((candidate) => candidate.id === connection.id)
+            ? current
+            : [...current, connection],
+        );
+      },
+      disconnect: async (connectionId) => {
+        await api.disconnectPrompt(connectionId);
+        setPromptConnections((current) =>
+          current.filter((connection) => connection.id !== connectionId),
+        );
+      },
+    }),
+    [],
+  );
+
+  return {
+    agents,
+    files,
+    fileConnections,
+    prompts,
+    promptConnections,
+    connected,
+    actions,
+    fileActions,
+    promptActions,
+  };
 }

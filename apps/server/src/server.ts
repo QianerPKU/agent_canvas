@@ -3,22 +3,27 @@ import { WebSocketServer, type WebSocket } from "ws";
 import type {
   AgentStartConfig,
   CreateCanvasFileInput,
+  CreateCanvasPromptInput,
   ServerFrame,
   UpdateCanvasFileInput,
+  UpdateCanvasPromptInput,
 } from "@agent-canvas/shared";
 import { AgentManager } from "./AgentManager.js";
 import { FileManager } from "./files/FileManager.js";
 import { openFileInVscode } from "./files/VscodeFileOpener.js";
+import { PromptManager } from "./prompts/PromptManager.js";
 
 export interface CreateServerResult {
   httpServer: http.Server;
   wss: WebSocketServer;
   manager: AgentManager;
   fileManager: FileManager;
+  promptManager: PromptManager;
 }
 
 export interface CreateServerOptions {
   openFile?: (filePath: string) => Promise<void>;
+  promptManager?: PromptManager;
 }
 
 /**
@@ -33,12 +38,19 @@ export function createServer(
   options: CreateServerOptions = {},
 ): CreateServerResult {
   manager.setFileAccessResolver((agentId) => fileManager.accessFor(agentId));
+  const promptManager =
+    options.promptManager ??
+    new PromptManager({
+      workspaceRoot: process.cwd(),
+    });
+  manager.setPromptAccessResolver((agentId) => promptManager.accessFor(agentId));
   const httpServer = http.createServer((req, res) => {
     handleHttp(
       req,
       res,
       manager,
       fileManager,
+      promptManager,
       options.openFile ?? openFileInVscode,
     ).catch((err) => {
       sendJson(res, 500, { error: errMsg(err) });
@@ -60,7 +72,7 @@ export function createServer(
     }
   });
 
-  return { httpServer, wss, manager, fileManager };
+  return { httpServer, wss, manager, fileManager, promptManager };
 }
 
 async function handleHttp(
@@ -68,6 +80,7 @@ async function handleHttp(
   res: http.ServerResponse,
   manager: AgentManager,
   fileManager: FileManager,
+  promptManager: PromptManager,
   openFile: (filePath: string) => Promise<void>,
 ): Promise<void> {
   setCors(res);
@@ -114,6 +127,44 @@ async function handleHttp(
       return sendJson(res, 201, { file: await fileManager.create(body) });
     } catch (error) {
       return sendJson(res, 400, { error: errMsg(error) });
+    }
+  }
+
+  if (method === "GET" && path === "/api/prompts") {
+    return sendJson(res, 200, { prompts: promptManager.list() });
+  }
+
+  if (method === "POST" && path === "/api/prompts") {
+    const body = await readJson<CreateCanvasPromptInput>(req);
+    if (
+      !body?.name ||
+      typeof body.content !== "string" ||
+      !["normal", "shared"].includes(body.kind)
+    ) {
+      return sendJson(res, 400, { error: "缺少提示词名称、内容或节点类型" });
+    }
+    try {
+      return sendJson(res, 201, { prompt: await promptManager.create(body) });
+    } catch (error) {
+      return sendJson(res, 400, { error: errMsg(error) });
+    }
+  }
+
+  const promptMatch = path.match(/^\/api\/prompts\/([^/]+)$/);
+  if (promptMatch) {
+    const id = decodeURIComponent(promptMatch[1]!);
+    if (!promptManager.get(id)) {
+      return sendJson(res, 404, { error: `未知提示词节点: ${id}` });
+    }
+    if (method === "PATCH") {
+      const body = await readJson<UpdateCanvasPromptInput>(req);
+      try {
+        return sendJson(res, 200, {
+          prompt: await promptManager.update(id, body ?? {}),
+        });
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
     }
   }
 
@@ -191,6 +242,47 @@ async function handleHttp(
     }
   }
 
+  if (method === "GET" && path === "/api/prompt-connections") {
+    return sendJson(res, 200, { connections: promptManager.listConnections() });
+  }
+
+  if (method === "POST" && path === "/api/prompt-connections") {
+    const body = await readJson<{
+      promptId?: string;
+      agentId?: string;
+      access?: "read" | "write";
+    }>(req);
+    if (
+      !body?.promptId ||
+      !body.agentId ||
+      !body.access ||
+      !["read", "write"].includes(body.access)
+    ) {
+      return sendJson(res, 400, { error: "缺少 promptId、agentId 或 access" });
+    }
+    if (!manager.get(body.agentId)) {
+      return sendJson(res, 404, { error: `未知 agent: ${body.agentId}` });
+    }
+    try {
+      return sendJson(res, 201, {
+        connection: promptManager.connect(body.promptId, body.agentId, body.access),
+      });
+    } catch (error) {
+      return sendJson(res, 400, { error: errMsg(error) });
+    }
+  }
+
+  const promptConnectionMatch = path.match(/^\/api\/prompt-connections\/([^/]+)$/);
+  if (method === "DELETE" && promptConnectionMatch) {
+    const id = decodeURIComponent(promptConnectionMatch[1]!);
+    if (!promptManager.disconnect(id)) {
+      return sendJson(res, 404, { error: `未知提示词连线: ${id}` });
+    }
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
   const connectionMatch = path.match(/^\/api\/file-connections\/([^/]+)$/);
   if (method === "DELETE" && connectionMatch) {
     const id = decodeURIComponent(connectionMatch[1]!);
@@ -228,6 +320,7 @@ async function handleHttp(
       const forked = manager.fork(id, body.anchorUuid, body.model);
       if (!forked) return sendJson(res, 409, { error: "源会话尚未建立，无法 fork" });
       fileManager.copyAgentConnections(id, forked.id);
+      promptManager.copyAgentConnections(id, forked.id);
       return sendJson(res, 201, { id: forked.id, origin: forked.origin });
     }
     if (method === "POST" && action === "send") {

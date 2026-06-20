@@ -194,6 +194,70 @@ button:disabled {
   box-shadow: 0 2px 5px rgba(15, 23, 42, 0.13);
 }
 
+.prompt-node {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid #cbd5e1;
+  border-top: 3px solid #7c3aed;
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: 0 2px 5px rgba(15, 23, 42, 0.13);
+}
+
+.prompt-node__header {
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 7px 5px 10px;
+  border-bottom: 1px solid #e2e8f0;
+  background: #faf5ff;
+  cursor: grab;
+}
+
+.prompt-node__header > input {
+  min-width: 0;
+  flex: 1;
+  height: 27px;
+  border: 0;
+  border-bottom: 1px solid transparent;
+  outline: none;
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.prompt-node__header > input:focus {
+  border-bottom-color: #7c3aed;
+}
+
+.prompt-node__content {
+  flex: 1;
+  min-height: 0;
+  resize: none;
+  padding: 10px;
+  border: 0;
+  outline: none;
+  color: #263244;
+  background: #fff;
+  font: 11px/1.55 Consolas, "Courier New", monospace;
+  letter-spacing: 0;
+}
+
+.prompt-dialog textarea {
+  width: 100%;
+  resize: vertical;
+  padding: 8px;
+  border: 1px solid #94a3b8;
+  border-radius: 4px;
+  font: 12px/1.5 Consolas, "Courier New", monospace;
+  letter-spacing: 0;
+}
+
 .file-node__header {
   min-height: 40px;
   display: flex;
@@ -222,8 +286,7 @@ button:disabled {
   gap: 4px;
 }
 
-.file-node__rename input,
-.file-node__rename select {
+.file-node__rename input {
   min-width: 0;
   height: 28px;
   padding: 3px 5px;
@@ -410,6 +473,7 @@ button:disabled {
   font-weight: 600;
 }
 
+.file-dialog__field > input,
 .file-dialog__field > select,
 .file-dialog__filename input,
 .file-dialog__filename select {

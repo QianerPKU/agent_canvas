@@ -1,6 +1,7 @@
 import type {
   AgentFileAccess,
   AgentEvent,
+  AgentPromptAccess,
   AgentProvider,
   AgentStartConfig,
   AgentStatus,
@@ -25,6 +26,7 @@ export interface AgentRunnerDeps {
   codexQuery?: QueryFn;
   now?: () => number;
   resolveFileAccess?: (agentId: string) => AgentFileAccess;
+  resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
 }
 
 export interface StartExtra {
@@ -44,6 +46,7 @@ export class AgentRunner {
   private readonly queries: Record<AgentProvider, QueryFn>;
   private readonly now: () => number;
   private readonly resolveFileAccess?: (agentId: string) => AgentFileAccess;
+  private readonly resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
   private readonly listeners = new Set<AgentEventListener>();
 
   private status: AgentStatus = "idle";
@@ -57,6 +60,7 @@ export class AgentRunner {
   private usage?: UsageInfo;
   private lastAssistantUuid?: string; // 本轮最后一条 assistant 消息 uuid（fork 锚点）
   private compactPending = false;
+  private promptInjectionPending = false;
   private readonly createdAt: number;
 
   constructor(id: string, deps: AgentRunnerDeps) {
@@ -67,6 +71,7 @@ export class AgentRunner {
     };
     this.now = deps.now ?? Date.now;
     this.resolveFileAccess = deps.resolveFileAccess;
+    this.resolvePromptAccess = deps.resolvePromptAccess;
     this.createdAt = this.now();
   }
 
@@ -107,12 +112,14 @@ export class AgentRunner {
     this.sessionId = undefined;
     this.lastAssistantUuid = undefined;
     this.compactPending = false;
+    this.promptInjectionPending = !config.resume && !extra.resumeSessionId;
 
     this.abortController = new AbortController();
     this.inputQueue = new AsyncMessageQueue<SdkUserInput>();
     // 首条任务作为第一条用户消息
     const fileAccess = this.resolveFileAccess?.(this.id);
-    this.inputQueue.push(toUserInput(config.prompt, fileAccess));
+    const promptAccess = this.promptAccessForNextInput();
+    this.inputQueue.push(toUserInput(config.prompt, fileAccess, promptAccess));
 
     this.setStatus("starting");
     this.emit({ kind: "user_input", text: config.prompt });
@@ -129,6 +136,7 @@ export class AgentRunner {
       forkSession: config.forkSession,
       abortController: this.abortController,
       fileAccess,
+      promptAccess,
     };
 
     this.handle = this.queries[provider]({ prompt: this.inputQueue, options });
@@ -141,7 +149,13 @@ export class AgentRunner {
     if (!this.inputQueue || this.inputQueue.isClosed || isTerminalStatus(this.status)) {
       throw new Error(`agent ${this.id} 当前不可接收输入（${this.status}）`);
     }
-    this.inputQueue.push(toUserInput(text, this.resolveFileAccess?.(this.id)));
+    this.inputQueue.push(
+      toUserInput(
+        text,
+        this.resolveFileAccess?.(this.id),
+        this.promptAccessForNextInput(),
+      ),
+    );
     this.setStatus("running");
     this.emit({ kind: "user_input", text });
   }
@@ -228,6 +242,7 @@ export class AgentRunner {
         break;
       case "compact":
         this.compactPending = false;
+        this.promptInjectionPending = true;
         this.emit(event);
         this.lastAssistantUuid = undefined;
         this.setStatus("waiting_input");
@@ -276,18 +291,36 @@ export class AgentRunner {
       }
     }
   }
+
+  private promptAccessForNextInput(): AgentPromptAccess | undefined {
+    const access = this.resolvePromptAccess?.(this.id);
+    if (!access) return undefined;
+    const includeReadable = this.promptInjectionPending;
+    this.promptInjectionPending = false;
+    return includeReadable
+      ? access
+      : {
+          ...access,
+          readablePrompts: [],
+        };
+  }
 }
 
 function normalizeProvider(provider: AgentProvider | undefined): AgentProvider {
   return provider ?? "claude";
 }
 
-function toUserInput(text: string, fileAccess?: AgentFileAccess): SdkUserInput {
+function toUserInput(
+  text: string,
+  fileAccess?: AgentFileAccess,
+  promptAccess?: AgentPromptAccess,
+): SdkUserInput {
   return {
     type: "user",
     message: { role: "user", content: text },
     parent_tool_use_id: null,
     fileAccess,
+    promptAccess,
   };
 }
 

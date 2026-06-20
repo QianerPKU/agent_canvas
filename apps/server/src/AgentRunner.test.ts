@@ -357,4 +357,66 @@ describe("AgentRunner 生命周期", () => {
     await flush();
     expect(ctl.inputs.at(-1)?.fileAccess?.readableFiles[0]?.name).toBe("input-1.txt");
   });
+
+  it("提示词只在新 Agent 首轮和 compact 后下一轮注入，fork 首轮不注入", async () => {
+    const promptAccess = {
+      readablePrompts: [
+        { id: "prompt_1", name: "规范", content: "先写测试", kind: "shared" as const },
+      ],
+      writablePrompts: [
+        { id: "prompt_2", name: "可维护规则", path: "/prompts/prompt_2.txt" },
+      ],
+      writableDirectories: ["/prompts"],
+    };
+    const ctl = makeControllableQuery();
+    const runner = new AgentRunner("prompt-agent", {
+      query: ctl.query,
+      resolvePromptAccess: () => promptAccess,
+    });
+
+    runner.start({ prompt: "first" });
+    await flush();
+    expect(ctl.inputs[0]?.promptAccess?.readablePrompts[0]?.content).toBe("先写测试");
+
+    ctl.emit(SYSTEM_INIT);
+    ctl.emit(resultMsg());
+    await flush();
+    runner.send("second");
+    await flush();
+    expect(ctl.inputs[1]?.promptAccess).toMatchObject({
+      readablePrompts: [],
+      writablePrompts: promptAccess.writablePrompts,
+    });
+
+    ctl.emit(resultMsg());
+    await flush();
+    runner.compact();
+    ctl.emit({
+      type: "system",
+      subtype: "compact_boundary",
+      compact_metadata: { trigger: "manual" },
+      uuid: "compact-1",
+      session_id: "s1",
+    });
+    await flush();
+    runner.send("after compact");
+    await flush();
+    expect(ctl.inputs.at(-1)?.promptAccess?.readablePrompts[0]?.content).toBe("先写测试");
+
+    const forkCtl = makeControllableQuery();
+    const fork = new AgentRunner("fork-agent", {
+      query: forkCtl.query,
+      resolvePromptAccess: () => promptAccess,
+    });
+    fork.start({
+      prompt: "fork first",
+      resume: "source-session",
+      forkSession: true,
+    });
+    await flush();
+    expect(forkCtl.inputs[0]?.promptAccess).toMatchObject({
+      readablePrompts: [],
+      writablePrompts: promptAccess.writablePrompts,
+    });
+  });
 });

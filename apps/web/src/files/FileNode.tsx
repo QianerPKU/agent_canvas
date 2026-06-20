@@ -15,8 +15,6 @@ export interface FileNodeData {
 
 export type FileNodeType = Node<FileNodeData, "file">;
 
-const EXTENSIONS = ["txt", "md", "csv", "json", "png", "jpg", "ts", "js", "py", ""];
-
 export function FileNode({ data }: NodeProps<FileNodeType>): React.ReactElement {
   const { file, actions, onPreview, onOpenEditor } = data;
   const [preview, setPreview] = useState("");
@@ -105,17 +103,12 @@ export function FileNode({ data }: NodeProps<FileNodeType>): React.ReactElement 
               autoFocus
               onChange={(event) => setName(event.target.value)}
             />
-            <select
+            <input
               aria-label="文件后缀"
               value={extension}
+              placeholder="无后缀"
               onChange={(event) => setExtension(event.target.value)}
-            >
-              {EXTENSIONS.map((candidate) => (
-                <option key={candidate || "none"} value={candidate}>
-                  {candidate ? `.${candidate}` : "无后缀"}
-                </option>
-              ))}
-            </select>
+            />
             <button className="icon-button" title="确认重命名" onClick={() => void finishRename()}>
               <Check size={14} />
             </button>

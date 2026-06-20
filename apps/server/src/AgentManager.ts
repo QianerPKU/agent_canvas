@@ -4,6 +4,7 @@ import type {
   AgentEventEnvelope,
   AgentSnapshot,
   AgentStartConfig,
+  AgentPromptAccess,
   ForkOrigin,
 } from "@agent-canvas/shared";
 import { AgentRunner } from "./AgentRunner.js";
@@ -16,6 +17,7 @@ export interface AgentManagerDeps {
   codexQuery?: QueryFn;
   now?: () => number;
   resolveFileAccess?: (agentId: string) => AgentFileAccess;
+  resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
 }
 
 /**
@@ -35,6 +37,7 @@ export class AgentManager {
   private readonly codexQuery?: QueryFn;
   private readonly now: () => number;
   private resolveFileAccess?: (agentId: string) => AgentFileAccess;
+  private resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
   private counter = 0;
 
   constructor(deps: AgentManagerDeps) {
@@ -42,6 +45,7 @@ export class AgentManager {
     this.codexQuery = deps.codexQuery;
     this.now = deps.now ?? Date.now;
     this.resolveFileAccess = deps.resolveFileAccess;
+    this.resolvePromptAccess = deps.resolvePromptAccess;
   }
 
   onEvent(listener: EnvelopeListener): () => void {
@@ -61,6 +65,12 @@ export class AgentManager {
           writableFiles: [],
           writableDirectories: [],
         },
+      resolvePromptAccess: (agentId) =>
+        this.resolvePromptAccess?.(agentId) ?? {
+          readablePrompts: [],
+          writablePrompts: [],
+          writableDirectories: [],
+        },
     });
     this.runners.set(id, runner);
     this.seqs.set(id, 0);
@@ -75,6 +85,10 @@ export class AgentManager {
 
   setFileAccessResolver(resolveFileAccess: (agentId: string) => AgentFileAccess): void {
     this.resolveFileAccess = resolveFileAccess;
+  }
+
+  setPromptAccessResolver(resolvePromptAccess: (agentId: string) => AgentPromptAccess): void {
+    this.resolvePromptAccess = resolvePromptAccess;
   }
 
   /**
