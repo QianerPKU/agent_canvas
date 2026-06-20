@@ -66,6 +66,10 @@ button:disabled {
   font-weight: 700;
 }
 
+.turn-node__restore:active {
+  cursor: grabbing;
+}
+
 .turn-node__restore:hover {
   border-color: #2563eb;
   color: #2563eb;

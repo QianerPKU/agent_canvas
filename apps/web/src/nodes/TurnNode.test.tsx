@@ -100,7 +100,9 @@ describe("TurnNode", () => {
     );
 
     expect(container.querySelectorAll(".react-flow__handle")).toHaveLength(3);
-    expect(screen.getByTitle("恢复 agent_1 第 3 轮")).toBeTruthy();
+    const restoreButton = screen.getByTitle("恢复 agent_1 第 3 轮");
+    expect(restoreButton.classList.contains("drag-handle")).toBe(true);
+    expect(restoreButton.classList.contains("nodrag")).toBe(false);
   });
 
   it("首轮 idle（可输入）：启动按钮 + submit 带 prompt", () => {

@@ -185,7 +185,7 @@ export function TurnNode({
     return (
       <div className="turn-node turn-node--minimized">
         <button
-          className="turn-node__restore nodrag"
+          className="turn-node__restore drag-handle"
           title={`恢复 ${agentId} 第 ${turn.index + 1} 轮`}
           onClick={toggleMinimized}
         >

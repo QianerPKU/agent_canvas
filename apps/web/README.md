@@ -36,7 +36,7 @@
 - Codex 的 `agentMessage` 流式 delta 按消息 UUID 合并到同一输出段落，避免每个小片段被渲染成独立短行。
 - 每个 agent 的最新节点显示 `Compact` 和 `Terminate`。Compact 仅在等待输入时启用，完成后当前 idle 节点定格为 `/compact` 完成轮并延伸新 idle 节点；Terminate 关闭底层 CLI 并进入 `terminated`。
 - 点击任意非最小化节点主体会打开独立历史窗口，内容累计到该轮为止；历史来自后端 `/history`，包括 provider 实际发出的 thinking/reasoning 与完整工具参数/结果。
-- 节点四边和四角可拖拽缩放。标题栏最小化按钮会保存当前宽高并把节点缩成 `68×48` 的小节点；再次点击恢复。节点 id 与 Handle 始终不变，因此轮次线和 fork 线保持连接。
+- 节点四边和四角可拖拽缩放。标题栏最小化按钮会保存当前宽高并把节点缩成 `68×48` 的小节点；小节点本身仍是拖动句柄，单击恢复。节点 id 与 Handle 始终不变，因此轮次线和 fork 线保持连接。
 - WebSocket 首次连接延迟到下一轮事件循环，兼容 React StrictMode 的开发期双重 effect 检查，避免 Vite 代理记录无害的 `ECONNABORTED`。
 - 节点只有头部可拖动（`.drag-handle`），控制区 `.nodrag`、日志区 `.nowheel`。
 
