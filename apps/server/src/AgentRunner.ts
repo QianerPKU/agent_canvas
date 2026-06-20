@@ -110,6 +110,7 @@ export class AgentRunner {
     this.inputQueue.push(toUserInput(config.prompt));
 
     this.setStatus("starting");
+    this.emit({ kind: "user_input", text: config.prompt });
 
     const options: QueryOptions = {
       cwd: config.cwd,
@@ -136,6 +137,7 @@ export class AgentRunner {
     }
     this.inputQueue.push(toUserInput(text));
     this.setStatus("running");
+    this.emit({ kind: "user_input", text });
   }
 
   /** 手动压缩当前会话上下文；压缩本身作为独立一轮。 */
@@ -146,6 +148,7 @@ export class AgentRunner {
     this.inputQueue.push(toUserInput("/compact"));
     this.compactPending = true;
     this.setStatus("running");
+    this.emit({ kind: "user_input", text: "/compact" });
   }
 
   /** 中止会话。 */

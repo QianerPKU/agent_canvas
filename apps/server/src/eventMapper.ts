@@ -90,6 +90,12 @@ function mapAssistant(message: SdkApiMessage, uuid?: string): AgentEvent[] {
       // 跳过空白文本块，减少噪声
       return text.length > 0 ? { kind: "assistant_text", text, messageUuid: uuid } : null;
     }
+    if (block.type === "thinking") {
+      const thinking = (block as { thinking?: unknown }).thinking;
+      return typeof thinking === "string" && thinking.length > 0
+        ? { kind: "thinking", text: thinking, messageUuid: uuid }
+        : null;
+    }
     if (block.type === "tool_use") {
       const b = block as { id?: string; name?: string; input?: unknown };
       return {

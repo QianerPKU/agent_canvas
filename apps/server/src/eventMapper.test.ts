@@ -116,7 +116,7 @@ describe("mapSdkMessage", () => {
     expect(mapSdkMessage(msg)).toEqual([]);
   });
 
-  it("thinking 块不投影", () => {
+  it("thinking 块 → thinking", () => {
     const msg: SdkMessage = {
       type: "assistant",
       session_id: "s1",
@@ -125,7 +125,9 @@ describe("mapSdkMessage", () => {
         content: [{ type: "thinking", thinking: "嗯..." }],
       },
     };
-    expect(mapSdkMessage(msg)).toEqual([]);
+    expect(mapSdkMessage(msg)).toEqual([
+      { kind: "thinking", text: "嗯...", messageUuid: undefined },
+    ]);
   });
 
   it("user/tool_result → tool_result（含 is_error）", () => {

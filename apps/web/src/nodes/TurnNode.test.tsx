@@ -2,7 +2,12 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup } from "@testing-library/react";
 import { ReactFlowProvider, type NodeProps } from "@xyflow/react";
-import { TurnNode, type TurnNodeData, type TurnNodeType } from "./TurnNode.js";
+import {
+  TurnNode,
+  toggleTurnNodeWindow,
+  type TurnNodeData,
+  type TurnNodeType,
+} from "./TurnNode.js";
 import type { Turn } from "../agentStore.js";
 import type { AgentStatus } from "@agent-canvas/shared";
 import type { AgentActions } from "../useAgentCanvas.js";
@@ -21,7 +26,14 @@ function makeActions(): AgentActions {
 }
 
 function renderTurn(turn: Turn, agentStatus: AgentStatus, actions: AgentActions, agentId = "agent_1") {
-  const data: TurnNodeData = { agentId, turn, agentStatus, isLatest: true, actions };
+  const data: TurnNodeData = {
+    agentId,
+    turn,
+    agentStatus,
+    isLatest: true,
+    onOpenHistory: vi.fn(),
+    actions,
+  };
   const props = { data } as unknown as NodeProps<TurnNodeType>;
   return render(
     <ReactFlowProvider>
@@ -31,6 +43,66 @@ function renderTurn(turn: Turn, agentStatus: AgentStatus, actions: AgentActions,
 }
 
 describe("TurnNode", () => {
+  it("最小化保存当前尺寸，并能恢复", () => {
+    const actions = makeActions();
+    const node: TurnNodeType = {
+      id: "agent_1#0",
+      type: "turn",
+      position: { x: 0, y: 0 },
+      width: 520,
+      height: 410,
+      data: {
+        agentId: "agent_1",
+        turn: { index: 0, status: "idle", lines: [] },
+        agentStatus: "idle",
+        isLatest: true,
+        onOpenHistory: vi.fn(),
+        actions,
+      },
+    };
+
+    const minimized = { ...node, ...toggleTurnNodeWindow(node) } as TurnNodeType;
+    expect(minimized).toMatchObject({
+      width: 68,
+      height: 48,
+      data: {
+        windowState: {
+          minimized: true,
+          restoreWidth: 520,
+          restoreHeight: 410,
+        },
+      },
+    });
+
+    const restored = toggleTurnNodeWindow(minimized);
+    expect(restored).toMatchObject({
+      width: 520,
+      height: 410,
+      data: { windowState: { minimized: false } },
+    });
+  });
+
+  it("最小化节点仍保留全部连接 Handle", () => {
+    const actions = makeActions();
+    const data: TurnNodeData = {
+      agentId: "agent_1",
+      turn: { index: 2, status: "done", lines: [] },
+      agentStatus: "waiting_input",
+      isLatest: false,
+      windowState: { minimized: true, restoreWidth: 360, restoreHeight: 300 },
+      onOpenHistory: vi.fn(),
+      actions,
+    };
+    const { container } = render(
+      <ReactFlowProvider>
+        <TurnNode {...({ data, id: "agent_1#2" } as unknown as NodeProps<TurnNodeType>)} />
+      </ReactFlowProvider>,
+    );
+
+    expect(container.querySelectorAll(".react-flow__handle")).toHaveLength(3);
+    expect(screen.getByTitle("恢复 agent_1 第 3 轮")).toBeTruthy();
+  });
+
   it("首轮 idle（可输入）：启动按钮 + submit 带 prompt", () => {
     const actions = makeActions();
     renderTurn({ index: 0, status: "idle", lines: [] }, "idle", actions);
@@ -131,6 +203,7 @@ describe("TurnNode", () => {
       provider: "codex",
       model: "gpt-5.4",
       isLatest: false,
+      onOpenHistory: vi.fn(),
       actions,
     };
     render(
@@ -150,5 +223,29 @@ describe("TurnNode", () => {
     const actions = makeActions();
     renderTurn({ index: 0, status: "done", lines: [] }, "waiting_input", actions);
     expect(screen.queryByText("⑂ 从此轮 fork")).toBeNull();
+  });
+
+  it("点击节点主体打开累计历史，点击控制按钮不会误触", () => {
+    const actions = makeActions();
+    const onOpenHistory = vi.fn();
+    const data: TurnNodeData = {
+      agentId: "agent_1",
+      turn: { index: 0, status: "idle", lines: [] },
+      agentStatus: "idle",
+      isLatest: true,
+      onOpenHistory,
+      actions,
+    };
+    const { container } = render(
+      <ReactFlowProvider>
+        <TurnNode {...({ data, id: "agent_1#0" } as unknown as NodeProps<TurnNodeType>)} />
+      </ReactFlowProvider>,
+    );
+
+    fireEvent.click(container.querySelector(".turn-node")!);
+    expect(onOpenHistory).toHaveBeenCalledWith("agent_1", 0);
+
+    fireEvent.click(screen.getByText("Terminate"));
+    expect(onOpenHistory).toHaveBeenCalledOnce();
   });
 });

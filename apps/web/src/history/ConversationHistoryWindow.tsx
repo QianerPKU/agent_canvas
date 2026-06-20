@@ -1,0 +1,217 @@
+import { useEffect, useState } from "react";
+import { X } from "lucide-react";
+import type { AgentEvent } from "@agent-canvas/shared";
+import { api } from "../api.js";
+import {
+  buildConversationHistory,
+  type HistoryItem,
+  type HistoryTurn,
+} from "./conversationHistory.js";
+
+export interface HistoryTarget {
+  agentId: string;
+  turnIndex: number;
+  lastSeq: number;
+}
+
+export function ConversationHistoryWindow({
+  target,
+  onClose,
+}: {
+  target: HistoryTarget;
+  onClose: () => void;
+}): React.ReactElement {
+  const [turns, setTurns] = useState<HistoryTurn[]>([]);
+  const [error, setError] = useState<string>();
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError(undefined);
+    void api
+      .history(target.agentId)
+      .then((events) => {
+        if (active) setTurns(buildConversationHistory(events, target.turnIndex));
+      })
+      .catch((err: unknown) => {
+        if (active) setError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [target.agentId, target.turnIndex, target.lastSeq]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  return (
+    <div
+      className="history-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <section
+        className="history-window"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`${target.agentId} 对话历史`}
+      >
+        <header className="history-window__header">
+          <div>
+            <strong>{target.agentId}</strong>
+            <span>截至第 {target.turnIndex + 1} 轮</span>
+          </div>
+          <button className="icon-button" title="关闭历史窗口" onClick={onClose}>
+            <X size={17} />
+          </button>
+        </header>
+
+        <div className="history-window__body">
+          {loading && <div className="history-empty">正在读取历史…</div>}
+          {error && <div className="history-error">{error}</div>}
+          {!loading && !error && turns.every((turn) => turn.items.length === 0) && (
+            <div className="history-empty">这一轮还没有历史事件。</div>
+          )}
+          {!loading &&
+            !error &&
+            turns.map((turn) =>
+              turn.items.length > 0 ? (
+                <section className="history-turn" key={turn.index}>
+                  <h2>第 {turn.index + 1} 轮</h2>
+                  <div className="history-events">
+                    {turn.items.map((item) => (
+                      <HistoryEvent key={item.seq} item={item} />
+                    ))}
+                  </div>
+                </section>
+              ) : null,
+            )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function HistoryEvent({ item }: { item: HistoryItem }): React.ReactElement {
+  const event = item.event;
+  const time = new Date(item.at).toLocaleTimeString();
+
+  switch (event.kind) {
+    case "user_input":
+      return <EventBlock tone="user" label="用户" time={time} content={event.text} />;
+    case "thinking":
+      return <EventBlock tone="thinking" label="思考" time={time} content={event.text} />;
+    case "assistant_text":
+      return <EventBlock tone="assistant" label="答复" time={time} content={event.text} />;
+    case "tool_use":
+      return (
+        <EventBlock
+          tone="tool"
+          label={`工具调用 · ${event.name}`}
+          time={time}
+          content={pretty(event.input)}
+          code
+        />
+      );
+    case "tool_result":
+      return (
+        <EventBlock
+          tone={event.isError ? "error" : "tool"}
+          label={event.isError ? "工具错误" : "工具结果"}
+          time={time}
+          content={pretty(event.content)}
+          code
+        />
+      );
+    case "system_init":
+      return (
+        <EventBlock
+          tone="system"
+          label="会话初始化"
+          time={time}
+          content={`${event.model} · ${event.cwd}\n工具：${event.tools.join(", ") || "无"}`}
+        />
+      );
+    case "result":
+      return (
+        <EventBlock
+          tone={event.isError ? "error" : "result"}
+          label="本轮结果"
+          time={time}
+          content={resultText(event)}
+        />
+      );
+    case "compact":
+      return (
+        <EventBlock
+          tone="result"
+          label="手动 compact"
+          time={time}
+          content={
+            event.preTokens != null && event.postTokens != null
+              ? `${event.preTokens} → ${event.postTokens} tokens`
+              : "上下文压缩完成"
+          }
+        />
+      );
+    case "error":
+      return <EventBlock tone="error" label="错误" time={time} content={event.message} />;
+    case "status":
+      return <EventBlock tone="system" label="状态" time={time} content={event.status} />;
+  }
+}
+
+function EventBlock({
+  tone,
+  label,
+  time,
+  content,
+  code = false,
+}: {
+  tone: string;
+  label: string;
+  time: string;
+  content: string;
+  code?: boolean;
+}): React.ReactElement {
+  return (
+    <article className={`history-event history-event--${tone}`}>
+      <div className="history-event__meta">
+        <strong>{label}</strong>
+        <time>{time}</time>
+      </div>
+      {code ? <pre>{content}</pre> : <div className="history-event__text">{content}</div>}
+    </article>
+  );
+}
+
+function pretty(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function resultText(event: Extract<AgentEvent, { kind: "result" }>): string {
+  const details = [event.subtype];
+  if (event.costUsd != null) details.push(`$${event.costUsd.toFixed(4)}`);
+  if (event.durationMs != null) details.push(`${event.durationMs}ms`);
+  if (event.usage?.inputTokens != null || event.usage?.outputTokens != null) {
+    details.push(
+      `tokens ${event.usage.inputTokens ?? 0} in / ${event.usage.outputTokens ?? 0} out`,
+    );
+  }
+  return details.join(" · ");
+}

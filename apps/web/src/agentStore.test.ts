@@ -109,6 +109,27 @@ describe("agentStore 轮次模型", () => {
     ]);
   });
 
+  it("同一 thinking 消息的流式片段合并为一行", () => {
+    seq = 0;
+    let map: AgentMap = { a1: newAgentView("a1") };
+    map = applyEnvelope(
+      map,
+      env("a1", { kind: "thinking", text: "先检查", messageUuid: "thinking-1" }),
+    );
+    map = applyEnvelope(
+      map,
+      env("a1", { kind: "thinking", text: "文件", messageUuid: "thinking-1" }),
+    );
+
+    expect(get(map).turns[0]!.lines).toEqual([
+      {
+        kind: "thinking",
+        text: "先检查文件",
+        messageUuid: "thinking-1",
+      },
+    ]);
+  });
+
   it("一轮以 result 收尾：定格 done + anchorUuid，并自动延伸新 idle 轮", () => {
     seq = 0;
     let map: AgentMap = { a1: newAgentView("a1") };

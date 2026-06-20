@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   ReactFlow,
   Background,
@@ -13,11 +13,17 @@ import { useAgentCanvas } from "./useAgentCanvas.js";
 import { TurnNode, type TurnNodeType } from "./nodes/TurnNode.js";
 import type { AgentMap } from "./agentStore.js";
 import type { AgentActions } from "./useAgentCanvas.js";
+import {
+  ConversationHistoryWindow,
+  type HistoryTarget,
+} from "./history/ConversationHistoryWindow.js";
 
 const nodeTypes = { turn: TurnNode };
 
 const COL_W = 430;
-const ROW_H = 320;
+const ROW_H = 360;
+const DEFAULT_NODE_WIDTH = 360;
+const DEFAULT_NODE_HEIGHT = 300;
 const X0 = 40;
 const Y0 = 40;
 
@@ -79,13 +85,19 @@ function computeEdges(agents: AgentMap): Edge[] {
   return edges;
 }
 
-function buildNodes(agents: AgentMap, actions: AgentActions, cur: TurnNodeType[]): TurnNodeType[] {
+function buildNodes(
+  agents: AgentMap,
+  actions: AgentActions,
+  cur: TurnNodeType[],
+  onOpenHistory: (agentId: string, turnIndex: number) => void,
+): TurnNodeType[] {
   const layout = computeLayout(agents);
   const byId = new Map(cur.map((n) => [n.id, n]));
   const result: TurnNodeType[] = [];
   for (const view of Object.values(agents)) {
     view.turns.forEach((turn, i) => {
       const id = nodeId(view.id, i);
+      const existing = byId.get(id);
       const data = {
         agentId: view.id,
         turn,
@@ -94,9 +106,10 @@ function buildNodes(agents: AgentMap, actions: AgentActions, cur: TurnNodeType[]
         model: view.model,
         providerLocked: !!view.forkOrigin,
         isLatest: i === view.turns.length - 1,
+        windowState: existing?.data.windowState,
+        onOpenHistory,
         actions,
       };
-      const existing = byId.get(id);
       if (existing) {
         result.push({ ...existing, data }); // 保留已拖动位置，仅更新数据
       } else {
@@ -104,6 +117,8 @@ function buildNodes(agents: AgentMap, actions: AgentActions, cur: TurnNodeType[]
           id,
           type: "turn",
           position: layout[id] ?? { x: X0, y: Y0 },
+          width: DEFAULT_NODE_WIDTH,
+          height: DEFAULT_NODE_HEIGHT,
           dragHandle: ".drag-handle",
           data,
         });
@@ -117,11 +132,23 @@ export default function App(): React.ReactElement {
   const { agents, connected, actions } = useAgentCanvas();
   const [nodes, setNodes, onNodesChange] = useNodesState<TurnNodeType>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
+  const [historyTarget, setHistoryTarget] = useState<HistoryTarget>();
+
+  const openHistory = useCallback(
+    (agentId: string, turnIndex: number) => {
+      setHistoryTarget({
+        agentId,
+        turnIndex,
+        lastSeq: agents[agentId]?.lastSeq ?? 0,
+      });
+    },
+    [agents],
+  );
 
   useEffect(() => {
-    setNodes((cur) => buildNodes(agents, actions, cur));
+    setNodes((cur) => buildNodes(agents, actions, cur, openHistory));
     setEdges(computeEdges(agents));
-  }, [agents, actions, setNodes, setEdges]);
+  }, [agents, actions, openHistory, setNodes, setEdges]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", width: "100vw" }}>
@@ -174,6 +201,15 @@ export default function App(): React.ReactElement {
           <Controls />
         </ReactFlow>
       </div>
+      {historyTarget && (
+        <ConversationHistoryWindow
+          target={{
+            ...historyTarget,
+            lastSeq: agents[historyTarget.agentId]?.lastSeq ?? historyTarget.lastSeq,
+          }}
+          onClose={() => setHistoryTarget(undefined)}
+        />
+      )}
     </div>
   );
 }

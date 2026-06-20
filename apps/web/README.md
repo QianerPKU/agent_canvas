@@ -17,7 +17,8 @@
 | `src/agentStore.ts` | **纯函数**：把事件流折叠成对话树（`AgentView.turns: Turn[]`）。result 收尾本轮并延伸新 idle 轮；记录每轮 `anchorUuid`（fork 锚点）、provider 与 model；合并同一消息的流式文本片段。无 React 依赖，单测主对象。 |
 | `src/api.ts` | REST 命令客户端（create/start/send/stop/compact/terminate/fork/resume） |
 | `src/useAgentCanvas.ts` | React hook：订阅 `/ws`、折叠出 `agents` 表、暴露动作（create/submit/stop/compact/terminate/fork）、断线自动重连 |
-| `src/nodes/TurnNode.tsx` | 自定义节点（一轮）：状态徽标 + provider/model 选择 + 输出滚动区；最新节点提供 Compact/Terminate，普通状态提供输入、停止或 fork 控件 |
+| `src/nodes/TurnNode.tsx` | 自定义节点（一轮）：状态徽标 + provider/model 选择 + 输出滚动区；支持边缘缩放、最小化/恢复，最新节点提供 Compact/Terminate |
+| `src/history/` | 点击节点后打开的累计历史窗口；按目标轮截断并展示用户输入、provider 思考、答复、完整工具调用/结果与状态 |
 | `src/App.tsx` | 画布装配：对话树布局（每 agent 一列、轮次向下、fork 另起列对齐锚点轮）+ 轮链边 + fork 边 |
 
 ## 数据流
@@ -34,6 +35,8 @@
 - 新建 / fork 后后端不发事件，前端**乐观插入**节点（fork 带 `forkOrigin` 以画连线）。
 - Codex 的 `agentMessage` 流式 delta 按消息 UUID 合并到同一输出段落，避免每个小片段被渲染成独立短行。
 - 每个 agent 的最新节点显示 `Compact` 和 `Terminate`。Compact 仅在等待输入时启用，完成后当前 idle 节点定格为 `/compact` 完成轮并延伸新 idle 节点；Terminate 关闭底层 CLI 并进入 `terminated`。
+- 点击任意非最小化节点主体会打开独立历史窗口，内容累计到该轮为止；历史来自后端 `/history`，包括 provider 实际发出的 thinking/reasoning 与完整工具参数/结果。
+- 节点四边和四角可拖拽缩放。标题栏最小化按钮会保存当前宽高并把节点缩成 `68×48` 的小节点；再次点击恢复。节点 id 与 Handle 始终不变，因此轮次线和 fork 线保持连接。
 - WebSocket 首次连接延迟到下一轮事件循环，兼容 React StrictMode 的开发期双重 effect 检查，避免 Vite 代理记录无害的 `ECONNABORTED`。
 - 节点只有头部可拖动（`.drag-handle`），控制区 `.nodrag`、日志区 `.nowheel`。
 
@@ -56,4 +59,5 @@ npm test --workspace apps/web
 
 - `agentStore.test.ts`：事件折叠、不可变更新、旧 seq 去重、行数封顶（node 环境）
 - `useAgentCanvas.test.tsx`：StrictMode 下只建立一次 WebSocket
-- `nodes/TurnNode.test.tsx`：各状态徽标、模型选择、Compact/Terminate 与 fork 控件交互（jsdom + Testing Library）
+- `history/*.test.ts(x)`：按轮截断、流式片段合并与完整历史窗口渲染
+- `nodes/TurnNode.test.tsx`：各状态徽标、模型选择、Compact/Terminate、历史点击、尺寸保存/恢复与 fork 控件交互

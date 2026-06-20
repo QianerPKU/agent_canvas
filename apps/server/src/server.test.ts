@@ -98,6 +98,18 @@ describe("HTTP server", () => {
     expect(r.status).toBe(202);
   });
 
+  it("history 记录用户输入", async () => {
+    const c = await request(port, "POST", "/api/agents");
+    await request(port, "POST", `/api/agents/${c.json.id}/start`, { prompt: "保留这条输入" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const history = await request(port, "GET", `/api/agents/${c.json.id}/history`);
+    expect(history.status).toBe(200);
+    expect(history.json.events.some(
+      (entry: { event?: { kind?: string; text?: string } }) =>
+        entry.event?.kind === "user_input" && entry.event.text === "保留这条输入",
+    )).toBe(true);
+  });
+
   it("未建立会话时 compact → 409", async () => {
     const c = await request(port, "POST", "/api/agents");
     const r = await request(port, "POST", `/api/agents/${c.json.id}/compact`);

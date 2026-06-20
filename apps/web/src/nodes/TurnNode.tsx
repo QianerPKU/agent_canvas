@@ -1,5 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
+import {
+  Handle,
+  NodeResizer,
+  Position,
+  useReactFlow,
+  useUpdateNodeInternals,
+  type Node,
+  type NodeProps,
+} from "@xyflow/react";
+import { MessageSquare, Minimize2 } from "lucide-react";
 import {
   CODEX_MODELS,
   DEFAULT_CODEX_MODEL,
@@ -19,11 +28,43 @@ export interface TurnNodeData {
   model?: string;
   providerLocked?: boolean;
   isLatest: boolean;
+  windowState?: {
+    minimized: boolean;
+    restoreWidth?: number;
+    restoreHeight?: number;
+  };
+  onOpenHistory: (agentId: string, turnIndex: number) => void;
   actions: AgentActions;
   [key: string]: unknown;
 }
 
 export type TurnNodeType = Node<TurnNodeData, "turn">;
+
+export function toggleTurnNodeWindow(node: TurnNodeType): Partial<TurnNodeType> {
+  const state = node.data.windowState;
+  if (state?.minimized) {
+    return {
+      width: state.restoreWidth ?? 360,
+      height: state.restoreHeight ?? 300,
+      data: {
+        ...node.data,
+        windowState: { ...state, minimized: false },
+      },
+    };
+  }
+  return {
+    width: 68,
+    height: 48,
+    data: {
+      ...node.data,
+      windowState: {
+        minimized: true,
+        restoreWidth: node.width ?? node.measured?.width ?? 360,
+        restoreHeight: node.height ?? node.measured?.height ?? 300,
+      },
+    },
+  };
+}
 
 const TURN_META: Record<TurnStatus, { label: string; color: string }> = {
   idle: { label: "待输入", color: "#6b7280" },
@@ -45,6 +86,8 @@ function lineStyle(kind: OutputLine["kind"], isError?: boolean): React.CSSProper
   switch (kind) {
     case "assistant":
       return { color: "#111827" };
+    case "thinking":
+      return { color: "#64748b", fontStyle: "italic" };
     case "tool_use":
       return { color: "#7c3aed", fontFamily: "monospace" };
     case "tool_result":
@@ -62,6 +105,8 @@ function renderLine(line: OutputLine): string {
   switch (line.kind) {
     case "assistant":
       return line.text;
+    case "thinking":
+      return `思考：${line.text}`;
     case "tool_use":
       return `🔧 ${line.name}(${short(line.input)})`;
     case "tool_result":
@@ -75,7 +120,10 @@ function renderLine(line: OutputLine): string {
   }
 }
 
-export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement {
+export function TurnNode({
+  id,
+  data,
+}: NodeProps<TurnNodeType>): React.ReactElement {
   const {
     agentId,
     turn,
@@ -86,6 +134,8 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
     isLatest,
     actions,
   } = data;
+  const reactFlow = useReactFlow<TurnNodeType>();
+  const updateNodeInternals = useUpdateNodeInternals();
   const [text, setText] = useState("");
   const [provider, setProvider] = useState<AgentProvider>(agentProvider ?? "claude");
   const [model, setModel] = useState<CodexModel>(codexModel(agentModel));
@@ -104,6 +154,7 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
     (agentStatus === "starting" ||
       agentStatus === "running" ||
       agentStatus === "waiting_input");
+  const minimized = data.windowState?.minimized === true;
 
   useEffect(() => {
     const el = logRef.current;
@@ -118,20 +169,70 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
     setModel(codexModel(agentModel));
   }, [agentModel]);
 
+  const toggleMinimized = (event: React.MouseEvent) => {
+    event.stopPropagation();
+    reactFlow.updateNode(id, toggleTurnNodeWindow);
+    requestAnimationFrame(() => updateNodeInternals(id));
+  };
+
+  const openHistory = (event: React.MouseEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement;
+    if (target.closest("button, textarea, select, input, .react-flow__resize-control")) return;
+    data.onOpenHistory(agentId, turn.index);
+  };
+
+  if (minimized) {
+    return (
+      <div className="turn-node turn-node--minimized">
+        <button
+          className="turn-node__restore nodrag"
+          title={`恢复 ${agentId} 第 ${turn.index + 1} 轮`}
+          onClick={toggleMinimized}
+        >
+          <MessageSquare size={17} />
+          <span>{turn.index + 1}</span>
+        </button>
+        <NodeHandles />
+      </div>
+    );
+  }
+
   return (
     <div
+      className="turn-node"
+      onClick={openHistory}
       style={{
-        width: 360,
-        background: "#fff",
-        border: "1px solid #e5e7eb",
-        borderTop: `3px solid ${meta.color}`,
-        borderRadius: 8,
-        boxShadow: "0 1px 3px rgba(0,0,0,0.1)",
+        width: "100%",
+        height: "100%",
         fontSize: 12,
-        overflow: "hidden",
       }}
     >
-      <Handle type="target" position={Position.Top} style={{ opacity: 0 }} />
+      <NodeResizer
+        isVisible
+        minWidth={280}
+        minHeight={260}
+        maxWidth={900}
+        maxHeight={800}
+        color="#94a3b8"
+        lineStyle={{ opacity: 0.55 }}
+        handleStyle={{ width: 8, height: 8, borderRadius: 2 }}
+      />
+      <NodeHandles />
+      <div
+        className="turn-node__surface"
+        style={{
+          width: "100%",
+          height: "100%",
+          display: "flex",
+          flexDirection: "column",
+          overflow: "hidden",
+          background: "#fff",
+          border: "1px solid #e5e7eb",
+          borderTop: `3px solid ${meta.color}`,
+          borderRadius: 8,
+          boxShadow: "0 1px 3px rgba(0,0,0,0.1)",
+        }}
+      >
 
       {/* 头部 */}
       <div
@@ -147,9 +248,16 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
       >
         <span style={{ fontWeight: 600 }}>第 {turn.index + 1} 轮</span>
         <span style={{ color: "#9ca3af", fontSize: 10 }}>{agentId}</span>
+        <button
+          className="icon-button nodrag"
+          title="最小化节点"
+          onClick={toggleMinimized}
+          style={{ marginLeft: "auto" }}
+        >
+          <Minimize2 size={14} />
+        </button>
         <span
           style={{
-            marginLeft: "auto",
             color: "#fff",
             background: meta.color,
             borderRadius: 10,
@@ -175,7 +283,8 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
           ref={logRef}
           className="nodrag nowheel"
           style={{
-            height: 140,
+            flex: "1 1 140px",
+            minHeight: 72,
             overflowY: "auto",
             padding: "6px 10px",
             borderTop: "1px solid #f3f4f6",
@@ -204,7 +313,11 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
       )}
 
       {/* 控制区 */}
-      <div className="nodrag" style={{ padding: 10, display: "flex", flexDirection: "column", gap: 6 }}>
+      <div
+        className="nodrag"
+        onClick={(event) => event.stopPropagation()}
+        style={{ padding: 10, display: "flex", flexDirection: "column", gap: 6 }}
+      >
         {isLatest && (
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
             <button
@@ -300,10 +413,18 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
           <span style={{ color: "#9ca3af", fontSize: 11 }}>（本轮已结束）</span>
         )}
       </div>
+      </div>
+    </div>
+  );
+}
 
+function NodeHandles(): React.ReactElement {
+  return (
+    <>
+      <Handle type="target" position={Position.Top} style={{ opacity: 0 }} />
       <Handle type="source" position={Position.Bottom} style={{ opacity: 0 }} />
       <Handle id="fork" type="source" position={Position.Right} style={{ background: "#7c3aed" }} />
-    </div>
+    </>
   );
 }
 

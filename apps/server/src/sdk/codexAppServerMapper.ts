@@ -9,10 +9,14 @@ export interface CodexAppServerMapState {
   threadId?: string;
   usage?: SdkUsage;
   agentMessageDeltaItemIds: Set<string>;
+  reasoningDeltaItemIds: Set<string>;
 }
 
 export function createCodexAppServerMapState(): CodexAppServerMapState {
-  return { agentMessageDeltaItemIds: new Set() };
+  return {
+    agentMessageDeltaItemIds: new Set(),
+    reasoningDeltaItemIds: new Set(),
+  };
 }
 
 export function mapCodexThreadInit(
@@ -52,6 +56,17 @@ export function mapCodexNotification(
     if (!itemId || !delta) return [];
     state.agentMessageDeltaItemIds.add(itemId);
     return [assistantMessage(delta, itemId, state.threadId ?? stringValue(params?.threadId))];
+  }
+
+  if (
+    method === "item/reasoning/textDelta" ||
+    method === "item/reasoning/summaryTextDelta"
+  ) {
+    const itemId = stringValue(params?.itemId);
+    const delta = stringValue(params?.delta);
+    if (!itemId || !delta) return [];
+    state.reasoningDeltaItemIds.add(itemId);
+    return [thinkingMessage(delta, itemId, state.threadId ?? stringValue(params?.threadId))];
   }
 
   if (method === "item/started") {
@@ -170,6 +185,11 @@ function mapItemCompleted(
       return [toolResult(id, { query: item.query, action: item.action }, false, sessionId)];
     case "plan":
       return [assistantMessage(stringValue(item.text), id, sessionId)];
+    case "reasoning": {
+      if (state.reasoningDeltaItemIds.has(id)) return [];
+      const text = [...stringArray(item.summary), ...stringArray(item.content)].join("\n");
+      return text ? [thinkingMessage(text, id, sessionId)] : [];
+    }
     default:
       return [];
   }
@@ -183,6 +203,18 @@ function assistantMessage(text: string, uuid: string | undefined, sessionId: str
     message: {
       role: "assistant",
       content: text ? [{ type: "text", text }] : [],
+    },
+  };
+}
+
+function thinkingMessage(text: string, uuid: string | undefined, sessionId: string): SdkMessage {
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    uuid,
+    message: {
+      role: "assistant",
+      content: text ? [{ type: "thinking", thinking: text }] : [],
     },
   };
 }
@@ -235,4 +267,9 @@ function stringValue(value: unknown): string {
 
 function numberValue(value: unknown): number | undefined {
   return typeof value === "number" ? value : undefined;
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
 }

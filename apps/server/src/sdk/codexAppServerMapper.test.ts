@@ -63,6 +63,56 @@ describe("codex app-server mapper", () => {
     ).toEqual([]);
   });
 
+  it("reasoning delta 映射为 thinking，并抑制 completed 重复内容", () => {
+    const state = createCodexAppServerMapState();
+    state.threadId = "thr_1";
+
+    expect(
+      mapCodexNotification(
+        {
+          method: "item/reasoning/summaryTextDelta",
+          params: {
+            threadId: "thr_1",
+            turnId: "turn_1",
+            itemId: "reasoning_1",
+            delta: "检查依赖关系",
+            summaryIndex: 0,
+          },
+        },
+        state,
+      ),
+    ).toEqual([
+      {
+        type: "assistant",
+        session_id: "thr_1",
+        uuid: "reasoning_1",
+        message: {
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "检查依赖关系" }],
+        },
+      },
+    ]);
+
+    expect(
+      mapCodexNotification(
+        {
+          method: "item/completed",
+          params: {
+            threadId: "thr_1",
+            turnId: "turn_1",
+            item: {
+              type: "reasoning",
+              id: "reasoning_1",
+              summary: ["检查依赖关系"],
+              content: [],
+            },
+          },
+        },
+        state,
+      ),
+    ).toEqual([]);
+  });
+
   it("command items map to tool_use and tool_result", () => {
     const state = createCodexAppServerMapState();
     state.threadId = "thr_1";

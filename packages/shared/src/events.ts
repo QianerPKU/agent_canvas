@@ -54,6 +54,7 @@ export interface UsageInfo {
  */
 export type AgentEvent =
   | { kind: "status"; status: AgentStatus }
+  | { kind: "user_input"; text: string }
   | {
       kind: "compact";
       trigger: "manual";
@@ -71,6 +72,7 @@ export type AgentEvent =
     }
   // messageUuid = 该 assistant 消息的 uuid，作为"从此轮 fork"的锚点
   | { kind: "assistant_text"; text: string; messageUuid?: string }
+  | { kind: "thinking"; text: string; messageUuid?: string }
   | { kind: "tool_use"; toolUseId: string; name: string; input: unknown; messageUuid?: string }
   | { kind: "tool_result"; toolUseId: string; isError: boolean; content: unknown }
   | {

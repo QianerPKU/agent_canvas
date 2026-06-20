@@ -110,6 +110,13 @@ describe("AgentRunner 生命周期", () => {
 
     // 两条用户输入都被送进了 SDK
     expect(ctl.inputs.map((i) => i.message.content)).toEqual(["做 x", "再做 y"]);
+    expect(
+      events
+        .filter((event): event is Extract<AgentEvent, { kind: "user_input" }> =>
+          event.kind === "user_input"
+        )
+        .map((event) => event.text),
+    ).toEqual(["做 x", "再做 y"]);
 
     // 状态变迁序列
     expect(collectStatuses(events)).toEqual([

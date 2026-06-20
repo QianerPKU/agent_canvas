@@ -10,7 +10,7 @@
 | `src/sdk/realQuery.ts` | 把真实 SDK 的 `query` 适配成 `QueryFn`（仅运行时引入） |
 | `src/sdk/codexAppServerQuery.ts` | 通过 `codex app-server --stdio` 驱动 Codex thread/turn/fork，并适配成 `QueryFn` |
 | `src/sdk/codexAppServerMapper.ts` | **纯函数**：Codex app-server JSON-RPC 通知 → SDK-like 消息 |
-| `src/eventMapper.ts` | **纯函数**：一条 SDK 消息 → 0..N 个统一 `AgentEvent` |
+| `src/eventMapper.ts` | **纯函数**：一条 SDK 消息 → 0..N 个统一 `AgentEvent`，保留 Claude thinking 与工具细节 |
 | `src/util/AsyncMessageQueue.ts` | 可动态 push、可关闭的异步队列；作为流式输入源，实现"中途干预" |
 | `src/AgentRunner.ts` | 单 agent 生命周期 + 状态机（`idle→starting→running↔waiting_input→done/stopped/error`） |
 | `src/AgentManager.ts` | 多 agent 注册表：分配 id、维护单调 `seq`、包 `AgentEventEnvelope` 广播、内存事件历史 |
@@ -33,6 +33,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 - **provider / model 选择**：`AgentStartConfig.provider` 可为 `claude` 或 `codex`，未指定时默认 `claude`。Codex UI 提供 `gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`，模型通过 app-server 的 `thread/start` / `thread/fork` / `turn/start` 参数传递。
 - **手动 compact**：只允许在 `waiting_input` 执行。Claude 将内置 `/compact` 送入现有流式会话，并等待 manual `compact_boundary`；Codex 调用原生 `thread/compact/start`，等待 `contextCompaction` 完成。两者都投影成统一 `compact` 事件，前端把它记录为一轮完成的对话。
 - **terminate**：调用 QueryHandle 的终止能力并关闭输入流。Claude adapter 会 interrupt 后结束 Query generator；Codex adapter 关闭并 kill 对应 app-server 子进程，状态进入 `terminated`。
+- **完整历史**：`AgentRunner` 把每次 start/send/compact 输入记录为 `user_input`；Claude thinking block 与 Codex reasoning delta/summary 统一映射为 `thinking`。`GET /api/agents/:id/history` 因而可回放用户输入、思考、答复、工具调用/结果与轮次结果。
 
 ## HTTP API
 
@@ -42,7 +43,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 | `GET /api/agents` | 列出全部 agent 快照 |
 | `POST /api/agents` | 新建 agent，返回 `{ id }` |
 | `GET /api/agents/:id` | 单个快照 |
-| `GET /api/agents/:id/history` | 该 agent 的事件历史（重连补齐） |
+| `GET /api/agents/:id/history` | 该 agent 的完整事件历史（用户输入、思考、工具、答复与结果） |
 | `POST /api/agents/:id/start` | body=`AgentStartConfig`，启动；`provider` 可选 `claude/codex` |
 | `POST /api/agents/:id/send` | body=`{ text }`，中途追加指令 |
 | `POST /api/agents/:id/compact` | 手动 compact 当前上下文；仅 `waiting_input` 可用 |

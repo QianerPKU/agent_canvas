@@ -19,6 +19,7 @@ import type {
 
 export type OutputLine =
   | { kind: "assistant"; text: string; messageUuid?: string }
+  | { kind: "thinking"; text: string; messageUuid?: string }
   | { kind: "tool_use"; name: string; input: unknown }
   | { kind: "tool_result"; isError: boolean; content: unknown }
   | { kind: "system"; text: string }
@@ -35,7 +36,7 @@ export type TurnStatus =
 
 export interface Turn {
   index: number;
-  /** 该轮的用户输入（前端记录，后端不回显）。 */
+  /** 该轮的用户输入（前端乐观记录，后端 user_input 事件确认）。 */
   userInput?: string;
   lines: OutputLine[];
   status: TurnStatus;
@@ -175,6 +176,12 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
         turns: [...finalized.turns, idleTurn(finalized.turns.length)],
       };
     }
+    case "user_input":
+      return withLastTurn(view, (turn) => ({
+        ...turn,
+        userInput: event.text,
+        status: turn.status === "idle" ? "running" : turn.status,
+      }));
     case "system_init":
       return pushLineToLast(
         { ...view, sessionId: event.sessionId, model: event.model },
@@ -182,6 +189,8 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
       );
     case "assistant_text":
       return appendAssistantText(view, event.text, event.messageUuid);
+    case "thinking":
+      return appendThinking(view, event.text, event.messageUuid);
     case "tool_use":
       return pushLineToLast(view, { kind: "tool_use", name: event.name, input: event.input });
     case "tool_result":
@@ -239,6 +248,27 @@ function appendAssistantText(
       lines[lines.length - 1] = { ...last, text: last.text + text };
     } else {
       lines.push({ kind: "assistant", text, messageUuid });
+    }
+    return {
+      ...turn,
+      lines: lines.length > MAX_LINES ? lines.slice(lines.length - MAX_LINES) : lines,
+      status: turn.status === "idle" ? "running" : turn.status,
+    };
+  });
+}
+
+function appendThinking(
+  view: AgentView,
+  text: string,
+  messageUuid: string | undefined,
+): AgentView {
+  return withLastTurn(view, (turn) => {
+    const lines = turn.lines.slice();
+    const last = lines.at(-1);
+    if (messageUuid && last?.kind === "thinking" && last.messageUuid === messageUuid) {
+      lines[lines.length - 1] = { ...last, text: last.text + text };
+    } else {
+      lines.push({ kind: "thinking", text, messageUuid });
     }
     return {
       ...turn,
