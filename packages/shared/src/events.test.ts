@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
+  CODEX_MODELS,
+  DEFAULT_CODEX_MODEL,
+  isCodexModel,
   isTerminalStatus,
   TERMINAL_STATUSES,
   type AgentStatus,
@@ -34,5 +37,14 @@ describe("AgentEvent 联合类型", () => {
     } else {
       throw new Error("收窄失败");
     }
+  });
+});
+
+describe("Codex models", () => {
+  it("包含当前可选模型并以 gpt-5.5 为默认值", () => {
+    expect(CODEX_MODELS).toEqual(["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]);
+    expect(DEFAULT_CODEX_MODEL).toBe("gpt-5.5");
+    expect(isCodexModel("gpt-5.4-mini")).toBe(true);
+    expect(isCodexModel("claude-opus-4-8")).toBe(false);
   });
 });

@@ -91,9 +91,9 @@ async function handleHttp(
       return sendJson(res, 202, { ok: true });
     }
     if (method === "POST" && action === "fork") {
-      const body = await readJson<{ anchorUuid?: string }>(req);
+      const body = await readJson<{ anchorUuid?: string; model?: string }>(req);
       if (!body?.anchorUuid) return sendJson(res, 400, { error: "缺少 anchorUuid" });
-      const forked = manager.fork(id, body.anchorUuid);
+      const forked = manager.fork(id, body.anchorUuid, body.model);
       if (!forked) return sendJson(res, 409, { error: "源会话尚未建立，无法 fork" });
       return sendJson(res, 201, { id: forked.id, origin: forked.origin });
     }

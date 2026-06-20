@@ -1,6 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
-import type { AgentProvider, AgentStatus } from "@agent-canvas/shared";
+import {
+  CODEX_MODELS,
+  DEFAULT_CODEX_MODEL,
+  isCodexModel,
+  type AgentProvider,
+  type AgentStatus,
+  type CodexModel,
+} from "@agent-canvas/shared";
 import type { OutputLine, Turn, TurnStatus } from "../agentStore.js";
 import type { AgentActions } from "../useAgentCanvas.js";
 
@@ -9,6 +16,7 @@ export interface TurnNodeData {
   turn: Turn;
   agentStatus: AgentStatus;
   provider?: AgentProvider;
+  model?: string;
   providerLocked?: boolean;
   actions: AgentActions;
   [key: string]: unknown;
@@ -66,9 +74,18 @@ function renderLine(line: OutputLine): string {
 }
 
 export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement {
-  const { agentId, turn, agentStatus, provider: agentProvider, providerLocked, actions } = data;
+  const {
+    agentId,
+    turn,
+    agentStatus,
+    provider: agentProvider,
+    model: agentModel,
+    providerLocked,
+    actions,
+  } = data;
   const [text, setText] = useState("");
   const [provider, setProvider] = useState<AgentProvider>(agentProvider ?? "claude");
+  const [model, setModel] = useState<CodexModel>(codexModel(agentModel));
   const logRef = useRef<HTMLDivElement>(null);
 
   const meta = TURN_META[turn.status];
@@ -88,10 +105,14 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
     setProvider(agentProvider ?? "claude");
   }, [agentProvider]);
 
+  useEffect(() => {
+    setModel(codexModel(agentModel));
+  }, [agentModel]);
+
   return (
     <div
       style={{
-        width: 300,
+        width: 360,
         background: "#fff",
         border: "1px solid #e5e7eb",
         borderTop: `3px solid ${meta.color}`,
@@ -151,7 +172,8 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
             borderTop: "1px solid #f3f4f6",
             background: "#fff",
             whiteSpace: "pre-wrap",
-            wordBreak: "break-word",
+            overflowWrap: "anywhere",
+            lineHeight: 1.55,
           }}
         >
           {turn.lines.length === 0 ? (
@@ -188,6 +210,13 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
                 <option value="codex">Codex</option>
               </select>
             )}
+            {turn.index === 0 && provider === "codex" && (
+              <CodexModelSelect
+                ariaLabel="codex model"
+                value={model}
+                onChange={setModel}
+              />
+            )}
             <textarea
               value={text}
               onChange={(e) => setText(e.target.value)}
@@ -199,7 +228,12 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
               style={btn("#2563eb")}
               disabled={!text.trim()}
               onClick={() => {
-                void actions.submit(agentId, text.trim(), turn.index === 0 ? provider : undefined);
+                void actions.submit(
+                  agentId,
+                  text.trim(),
+                  turn.index === 0 ? provider : undefined,
+                  turn.index === 0 && provider === "codex" ? model : undefined,
+                );
                 setText("");
               }}
             >
@@ -211,13 +245,28 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
             停止
           </button>
         ) : canFork ? (
-          <button
-            style={btn("#7c3aed")}
-            title="从这一轮的对话状态分叉出一个新 agent"
-            onClick={() => void actions.fork(agentId, turn.anchorUuid!)}
-          >
-            ⑂ 从此轮 fork
-          </button>
+          <>
+            {agentProvider === "codex" && (
+              <CodexModelSelect
+                ariaLabel="fork model"
+                value={model}
+                onChange={setModel}
+              />
+            )}
+            <button
+              style={btn("#7c3aed")}
+              title="从这一轮的对话状态分叉出一个新 agent"
+              onClick={() =>
+                void actions.fork(
+                  agentId,
+                  turn.anchorUuid!,
+                  agentProvider === "codex" ? model : undefined,
+                )
+              }
+            >
+              ⑂ 从此轮 fork
+            </button>
+          </>
         ) : (
           <span style={{ color: "#9ca3af", fontSize: 11 }}>（本轮已结束）</span>
         )}
@@ -227,6 +276,35 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
       <Handle id="fork" type="source" position={Position.Right} style={{ background: "#7c3aed" }} />
     </div>
   );
+}
+
+function CodexModelSelect({
+  ariaLabel,
+  value,
+  onChange,
+}: {
+  ariaLabel: string;
+  value: CodexModel;
+  onChange: (model: CodexModel) => void;
+}): React.ReactElement {
+  return (
+    <select
+      aria-label={ariaLabel}
+      value={value}
+      onChange={(event) => onChange(event.target.value as CodexModel)}
+      style={selectStyle}
+    >
+      {CODEX_MODELS.map((candidate) => (
+        <option key={candidate} value={candidate}>
+          {candidate}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function codexModel(model: string | undefined): CodexModel {
+  return isCodexModel(model) ? model : DEFAULT_CODEX_MODEL;
 }
 
 const textareaStyle: React.CSSProperties = {

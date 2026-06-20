@@ -28,7 +28,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 ```
 
 - **流式输入干预**：`AgentRunner` 用 `AsyncMessageQueue` 作为 `prompt` 源；首条任务入队即启动，运行中 `send()` 继续入队。Claude SDK 原生消费流式输入；Codex app-server 按 thread 连续启动 turn，并用 `turn/interrupt` 尽力中止当前 turn。
-- **provider 选择**：`AgentStartConfig.provider` 可为 `claude` 或 `codex`，未指定时默认 `claude`。
+- **provider / model 选择**：`AgentStartConfig.provider` 可为 `claude` 或 `codex`，未指定时默认 `claude`。Codex UI 提供 `gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`，模型通过 app-server 的 `thread/start` / `thread/fork` / `turn/start` 参数传递。
 
 ## HTTP API
 
@@ -42,13 +42,13 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 | `POST /api/agents/:id/start` | body=`AgentStartConfig`，启动；`provider` 可选 `claude/codex` |
 | `POST /api/agents/:id/send` | body=`{ text }`，中途追加指令 |
 | `POST /api/agents/:id/resume` | body=`{ sessionId, text }`，续接会话 |
-| `POST /api/agents/:id/fork` | body=`{ anchorUuid }`，从该 agent 某轮 fork 出新 agent，返回 `{ id, origin }` |
+| `POST /api/agents/:id/fork` | body=`{ anchorUuid, model? }`，从该 agent 某轮 fork 出新 agent，可为 Codex fork 指定模型，返回 `{ id, origin }` |
 | `POST /api/agents/:id/stop` | 中止 |
 
 ## 多轮对话与 fork（对话历史分叉）
 
 - **多轮**：同一 agent = 同一 provider 会话。每轮 = 一次用户输入 + 一次完整答复，以 `result` 事件收尾。每个 `result` 携带本轮最后一条 assistant 消息的 `anchorUuid`（fork UI 锚点）。
-- **fork**：`POST /:id/fork { anchorUuid }` 会创建独立新 agent 并继承父 provider。Claude 使用 `resume + resumeSessionAt + forkSession:true` 从指定 assistant uuid 分叉；Codex 使用 app-server `thread/fork` 从父 thread 分叉（Codex app-server 当前是 thread 级 fork，不是按某个 assistant uuid 回滚）。对话 fork 与 git 分支无关。
+- **fork**：`POST /:id/fork { anchorUuid, model? }` 会创建独立新 agent 并继承父 provider。Codex 可覆盖目标模型，未指定则继承父启动配置。Claude 使用 `resume + resumeSessionAt + forkSession:true` 从指定 assistant uuid 分叉；Codex 使用 app-server `thread/fork` 从父 thread 分叉（Codex app-server 当前是 thread 级 fork，不是按某个 assistant uuid 回滚）。对话 fork 与 git 分支无关。
 
 ## WebSocket (`/ws`)
 

@@ -21,11 +21,16 @@ export interface AgentActions {
   /** 新建一个 agent（出现一个 idle 起始节点）。 */
   create: () => Promise<void>;
   /** 在末尾 idle 轮提交输入：首轮→start，续轮→send（自动判断）。 */
-  submit: (agentId: string, text: string, provider?: AgentProvider) => Promise<void>;
+  submit: (
+    agentId: string,
+    text: string,
+    provider?: AgentProvider,
+    model?: string,
+  ) => Promise<void>;
   /** 中止 agent。 */
   stop: (agentId: string) => Promise<void>;
   /** 从某轮（anchorUuid）fork 出一个新 agent。 */
-  fork: (agentId: string, anchorUuid: string) => Promise<void>;
+  fork: (agentId: string, anchorUuid: string, model?: string) => Promise<void>;
 }
 
 export interface UseAgentCanvas {
@@ -101,21 +106,26 @@ export function useAgentCanvas(): UseAgentCanvas {
         // 后端 create 不发事件，乐观插入一个 idle 节点
         setAgents((prev) => (prev[id] ? prev : { ...prev, [id]: newAgentView(id) }));
       },
-      submit: async (agentId, text, provider) => {
+      submit: async (agentId, text, provider, model) => {
         const view = agentsRef.current[agentId];
         const startProvider = provider ?? view?.provider;
-        setAgents((prev) => recordInput(prev, agentId, text, startProvider)); // 乐观置 running
+        const startModel = model ?? (startProvider === "codex" ? view?.model : undefined);
+        setAgents((prev) => recordInput(prev, agentId, text, startProvider, startModel));
         // 首轮（idle）用 start（fork 出来的 agent 由后端合并 fork 配置）；续轮用 send
         if (!view || view.status === "idle") {
-          await api.start(agentId, { prompt: text, provider: startProvider });
+          await api.start(agentId, {
+            prompt: text,
+            provider: startProvider,
+            model: startModel,
+          });
         } else {
           await api.send(agentId, text);
         }
       },
       stop: (agentId) => api.stop(agentId).then(() => undefined),
-      fork: async (agentId, anchorUuid) => {
-        const { id, origin } = await api.fork(agentId, anchorUuid);
-        setAgents((prev) => insertForked(prev, id, origin));
+      fork: async (agentId, anchorUuid, model) => {
+        const { id, origin } = await api.fork(agentId, anchorUuid, model);
+        setAgents((prev) => insertForked(prev, id, origin, model));
       },
     }),
     [],

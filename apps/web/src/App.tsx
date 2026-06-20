@@ -16,8 +16,8 @@ import type { AgentActions } from "./useAgentCanvas.js";
 
 const nodeTypes = { turn: TurnNode };
 
-const COL_W = 360;
-const ROW_H = 240;
+const COL_W = 430;
+const ROW_H = 280;
 const X0 = 40;
 const Y0 = 40;
 
@@ -91,6 +91,7 @@ function buildNodes(agents: AgentMap, actions: AgentActions, cur: TurnNodeType[]
         turn,
         agentStatus: view.status,
         provider: view.provider,
+        model: view.model,
         providerLocked: !!view.forkOrigin,
         actions,
       };

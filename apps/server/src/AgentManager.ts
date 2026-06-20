@@ -65,21 +65,27 @@ export class AgentManager {
 
   /**
    * 从某 agent 的某一轮（anchorUuid）fork 出一个新 agent。
-   * 记录其来源与启动时要合并的 fork 配置（resume/resumeSessionAt/forkSession）。
+   * 记录其来源与启动时要合并的 fork 配置（model/resume/resumeSessionAt/forkSession）。
    * 父会话尚未建立（无 sessionId）时返回 undefined。
    */
-  fork(parentId: string, anchorUuid: string): { id: string; origin: ForkOrigin } | undefined {
+  fork(
+    parentId: string,
+    anchorUuid: string,
+    model?: string,
+  ): { id: string; origin: ForkOrigin } | undefined {
     const parent = this.runners.get(parentId);
     if (!parent) return undefined;
-    const parentSession = parent.snapshot().sessionId;
+    const parentSnapshot = parent.snapshot();
+    const parentSession = parentSnapshot.sessionId;
     if (!parentSession) return undefined;
-    const parentProvider = parent.snapshot().config?.provider;
+    const parentProvider = parentSnapshot.config?.provider;
 
     const runner = this.create();
     const origin: ForkOrigin = { parentAgentId: parentId, anchorUuid };
     this.forkOrigins.set(runner.id, origin);
     this.forkConfigs.set(runner.id, {
       provider: parentProvider,
+      model: model ?? parentSnapshot.config?.model,
       resume: parentSession,
       resumeSessionAt: anchorUuid,
       forkSession: true,
@@ -98,12 +104,14 @@ export class AgentManager {
   list(): AgentSnapshot[] {
     return [...this.runners.entries()].map(([id, runner]) => {
       const s = runner.snapshot();
+      const config: AgentStartConfig =
+        s.config ?? { ...this.forkConfigs.get(id), prompt: "" };
       return {
         id,
-        provider: s.config?.provider,
+        provider: config.provider,
         status: s.status,
         sessionId: s.sessionId,
-        config: s.config ?? { prompt: "" },
+        config,
         createdAt: s.createdAt,
         lastEventSeq: this.seqs.get(id) ?? 0,
         totalCostUsd: s.totalCostUsd,

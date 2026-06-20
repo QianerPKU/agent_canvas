@@ -38,10 +38,10 @@ describe("TurnNode", () => {
       target: { value: "写个 a+b" },
     });
     fireEvent.click(screen.getByText("▶ 启动"));
-    expect(actions.submit).toHaveBeenCalledWith("agent_1", "写个 a+b", "claude");
+    expect(actions.submit).toHaveBeenCalledWith("agent_1", "写个 a+b", "claude", undefined);
   });
 
-  it("首轮可选择 Codex provider", () => {
+  it("首轮可选择 Codex provider 与模型", () => {
     const actions = makeActions();
     renderTurn({ index: 0, status: "idle", lines: [] }, "idle", actions);
 
@@ -51,8 +51,16 @@ describe("TurnNode", () => {
     fireEvent.change(screen.getByPlaceholderText("输入任务/提示词…"), {
       target: { value: "用 codex 跑" },
     });
+    fireEvent.change(screen.getByLabelText("codex model"), {
+      target: { value: "gpt-5.4-mini" },
+    });
     fireEvent.click(screen.getByText("▶ 启动"));
-    expect(actions.submit).toHaveBeenCalledWith("agent_1", "用 codex 跑", "codex");
+    expect(actions.submit).toHaveBeenCalledWith(
+      "agent_1",
+      "用 codex 跑",
+      "codex",
+      "gpt-5.4-mini",
+    );
   });
 
   it("续轮 idle（agent waiting_input）：发送本轮按钮", () => {
@@ -63,7 +71,7 @@ describe("TurnNode", () => {
       target: { value: "继续" },
     });
     fireEvent.click(screen.getByText("▶ 发送本轮"));
-    expect(actions.submit).toHaveBeenCalledWith("agent_1", "继续", undefined);
+    expect(actions.submit).toHaveBeenCalledWith("agent_1", "继续", undefined, undefined);
   });
 
   it("运行中：显示停止按钮", () => {
@@ -94,7 +102,35 @@ describe("TurnNode", () => {
     expect(screen.getByText("完成")).toBeTruthy();
     expect(screen.getByText(/做 x/)).toBeTruthy();
     fireEvent.click(screen.getByText("⑂ 从此轮 fork"));
-    expect(actions.fork).toHaveBeenCalledWith("agent_1", "u-1");
+    expect(actions.fork).toHaveBeenCalledWith("agent_1", "u-1", undefined);
+  });
+
+  it("Codex 完成轮可选择 fork 模型", () => {
+    const actions = makeActions();
+    const data: TurnNodeData = {
+      agentId: "agent_1",
+      turn: {
+        index: 0,
+        status: "done",
+        anchorUuid: "u-1",
+        lines: [{ kind: "assistant", text: "完成了" }],
+      },
+      agentStatus: "waiting_input",
+      provider: "codex",
+      model: "gpt-5.4",
+      actions,
+    };
+    render(
+      <ReactFlowProvider>
+        <TurnNode {...({ data } as unknown as NodeProps<TurnNodeType>)} />
+      </ReactFlowProvider>,
+    );
+
+    fireEvent.change(screen.getByLabelText("fork model"), {
+      target: { value: "gpt-5.5" },
+    });
+    fireEvent.click(screen.getByText("⑂ 从此轮 fork"));
+    expect(actions.fork).toHaveBeenCalledWith("agent_1", "u-1", "gpt-5.5");
   });
 
   it("完成轮但无 anchorUuid：不显示 fork", () => {

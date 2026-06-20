@@ -82,4 +82,47 @@ describe("AgentManager fork", () => {
     expect(claude.calls).toHaveLength(0);
     expect(codex.calls).toHaveLength(2);
   });
+
+  it("Codex fork 可选择模型并写入启动配置与快照", async () => {
+    const codex = makeQuery("codex-thread");
+    const mgr = new AgentManager({ query: codex.query, codexQuery: codex.query });
+
+    const parent = mgr.create();
+    mgr.startAgent(parent.id, {
+      prompt: "p",
+      provider: "codex",
+      model: "gpt-5.4",
+    });
+    await flush();
+
+    const forked = mgr.fork(parent.id, "turn-anchor", "gpt-5.4-mini");
+    expect(forked).toBeDefined();
+    expect(mgr.list().find((agent) => agent.id === forked!.id)?.config).toMatchObject({
+      provider: "codex",
+      model: "gpt-5.4-mini",
+      prompt: "",
+    });
+
+    mgr.startAgent(forked!.id, { prompt: "go" });
+    await flush();
+    expect(codex.calls.at(-1)?.model).toBe("gpt-5.4-mini");
+  });
+
+  it("fork 子 agent 启动前可覆盖继承的模型", async () => {
+    const codex = makeQuery("codex-thread");
+    const mgr = new AgentManager({ query: codex.query, codexQuery: codex.query });
+
+    const parent = mgr.create();
+    mgr.startAgent(parent.id, {
+      prompt: "p",
+      provider: "codex",
+      model: "gpt-5.4",
+    });
+    await flush();
+
+    const forked = mgr.fork(parent.id, "turn-anchor");
+    mgr.startAgent(forked!.id, { prompt: "go", model: "gpt-5.5" });
+    await flush();
+    expect(codex.calls.at(-1)?.model).toBe("gpt-5.5");
+  });
 });

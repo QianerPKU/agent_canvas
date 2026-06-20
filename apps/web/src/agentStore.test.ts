@@ -3,7 +3,6 @@ import type { AgentEvent, AgentEventEnvelope } from "@agent-canvas/shared";
 import {
   applyEnvelope,
   applyHello,
-  emptyMap,
   insertForked,
   newAgentView,
   recordInput,
@@ -43,6 +42,41 @@ describe("agentStore 轮次模型", () => {
     const t0 = get(map).turns[0]!;
     expect(t0.status).toBe("running");
     expect(t0.userInput).toBe("写个 a+b");
+  });
+
+  it("recordInput 记录 provider 与模型", () => {
+    let map: AgentMap = { a1: newAgentView("a1") };
+    map = recordInput(map, "a1", "扫描项目", "codex", "gpt-5.4-mini");
+    expect(get(map)).toMatchObject({
+      provider: "codex",
+      model: "gpt-5.4-mini",
+    });
+  });
+
+  it("同一 assistant 消息的流式片段合并为一行", () => {
+    seq = 0;
+    let map: AgentMap = { a1: newAgentView("a1") };
+    map = applyEnvelope(
+      map,
+      env("a1", { kind: "assistant_text", text: "你好，", messageUuid: "message-1" }),
+    );
+    map = applyEnvelope(
+      map,
+      env("a1", { kind: "assistant_text", text: "这是完整句子。", messageUuid: "message-1" }),
+    );
+    map = applyEnvelope(
+      map,
+      env("a1", { kind: "assistant_text", text: "新消息", messageUuid: "message-2" }),
+    );
+
+    expect(get(map).turns[0]!.lines).toEqual([
+      {
+        kind: "assistant",
+        text: "你好，这是完整句子。",
+        messageUuid: "message-1",
+      },
+      { kind: "assistant", text: "新消息", messageUuid: "message-2" },
+    ]);
   });
 
   it("一轮以 result 收尾：定格 done + anchorUuid，并自动延伸新 idle 轮", () => {
@@ -96,11 +130,20 @@ describe("agentStore 轮次模型", () => {
     expect(get(map).status).toBe("stopped");
   });
 
-  it("insertForked 插入带 forkOrigin 的新 agent", () => {
-    let map = emptyMap();
-    map = insertForked(map, "a2", { parentAgentId: "a1", anchorUuid: "u1" });
+  it("insertForked 插入带 forkOrigin 与模型的新 agent", () => {
+    let map: AgentMap = {
+      a1: newAgentView("a1", { provider: "codex", model: "gpt-5.4" }),
+    };
+    map = insertForked(
+      map,
+      "a2",
+      { parentAgentId: "a1", anchorUuid: "u1" },
+      "gpt-5.5",
+    );
     const v = get(map, "a2");
     expect(v.forkOrigin).toEqual({ parentAgentId: "a1", anchorUuid: "u1" });
+    expect(v.provider).toBe("codex");
+    expect(v.model).toBe("gpt-5.5");
     expect(v.turns).toHaveLength(1);
     expect(v.turns[0]!.status).toBe("idle");
   });
@@ -110,13 +153,14 @@ describe("agentStore 轮次模型", () => {
       {
         id: "a2",
         status: "idle",
-        config: { prompt: "" },
+        config: { prompt: "", provider: "codex", model: "gpt-5.4-mini" },
         createdAt: 1,
         lastEventSeq: 0,
         forkOrigin: { parentAgentId: "a1", anchorUuid: "u1" },
       },
     ]);
     expect(get(map, "a2").forkOrigin).toEqual({ parentAgentId: "a1", anchorUuid: "u1" });
+    expect(get(map, "a2").model).toBe("gpt-5.4-mini");
   });
 
   it("忽略旧 seq", () => {

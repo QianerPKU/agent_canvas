@@ -18,7 +18,7 @@ import type {
 } from "@agent-canvas/shared";
 
 export type OutputLine =
-  | { kind: "assistant"; text: string }
+  | { kind: "assistant"; text: string; messageUuid?: string }
   | { kind: "tool_use"; name: string; input: unknown }
   | { kind: "tool_result"; isError: boolean; content: unknown }
   | { kind: "system"; text: string }
@@ -74,6 +74,7 @@ export function applyHello(agents: AgentSnapshot[]): AgentMap {
       provider: a.provider ?? a.config.provider,
       status: a.status,
       sessionId: a.sessionId,
+      model: a.config.model,
       forkOrigin: a.forkOrigin,
       createdAt: a.createdAt,
       lastSeq: a.lastEventSeq,
@@ -83,12 +84,19 @@ export function applyHello(agents: AgentSnapshot[]): AgentMap {
 }
 
 /** 乐观插入一个 fork 出来的新 agent。 */
-export function insertForked(map: AgentMap, id: string, origin: ForkOrigin): AgentMap {
+export function insertForked(
+  map: AgentMap,
+  id: string,
+  origin: ForkOrigin,
+  model?: string,
+): AgentMap {
   if (map[id]) return map;
+  const parent = map[origin.parentAgentId];
   return {
     ...map,
     [id]: newAgentView(id, {
-      provider: map[origin.parentAgentId]?.provider,
+      provider: parent?.provider,
+      model: model ?? parent?.model,
       forkOrigin: origin,
     }),
   };
@@ -100,10 +108,18 @@ export function recordInput(
   agentId: string,
   text: string,
   provider?: AgentProvider,
+  model?: string,
 ): AgentMap {
   const prev = map[agentId] ?? newAgentView(agentId);
   const next = withLastTurn(prev, (t) => ({ ...t, userInput: text, status: "running" }));
-  return { ...map, [agentId]: { ...next, provider: provider ?? prev.provider } };
+  return {
+    ...map,
+    [agentId]: {
+      ...next,
+      provider: provider ?? prev.provider,
+      model: model ?? prev.model,
+    },
+  };
 }
 
 /** 应用一条事件信封；旧/重复 seq 忽略。 */
@@ -129,7 +145,7 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
         { kind: "system", text: `会话建立 · ${event.model}` },
       );
     case "assistant_text":
-      return pushLineToLast(view, { kind: "assistant", text: event.text });
+      return appendAssistantText(view, event.text, event.messageUuid);
     case "tool_use":
       return pushLineToLast(view, { kind: "tool_use", name: event.name, input: event.input });
     case "tool_result":
@@ -173,6 +189,27 @@ function pushLineToLast(view: AgentView, line: OutputLine): AgentView {
     lines: pushLine(t.lines, line),
     status: t.status === "idle" ? "running" : t.status,
   }));
+}
+
+function appendAssistantText(
+  view: AgentView,
+  text: string,
+  messageUuid: string | undefined,
+): AgentView {
+  return withLastTurn(view, (turn) => {
+    const lines = turn.lines.slice();
+    const last = lines.at(-1);
+    if (messageUuid && last?.kind === "assistant" && last.messageUuid === messageUuid) {
+      lines[lines.length - 1] = { ...last, text: last.text + text };
+    } else {
+      lines.push({ kind: "assistant", text, messageUuid });
+    }
+    return {
+      ...turn,
+      lines: lines.length > MAX_LINES ? lines.slice(lines.length - MAX_LINES) : lines,
+      status: turn.status === "idle" ? "running" : turn.status,
+    };
+  });
 }
 
 function markLastTurn(view: AgentView, status: TurnStatus): AgentView {

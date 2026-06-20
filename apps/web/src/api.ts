@@ -26,9 +26,9 @@ export const api = {
   stop: (id: string) => call(`/agents/${id}/stop`, { method: "POST" }),
   resume: (id: string, sessionId: string, text: string) =>
     call(`/agents/${id}/resume`, { method: "POST", body: JSON.stringify({ sessionId, text }) }),
-  fork: (id: string, anchorUuid: string) =>
+  fork: (id: string, anchorUuid: string, model?: string) =>
     call<{ id: string; origin: ForkOrigin }>(`/agents/${id}/fork`, {
       method: "POST",
-      body: JSON.stringify({ anchorUuid }),
+      body: JSON.stringify({ anchorUuid, model }),
     }),
 };

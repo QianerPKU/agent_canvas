@@ -25,6 +25,15 @@ export function isTerminalStatus(s: AgentStatus): boolean {
 /** 底层 agent 驱动。未指定时保持向后兼容，默认 Claude。 */
 export type AgentProvider = "claude" | "codex";
 
+/** Codex 当前在本项目 UI 中提供的模型。 */
+export const CODEX_MODELS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"] as const;
+export type CodexModel = (typeof CODEX_MODELS)[number];
+export const DEFAULT_CODEX_MODEL: CodexModel = "gpt-5.5";
+
+export function isCodexModel(model: string | undefined): model is CodexModel {
+  return CODEX_MODELS.some((candidate) => candidate === model);
+}
+
 /** token 使用量（来自 SDK result.usage）。 */
 export interface UsageInfo {
   inputTokens?: number;
