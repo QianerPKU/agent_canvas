@@ -103,6 +103,14 @@ async function handleHttp(
       runner.send(body.text);
       return sendJson(res, 202, { ok: true });
     }
+    if (method === "POST" && action === "compact") {
+      try {
+        runner.compact();
+      } catch (err) {
+        return sendJson(res, 409, { error: errMsg(err) });
+      }
+      return sendJson(res, 202, { ok: true });
+    }
     if (method === "POST" && action === "resume") {
       const body = await readJson<{ sessionId?: string; text?: string }>(req);
       if (!body?.sessionId || !body?.text)
@@ -115,6 +123,10 @@ async function handleHttp(
     }
     if (method === "POST" && action === "stop") {
       await runner.stop();
+      return sendJson(res, 202, { ok: true });
+    }
+    if (method === "POST" && action === "terminate") {
+      await runner.terminate();
       return sendJson(res, 202, { ok: true });
     }
   }

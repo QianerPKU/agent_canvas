@@ -6,7 +6,7 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/sdk/types.ts` | 对 Agent SDK 的**最小本地类型映射** + `QueryFn`（依赖注入点，便于单测注入假实现） |
+| `src/sdk/types.ts` | 对 Agent SDK 的**最小本地类型映射** + `QueryFn/QueryHandle`（含 interrupt/terminate，便于单测注入假实现） |
 | `src/sdk/realQuery.ts` | 把真实 SDK 的 `query` 适配成 `QueryFn`（仅运行时引入） |
 | `src/sdk/codexAppServerQuery.ts` | 通过 `codex app-server --stdio` 驱动 Codex thread/turn/fork，并适配成 `QueryFn` |
 | `src/sdk/codexAppServerMapper.ts` | **纯函数**：Codex app-server JSON-RPC 通知 → SDK-like 消息 |
@@ -24,11 +24,15 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
                                             ▲                      │
                                             └──────── send ────────┘
   running/waiting_input ──stop──▶ stopped
+  starting/running/waiting_input ──terminate──▶ terminated
+  waiting_input ──compact──▶ running ──compact_boundary──▶ waiting_input
   running ──(消息流结束/抛错)──▶ done / error
 ```
 
 - **流式输入干预**：`AgentRunner` 用 `AsyncMessageQueue` 作为 `prompt` 源；首条任务入队即启动，运行中 `send()` 继续入队。Claude SDK 原生消费流式输入；Codex app-server 按 thread 连续启动 turn，并用 `turn/interrupt` 尽力中止当前 turn。
 - **provider / model 选择**：`AgentStartConfig.provider` 可为 `claude` 或 `codex`，未指定时默认 `claude`。Codex UI 提供 `gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`，模型通过 app-server 的 `thread/start` / `thread/fork` / `turn/start` 参数传递。
+- **手动 compact**：只允许在 `waiting_input` 执行。Claude 将内置 `/compact` 送入现有流式会话，并等待 manual `compact_boundary`；Codex 调用原生 `thread/compact/start`，等待 `contextCompaction` 完成。两者都投影成统一 `compact` 事件，前端把它记录为一轮完成的对话。
+- **terminate**：调用 QueryHandle 的终止能力并关闭输入流。Claude adapter 会 interrupt 后结束 Query generator；Codex adapter 关闭并 kill 对应 app-server 子进程，状态进入 `terminated`。
 
 ## HTTP API
 
@@ -41,9 +45,11 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 | `GET /api/agents/:id/history` | 该 agent 的事件历史（重连补齐） |
 | `POST /api/agents/:id/start` | body=`AgentStartConfig`，启动；`provider` 可选 `claude/codex` |
 | `POST /api/agents/:id/send` | body=`{ text }`，中途追加指令 |
+| `POST /api/agents/:id/compact` | 手动 compact 当前上下文；仅 `waiting_input` 可用 |
 | `POST /api/agents/:id/resume` | body=`{ sessionId, text }`，续接会话 |
 | `POST /api/agents/:id/fork` | body=`{ anchorUuid, model? }`，从该 agent 某轮 fork 出新 agent，可为 Codex fork 指定模型，返回 `{ id, origin }` |
 | `POST /api/agents/:id/stop` | 中止 |
+| `POST /api/agents/:id/terminate` | 关闭底层 CLI / Query，进入 `terminated` |
 
 ## 多轮对话与 fork（对话历史分叉）
 
@@ -62,6 +68,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 
 - `eventMapper.test.ts`：各类 SDK 消息 → 统一事件的映射
 - `sdk/codexAppServerMapper.test.ts`：Codex app-server 通知 → SDK-like 消息
+- `sdk/codexAppServerQuery.test.ts`：`/compact` → 原生 `thread/compact/start`，以及 app-server 进程终止
 - `AgentRunner.test.ts`：start/running/waiting_input/send/stop/done/error 全状态流转 + 流式输入
 - `util/AsyncMessageQueue.test.ts`：队列的 push/wait/close 语义
 

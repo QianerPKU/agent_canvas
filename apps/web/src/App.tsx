@@ -17,7 +17,7 @@ import type { AgentActions } from "./useAgentCanvas.js";
 const nodeTypes = { turn: TurnNode };
 
 const COL_W = 430;
-const ROW_H = 280;
+const ROW_H = 320;
 const X0 = 40;
 const Y0 = 40;
 
@@ -93,6 +93,7 @@ function buildNodes(agents: AgentMap, actions: AgentActions, cur: TurnNodeType[]
         provider: view.provider,
         model: view.model,
         providerLocked: !!view.forkOrigin,
+        isLatest: i === view.turns.length - 1,
         actions,
       };
       const existing = byId.get(id);

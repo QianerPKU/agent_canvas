@@ -14,12 +14,14 @@ function makeActions(): AgentActions {
     create: vi.fn().mockResolvedValue(undefined),
     submit: vi.fn().mockResolvedValue(undefined),
     stop: vi.fn().mockResolvedValue(undefined),
+    compact: vi.fn().mockResolvedValue(undefined),
+    terminate: vi.fn().mockResolvedValue(undefined),
     fork: vi.fn().mockResolvedValue(undefined),
   };
 }
 
 function renderTurn(turn: Turn, agentStatus: AgentStatus, actions: AgentActions, agentId = "agent_1") {
-  const data: TurnNodeData = { agentId, turn, agentStatus, actions };
+  const data: TurnNodeData = { agentId, turn, agentStatus, isLatest: true, actions };
   const props = { data } as unknown as NodeProps<TurnNodeType>;
   return render(
     <ReactFlowProvider>
@@ -74,6 +76,16 @@ describe("TurnNode", () => {
     expect(actions.submit).toHaveBeenCalledWith("agent_1", "继续", undefined, undefined);
   });
 
+  it("等待输入时可 compact，并始终可 terminate CLI", () => {
+    const actions = makeActions();
+    renderTurn({ index: 1, status: "idle", lines: [] }, "waiting_input", actions);
+
+    fireEvent.click(screen.getByText("Compact"));
+    fireEvent.click(screen.getByText("Terminate"));
+    expect(actions.compact).toHaveBeenCalledWith("agent_1");
+    expect(actions.terminate).toHaveBeenCalledWith("agent_1");
+  });
+
   it("运行中：显示停止按钮", () => {
     const actions = makeActions();
     renderTurn(
@@ -118,6 +130,7 @@ describe("TurnNode", () => {
       agentStatus: "waiting_input",
       provider: "codex",
       model: "gpt-5.4",
+      isLatest: false,
       actions,
     };
     render(

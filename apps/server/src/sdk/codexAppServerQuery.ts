@@ -70,14 +70,19 @@ function createHandle(
 
       let next: IteratorResult<string> = first;
       while (!next.done) {
-        const started = await client.request("turn/start", {
-          ...turnOverrides(options),
-          threadId,
-          input: [{ type: "text", text: next.value, text_elements: [] }],
-        });
-        turnId = stringValue(asRecord(asRecord(started)?.turn)?.id);
-        yield* client.readTurnMessages(threadId, turnId, state);
-        turnId = undefined;
+        if (next.value.trim() === "/compact") {
+          await client.request("thread/compact/start", { threadId });
+          yield* client.readCompactMessages(threadId);
+        } else {
+          const started = await client.request("turn/start", {
+            ...turnOverrides(options),
+            threadId,
+            input: [{ type: "text", text: next.value, text_elements: [] }],
+          });
+          turnId = stringValue(asRecord(asRecord(started)?.turn)?.id);
+          yield* client.readTurnMessages(threadId, turnId, state);
+          turnId = undefined;
+        }
         next = await promptIterator.next();
       }
     } finally {
@@ -93,6 +98,10 @@ function createHandle(
         void client.request("turn/interrupt", { threadId, turnId }).catch(() => undefined);
       }
       client?.close();
+    },
+    terminate: async () => {
+      client?.close();
+      await iterator.return(undefined).catch(() => undefined);
     },
   };
 }
@@ -247,10 +256,62 @@ class CodexAppServerClient {
         throw new Error(`Codex app-server exited before turn completed${this.stderrSuffix()}`);
       }
       const msg = next.value;
+      if (!belongsToTurn(msg, threadId, turnId)) continue;
       for (const mapped of mapCodexNotification(msg, state)) {
         yield mapped;
       }
       if (isTurnCompleted(msg, threadId, turnId)) return;
+    }
+  }
+
+  async *readCompactMessages(threadId: string): AsyncGenerator<SdkMessage> {
+    const iterator = this.notifications[Symbol.asyncIterator]();
+    let compactTurnId = "";
+    let emittedBoundary = false;
+    while (true) {
+      const next = await iterator.next();
+      if (next.done) {
+        throw new Error(`Codex app-server exited before compact completed${this.stderrSuffix()}`);
+      }
+      const msg = next.value;
+      const params = asRecord(msg.params);
+      if (stringValue(params?.threadId) !== threadId) continue;
+
+      if (msg.method === "turn/started") {
+        compactTurnId = stringValue(asRecord(params?.turn)?.id);
+      }
+
+      if (isContextCompactionCompleted(msg)) {
+        emittedBoundary = true;
+        yield {
+          type: "system",
+          subtype: "compact_boundary",
+          compact_metadata: { trigger: "manual" },
+          uuid: stringValue(asRecord(params?.item)?.id) || `compact-${Date.now()}`,
+          session_id: threadId,
+        };
+      }
+
+      if (msg.method === "error") {
+        const error = asRecord(params?.error);
+        throw new Error(stringValue(error?.message) || "Codex compact failed");
+      }
+
+      if (
+        msg.method === "turn/completed" &&
+        (!compactTurnId || stringValue(asRecord(params?.turn)?.id) === compactTurnId)
+      ) {
+        if (!emittedBoundary) {
+          yield {
+            type: "system",
+            subtype: "compact_boundary",
+            compact_metadata: { trigger: "manual" },
+            uuid: `compact-${Date.now()}`,
+            session_id: threadId,
+          };
+        }
+        return;
+      }
     }
   }
 
@@ -374,6 +435,21 @@ function isTurnCompleted(message: JsonRpcMessage, threadId: string, turnId: stri
   const params = asRecord(message.params);
   const turn = asRecord(params?.turn);
   return stringValue(params?.threadId) === threadId && stringValue(turn?.id) === turnId;
+}
+
+function belongsToTurn(message: JsonRpcMessage, threadId: string, turnId: string): boolean {
+  const params = asRecord(message.params);
+  const messageThreadId = stringValue(params?.threadId);
+  const messageTurnId =
+    stringValue(params?.turnId) || stringValue(asRecord(params?.turn)?.id);
+  if (messageThreadId && messageThreadId !== threadId) return false;
+  if (messageTurnId && messageTurnId !== turnId) return false;
+  return true;
+}
+
+function isContextCompactionCompleted(message: JsonRpcMessage): boolean {
+  if (message.method !== "item/completed") return false;
+  return stringValue(asRecord(asRecord(message.params)?.item)?.type) === "contextCompaction";
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

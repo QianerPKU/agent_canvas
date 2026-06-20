@@ -37,6 +37,7 @@ function makeControllableQuery() {
   const out = new AsyncMessageQueue<SdkMessage>();
   const inputs: SdkUserInput[] = [];
   let interrupted = false;
+  let terminated = false;
   let lastOptions: QueryOptions | undefined;
 
   const query: QueryFn = ({ prompt, options }) => {
@@ -52,6 +53,10 @@ function makeControllableQuery() {
       interrupt: async () => {
         interrupted = true;
       },
+      terminate: async () => {
+        terminated = true;
+        out.close();
+      },
     };
     return handle;
   };
@@ -62,6 +67,7 @@ function makeControllableQuery() {
     finish: () => out.close(),
     inputs,
     wasInterrupted: () => interrupted,
+    wasTerminated: () => terminated,
     getOptions: () => lastOptions,
   };
 }
@@ -127,6 +133,75 @@ describe("AgentRunner 生命周期", () => {
     await runner.stop();
     expect(runner.getStatus()).toBe("stopped");
     expect(ctl.wasInterrupted()).toBe(true);
+    expect(() => runner.send("y")).toThrow();
+  });
+
+  it("compact 作为独立一轮，完成后回到 waiting_input", async () => {
+    const ctl = makeControllableQuery();
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("compact-agent", { query: ctl.query });
+    runner.on((event) => events.push(event));
+    runner.start({ prompt: "x" });
+    ctl.emit(SYSTEM_INIT);
+    ctl.emit(resultMsg());
+    await flush();
+
+    runner.compact();
+    await flush();
+    expect(runner.getStatus()).toBe("running");
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual(["x", "/compact"]);
+
+    ctl.emit({
+      type: "system",
+      subtype: "compact_boundary",
+      compact_metadata: { trigger: "manual", pre_tokens: 100, post_tokens: 30 },
+      uuid: "compact-1",
+      session_id: "s1",
+    });
+    await flush();
+
+    expect(runner.getStatus()).toBe("waiting_input");
+    expect(events).toContainEqual({
+      kind: "compact",
+      trigger: "manual",
+      preTokens: 100,
+      postTokens: 30,
+      durationMs: undefined,
+    });
+  });
+
+  it("compact 失败后恢复 waiting_input", async () => {
+    const ctl = makeControllableQuery();
+    const runner = new AgentRunner("compact-failed", { query: ctl.query });
+    runner.start({ prompt: "x" });
+    ctl.emit(SYSTEM_INIT);
+    ctl.emit(resultMsg());
+    await flush();
+
+    runner.compact();
+    ctl.emit({
+      type: "system",
+      subtype: "status",
+      status: null,
+      compact_result: "failed",
+      compact_error: "上下文过短",
+      session_id: "s1",
+    });
+    await flush();
+    expect(runner.getStatus()).toBe("waiting_input");
+  });
+
+  it("terminate → terminated，并关闭底层 handle", async () => {
+    const ctl = makeControllableQuery();
+    const runner = new AgentRunner("terminate-agent", { query: ctl.query });
+    runner.start({ prompt: "x" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+
+    await runner.terminate();
+    await flush();
+    expect(runner.getStatus()).toBe("terminated");
+    expect(ctl.wasTerminated()).toBe(true);
     expect(() => runner.send("y")).toThrow();
   });
 

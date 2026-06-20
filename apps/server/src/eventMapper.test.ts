@@ -25,6 +25,52 @@ describe("mapSdkMessage", () => {
     ]);
   });
 
+  it("manual compact boundary → compact", () => {
+    const msg: SdkMessage = {
+      type: "system",
+      subtype: "compact_boundary",
+      compact_metadata: {
+        trigger: "manual",
+        pre_tokens: 12000,
+        post_tokens: 3200,
+        duration_ms: 900,
+      },
+      uuid: "compact-1",
+      session_id: "s1",
+    };
+    expect(mapSdkMessage(msg)).toEqual([
+      {
+        kind: "compact",
+        trigger: "manual",
+        preTokens: 12000,
+        postTokens: 3200,
+        durationMs: 900,
+      },
+    ]);
+  });
+
+  it("auto compact boundary 不生成手动轮次，失败状态生成错误", () => {
+    expect(
+      mapSdkMessage({
+        type: "system",
+        subtype: "compact_boundary",
+        compact_metadata: { trigger: "auto" },
+        uuid: "compact-2",
+        session_id: "s1",
+      }),
+    ).toEqual([]);
+    expect(
+      mapSdkMessage({
+        type: "system",
+        subtype: "status",
+        status: null,
+        compact_result: "failed",
+        compact_error: "上下文过短",
+        session_id: "s1",
+      }),
+    ).toEqual([{ kind: "error", message: "上下文过短" }]);
+  });
+
   it("assistant 含 text + tool_use → 两个事件，顺序保持", () => {
     const msg: SdkMessage = {
       type: "assistant",

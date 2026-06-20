@@ -51,6 +51,26 @@ export interface SdkSystemInitMessage {
   tools: string[];
   permissionMode?: string;
 }
+export interface SdkCompactBoundaryMessage {
+  type: "system";
+  subtype: "compact_boundary";
+  compact_metadata: {
+    trigger: "manual" | "auto";
+    pre_tokens?: number;
+    post_tokens?: number;
+    duration_ms?: number;
+  };
+  uuid: string;
+  session_id: string;
+}
+export interface SdkStatusMessage {
+  type: "system";
+  subtype: "status";
+  status: "compacting" | "requesting" | null;
+  compact_result?: "success" | "failed";
+  compact_error?: string;
+  session_id: string;
+}
 export interface SdkAssistantMessage {
   type: "assistant";
   message: SdkApiMessage;
@@ -87,6 +107,8 @@ export interface SdkStreamEventMessage {
 
 export type SdkMessage =
   | SdkSystemInitMessage
+  | SdkCompactBoundaryMessage
+  | SdkStatusMessage
   | SdkAssistantMessage
   | SdkUserMessage
   | SdkResultMessage
@@ -122,6 +144,8 @@ export interface QueryOptions {
 /** query 返回值：可异步迭代的消息流，可选 interrupt。 */
 export interface QueryHandle extends AsyncIterable<SdkMessage> {
   interrupt?(): Promise<void>;
+  /** 关闭底层 CLI / transport，不再保留会话进程。 */
+  terminate?(): Promise<void>;
 }
 
 export type QueryFn = (args: {

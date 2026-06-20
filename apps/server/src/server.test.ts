@@ -98,6 +98,18 @@ describe("HTTP server", () => {
     expect(r.status).toBe(202);
   });
 
+  it("未建立会话时 compact → 409", async () => {
+    const c = await request(port, "POST", "/api/agents");
+    const r = await request(port, "POST", `/api/agents/${c.json.id}/compact`);
+    expect(r.status).toBe(409);
+  });
+
+  it("terminate → 202", async () => {
+    const c = await request(port, "POST", "/api/agents");
+    const r = await request(port, "POST", `/api/agents/${c.json.id}/terminate`);
+    expect(r.status).toBe(202);
+  });
+
   it("fork 缺 anchorUuid → 400", async () => {
     const c = await request(port, "POST", "/api/agents");
     const r = await request(port, "POST", `/api/agents/${c.json.id}/fork`, {});

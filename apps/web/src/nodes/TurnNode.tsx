@@ -18,6 +18,7 @@ export interface TurnNodeData {
   provider?: AgentProvider;
   model?: string;
   providerLocked?: boolean;
+  isLatest: boolean;
   actions: AgentActions;
   [key: string]: unknown;
 }
@@ -30,6 +31,7 @@ const TURN_META: Record<TurnStatus, { label: string; color: string }> = {
   done: { label: "完成", color: "#16a34a" },
   error: { label: "错误", color: "#dc2626" },
   stopped: { label: "已停止", color: "#6b7280" },
+  terminated: { label: "已终止", color: "#111827" },
 };
 
 function short(v: unknown, n = 120): string {
@@ -81,6 +83,7 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
     provider: agentProvider,
     model: agentModel,
     providerLocked,
+    isLatest,
     actions,
   } = data;
   const [text, setText] = useState("");
@@ -95,6 +98,12 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
     (turn.index === 0 ? agentStatus === "idle" : agentStatus === "waiting_input");
   const canFork = turn.status === "done" && !!turn.anchorUuid;
   const isRunning = turn.status === "running";
+  const canCompact = isLatest && agentStatus === "waiting_input";
+  const canTerminate =
+    isLatest &&
+    (agentStatus === "starting" ||
+      agentStatus === "running" ||
+      agentStatus === "waiting_input");
 
   useEffect(() => {
     const el = logRef.current;
@@ -196,6 +205,26 @@ export function TurnNode({ data }: NodeProps<TurnNodeType>): React.ReactElement 
 
       {/* 控制区 */}
       <div className="nodrag" style={{ padding: 10, display: "flex", flexDirection: "column", gap: 6 }}>
+        {isLatest && (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+            <button
+              style={btn("#475569")}
+              disabled={!canCompact}
+              title="手动压缩当前上下文，并记为一轮完成的对话"
+              onClick={() => void actions.compact(agentId)}
+            >
+              Compact
+            </button>
+            <button
+              style={btn("#111827")}
+              disabled={!canTerminate}
+              title="关闭这个 agent 的底层 CLI"
+              onClick={() => void actions.terminate(agentId)}
+            >
+              Terminate
+            </button>
+          </div>
+        )}
         {isActiveInput ? (
           <>
             {turn.index === 0 && (

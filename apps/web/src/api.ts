@@ -23,7 +23,9 @@ export const api = {
     call(`/agents/${id}/start`, { method: "POST", body: JSON.stringify(config) }),
   send: (id: string, text: string) =>
     call(`/agents/${id}/send`, { method: "POST", body: JSON.stringify({ text }) }),
+  compact: (id: string) => call(`/agents/${id}/compact`, { method: "POST" }),
   stop: (id: string) => call(`/agents/${id}/stop`, { method: "POST" }),
+  terminate: (id: string) => call(`/agents/${id}/terminate`, { method: "POST" }),
   resume: (id: string, sessionId: string, text: string) =>
     call(`/agents/${id}/resume`, { method: "POST", body: JSON.stringify({ sessionId, text }) }),
   fork: (id: string, anchorUuid: string, model?: string) =>

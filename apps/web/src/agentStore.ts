@@ -25,7 +25,13 @@ export type OutputLine =
   | { kind: "result"; text: string }
   | { kind: "error"; text: string };
 
-export type TurnStatus = "idle" | "running" | "done" | "error" | "stopped";
+export type TurnStatus =
+  | "idle"
+  | "running"
+  | "done"
+  | "error"
+  | "stopped"
+  | "terminated";
 
 export interface Turn {
   index: number;
@@ -122,6 +128,17 @@ export function recordInput(
   };
 }
 
+/** 手动 compact 占用末尾 idle 轮，并作为一轮运行。 */
+export function recordCompact(map: AgentMap, agentId: string): AgentMap {
+  const prev = map[agentId] ?? newAgentView(agentId);
+  const next = withLastTurn(prev, (turn) => ({
+    ...turn,
+    userInput: "/compact",
+    status: "running",
+  }));
+  return { ...map, [agentId]: { ...next, status: "running" } };
+}
+
 /** 应用一条事件信封；旧/重复 seq 忽略。 */
 export function applyEnvelope(map: AgentMap, env: AgentEventEnvelope): AgentMap {
   const prev = map[env.agentId] ?? newAgentView(env.agentId);
@@ -136,8 +153,27 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
       const v: AgentView = { ...view, status: event.status };
       if (event.status === "error") return markLastTurn(v, "error");
       if (event.status === "stopped") return markLastTurn(v, "stopped");
+      if (event.status === "terminated") return markLastTurn(v, "terminated");
       if (event.status === "running") return markLastTurnIfIdle(v, "running");
       return v;
+    }
+    case "compact": {
+      const tokenText =
+        event.preTokens != null && event.postTokens != null
+          ? ` · ${event.preTokens} → ${event.postTokens} tokens`
+          : "";
+      const finalized = withLastTurn(view, (turn) => ({
+        ...turn,
+        status: "done",
+        lines: pushLine(turn.lines, {
+          kind: "result",
+          text: `手动 compact 完成${tokenText}`,
+        }),
+      }));
+      return {
+        ...finalized,
+        turns: [...finalized.turns, idleTurn(finalized.turns.length)],
+      };
     }
     case "system_init":
       return pushLineToLast(

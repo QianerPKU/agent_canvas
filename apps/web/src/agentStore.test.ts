@@ -5,6 +5,7 @@ import {
   applyHello,
   insertForked,
   newAgentView,
+  recordCompact,
   recordInput,
   type AgentMap,
   type AgentView,
@@ -51,6 +52,35 @@ describe("agentStore 轮次模型", () => {
       provider: "codex",
       model: "gpt-5.4-mini",
     });
+  });
+
+  it("compact 占用一轮，完成后自动延伸 idle 轮", () => {
+    seq = 0;
+    let map: AgentMap = {
+      a1: newAgentView("a1", { status: "waiting_input" }),
+    };
+    map = recordCompact(map, "a1");
+    expect(get(map).turns[0]).toMatchObject({
+      userInput: "/compact",
+      status: "running",
+    });
+
+    map = applyEnvelope(
+      map,
+      env("a1", {
+        kind: "compact",
+        trigger: "manual",
+        preTokens: 1000,
+        postTokens: 250,
+      }),
+    );
+    expect(get(map).turns).toHaveLength(2);
+    expect(get(map).turns[0]).toMatchObject({ status: "done" });
+    expect(get(map).turns[0]!.lines).toContainEqual({
+      kind: "result",
+      text: "手动 compact 完成 · 1000 → 250 tokens",
+    });
+    expect(get(map).turns[1]).toMatchObject({ status: "idle" });
   });
 
   it("同一 assistant 消息的流式片段合并为一行", () => {
@@ -128,6 +158,18 @@ describe("agentStore 轮次模型", () => {
     map = applyEnvelope(map, env("a1", { kind: "status", status: "stopped" }));
     expect(get(map).turns[0]!.status).toBe("stopped");
     expect(get(map).status).toBe("stopped");
+  });
+
+  it("status=terminated 把当前轮和 agent 标记为 terminated", () => {
+    let map: AgentMap = {
+      a1: newAgentView("a1", {
+        status: "waiting_input",
+        turns: [{ index: 0, status: "idle", lines: [] }],
+      }),
+    };
+    map = applyEnvelope(map, env("a1", { kind: "status", status: "terminated" }));
+    expect(get(map).turns[0]!.status).toBe("terminated");
+    expect(get(map).status).toBe("terminated");
   });
 
   it("insertForked 插入带 forkOrigin 与模型的新 agent", () => {

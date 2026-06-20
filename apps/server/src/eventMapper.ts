@@ -40,7 +40,30 @@ function mapSystem(msg: SdkMessage): AgentEvent[] {
     cwd?: string;
     tools?: string[];
     permissionMode?: string;
+    compact_metadata?: {
+      trigger?: string;
+      pre_tokens?: number;
+      post_tokens?: number;
+      duration_ms?: number;
+    };
+    compact_result?: string;
+    compact_error?: string;
   };
+  if (m.subtype === "compact_boundary") {
+    if (m.compact_metadata?.trigger !== "manual") return [];
+    return [
+      {
+        kind: "compact",
+        trigger: "manual",
+        preTokens: m.compact_metadata.pre_tokens,
+        postTokens: m.compact_metadata.post_tokens,
+        durationMs: m.compact_metadata.duration_ms,
+      },
+    ];
+  }
+  if (m.subtype === "status" && m.compact_result === "failed") {
+    return [{ kind: "error", message: m.compact_error ?? "compact 失败" }];
+  }
   if (m.subtype !== "init") return [];
   return [
     {

@@ -53,6 +53,7 @@ export class AgentRunner {
   private totalCostUsd?: number;
   private usage?: UsageInfo;
   private lastAssistantUuid?: string; // 本轮最后一条 assistant 消息 uuid（fork 锚点）
+  private compactPending = false;
   private readonly createdAt: number;
 
   constructor(id: string, deps: AgentRunnerDeps) {
@@ -101,6 +102,7 @@ export class AgentRunner {
     this.usage = undefined;
     this.sessionId = undefined;
     this.lastAssistantUuid = undefined;
+    this.compactPending = false;
 
     this.abortController = new AbortController();
     this.inputQueue = new AsyncMessageQueue<SdkUserInput>();
@@ -136,10 +138,21 @@ export class AgentRunner {
     this.setStatus("running");
   }
 
+  /** 手动压缩当前会话上下文；压缩本身作为独立一轮。 */
+  compact(): void {
+    if (!this.inputQueue || this.inputQueue.isClosed || this.status !== "waiting_input") {
+      throw new Error(`agent ${this.id} 当前不可 compact（${this.status}）`);
+    }
+    this.inputQueue.push(toUserInput("/compact"));
+    this.compactPending = true;
+    this.setStatus("running");
+  }
+
   /** 中止会话。 */
   async stop(): Promise<void> {
     if (isTerminalStatus(this.status) || this.status === "idle") return;
     this.inputQueue?.close();
+    this.compactPending = false;
     this.abortController?.abort();
     try {
       await this.handle?.interrupt?.();
@@ -147,6 +160,24 @@ export class AgentRunner {
       // interrupt 尽力而为，忽略错误
     }
     this.setStatus("stopped");
+  }
+
+  /** 关闭底层 CLI / Query 进程。 */
+  async terminate(): Promise<void> {
+    if (this.status === "terminated") return;
+    this.inputQueue?.close();
+    this.compactPending = false;
+    this.setStatus("terminated");
+    this.abortController?.abort();
+    try {
+      if (this.handle?.terminate) {
+        await this.handle.terminate();
+      } else {
+        await this.handle?.interrupt?.();
+      }
+    } catch {
+      // 终止尽力而为；状态仍保持 terminated
+    }
   }
 
   // ---- 内部 ----
@@ -186,6 +217,12 @@ export class AgentRunner {
         if (this.status === "starting") this.setStatus("running");
         this.emit(event);
         break;
+      case "compact":
+        this.compactPending = false;
+        this.emit(event);
+        this.lastAssistantUuid = undefined;
+        this.setStatus("waiting_input");
+        break;
       case "result": {
         if (event.costUsd !== undefined) this.totalCostUsd = event.costUsd;
         if (event.usage) this.usage = event.usage;
@@ -200,6 +237,13 @@ export class AgentRunner {
         this.setStatus(this.inputQueue?.isClosed ? "done" : "waiting_input");
         break;
       }
+      case "error":
+        this.emit(event);
+        if (this.compactPending) {
+          this.compactPending = false;
+          this.setStatus("waiting_input");
+        }
+        break;
       default:
         // 收到实质内容却仍处于 starting，则补一个 running
         if (this.status === "starting") this.setStatus("running");

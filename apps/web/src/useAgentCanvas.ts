@@ -13,6 +13,7 @@ import {
   emptyMap,
   insertForked,
   newAgentView,
+  recordCompact,
   recordInput,
   type AgentMap,
 } from "./agentStore.js";
@@ -29,6 +30,10 @@ export interface AgentActions {
   ) => Promise<void>;
   /** 中止 agent。 */
   stop: (agentId: string) => Promise<void>;
+  /** 手动压缩上下文，并把 compact 记为独立一轮。 */
+  compact: (agentId: string) => Promise<void>;
+  /** 关闭底层 CLI / Query。 */
+  terminate: (agentId: string) => Promise<void>;
   /** 从某轮（anchorUuid）fork 出一个新 agent。 */
   fork: (agentId: string, anchorUuid: string, model?: string) => Promise<void>;
 }
@@ -123,6 +128,11 @@ export function useAgentCanvas(): UseAgentCanvas {
         }
       },
       stop: (agentId) => api.stop(agentId).then(() => undefined),
+      compact: async (agentId) => {
+        setAgents((prev) => recordCompact(prev, agentId));
+        await api.compact(agentId);
+      },
+      terminate: (agentId) => api.terminate(agentId).then(() => undefined),
       fork: async (agentId, anchorUuid, model) => {
         const { id, origin } = await api.fork(agentId, anchorUuid, model);
         setAgents((prev) => insertForked(prev, id, origin, model));

@@ -13,10 +13,16 @@ export type AgentStatus =
   | "waiting_input" // 完成一轮，流式会话保持打开，等待用户追加指令
   | "done" // 收到最终 result，会话结束
   | "stopped" // 被用户中止
+  | "terminated" // 底层 CLI / Query 已关闭
   | "error"; // 出错
 
 /** 终态：不会再自动产生新事件的状态。 */
-export const TERMINAL_STATUSES: readonly AgentStatus[] = ["done", "stopped", "error"];
+export const TERMINAL_STATUSES: readonly AgentStatus[] = [
+  "done",
+  "stopped",
+  "terminated",
+  "error",
+];
 
 export function isTerminalStatus(s: AgentStatus): boolean {
   return TERMINAL_STATUSES.includes(s);
@@ -48,6 +54,13 @@ export interface UsageInfo {
  */
 export type AgentEvent =
   | { kind: "status"; status: AgentStatus }
+  | {
+      kind: "compact";
+      trigger: "manual";
+      preTokens?: number;
+      postTokens?: number;
+      durationMs?: number;
+    }
   | {
       kind: "system_init";
       sessionId: string;
@@ -123,6 +136,8 @@ export interface ForkOrigin {
 export type ClientCommand =
   | { type: "start"; config: AgentStartConfig }
   | { type: "stop" }
+  | { type: "compact" }
+  | { type: "terminate" }
   | { type: "send"; text: string } // 中途追加指令（流式输入干预）
   | { type: "resume"; sessionId: string; text: string };
 
