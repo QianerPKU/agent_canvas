@@ -58,6 +58,10 @@ export const api = {
     }).then((r) => r.file),
   fileContent: (id: string) =>
     call<{ content: string; truncated: boolean }>(`/files/${id}/content`),
+  fileFullContent: (id: string) =>
+    call<{ content: string; truncated: false }>(`/files/${id}/content?full=1`),
+  openFileInVscode: (id: string) =>
+    call<{ ok: true }>(`/files/${encodeURIComponent(id)}/open`, { method: "POST" }),
   fileRawUrl: (id: string, version?: number) =>
     `${BASE}/files/${encodeURIComponent(id)}/raw${version ? `?v=${version}` : ""}`,
   listFileConnections: () =>

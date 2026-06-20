@@ -9,7 +9,8 @@ import {
   type Connection,
   type Edge,
 } from "@xyflow/react";
-import { FilePlus2 } from "lucide-react";
+import { FilePlus2, X } from "lucide-react";
+import { api } from "./api.js";
 import type { CanvasFileConnection, CanvasFileNode } from "@agent-canvas/shared";
 import "@xyflow/react/dist/style.css";
 import { useAgentCanvas, type AgentActions, type FileActions } from "./useAgentCanvas.js";
@@ -21,6 +22,7 @@ import {
 } from "./history/ConversationHistoryWindow.js";
 import { CreateFileDialog } from "./files/CreateFileDialog.js";
 import { FileNode, type FileNodeType } from "./files/FileNode.js";
+import { FileContentWindow } from "./files/FileContentWindow.js";
 
 const nodeTypes = { turn: TurnNode, file: FileNode };
 
@@ -152,6 +154,8 @@ function buildNodes(
   fileActions: FileActions,
   current: CanvasNode[],
   onOpenHistory: (agentId: string, turnIndex: number) => void,
+  onPreviewFile: (fileId: string) => void,
+  onOpenFileEditor: (fileId: string) => void,
 ): CanvasNode[] {
   const layout = computeLayout(agents);
   const byId = new Map(current.map((node) => [node.id, node]));
@@ -194,7 +198,12 @@ function buildNodes(
     const id = fileNodeId(file.id);
     const existing = byId.get(id);
     const existingFile = existing?.type === "file" ? existing : undefined;
-    const data = { file, actions: fileActions };
+    const data = {
+      file,
+      actions: fileActions,
+      onPreview: onPreviewFile,
+      onOpenEditor: onOpenFileEditor,
+    };
     result.push(
       existingFile
         ? { ...existingFile, data }
@@ -224,7 +233,17 @@ export default function App(): React.ReactElement {
   const [nodes, setNodes, onNodesChange] = useNodesState<CanvasNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [historyTarget, setHistoryTarget] = useState<HistoryTarget>();
+  const [openFileId, setOpenFileId] = useState<string>();
+  const [fileOpenError, setFileOpenError] = useState<string>();
   const [creatingFile, setCreatingFile] = useState(false);
+  const openFile = files.find((file) => file.id === openFileId);
+
+  const openFileEditor = useCallback((fileId: string) => {
+    setFileOpenError(undefined);
+    void api.openFileInVscode(fileId).catch((error: unknown) => {
+      setFileOpenError(error instanceof Error ? error.message : String(error));
+    });
+  }, []);
 
   const openHistory = useCallback(
     (agentId: string, turnIndex: number) => {
@@ -239,7 +258,16 @@ export default function App(): React.ReactElement {
 
   useEffect(() => {
     setNodes((current) =>
-      buildNodes(agents, files, actions, fileActions, current, openHistory),
+      buildNodes(
+        agents,
+        files,
+        actions,
+        fileActions,
+        current,
+        openHistory,
+        setOpenFileId,
+        openFileEditor,
+      ),
     );
     setEdges([
       ...computeConversationEdges(agents),
@@ -252,6 +280,7 @@ export default function App(): React.ReactElement {
     actions,
     fileActions,
     openHistory,
+    openFileEditor,
     setNodes,
     setEdges,
   ]);
@@ -345,6 +374,21 @@ export default function App(): React.ReactElement {
           }}
           onClose={() => setHistoryTarget(undefined)}
         />
+      )}
+      {openFile && (
+        <FileContentWindow
+          file={openFile}
+          onClose={() => setOpenFileId(undefined)}
+          onOpenEditor={openFileEditor}
+        />
+      )}
+      {fileOpenError && (
+        <div className="file-open-error" role="alert">
+          <span>{fileOpenError}</span>
+          <button className="icon-button" title="关闭错误提示" onClick={() => setFileOpenError(undefined)}>
+            <X size={15} />
+          </button>
+        </div>
       )}
     </div>
   );

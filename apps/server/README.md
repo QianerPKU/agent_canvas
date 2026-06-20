@@ -97,10 +97,12 @@ npm run smoke --workspace apps/server
 
 - `src/files/FileManager.ts` 管理节点元数据、真实文件、共享权限和普通读写连线。
 - Agent 工作目录存储直接在所选工作区创建文件；隔离存储使用用户本地数据目录，并让每个文件节点独占目录。
-- `GET/POST /api/files` 列出/创建；`PATCH /api/files/:id` 重命名或更新共享开关；`content/raw` 子路径提供预览。
+- `GET/POST /api/files` 列出/创建；`PATCH /api/files/:id` 重命名或更新共享开关；`content/raw` 子路径提供预览与原始内容。
+- `POST /api/files/:id/open` 使用 VS Code 打开真实文件。Windows 会检查标准安装位置和 PATH 中 VS Code 的 `bin` 目录；自定义位置可设置 `AGENT_CANVAS_VSCODE_PATH` 为 `Code.exe` 完整路径。
 - `GET/POST /api/file-connections` 与 `DELETE /api/file-connections/:id` 管理普通节点连线。
 - Codex 使用 app-server 原生 `mention/localImage` 和 `workspaceWrite.writableRoots`。
 - Claude 使用 `@绝对路径`、`additionalDirectories`，并通过 `applyFlagSettings()` 在流式会话下一轮动态刷新写目录。
+- `AgentRunner` 在首轮和每次 `send` 前重新解析文件权限；因此 Claude/Codex 的每个完整业务请求都会携带该轮最新的可读文件引用和可写目标。`compact` 是 CLI 控制指令，不附加业务文件引用。
 - 写权限是 CLI 的目录粒度，而且可写目录天然也可读；隔离文件采用单节点目录来缩小授权范围。读连线负责显式引用和画布层授权，不等同于操作系统级读取隔离。
 
 官方参考：

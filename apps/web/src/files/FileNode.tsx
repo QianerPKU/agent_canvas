@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
-import { Check, File, FileText, Image, Pencil, X } from "lucide-react";
+import { Check, Eye, File, FileText, Image, Pencil, X } from "lucide-react";
 import type { CanvasFileNode } from "@agent-canvas/shared";
 import { api } from "../api.js";
 import type { FileActions } from "../useAgentCanvas.js";
@@ -8,6 +8,8 @@ import type { FileActions } from "../useAgentCanvas.js";
 export interface FileNodeData {
   file: CanvasFileNode;
   actions: FileActions;
+  onPreview: (fileId: string) => void;
+  onOpenEditor: (fileId: string) => void;
   [key: string]: unknown;
 }
 
@@ -16,7 +18,7 @@ export type FileNodeType = Node<FileNodeData, "file">;
 const EXTENSIONS = ["txt", "md", "csv", "json", "png", "jpg", "ts", "js", "py", ""];
 
 export function FileNode({ data }: NodeProps<FileNodeType>): React.ReactElement {
-  const { file, actions } = data;
+  const { file, actions, onPreview, onOpenEditor } = data;
   const [preview, setPreview] = useState("");
   const [previewError, setPreviewError] = useState("");
   const [imageVersion, setImageVersion] = useState(() => Date.now());
@@ -126,6 +128,13 @@ export function FileNode({ data }: NodeProps<FileNodeType>): React.ReactElement 
             <strong title={file.path}>{file.filename}</strong>
             <button
               className="icon-button nodrag"
+              title="查看完整内容"
+              onClick={() => onPreview(file.id)}
+            >
+              <Eye size={14} />
+            </button>
+            <button
+              className="icon-button nodrag"
               title="重命名文件"
               onClick={() => setRenaming(true)}
             >
@@ -135,7 +144,19 @@ export function FileNode({ data }: NodeProps<FileNodeType>): React.ReactElement 
         )}
       </div>
 
-      <div className="file-node__preview nodrag nowheel">
+      <div
+        className="file-node__preview nodrag nowheel"
+        role="button"
+        tabIndex={0}
+        aria-label={`用 VS Code 打开 ${file.filename}`}
+        onClick={() => onOpenEditor(file.id)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            onOpenEditor(file.id);
+          }
+        }}
+      >
         {file.previewKind === "image" ? (
           imageError ? (
             <div className="file-node__binary">

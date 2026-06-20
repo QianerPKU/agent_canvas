@@ -8,12 +8,17 @@ import type {
 } from "@agent-canvas/shared";
 import { AgentManager } from "./AgentManager.js";
 import { FileManager } from "./files/FileManager.js";
+import { openFileInVscode } from "./files/VscodeFileOpener.js";
 
 export interface CreateServerResult {
   httpServer: http.Server;
   wss: WebSocketServer;
   manager: AgentManager;
   fileManager: FileManager;
+}
+
+export interface CreateServerOptions {
+  openFile?: (filePath: string) => Promise<void>;
 }
 
 /**
@@ -25,10 +30,17 @@ export function createServer(
   fileManager = new FileManager({
     resolveAgentCwd: (agentId) => manager.get(agentId)?.snapshot().config?.cwd,
   }),
+  options: CreateServerOptions = {},
 ): CreateServerResult {
   manager.setFileAccessResolver((agentId) => fileManager.accessFor(agentId));
   const httpServer = http.createServer((req, res) => {
-    handleHttp(req, res, manager, fileManager).catch((err) => {
+    handleHttp(
+      req,
+      res,
+      manager,
+      fileManager,
+      options.openFile ?? openFileInVscode,
+    ).catch((err) => {
       sendJson(res, 500, { error: errMsg(err) });
     });
   });
@@ -56,6 +68,7 @@ async function handleHttp(
   res: http.ServerResponse,
   manager: AgentManager,
   fileManager: FileManager,
+  openFile: (filePath: string) => Promise<void>,
 ): Promise<void> {
   setCors(res);
   if (req.method === "OPTIONS") {
@@ -119,7 +132,13 @@ async function handleHttp(
     }
     if (method === "GET" && action === "content") {
       try {
-        return sendJson(res, 200, await fileManager.readPreview(id));
+        return sendJson(
+          res,
+          200,
+          url.searchParams.get("full") === "1"
+            ? await fileManager.readContent(id)
+            : await fileManager.readPreview(id),
+        );
       } catch (error) {
         return sendJson(res, 415, { error: errMsg(error) });
       }
@@ -133,6 +152,14 @@ async function handleHttp(
       });
       res.end(data);
       return;
+    }
+    if (method === "POST" && action === "open") {
+      try {
+        await openFile(fileManager.get(id)!.path);
+        return sendJson(res, 202, { ok: true });
+      } catch (error) {
+        return sendJson(res, 500, { error: errMsg(error) });
+      }
     }
   }
 

@@ -1,7 +1,7 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { AgentManager } from "./AgentManager.js";
@@ -58,6 +58,7 @@ describe("HTTP server", () => {
   let server: http.Server;
   let port = 0;
   let root = "";
+  const openFile = vi.fn<(filePath: string) => Promise<void>>().mockResolvedValue(undefined);
 
   beforeAll(async () => {
     const manager = new AgentManager({ query: emptyQuery });
@@ -67,7 +68,7 @@ describe("HTTP server", () => {
       isolatedRoot: path.join(root, "isolated"),
       resolveAgentCwd: () => root,
     });
-    ({ httpServer: server } = createServer(manager, fileManager));
+    ({ httpServer: server } = createServer(manager, fileManager, { openFile }));
     await new Promise<void>((r) => server.listen(0, r));
     port = (server.address() as AddressInfo).port;
   });
@@ -174,6 +175,28 @@ describe("HTTP server", () => {
       status: 200,
       json: { content: "", truncated: false },
     });
+
+    const longContent = "x".repeat(300 * 1024);
+    await writeFile(updated.json.file.path, longContent, "utf-8");
+    const truncated = await request(port, "GET", `/api/files/${created.json.file.id}/content`);
+    expect(truncated.json.truncated).toBe(true);
+    const full = await request(
+      port,
+      "GET",
+      `/api/files/${created.json.file.id}/content?full=1`,
+    );
+    expect(full).toEqual({
+      status: 200,
+      json: { content: longContent, truncated: false },
+    });
+
+    const opened = await request(
+      port,
+      "POST",
+      `/api/files/${created.json.file.id}/open`,
+    );
+    expect(opened).toEqual({ status: 202, json: { ok: true } });
+    expect(openFile).toHaveBeenCalledWith(updated.json.file.path);
 
     const connection = await request(port, "POST", "/api/file-connections", {
       fileId: created.json.file.id,

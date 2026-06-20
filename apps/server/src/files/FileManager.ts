@@ -125,14 +125,19 @@ export class FileManager {
     id: string,
     maxBytes = 256 * 1024,
   ): Promise<{ content: string; truncated: boolean }> {
-    const file = this.requireFile(id);
-    if (file.previewKind === "image" || file.previewKind === "none") {
-      throw new Error(`文件 ${file.filename} 不支持文本预览`);
-    }
+    const file = this.requireTextFile(id);
     const buffer = await readFile(file.path);
     return {
       content: buffer.subarray(0, maxBytes).toString("utf-8"),
       truncated: buffer.length > maxBytes,
+    };
+  }
+
+  async readContent(id: string): Promise<{ content: string; truncated: false }> {
+    const file = this.requireTextFile(id);
+    return {
+      content: await readFile(file.path, "utf-8"),
+      truncated: false,
     };
   }
 
@@ -230,6 +235,14 @@ export class FileManager {
   private requireFile(id: string): CanvasFileNode {
     const file = this.files.get(id);
     if (!file) throw new Error(`未知文件节点: ${id}`);
+    return file;
+  }
+
+  private requireTextFile(id: string): CanvasFileNode {
+    const file = this.requireFile(id);
+    if (file.previewKind === "image" || file.previewKind === "none") {
+      throw new Error(`文件 ${file.filename} 不支持文本预览`);
+    }
     return file;
   }
 }

@@ -36,13 +36,18 @@ function actions(): FileActions {
   };
 }
 
-function renderFile(fileData: CanvasFileNode, fileActions: FileActions) {
+function renderFile(
+  fileData: CanvasFileNode,
+  fileActions: FileActions,
+  onPreview = vi.fn(),
+  onOpenEditor = vi.fn(),
+) {
   return render(
     <ReactFlowProvider>
       <FileNode
         {...({
           id: `file:${fileData.id}`,
-          data: { file: fileData, actions: fileActions },
+          data: { file: fileData, actions: fileActions, onPreview, onOpenEditor },
         } as unknown as NodeProps<FileNodeType>)}
       />
     </ReactFlowProvider>,
@@ -81,5 +86,17 @@ describe("FileNode", () => {
     expect((read as HTMLInputElement).checked).toBe(true);
     fireEvent.click(write);
     expect(fileActions.update).toHaveBeenCalledWith("file_1", { sharedWrite: true });
+  });
+
+  it("点击预览区默认用 VS Code 打开，查看按钮打开画布内窗口", () => {
+    const onPreview = vi.fn();
+    const onOpenEditor = vi.fn();
+    renderFile(file(), actions(), onPreview, onOpenEditor);
+
+    fireEvent.click(screen.getByRole("button", { name: "用 VS Code 打开 archive.bin" }));
+    fireEvent.click(screen.getByTitle("查看完整内容"));
+
+    expect(onOpenEditor).toHaveBeenCalledWith("file_1");
+    expect(onPreview).toHaveBeenCalledWith("file_1");
   });
 });

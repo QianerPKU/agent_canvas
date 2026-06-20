@@ -21,20 +21,20 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({ query: sdk.query }));
 import { realQuery } from "./realQuery.js";
 
 describe("realQuery file access", () => {
-  it("给 Claude 输入追加 @ 文件引用，并动态更新额外写目录", async () => {
+  it("给 Claude 每轮输入追加当时的 @ 文件引用，并动态更新额外写目录", async () => {
     const prompt = new AsyncMessageQueue<SdkUserInput>();
     prompt.push({
       type: "user",
-      message: { role: "user", content: "检查文件" },
+      message: { role: "user", content: "检查第一轮文件" },
       parent_tool_use_id: null,
       fileAccess: {
         readableFiles: [
-          { name: "notes.md", path: "C:/shared/notes.md", previewKind: "markdown" },
+          { name: "first.md", path: "C:/shared/first.md", previewKind: "markdown" },
         ],
         writableFiles: [
-          { name: "output.md", path: "C:/shared/output.md", previewKind: "markdown" },
+          { name: "first-output.md", path: "C:/shared/first-output.md", previewKind: "markdown" },
         ],
-        writableDirectories: ["C:/shared/output"],
+        writableDirectories: ["C:/shared/first-output"],
       },
     });
 
@@ -42,12 +42,33 @@ describe("realQuery file access", () => {
     const sdkArgs = (sdk.query.mock.calls.at(-1)?.[0] as {
       prompt: AsyncIterable<SdkUserInput>;
     });
-    const next = await sdkArgs.prompt[Symbol.asyncIterator]().next();
+    const iterator = sdkArgs.prompt[Symbol.asyncIterator]();
+    const first = await iterator.next();
 
-    expect(next.value?.message.content).toContain("@C:/shared/notes.md");
-    expect(next.value?.message.content).toContain("C:/shared/output.md");
-    expect(sdk.applyFlagSettings).toHaveBeenCalledWith({
-      permissions: { additionalDirectories: ["C:/shared/output"] },
+    expect(first.value?.message.content).toContain("@C:/shared/first.md");
+    expect(first.value?.message.content).toContain("C:/shared/first-output.md");
+
+    prompt.push({
+      type: "user",
+      message: { role: "user", content: "检查第二轮文件" },
+      parent_tool_use_id: null,
+      fileAccess: {
+        readableFiles: [
+          { name: "second.csv", path: "C:/shared/second.csv", previewKind: "csv" },
+        ],
+        writableFiles: [],
+        writableDirectories: [],
+      },
+    });
+    const second = await iterator.next();
+
+    expect(second.value?.message.content).toContain("@C:/shared/second.csv");
+    expect(second.value?.message.content).not.toContain("@C:/shared/first.md");
+    expect(sdk.applyFlagSettings).toHaveBeenNthCalledWith(1, {
+      permissions: { additionalDirectories: ["C:/shared/first-output"] },
+    });
+    expect(sdk.applyFlagSettings).toHaveBeenNthCalledWith(2, {
+      permissions: { additionalDirectories: [] },
     });
   });
 });

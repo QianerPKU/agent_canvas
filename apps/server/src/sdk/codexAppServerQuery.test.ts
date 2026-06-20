@@ -144,7 +144,7 @@ describe("Codex app-server query", () => {
     expect(fake.proc.kill).toHaveBeenCalledOnce();
   });
 
-  it("把文件引用和额外写目录映射到 Codex 原生输入与 sandboxPolicy", async () => {
+  it("把每轮文件引用和额外写目录映射到 Codex 原生输入与 sandboxPolicy", async () => {
     const fake = makeFakeSpawn();
     const prompt = new AsyncMessageQueue<SdkUserInput>();
     prompt.push(
@@ -168,8 +168,19 @@ describe("Codex app-server query", () => {
     await iterator.next();
     await iterator.next();
 
-    const turnStart = fake.messages.find((message) => message.method === "turn/start");
-    expect(turnStart?.params?.input).toEqual([
+    prompt.push(
+      userInput("处理下一轮文件", {
+        readableFiles: [
+          { name: "next.txt", path: "C:/shared/next.txt", previewKind: "text" },
+        ],
+        writableFiles: [],
+        writableDirectories: [],
+      }),
+    );
+    await iterator.next();
+
+    const turnStarts = fake.messages.filter((message) => message.method === "turn/start");
+    expect(turnStarts[0]?.params?.input).toEqual([
       {
         type: "text",
         text:
@@ -180,7 +191,7 @@ describe("Codex app-server query", () => {
       { type: "mention", name: "notes.md", path: "C:/shared/notes.md" },
       { type: "localImage", path: "C:/shared/shot.png" },
     ]);
-    expect(turnStart?.params?.sandboxPolicy).toEqual({
+    expect(turnStarts[0]?.params?.sandboxPolicy).toEqual({
       type: "workspaceWrite",
       writableRoots: [
         expect.stringMatching(/C:[\\/]repo$/),
@@ -190,7 +201,16 @@ describe("Codex app-server query", () => {
       excludeTmpdirEnvVar: false,
       excludeSlashTmp: false,
     });
-    expect(turnStart?.params?.approvalPolicy).toBe("never");
+    expect(turnStarts[0]?.params?.approvalPolicy).toBe("never");
+    expect(turnStarts[1]?.params?.input).toEqual([
+      {
+        type: "text",
+        text: "处理下一轮文件",
+        text_elements: [],
+      },
+      { type: "mention", name: "next.txt", path: "C:/shared/next.txt" },
+    ]);
+    expect(turnStarts[1]?.params?.sandboxPolicy).toBeUndefined();
     await handle.terminate?.();
   });
 });

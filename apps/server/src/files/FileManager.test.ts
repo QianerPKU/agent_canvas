@@ -35,6 +35,10 @@ describe("FileManager", () => {
       content: "hello file node",
       truncated: false,
     });
+    expect(await manager.readContent(file.id)).toEqual({
+      content: "hello file node",
+      truncated: false,
+    });
 
     const renamed = await manager.update(file.id, { name: "summary", extension: "md" });
     expect(renamed.filename).toBe("summary.md");
