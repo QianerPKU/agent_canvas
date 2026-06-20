@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
-import { Check, Eye, File, FileText, Image, Pencil, X } from "lucide-react";
+import { Check, ExternalLink, Eye, File, FileText, Image, Pencil, X } from "lucide-react";
 import type { CanvasFileNode } from "@agent-canvas/shared";
 import { api } from "../api.js";
 import type { FileActions } from "../useAgentCanvas.js";
@@ -126,6 +126,13 @@ export function FileNode({ data }: NodeProps<FileNodeType>): React.ReactElement 
         ) : (
           <>
             <strong title={file.path}>{file.filename}</strong>
+            <button
+              className="icon-button nodrag"
+              title="用 VS Code 打开"
+              onClick={() => onOpenEditor(file.id)}
+            >
+              <ExternalLink size={14} />
+            </button>
             <button
               className="icon-button nodrag"
               title="查看完整内容"

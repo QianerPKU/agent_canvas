@@ -98,7 +98,7 @@ npm run smoke --workspace apps/server
 - `src/files/FileManager.ts` 管理节点元数据、真实文件、共享权限和普通读写连线。
 - Agent 工作目录存储直接在所选工作区创建文件；隔离存储使用用户本地数据目录，并让每个文件节点独占目录。
 - `GET/POST /api/files` 列出/创建；`PATCH /api/files/:id` 重命名或更新共享开关；`content/raw` 子路径提供预览与原始内容。
-- `POST /api/files/:id/open` 使用 VS Code 打开真实文件。Windows 会检查标准安装位置和 PATH 中 VS Code 的 `bin` 目录；自定义位置可设置 `AGENT_CANVAS_VSCODE_PATH` 为 `Code.exe` 完整路径。
+- `POST /api/files/:id/open` 使用 VS Code CLI 打开真实文件，并等待 CLI 返回实际退出状态。Windows 会检查标准安装位置和 PATH 中的 `code.cmd`；自定义位置可设置 `AGENT_CANVAS_VSCODE_PATH` 为 `code.cmd` 完整路径，也可传 `Code.exe` 并自动解析同目录下的 `bin\code.cmd`。
 - `GET/POST /api/file-connections` 与 `DELETE /api/file-connections/:id` 管理普通节点连线。
 - Codex 使用 app-server 原生 `mention/localImage` 和 `workspaceWrite.writableRoots`。
 - Claude 使用 `@绝对路径`、`additionalDirectories`，并通过 `applyFlagSettings()` 在流式会话下一轮动态刷新写目录。

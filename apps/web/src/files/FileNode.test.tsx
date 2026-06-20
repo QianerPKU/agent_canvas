@@ -94,9 +94,11 @@ describe("FileNode", () => {
     renderFile(file(), actions(), onPreview, onOpenEditor);
 
     fireEvent.click(screen.getByRole("button", { name: "用 VS Code 打开 archive.bin" }));
+    fireEvent.click(screen.getByTitle("用 VS Code 打开"));
     fireEvent.click(screen.getByTitle("查看完整内容"));
 
-    expect(onOpenEditor).toHaveBeenCalledWith("file_1");
+    expect(onOpenEditor).toHaveBeenCalledTimes(2);
+    expect(onOpenEditor).toHaveBeenLastCalledWith("file_1");
     expect(onPreview).toHaveBeenCalledWith("file_1");
   });
 });
