@@ -154,6 +154,12 @@ export function TurnNode({
     (agentStatus === "starting" ||
       agentStatus === "running" ||
       agentStatus === "waiting_input");
+  const hasFileHandles =
+    isLatest &&
+    agentStatus !== "done" &&
+    agentStatus !== "stopped" &&
+    agentStatus !== "terminated" &&
+    agentStatus !== "error";
   const minimized = data.windowState?.minimized === true;
 
   useEffect(() => {
@@ -192,7 +198,7 @@ export function TurnNode({
           <MessageSquare size={17} />
           <span>{turn.index + 1}</span>
         </button>
-        <NodeHandles />
+        <NodeHandles fileAccess={hasFileHandles} />
       </div>
     );
   }
@@ -217,7 +223,7 @@ export function TurnNode({
         lineStyle={{ opacity: 0.55 }}
         handleStyle={{ width: 8, height: 8, borderRadius: 2 }}
       />
-      <NodeHandles />
+      <NodeHandles fileAccess={hasFileHandles} />
       <div
         className="turn-node__surface"
         style={{
@@ -418,12 +424,37 @@ export function TurnNode({
   );
 }
 
-function NodeHandles(): React.ReactElement {
+function NodeHandles({ fileAccess }: { fileAccess: boolean }): React.ReactElement {
   return (
     <>
       <Handle type="target" position={Position.Top} style={{ opacity: 0 }} />
       <Handle type="source" position={Position.Bottom} style={{ opacity: 0 }} />
-      <Handle id="fork" type="source" position={Position.Right} style={{ background: "#7c3aed" }} />
+      <Handle
+        id="fork"
+        type="source"
+        position={Position.Right}
+        style={{ top: "24%", background: "#7c3aed" }}
+      />
+      {fileAccess && (
+        <>
+          <Handle
+            id="file-read"
+            type="target"
+            position={Position.Left}
+            className="turn-node__file-handle turn-node__file-handle--read"
+            title="连接文件输出：允许 Agent 读取"
+          />
+          <span className="turn-node__file-label turn-node__file-label--read">读入</span>
+          <Handle
+            id="file-write"
+            type="source"
+            position={Position.Right}
+            className="turn-node__file-handle turn-node__file-handle--write"
+            title="连接到文件输入：允许 Agent 写入"
+          />
+          <span className="turn-node__file-label turn-node__file-label--write">写出</span>
+        </>
+      )}
     </>
   );
 }

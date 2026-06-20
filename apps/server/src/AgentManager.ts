@@ -1,4 +1,5 @@
 import type {
+  AgentFileAccess,
   AgentEvent,
   AgentEventEnvelope,
   AgentSnapshot,
@@ -14,6 +15,7 @@ export interface AgentManagerDeps {
   query: QueryFn;
   codexQuery?: QueryFn;
   now?: () => number;
+  resolveFileAccess?: (agentId: string) => AgentFileAccess;
 }
 
 /**
@@ -32,12 +34,14 @@ export class AgentManager {
   private readonly query: QueryFn;
   private readonly codexQuery?: QueryFn;
   private readonly now: () => number;
+  private resolveFileAccess?: (agentId: string) => AgentFileAccess;
   private counter = 0;
 
   constructor(deps: AgentManagerDeps) {
     this.query = deps.query;
     this.codexQuery = deps.codexQuery;
     this.now = deps.now ?? Date.now;
+    this.resolveFileAccess = deps.resolveFileAccess;
   }
 
   onEvent(listener: EnvelopeListener): () => void {
@@ -51,6 +55,12 @@ export class AgentManager {
       query: this.query,
       codexQuery: this.codexQuery,
       now: this.now,
+      resolveFileAccess: (agentId) =>
+        this.resolveFileAccess?.(agentId) ?? {
+          readableFiles: [],
+          writableFiles: [],
+          writableDirectories: [],
+        },
     });
     this.runners.set(id, runner);
     this.seqs.set(id, 0);
@@ -61,6 +71,10 @@ export class AgentManager {
 
   get(id: string): AgentRunner | undefined {
     return this.runners.get(id);
+  }
+
+  setFileAccessResolver(resolveFileAccess: (agentId: string) => AgentFileAccess): void {
+    this.resolveFileAccess = resolveFileAccess;
   }
 
   /**

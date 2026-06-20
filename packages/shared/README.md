@@ -32,3 +32,7 @@
 npm run build --workspace packages/shared   # tsc 编译到 dist/
 npm test --workspace packages/shared        # vitest
 ```
+
+## 文件节点模型
+
+`src/files.ts` 定义 `CanvasFileNode`、`CanvasFileConnection`、创建/更新输入，以及服务端解析后的 `AgentFileAccess`。普通节点通过 `read/write` 连线授权，共享节点通过全局读写开关授权。

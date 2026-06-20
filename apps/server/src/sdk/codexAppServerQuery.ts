@@ -1,5 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import path from "node:path";
 import readline from "node:readline";
+import type { AgentFileAccess } from "@agent-canvas/shared";
 import { AsyncMessageQueue } from "../util/AsyncMessageQueue.js";
 import {
   createCodexAppServerMapState,
@@ -58,7 +60,7 @@ function createHandle(
 
     const state = createCodexAppServerMapState();
     try {
-      const promptIterator = promptTexts(prompt)[Symbol.asyncIterator]();
+      const promptIterator = promptTurns(prompt)[Symbol.asyncIterator]();
       const first = await promptIterator.next();
       if (first.done) return;
 
@@ -68,16 +70,16 @@ function createHandle(
       state.threadId = threadId;
       yield initMessage;
 
-      let next: IteratorResult<string> = first;
+      let next: IteratorResult<PromptTurn> = first;
       while (!next.done) {
-        if (next.value.trim() === "/compact") {
+        if (next.value.text.trim() === "/compact") {
           await client.request("thread/compact/start", { threadId });
           yield* client.readCompactMessages(threadId);
         } else {
           const started = await client.request("turn/start", {
-            ...turnOverrides(options),
+            ...turnOverrides(options, next.value.fileAccess),
             threadId,
-            input: [{ type: "text", text: next.value, text_elements: [] }],
+            input: codexInputs(next.value),
           });
           turnId = stringValue(asRecord(asRecord(started)?.turn)?.id);
           yield* client.readTurnMessages(threadId, turnId, state);
@@ -135,21 +137,38 @@ function threadParams(options: QueryOptions | undefined): Record<string, unknown
   return params;
 }
 
-function turnOverrides(options: QueryOptions | undefined): Record<string, unknown> {
+function turnOverrides(
+  options: QueryOptions | undefined,
+  fileAccess: AgentFileAccess | undefined,
+): Record<string, unknown> {
   const params: Record<string, unknown> = {};
-  const approvalPolicy = approvalPolicyFor(options?.permissionMode);
+  const writableDirectories =
+    fileAccess?.writableDirectories ?? options?.fileAccess?.writableDirectories ?? [];
+  const approvalPolicy = approvalPolicyFor(
+    options?.permissionMode,
+    writableDirectories.length > 0,
+  );
   if (approvalPolicy) params.approvalPolicy = approvalPolicy;
   if (options?.model) params.model = options.model;
+  const sandboxPolicy = sandboxPolicyFor(
+    options?.permissionMode,
+    options?.cwd,
+    writableDirectories,
+  );
+  if (sandboxPolicy) params.sandboxPolicy = sandboxPolicy;
   return params;
 }
 
-function approvalPolicyFor(permissionMode: unknown): string | undefined {
+function approvalPolicyFor(
+  permissionMode: unknown,
+  hasWritableFiles = false,
+): string | undefined {
   switch (permissionMode) {
     case "acceptEdits":
     case "bypassPermissions":
       return "never";
     default:
-      return undefined;
+      return hasWritableFiles ? "never" : undefined;
   }
 }
 
@@ -166,14 +185,70 @@ function sandboxMode(permissionMode: unknown): string | undefined {
   }
 }
 
-async function* promptTexts(prompt: QueryPrompt): AsyncGenerator<string> {
+interface PromptTurn {
+  text: string;
+  fileAccess?: AgentFileAccess;
+}
+
+async function* promptTurns(prompt: QueryPrompt): AsyncGenerator<PromptTurn> {
   if (typeof prompt === "string") {
-    yield prompt;
+    yield { text: prompt };
     return;
   }
   for await (const input of prompt) {
-    yield inputText(input);
+    yield { text: inputText(input), fileAccess: input.fileAccess };
   }
+}
+
+function codexInputs(turn: PromptTurn): Record<string, unknown>[] {
+  const inputs: Record<string, unknown>[] = [
+    {
+      type: "text",
+      text: appendWritableTargets(turn.text, turn.fileAccess),
+      text_elements: [],
+    },
+  ];
+  for (const file of turn.fileAccess?.readableFiles ?? []) {
+    inputs.push(
+      file.previewKind === "image"
+        ? { type: "localImage", path: file.path }
+        : { type: "mention", name: file.name, path: file.path },
+    );
+  }
+  return inputs;
+}
+
+function appendWritableTargets(text: string, fileAccess: AgentFileAccess | undefined): string {
+  const writableFiles = fileAccess?.writableFiles ?? [];
+  if (writableFiles.length === 0) return text;
+  return `${text}\n\n可写的画布文件（作为输出目标）：\n${writableFiles
+    .map((file) => `- ${file.path}`)
+    .join("\n")}`;
+}
+
+function sandboxPolicyFor(
+  permissionMode: unknown,
+  cwd: string | undefined,
+  writableDirectories: string[],
+): Record<string, unknown> | undefined {
+  if (permissionMode === "bypassPermissions") return { type: "dangerFullAccess" };
+  if (permissionMode === "plan") {
+    return { type: "readOnly", networkAccess: false };
+  }
+  if (permissionMode !== "acceptEdits" && writableDirectories.length === 0) {
+    return undefined;
+  }
+  const writableRoots = [
+    path.resolve(cwd ?? process.cwd()),
+    ...writableDirectories.map((directory) => path.resolve(directory)),
+  ];
+  return {
+    type: "workspaceWrite",
+    writableRoots: [...new Set(writableRoots)],
+    networkAccess: false,
+    excludeTmpdirEnvVar: false,
+    excludeSlashTmp: false,
+  };
 }
 
 function inputText(input: SdkUserInput): string {

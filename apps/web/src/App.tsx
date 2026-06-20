@@ -1,83 +1,109 @@
 import { useCallback, useEffect, useState } from "react";
 import {
-  ReactFlow,
   Background,
   Controls,
   MiniMap,
-  useNodesState,
+  ReactFlow,
   useEdgesState,
+  useNodesState,
+  type Connection,
   type Edge,
 } from "@xyflow/react";
+import { FilePlus2 } from "lucide-react";
+import type { CanvasFileConnection, CanvasFileNode } from "@agent-canvas/shared";
 import "@xyflow/react/dist/style.css";
-import { useAgentCanvas } from "./useAgentCanvas.js";
+import { useAgentCanvas, type AgentActions, type FileActions } from "./useAgentCanvas.js";
 import { TurnNode, type TurnNodeType } from "./nodes/TurnNode.js";
 import type { AgentMap } from "./agentStore.js";
-import type { AgentActions } from "./useAgentCanvas.js";
 import {
   ConversationHistoryWindow,
   type HistoryTarget,
 } from "./history/ConversationHistoryWindow.js";
+import { CreateFileDialog } from "./files/CreateFileDialog.js";
+import { FileNode, type FileNodeType } from "./files/FileNode.js";
 
-const nodeTypes = { turn: TurnNode };
+const nodeTypes = { turn: TurnNode, file: FileNode };
 
 const COL_W = 430;
 const ROW_H = 360;
+const FILE_ROW_H = 280;
 const DEFAULT_NODE_WIDTH = 360;
 const DEFAULT_NODE_HEIGHT = 300;
+const FILE_NODE_WIDTH = 280;
+const FILE_NODE_HEIGHT = 240;
 const X0 = 40;
 const Y0 = 40;
+
+type CanvasNode = TurnNodeType | FileNodeType;
 
 function nodeId(agentId: string, turnIndex: number): string {
   return `${agentId}#${turnIndex}`;
 }
 
-/** 找到父 agent 中锚点 uuid 对应的轮次 index。 */
+function fileNodeId(fileId: string): string {
+  return `file:${fileId}`;
+}
+
 function anchorIndex(agents: AgentMap, parentId: string, anchorUuid: string): number {
   const parent = agents[parentId];
   if (!parent) return -1;
-  return parent.turns.findIndex((t) => t.anchorUuid === anchorUuid);
+  return parent.turns.findIndex((turn) => turn.anchorUuid === anchorUuid);
 }
 
-/** 计算每个轮次节点的初始位置：每个 agent 一列，轮次向下；fork 出来的 agent 另起一列、对齐到锚点轮的高度。 */
 function computeLayout(agents: AgentMap): Record<string, { x: number; y: number }> {
-  const pos: Record<string, { x: number; y: number }> = {};
+  const positions: Record<string, { x: number; y: number }> = {};
   const baseY: Record<string, number> = {};
-  let col = 0;
+  let column = 0;
   for (const view of Object.values(agents)) {
-    const c = col++;
-    let by = 0;
+    const currentColumn = column++;
+    let y = 0;
     if (view.forkOrigin) {
-      const pBase = baseY[view.forkOrigin.parentAgentId] ?? 0;
-      const ai = anchorIndex(agents, view.forkOrigin.parentAgentId, view.forkOrigin.anchorUuid);
-      by = pBase + (ai >= 0 ? ai : 0) * ROW_H;
+      const parentBase = baseY[view.forkOrigin.parentAgentId] ?? 0;
+      const index = anchorIndex(
+        agents,
+        view.forkOrigin.parentAgentId,
+        view.forkOrigin.anchorUuid,
+      );
+      y = parentBase + (index >= 0 ? index : 0) * ROW_H;
     }
-    baseY[view.id] = by;
-    view.turns.forEach((_, i) => {
-      pos[nodeId(view.id, i)] = { x: X0 + c * COL_W, y: Y0 + by + i * ROW_H };
+    baseY[view.id] = y;
+    view.turns.forEach((_, index) => {
+      positions[nodeId(view.id, index)] = {
+        x: X0 + currentColumn * COL_W,
+        y: Y0 + y + index * ROW_H,
+      };
     });
   }
-  return pos;
+  return positions;
 }
 
-function computeEdges(agents: AgentMap): Edge[] {
+function computeConversationEdges(agents: AgentMap): Edge[] {
   const edges: Edge[] = [];
   for (const view of Object.values(agents)) {
-    // 轮次链
-    for (let i = 1; i < view.turns.length; i++) {
-      edges.push({ id: `${view.id}#${i - 1}->${i}`, source: nodeId(view.id, i - 1), target: nodeId(view.id, i) });
+    for (let index = 1; index < view.turns.length; index++) {
+      edges.push({
+        id: `${view.id}#${index - 1}->${index}`,
+        source: nodeId(view.id, index - 1),
+        target: nodeId(view.id, index),
+        deletable: false,
+      });
     }
-    // fork 连线（父某轮 → 子第 0 轮）
     if (view.forkOrigin) {
-      const ai = anchorIndex(agents, view.forkOrigin.parentAgentId, view.forkOrigin.anchorUuid);
-      if (ai >= 0) {
+      const index = anchorIndex(
+        agents,
+        view.forkOrigin.parentAgentId,
+        view.forkOrigin.anchorUuid,
+      );
+      if (index >= 0) {
         edges.push({
           id: `fork->${view.id}`,
-          source: nodeId(view.forkOrigin.parentAgentId, ai),
+          source: nodeId(view.forkOrigin.parentAgentId, index),
           sourceHandle: "fork",
           target: nodeId(view.id, 0),
           animated: true,
           label: "fork",
           style: { stroke: "#7c3aed" },
+          deletable: false,
         });
       }
     }
@@ -85,19 +111,56 @@ function computeEdges(agents: AgentMap): Edge[] {
   return edges;
 }
 
+export function computeFileEdges(
+  agents: AgentMap,
+  connections: CanvasFileConnection[],
+): Edge[] {
+  const edges: Edge[] = [];
+  for (const connection of connections) {
+    const agent = agents[connection.agentId];
+    if (!agent || ["done", "stopped", "terminated", "error"].includes(agent.status)) continue;
+    const activeTurnId = nodeId(agent.id, agent.turns.length - 1);
+    if (connection.access === "read") {
+      edges.push({
+        id: connection.id,
+        source: fileNodeId(connection.fileId),
+        sourceHandle: "read",
+        target: activeTurnId,
+        targetHandle: "file-read",
+        animated: true,
+        style: { stroke: "#0f766e" },
+      });
+      continue;
+    }
+    edges.push({
+      id: connection.id,
+      source: activeTurnId,
+      sourceHandle: "file-write",
+      target: fileNodeId(connection.fileId),
+      targetHandle: "write",
+      animated: true,
+      style: { stroke: "#b45309" },
+    });
+  }
+  return edges;
+}
+
 function buildNodes(
   agents: AgentMap,
+  files: CanvasFileNode[],
   actions: AgentActions,
-  cur: TurnNodeType[],
+  fileActions: FileActions,
+  current: CanvasNode[],
   onOpenHistory: (agentId: string, turnIndex: number) => void,
-): TurnNodeType[] {
+): CanvasNode[] {
   const layout = computeLayout(agents);
-  const byId = new Map(cur.map((n) => [n.id, n]));
-  const result: TurnNodeType[] = [];
+  const byId = new Map(current.map((node) => [node.id, node]));
+  const result: CanvasNode[] = [];
   for (const view of Object.values(agents)) {
-    view.turns.forEach((turn, i) => {
-      const id = nodeId(view.id, i);
+    view.turns.forEach((turn, index) => {
+      const id = nodeId(view.id, index);
       const existing = byId.get(id);
+      const existingTurn = existing?.type === "turn" ? existing : undefined;
       const data = {
         agentId: view.id,
         turn,
@@ -105,13 +168,13 @@ function buildNodes(
         provider: view.provider,
         model: view.model,
         providerLocked: !!view.forkOrigin,
-        isLatest: i === view.turns.length - 1,
-        windowState: existing?.data.windowState,
+        isLatest: index === view.turns.length - 1,
+        windowState: existingTurn?.data.windowState,
         onOpenHistory,
         actions,
       };
-      if (existing) {
-        result.push({ ...existing, data }); // 保留已拖动位置，仅更新数据
+      if (existingTurn) {
+        result.push({ ...existingTurn, data });
       } else {
         result.push({
           id,
@@ -125,14 +188,43 @@ function buildNodes(
       }
     });
   }
+
+  const fileX = X0 + Math.max(Object.keys(agents).length, 1) * COL_W;
+  files.forEach((file, index) => {
+    const id = fileNodeId(file.id);
+    const existing = byId.get(id);
+    const existingFile = existing?.type === "file" ? existing : undefined;
+    const data = { file, actions: fileActions };
+    result.push(
+      existingFile
+        ? { ...existingFile, data }
+        : {
+            id,
+            type: "file",
+            position: { x: fileX, y: Y0 + index * FILE_ROW_H },
+            width: FILE_NODE_WIDTH,
+            height: FILE_NODE_HEIGHT,
+            dragHandle: ".drag-handle",
+            data,
+          },
+    );
+  });
   return result;
 }
 
 export default function App(): React.ReactElement {
-  const { agents, connected, actions } = useAgentCanvas();
-  const [nodes, setNodes, onNodesChange] = useNodesState<TurnNodeType>([]);
+  const {
+    agents,
+    files,
+    fileConnections,
+    connected,
+    actions,
+    fileActions,
+  } = useAgentCanvas();
+  const [nodes, setNodes, onNodesChange] = useNodesState<CanvasNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [historyTarget, setHistoryTarget] = useState<HistoryTarget>();
+  const [creatingFile, setCreatingFile] = useState(false);
 
   const openHistory = useCallback(
     (agentId: string, turnIndex: number) => {
@@ -146,53 +238,87 @@ export default function App(): React.ReactElement {
   );
 
   useEffect(() => {
-    setNodes((cur) => buildNodes(agents, actions, cur, openHistory));
-    setEdges(computeEdges(agents));
-  }, [agents, actions, openHistory, setNodes, setEdges]);
+    setNodes((current) =>
+      buildNodes(agents, files, actions, fileActions, current, openHistory),
+    );
+    setEdges([
+      ...computeConversationEdges(agents),
+      ...computeFileEdges(agents, fileConnections),
+    ]);
+  }, [
+    agents,
+    files,
+    fileConnections,
+    actions,
+    fileActions,
+    openHistory,
+    setNodes,
+    setEdges,
+  ]);
+
+  const connect = useCallback(
+    async (connection: Connection) => {
+      if (
+        connection.source.startsWith("file:") &&
+        connection.sourceHandle === "read" &&
+        connection.targetHandle === "file-read"
+      ) {
+        await fileActions.connect(
+          connection.source.slice("file:".length),
+          connection.target.split("#")[0]!,
+          "read",
+        );
+        return;
+      }
+      if (
+        connection.target.startsWith("file:") &&
+        connection.sourceHandle === "file-write" &&
+        connection.targetHandle === "write"
+      ) {
+        await fileActions.connect(
+          connection.target.slice("file:".length),
+          connection.source.split("#")[0]!,
+          "write",
+        );
+      }
+    },
+    [fileActions],
+  );
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100vh", width: "100vw" }}>
-      <header
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 12,
-          padding: "10px 16px",
-          borderBottom: "1px solid #e5e7eb",
-          background: "#fff",
-        }}
-      >
-        <strong style={{ fontSize: 15 }}>agent_canvas</strong>
-        <span style={{ fontSize: 12, color: connected ? "#16a34a" : "#dc2626" }}>
-          {connected ? "● 已连接后端" : "○ 未连接"}
+    <div className="app-shell">
+      <header className="app-header">
+        <strong>agent_canvas</strong>
+        <span className={connected ? "connection-state is-connected" : "connection-state"}>
+          {connected ? "● 已连接后端" : "● 未连接"}
         </span>
-        <span style={{ fontSize: 12, color: "#9ca3af" }}>
-          节点=一轮对话 · 完成后自动延伸待输入轮 · 可从任意完成轮 fork
+        <span className="app-header__hint">
+          节点代表一轮对话，文件连线控制当前 Agent 的读写权限
         </span>
-        <button
-          onClick={() => void actions.create()}
-          style={{
-            marginLeft: "auto",
-            background: "#2563eb",
-            color: "#fff",
-            border: "none",
-            borderRadius: 6,
-            padding: "6px 14px",
-            cursor: "pointer",
-            fontSize: 13,
-          }}
-        >
-          ＋ 新建 agent
+        <button className="header-button header-button--secondary" onClick={() => setCreatingFile(true)}>
+          <FilePlus2 size={15} />
+          新建文件
+        </button>
+        <button className="header-button" onClick={() => void actions.create()}>
+          新建 Agent
         </button>
       </header>
 
-      <div style={{ flex: 1, minHeight: 0 }}>
+      <div className="canvas-wrap">
         <ReactFlow
           nodes={nodes}
           edges={edges}
           nodeTypes={nodeTypes}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
+          onConnect={(connection) => void connect(connection)}
+          onEdgesDelete={(deleted) => {
+            for (const edge of deleted) {
+              if (edge.id.startsWith("file_connection_")) {
+                void fileActions.disconnect(edge.id);
+              }
+            }
+          }}
           fitView
           proOptions={{ hideAttribution: true }}
         >
@@ -201,6 +327,16 @@ export default function App(): React.ReactElement {
           <Controls />
         </ReactFlow>
       </div>
+
+      {creatingFile && (
+        <CreateFileDialog
+          agents={agents}
+          onCreate={async (input) => {
+            await fileActions.create(input);
+          }}
+          onClose={() => setCreatingFile(false)}
+        />
+      )}
       {historyTarget && (
         <ConversationHistoryWindow
           target={{

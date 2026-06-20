@@ -1,8 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { AgentManager } from "./AgentManager.js";
 import { createServer } from "./server.js";
+import { FileManager } from "./files/FileManager.js";
 import type { QueryFn } from "./sdk/types.js";
 
 /** 立即结束消息流的假 query：足以测 HTTP 路由，不触达模型。 */
@@ -53,16 +57,24 @@ function request(
 describe("HTTP server", () => {
   let server: http.Server;
   let port = 0;
+  let root = "";
 
   beforeAll(async () => {
     const manager = new AgentManager({ query: emptyQuery });
-    ({ httpServer: server } = createServer(manager));
+    root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-server-"));
+    const fileManager = new FileManager({
+      workspaceRoot: root,
+      isolatedRoot: path.join(root, "isolated"),
+      resolveAgentCwd: () => root,
+    });
+    ({ httpServer: server } = createServer(manager, fileManager));
     await new Promise<void>((r) => server.listen(0, r));
     port = (server.address() as AddressInfo).port;
   });
 
   afterAll(async () => {
     await new Promise<void>((r) => server.close(() => r()));
+    await rm(root, { recursive: true, force: true });
   });
 
   it("GET /api/health → 200 ok", async () => {
@@ -137,5 +149,47 @@ describe("HTTP server", () => {
   it("未知路由 → 404", async () => {
     const r = await request(port, "GET", "/nope");
     expect(r.status).toBe(404);
+  });
+
+  it("文件节点 REST 支持创建、重命名、预览与普通读连线", async () => {
+    const agent = await request(port, "POST", "/api/agents");
+    const created = await request(port, "POST", "/api/files", {
+      name: "notes",
+      extension: "txt",
+      storage: "isolated",
+      kind: "normal",
+    });
+    expect(created.status).toBe(201);
+    expect(created.json.file.filename).toBe("notes.txt");
+
+    const updated = await request(port, "PATCH", `/api/files/${created.json.file.id}`, {
+      name: "renamed",
+      extension: "md",
+    });
+    expect(updated.status).toBe(200);
+    expect(updated.json.file.filename).toBe("renamed.md");
+
+    const preview = await request(port, "GET", `/api/files/${created.json.file.id}/content`);
+    expect(preview).toMatchObject({
+      status: 200,
+      json: { content: "", truncated: false },
+    });
+
+    const connection = await request(port, "POST", "/api/file-connections", {
+      fileId: created.json.file.id,
+      agentId: agent.json.id,
+      access: "read",
+    });
+    expect(connection.status).toBe(201);
+
+    const listed = await request(port, "GET", "/api/file-connections");
+    expect(listed.json.connections).toContainEqual(connection.json.connection);
+
+    const removed = await request(
+      port,
+      "DELETE",
+      `/api/file-connections/${connection.json.connection.id}`,
+    );
+    expect(removed.status).toBe(204);
   });
 });

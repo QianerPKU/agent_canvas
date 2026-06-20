@@ -2,7 +2,10 @@ CLAUDE.md
 AGENTS.md
 MEMORY.md
 tmp
+tmp_prompt
+TODO.md
 .claude
+.agent-canvas/
 
 # deps
 node_modules/

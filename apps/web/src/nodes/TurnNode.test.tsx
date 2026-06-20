@@ -105,6 +105,49 @@ describe("TurnNode", () => {
     expect(restoreButton.classList.contains("nodrag")).toBe(false);
   });
 
+  it("只有最新活跃轮次显示文件读写 Handle", () => {
+    const actions = makeActions();
+    const { container, rerender } = render(
+      <ReactFlowProvider>
+        <TurnNode
+          {...({
+            id: "agent_1#1",
+            data: {
+              agentId: "agent_1",
+              turn: { index: 1, status: "idle", lines: [] },
+              agentStatus: "waiting_input",
+              isLatest: true,
+              onOpenHistory: vi.fn(),
+              actions,
+            },
+          } as unknown as NodeProps<TurnNodeType>)}
+        />
+      </ReactFlowProvider>,
+    );
+    expect(container.querySelector('[data-handleid="file-read"]')).toBeTruthy();
+    expect(container.querySelector('[data-handleid="file-write"]')).toBeTruthy();
+
+    rerender(
+      <ReactFlowProvider>
+        <TurnNode
+          {...({
+            id: "agent_1#0",
+            data: {
+              agentId: "agent_1",
+              turn: { index: 0, status: "done", lines: [] },
+              agentStatus: "waiting_input",
+              isLatest: false,
+              onOpenHistory: vi.fn(),
+              actions,
+            },
+          } as unknown as NodeProps<TurnNodeType>)}
+        />
+      </ReactFlowProvider>,
+    );
+    expect(container.querySelector('[data-handleid="file-read"]')).toBeNull();
+    expect(container.querySelector('[data-handleid="file-write"]')).toBeNull();
+  });
+
   it("首轮 idle（可输入）：启动按钮 + submit 带 prompt", () => {
     const actions = makeActions();
     renderTurn({ index: 0, status: "idle", lines: [] }, "idle", actions);

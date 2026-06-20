@@ -1,4 +1,5 @@
 import type {
+  AgentFileAccess,
   AgentEvent,
   AgentProvider,
   AgentStartConfig,
@@ -23,6 +24,7 @@ export interface AgentRunnerDeps {
   /** 注入 Codex query；未提供时复用 query，便于单测。 */
   codexQuery?: QueryFn;
   now?: () => number;
+  resolveFileAccess?: (agentId: string) => AgentFileAccess;
 }
 
 export interface StartExtra {
@@ -41,6 +43,7 @@ export class AgentRunner {
   readonly id: string;
   private readonly queries: Record<AgentProvider, QueryFn>;
   private readonly now: () => number;
+  private readonly resolveFileAccess?: (agentId: string) => AgentFileAccess;
   private readonly listeners = new Set<AgentEventListener>();
 
   private status: AgentStatus = "idle";
@@ -63,6 +66,7 @@ export class AgentRunner {
       codex: deps.codexQuery ?? deps.query,
     };
     this.now = deps.now ?? Date.now;
+    this.resolveFileAccess = deps.resolveFileAccess;
     this.createdAt = this.now();
   }
 
@@ -107,7 +111,8 @@ export class AgentRunner {
     this.abortController = new AbortController();
     this.inputQueue = new AsyncMessageQueue<SdkUserInput>();
     // 首条任务作为第一条用户消息
-    this.inputQueue.push(toUserInput(config.prompt));
+    const fileAccess = this.resolveFileAccess?.(this.id);
+    this.inputQueue.push(toUserInput(config.prompt, fileAccess));
 
     this.setStatus("starting");
     this.emit({ kind: "user_input", text: config.prompt });
@@ -123,6 +128,7 @@ export class AgentRunner {
       resumeSessionAt: config.resumeSessionAt,
       forkSession: config.forkSession,
       abortController: this.abortController,
+      fileAccess,
     };
 
     this.handle = this.queries[provider]({ prompt: this.inputQueue, options });
@@ -135,7 +141,7 @@ export class AgentRunner {
     if (!this.inputQueue || this.inputQueue.isClosed || isTerminalStatus(this.status)) {
       throw new Error(`agent ${this.id} 当前不可接收输入（${this.status}）`);
     }
-    this.inputQueue.push(toUserInput(text));
+    this.inputQueue.push(toUserInput(text, this.resolveFileAccess?.(this.id)));
     this.setStatus("running");
     this.emit({ kind: "user_input", text });
   }
@@ -276,11 +282,12 @@ function normalizeProvider(provider: AgentProvider | undefined): AgentProvider {
   return provider ?? "claude";
 }
 
-function toUserInput(text: string): SdkUserInput {
+function toUserInput(text: string, fileAccess?: AgentFileAccess): SdkUserInput {
   return {
     type: "user",
     message: { role: "user", content: text },
     parent_tool_use_id: null,
+    fileAccess,
   };
 }
 

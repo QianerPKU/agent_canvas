@@ -6,16 +6,21 @@ import { AsyncMessageQueue } from "../util/AsyncMessageQueue.js";
 import { createCodexAppServerQuery } from "./codexAppServerQuery.js";
 import type { SdkUserInput } from "./types.js";
 
-function userInput(text: string): SdkUserInput {
+function userInput(
+  text: string,
+  fileAccess?: SdkUserInput["fileAccess"],
+): SdkUserInput {
   return {
     type: "user",
     message: { role: "user", content: text },
     parent_tool_use_id: null,
+    fileAccess,
   };
 }
 
 function makeFakeSpawn() {
   const requests: string[] = [];
+  const messages: Array<{ id?: number; method?: string; params?: Record<string, unknown> }> = [];
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   const stderr = new PassThrough();
@@ -39,8 +44,13 @@ function makeFakeSpawn() {
   const write = (message: unknown) => stdout.write(`${JSON.stringify(message)}\n`);
   const inputLines = readline.createInterface({ input: stdin });
   inputLines.on("line", (line) => {
-    const message = JSON.parse(line) as { id?: number; method?: string };
+    const message = JSON.parse(line) as {
+      id?: number;
+      method?: string;
+      params?: Record<string, unknown>;
+    };
     if (!message.method) return;
+    messages.push(message);
     requests.push(message.method);
     if (message.id === undefined) return;
 
@@ -95,6 +105,7 @@ function makeFakeSpawn() {
   return {
     spawnFn: vi.fn(() => proc) as never,
     requests,
+    messages,
     proc,
   };
 }
@@ -131,5 +142,55 @@ describe("Codex app-server query", () => {
     await handle.terminate?.();
     expect(fake.requests).toContain("thread/compact/start");
     expect(fake.proc.kill).toHaveBeenCalledOnce();
+  });
+
+  it("把文件引用和额外写目录映射到 Codex 原生输入与 sandboxPolicy", async () => {
+    const fake = makeFakeSpawn();
+    const prompt = new AsyncMessageQueue<SdkUserInput>();
+    prompt.push(
+      userInput("处理这些文件", {
+        readableFiles: [
+          { name: "notes.md", path: "C:/shared/notes.md", previewKind: "markdown" },
+          { name: "shot.png", path: "C:/shared/shot.png", previewKind: "image" },
+        ],
+        writableFiles: [
+          { name: "output.csv", path: "C:/shared/output/output.csv", previewKind: "csv" },
+        ],
+        writableDirectories: ["C:/shared/output"],
+      }),
+    );
+
+    const handle = createCodexAppServerQuery({ spawnFn: fake.spawnFn })({
+      prompt,
+      options: { cwd: "C:/repo" },
+    });
+    const iterator = handle[Symbol.asyncIterator]();
+    await iterator.next();
+    await iterator.next();
+
+    const turnStart = fake.messages.find((message) => message.method === "turn/start");
+    expect(turnStart?.params?.input).toEqual([
+      {
+        type: "text",
+        text:
+          "处理这些文件\n\n可写的画布文件（作为输出目标）：\n" +
+          "- C:/shared/output/output.csv",
+        text_elements: [],
+      },
+      { type: "mention", name: "notes.md", path: "C:/shared/notes.md" },
+      { type: "localImage", path: "C:/shared/shot.png" },
+    ]);
+    expect(turnStart?.params?.sandboxPolicy).toEqual({
+      type: "workspaceWrite",
+      writableRoots: [
+        expect.stringMatching(/C:[\\/]repo$/),
+        expect.stringMatching(/C:[\\/]shared[\\/]output$/),
+      ],
+      networkAccess: false,
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false,
+    });
+    expect(turnStart?.params?.approvalPolicy).toBe("never");
+    await handle.terminate?.();
   });
 });

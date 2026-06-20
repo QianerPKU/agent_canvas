@@ -5,7 +5,15 @@
  *  - 自动断线重连
  */
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { AgentProvider, ServerFrame } from "@agent-canvas/shared";
+import type {
+  AgentProvider,
+  CanvasFileConnection,
+  CanvasFileNode,
+  CreateCanvasFileInput,
+  FileConnectionAccess,
+  ServerFrame,
+  UpdateCanvasFileInput,
+} from "@agent-canvas/shared";
 import { api } from "./api.js";
 import {
   applyEnvelope,
@@ -40,8 +48,22 @@ export interface AgentActions {
 
 export interface UseAgentCanvas {
   agents: AgentMap;
+  files: CanvasFileNode[];
+  fileConnections: CanvasFileConnection[];
   connected: boolean;
   actions: AgentActions;
+  fileActions: FileActions;
+}
+
+export interface FileActions {
+  create: (input: CreateCanvasFileInput) => Promise<CanvasFileNode>;
+  update: (id: string, input: UpdateCanvasFileInput) => Promise<void>;
+  connect: (
+    fileId: string,
+    agentId: string,
+    access: FileConnectionAccess,
+  ) => Promise<void>;
+  disconnect: (connectionId: string) => Promise<void>;
 }
 
 function wsUrl(): string {
@@ -51,6 +73,8 @@ function wsUrl(): string {
 
 export function useAgentCanvas(): UseAgentCanvas {
   const [agents, setAgents] = useState<AgentMap>(emptyMap);
+  const [files, setFiles] = useState<CanvasFileNode[]>([]);
+  const [fileConnections, setFileConnections] = useState<CanvasFileConnection[]>([]);
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   // 始终指向最新 agents，供 submit 判断 start/send（避免闭包过期）
@@ -97,6 +121,14 @@ export function useAgentCanvas(): UseAgentCanvas {
     // React StrictMode 会在开发环境执行一次 setup→cleanup→setup。
     // 延迟到下一轮事件循环，避免试探性 setup 建立后立刻中断 WebSocket。
     scheduleConnect(0);
+    void Promise.all([api.listFiles(), api.listFileConnections()]).then(
+      ([nextFiles, nextConnections]) => {
+        if (closed) return;
+        setFiles(nextFiles);
+        setFileConnections(nextConnections);
+      },
+      () => undefined,
+    );
     return () => {
       closed = true;
       if (connectTimer) clearTimeout(connectTimer);
@@ -136,10 +168,40 @@ export function useAgentCanvas(): UseAgentCanvas {
       fork: async (agentId, anchorUuid, model) => {
         const { id, origin } = await api.fork(agentId, anchorUuid, model);
         setAgents((prev) => insertForked(prev, id, origin, model));
+        setFileConnections(await api.listFileConnections());
       },
     }),
     [],
   );
 
-  return { agents, connected, actions };
+  const fileActions = useMemo<FileActions>(
+    () => ({
+      create: async (input) => {
+        const file = await api.createFile(input);
+        setFiles((current) => [...current, file]);
+        return file;
+      },
+      update: async (id, input) => {
+        const file = await api.updateFile(id, input);
+        setFiles((current) => current.map((candidate) => (candidate.id === id ? file : candidate)));
+      },
+      connect: async (fileId, agentId, access) => {
+        const connection = await api.connectFile(fileId, agentId, access);
+        setFileConnections((current) =>
+          current.some((candidate) => candidate.id === connection.id)
+            ? current
+            : [...current, connection],
+        );
+      },
+      disconnect: async (connectionId) => {
+        await api.disconnectFile(connectionId);
+        setFileConnections((current) =>
+          current.filter((connection) => connection.id !== connectionId),
+        );
+      },
+    }),
+    [],
+  );
+
+  return { agents, files, fileConnections, connected, actions, fileActions };
 }

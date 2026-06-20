@@ -92,3 +92,20 @@ npm run smoke --workspace apps/server
 >
 > ⚠️ 安全：实测发现 `allowedTools` 并不能阻止 agent 调用其他工具（如 PowerShell）。
 > 要"只读/禁止执行命令"，需用 `permissionMode='plan'` 或其他机制，不能依赖 `allowedTools`。
+
+## 文件节点
+
+- `src/files/FileManager.ts` 管理节点元数据、真实文件、共享权限和普通读写连线。
+- Agent 工作目录存储直接在所选工作区创建文件；隔离存储使用用户本地数据目录，并让每个文件节点独占目录。
+- `GET/POST /api/files` 列出/创建；`PATCH /api/files/:id` 重命名或更新共享开关；`content/raw` 子路径提供预览。
+- `GET/POST /api/file-connections` 与 `DELETE /api/file-connections/:id` 管理普通节点连线。
+- Codex 使用 app-server 原生 `mention/localImage` 和 `workspaceWrite.writableRoots`。
+- Claude 使用 `@绝对路径`、`additionalDirectories`，并通过 `applyFlagSettings()` 在流式会话下一轮动态刷新写目录。
+- 写权限是 CLI 的目录粒度，而且可写目录天然也可读；隔离文件采用单节点目录来缩小授权范围。读连线负责显式引用和画布层授权，不等同于操作系统级读取隔离。
+
+官方参考：
+
+- https://developers.openai.com/codex/cli/slash-commands
+- https://developers.openai.com/codex/cli/reference
+- https://docs.anthropic.com/en/docs/claude-code/common-workflows
+- https://docs.anthropic.com/en/docs/claude-code/cli-reference

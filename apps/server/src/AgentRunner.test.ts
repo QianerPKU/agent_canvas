@@ -317,4 +317,44 @@ describe("AgentRunner 生命周期", () => {
     runner2.start({ prompt: "x" });
     expect(runner2.snapshot().config?.provider).toBe("claude");
   });
+
+  it("把当前文件读写权限传给 query，并在后续轮次重新解析", async () => {
+    const ctl = makeControllableQuery();
+    let revision = 0;
+    const runner = new AgentRunner("file-agent", {
+      query: ctl.query,
+      resolveFileAccess: () => ({
+        readableFiles: [
+          {
+            name: `input-${revision}.txt`,
+            path: `/files/input-${revision}.txt`,
+            previewKind: "text",
+          },
+        ],
+        writableFiles: [],
+        writableDirectories: [`/files/write-${revision}`],
+      }),
+    });
+
+    runner.start({ prompt: "first" });
+    expect(ctl.getOptions()?.fileAccess).toEqual({
+      readableFiles: [
+        {
+          name: "input-0.txt",
+          path: "/files/input-0.txt",
+          previewKind: "text",
+        },
+      ],
+      writableFiles: [],
+      writableDirectories: ["/files/write-0"],
+    });
+
+    revision = 1;
+    ctl.emit(SYSTEM_INIT);
+    ctl.emit(resultMsg());
+    await flush();
+    runner.send("second");
+    await flush();
+    expect(ctl.inputs.at(-1)?.fileAccess?.readableFiles[0]?.name).toBe("input-1.txt");
+  });
 });

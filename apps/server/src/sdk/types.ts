@@ -123,6 +123,7 @@ export interface SdkUserInput {
   message: { role: "user"; content: string | SdkContentBlock[] };
   parent_tool_use_id: string | null; // SDK 要求必填，顶层用户消息填 null
   session_id?: string;
+  fileAccess?: import("@agent-canvas/shared").AgentFileAccess;
 }
 
 export type QueryPrompt = string | AsyncIterable<SdkUserInput>;
@@ -138,6 +139,7 @@ export interface QueryOptions {
   resumeSessionAt?: string;
   forkSession?: boolean;
   abortController?: AbortController;
+  fileAccess?: import("@agent-canvas/shared").AgentFileAccess;
   [k: string]: unknown;
 }
 

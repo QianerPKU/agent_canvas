@@ -61,3 +61,12 @@ npm test --workspace apps/web
 - `useAgentCanvas.test.tsx`：StrictMode 下只建立一次 WebSocket
 - `history/*.test.ts(x)`：按轮截断、流式片段合并与完整历史窗口渲染
 - `nodes/TurnNode.test.tsx`：各状态徽标、模型选择、Compact/Terminate、历史点击、尺寸保存/恢复与 fork 控件交互
+
+## 文件节点
+
+- 顶栏“新建文件”选择文件名、后缀、普通/共享类型以及 Agent 工作目录/隔离目录。
+- 普通文件右侧“读”输出连接 Agent 左侧“读入”；Agent 右侧“写出”连接文件左侧“写”输入。
+- 文件连接绑定 Agent 而非单轮，完成一轮后自动指向最新轮次；fork 时复制父 Agent 的连接。
+- 共享文件不画连线，使用节点底部的“全局读/全局写”开关。
+- 文本、Markdown、CSV、常见源码和图片显示预览；其他格式只显示文件名。预览定时刷新以反映 Agent 修改。
+- `src/files/README.md` 记录组件边界与 Handle 语义。

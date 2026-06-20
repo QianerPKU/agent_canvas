@@ -2,23 +2,33 @@ import http from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import type {
   AgentStartConfig,
+  CreateCanvasFileInput,
   ServerFrame,
+  UpdateCanvasFileInput,
 } from "@agent-canvas/shared";
 import { AgentManager } from "./AgentManager.js";
+import { FileManager } from "./files/FileManager.js";
 
 export interface CreateServerResult {
   httpServer: http.Server;
   wss: WebSocketServer;
   manager: AgentManager;
+  fileManager: FileManager;
 }
 
 /**
  * 组装 HTTP（REST 命令）+ WebSocket（事件广播）服务。
  * 命令端到端：前端 POST /api/... → manager/runner；事件 runner → manager → WS。
  */
-export function createServer(manager: AgentManager): CreateServerResult {
+export function createServer(
+  manager: AgentManager,
+  fileManager = new FileManager({
+    resolveAgentCwd: (agentId) => manager.get(agentId)?.snapshot().config?.cwd,
+  }),
+): CreateServerResult {
+  manager.setFileAccessResolver((agentId) => fileManager.accessFor(agentId));
   const httpServer = http.createServer((req, res) => {
-    handleHttp(req, res, manager).catch((err) => {
+    handleHttp(req, res, manager, fileManager).catch((err) => {
       sendJson(res, 500, { error: errMsg(err) });
     });
   });
@@ -38,13 +48,14 @@ export function createServer(manager: AgentManager): CreateServerResult {
     }
   });
 
-  return { httpServer, wss, manager };
+  return { httpServer, wss, manager, fileManager };
 }
 
 async function handleHttp(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   manager: AgentManager,
+  fileManager: FileManager,
 ): Promise<void> {
   setCors(res);
   if (req.method === "OPTIONS") {
@@ -68,6 +79,100 @@ async function handleHttp(
   if (method === "POST" && path === "/api/agents") {
     const runner = manager.create();
     return sendJson(res, 201, { id: runner.id });
+  }
+
+  if (method === "GET" && path === "/api/files") {
+    return sendJson(res, 200, { files: fileManager.list() });
+  }
+
+  if (method === "POST" && path === "/api/files") {
+    const body = await readJson<CreateCanvasFileInput>(req);
+    if (
+      !body?.name ||
+      !["agent", "isolated"].includes(body.storage) ||
+      !["normal", "shared"].includes(body.kind)
+    ) {
+      return sendJson(res, 400, { error: "缺少文件名、存储位置或节点类型" });
+    }
+    if (body.storage === "agent" && (!body.agentId || !manager.get(body.agentId))) {
+      return sendJson(res, 400, { error: "请选择有效的 agent 工作目录" });
+    }
+    try {
+      return sendJson(res, 201, { file: await fileManager.create(body) });
+    } catch (error) {
+      return sendJson(res, 400, { error: errMsg(error) });
+    }
+  }
+
+  const fileMatch = path.match(/^\/api\/files\/([^/]+)(?:\/([^/]+))?$/);
+  if (fileMatch) {
+    const id = decodeURIComponent(fileMatch[1]!);
+    const action = fileMatch[2];
+    if (!fileManager.get(id)) return sendJson(res, 404, { error: `未知文件节点: ${id}` });
+    if (method === "PATCH" && !action) {
+      const body = await readJson<UpdateCanvasFileInput>(req);
+      try {
+        return sendJson(res, 200, { file: await fileManager.update(id, body ?? {}) });
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
+    }
+    if (method === "GET" && action === "content") {
+      try {
+        return sendJson(res, 200, await fileManager.readPreview(id));
+      } catch (error) {
+        return sendJson(res, 415, { error: errMsg(error) });
+      }
+    }
+    if (method === "GET" && action === "raw") {
+      const { file, data } = await fileManager.readRaw(id);
+      res.writeHead(200, {
+        "Content-Type": file.mimeType,
+        "Content-Length": data.length,
+        "Cache-Control": "no-store",
+      });
+      res.end(data);
+      return;
+    }
+  }
+
+  if (method === "GET" && path === "/api/file-connections") {
+    return sendJson(res, 200, { connections: fileManager.listConnections() });
+  }
+
+  if (method === "POST" && path === "/api/file-connections") {
+    const body = await readJson<{ fileId?: string; agentId?: string; access?: "read" | "write" }>(
+      req,
+    );
+    if (
+      !body?.fileId ||
+      !body.agentId ||
+      !body.access ||
+      !["read", "write"].includes(body.access)
+    ) {
+      return sendJson(res, 400, { error: "缺少 fileId、agentId 或 access" });
+    }
+    if (!manager.get(body.agentId)) {
+      return sendJson(res, 404, { error: `未知 agent: ${body.agentId}` });
+    }
+    try {
+      return sendJson(res, 201, {
+        connection: fileManager.connect(body.fileId, body.agentId, body.access),
+      });
+    } catch (error) {
+      return sendJson(res, 400, { error: errMsg(error) });
+    }
+  }
+
+  const connectionMatch = path.match(/^\/api\/file-connections\/([^/]+)$/);
+  if (method === "DELETE" && connectionMatch) {
+    const id = decodeURIComponent(connectionMatch[1]!);
+    if (!fileManager.disconnect(id)) {
+      return sendJson(res, 404, { error: `未知文件连线: ${id}` });
+    }
+    res.writeHead(204);
+    res.end();
+    return;
   }
 
   // /api/agents/:id(/action)
@@ -95,6 +200,7 @@ async function handleHttp(
       if (!body?.anchorUuid) return sendJson(res, 400, { error: "缺少 anchorUuid" });
       const forked = manager.fork(id, body.anchorUuid, body.model);
       if (!forked) return sendJson(res, 409, { error: "源会话尚未建立，无法 fork" });
+      fileManager.copyAgentConnections(id, forked.id);
       return sendJson(res, 201, { id: forked.id, origin: forked.origin });
     }
     if (method === "POST" && action === "send") {
@@ -138,7 +244,7 @@ async function handleHttp(
 
 function setCors(res: http.ServerResponse): void {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 

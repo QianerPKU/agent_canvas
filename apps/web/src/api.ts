@@ -3,7 +3,12 @@ import type {
   AgentEventEnvelope,
   AgentSnapshot,
   AgentStartConfig,
+  CanvasFileConnection,
+  CanvasFileNode,
+  CreateCanvasFileInput,
+  FileConnectionAccess,
   ForkOrigin,
+  UpdateCanvasFileInput,
 } from "@agent-canvas/shared";
 
 const BASE = "/api";
@@ -40,4 +45,30 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ anchorUuid, model }),
     }),
+  listFiles: () => call<{ files: CanvasFileNode[] }>("/files").then((r) => r.files),
+  createFile: (input: CreateCanvasFileInput) =>
+    call<{ file: CanvasFileNode }>("/files", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }).then((r) => r.file),
+  updateFile: (id: string, input: UpdateCanvasFileInput) =>
+    call<{ file: CanvasFileNode }>(`/files/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }).then((r) => r.file),
+  fileContent: (id: string) =>
+    call<{ content: string; truncated: boolean }>(`/files/${id}/content`),
+  fileRawUrl: (id: string, version?: number) =>
+    `${BASE}/files/${encodeURIComponent(id)}/raw${version ? `?v=${version}` : ""}`,
+  listFileConnections: () =>
+    call<{ connections: CanvasFileConnection[] }>("/file-connections").then(
+      (r) => r.connections,
+    ),
+  connectFile: (fileId: string, agentId: string, access: FileConnectionAccess) =>
+    call<{ connection: CanvasFileConnection }>("/file-connections", {
+      method: "POST",
+      body: JSON.stringify({ fileId, agentId, access }),
+    }).then((r) => r.connection),
+  disconnectFile: (id: string) =>
+    call<void>(`/file-connections/${encodeURIComponent(id)}`, { method: "DELETE" }),
 };
