@@ -49,6 +49,8 @@ describe("PromptNode", () => {
     const promptActions = actions();
     const { container } = renderPrompt(prompt(), promptActions);
     expect(container.querySelectorAll(".react-flow__handle")).toHaveLength(2);
+    expect(container.querySelector(".react-flow__resize-control")).toBeTruthy();
+    expect(screen.queryByLabelText("提示词节点名称")).toBeNull();
 
     fireEvent.change(screen.getByLabelText("工程规范 内容"), {
       target: { value: "先测试，再实现" },
@@ -58,6 +60,25 @@ describe("PromptNode", () => {
       expect(promptActions.update).toHaveBeenCalledWith("prompt_1", {
         name: "工程规范",
         content: "先测试，再实现",
+      }),
+    );
+  });
+
+  it("名称只通过重命名按钮进入输入态，避免标题栏误触", async () => {
+    const promptActions = actions();
+    renderPrompt(prompt(), promptActions);
+    expect(screen.getByText("工程规范")).toBeTruthy();
+    expect(screen.queryByLabelText("提示词节点名称")).toBeNull();
+
+    fireEvent.click(screen.getByTitle("重命名提示词"));
+    fireEvent.change(screen.getByLabelText("提示词节点名称"), {
+      target: { value: "新规范" },
+    });
+    fireEvent.click(screen.getByTitle("确认重命名"));
+
+    await waitFor(() =>
+      expect(promptActions.update).toHaveBeenCalledWith("prompt_1", {
+        name: "新规范",
       }),
     );
   });

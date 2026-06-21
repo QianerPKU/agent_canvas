@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
-import { Check, MessageSquareText } from "lucide-react";
+import { Handle, NodeResizer, Position, type Node, type NodeProps } from "@xyflow/react";
+import { Check, MessageSquareText, Pencil, X } from "lucide-react";
 import type { CanvasPromptNode } from "@agent-canvas/shared";
 import type { PromptActions } from "../useAgentCanvas.js";
 
@@ -18,26 +18,55 @@ export function PromptNode({ data }: NodeProps<PromptNodeType>): React.ReactElem
   const [content, setContent] = useState(prompt.content);
   const [saving, setSaving] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [renaming, setRenaming] = useState(false);
   const dirty = name !== prompt.name || content !== prompt.content;
 
   useEffect(() => {
-    if (editing) return;
+    if (editing || renaming) return;
     setName(prompt.name);
     setContent(prompt.content);
-  }, [prompt.name, prompt.content, editing]);
+  }, [prompt.name, prompt.content, editing, renaming]);
 
   const save = async () => {
     setSaving(true);
     try {
       await actions.update(prompt.id, { name: name.trim(), content });
       setEditing(false);
+      setRenaming(false);
     } finally {
       setSaving(false);
     }
   };
 
+  const finishRename = async () => {
+    setSaving(true);
+    try {
+      await actions.update(prompt.id, { name: name.trim() });
+      setRenaming(false);
+      setEditing(content !== prompt.content);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const cancelRename = () => {
+    setName(prompt.name);
+    setRenaming(false);
+    setEditing(content !== prompt.content);
+  };
+
   return (
     <div className="prompt-node">
+      <NodeResizer
+        isVisible
+        minWidth={250}
+        minHeight={190}
+        maxWidth={720}
+        maxHeight={760}
+        color="#94a3b8"
+        lineStyle={{ opacity: 0.55 }}
+        handleStyle={{ width: 8, height: 8, borderRadius: 2 }}
+      />
       {prompt.kind === "normal" && (
         <>
           <Handle
@@ -61,23 +90,56 @@ export function PromptNode({ data }: NodeProps<PromptNodeType>): React.ReactElem
 
       <div className="prompt-node__header drag-handle">
         <MessageSquareText size={16} />
-        <input
-          className="nodrag"
-          aria-label="提示词节点名称"
-          value={name}
-          onChange={(event) => {
-            setEditing(true);
-            setName(event.target.value);
-          }}
-        />
-        <button
-          className="icon-button nodrag"
-          title="保存提示词"
-          disabled={!dirty || !name.trim() || !content.trim() || saving}
-          onClick={() => void save()}
-        >
-          <Check size={14} />
-        </button>
+        {renaming ? (
+          <div className="prompt-node__rename nodrag">
+            <input
+              aria-label="提示词节点名称"
+              value={name}
+              autoFocus
+              onChange={(event) => {
+                setEditing(true);
+                setName(event.target.value);
+              }}
+            />
+            <button
+              className="icon-button"
+              title="确认重命名"
+              disabled={!name.trim() || saving}
+              onClick={() => void finishRename()}
+            >
+              <Check size={14} />
+            </button>
+            <button
+              className="icon-button"
+              title="取消重命名"
+              disabled={saving}
+              onClick={cancelRename}
+            >
+              <X size={14} />
+            </button>
+          </div>
+        ) : (
+          <>
+            <strong className="prompt-node__title" title={prompt.name}>
+              {prompt.name}
+            </strong>
+            <button
+              className="icon-button nodrag"
+              title="重命名提示词"
+              onClick={() => setRenaming(true)}
+            >
+              <Pencil size={13} />
+            </button>
+            <button
+              className="icon-button nodrag"
+              title="保存提示词"
+              disabled={!dirty || !name.trim() || !content.trim() || saving}
+              onClick={() => void save()}
+            >
+              <Check size={14} />
+            </button>
+          </>
+        )}
       </div>
 
       <textarea

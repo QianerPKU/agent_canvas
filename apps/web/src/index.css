@@ -218,21 +218,33 @@ button:disabled {
   cursor: grab;
 }
 
-.prompt-node__header > input {
+.prompt-node__title {
   min-width: 0;
   flex: 1;
-  height: 27px;
-  border: 0;
-  border-bottom: 1px solid transparent;
-  outline: none;
-  background: transparent;
-  font: inherit;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 12px;
   font-weight: 700;
 }
 
-.prompt-node__header > input:focus {
-  border-bottom-color: #7c3aed;
+.prompt-node__rename {
+  min-width: 0;
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(80px, 1fr) 28px 28px;
+  gap: 4px;
+}
+
+.prompt-node__rename input {
+  min-width: 0;
+  height: 28px;
+  padding: 3px 5px;
+  border: 1px solid #94a3b8;
+  border-radius: 4px;
+  background: #fff;
+  font: inherit;
+  font-size: 11px;
 }
 
 .prompt-node__content {

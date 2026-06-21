@@ -59,6 +59,7 @@ describe("FileNode", () => {
     const fileActions = actions();
     const { container } = renderFile(file(), fileActions);
     expect(container.querySelectorAll(".react-flow__handle")).toHaveLength(2);
+    expect(container.querySelector(".react-flow__resize-control")).toBeTruthy();
 
     fireEvent.click(screen.getByTitle("重命名文件"));
     fireEvent.change(screen.getByLabelText("文件名"), { target: { value: "report" } });

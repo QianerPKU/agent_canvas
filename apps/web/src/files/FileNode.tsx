@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
+import { Handle, NodeResizer, Position, type Node, type NodeProps } from "@xyflow/react";
 import { Check, ExternalLink, Eye, File, FileText, Image, Pencil, X } from "lucide-react";
 import type { CanvasFileNode } from "@agent-canvas/shared";
 import { api } from "../api.js";
@@ -72,6 +72,16 @@ export function FileNode({ data }: NodeProps<FileNodeType>): React.ReactElement 
 
   return (
     <div className="file-node">
+      <NodeResizer
+        isVisible
+        minWidth={240}
+        minHeight={180}
+        maxWidth={720}
+        maxHeight={720}
+        color="#94a3b8"
+        lineStyle={{ opacity: 0.55 }}
+        handleStyle={{ width: 8, height: 8, borderRadius: 2 }}
+      />
       {file.kind === "normal" && (
         <>
           <Handle
