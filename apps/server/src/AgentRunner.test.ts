@@ -35,7 +35,7 @@ function resultMsg(extra: Partial<Record<string, unknown>> = {}): SdkMessage {
 
 /** 可手动驱动的假 query：emit 推消息，finish 关闭输出，记录收到的输入与 interrupt。 */
 function makeControllableQuery() {
-  const out = new AsyncMessageQueue<SdkMessage>();
+  let out = new AsyncMessageQueue<SdkMessage>();
   const inputs: SdkUserInput[] = [];
   const steeredInputs: SdkUserInput[] = [];
   let interrupted = false;
@@ -43,6 +43,7 @@ function makeControllableQuery() {
   let lastOptions: QueryOptions | undefined;
 
   const query: QueryFn = ({ prompt, options }) => {
+    out = new AsyncMessageQueue<SdkMessage>();
     lastOptions = options;
     options?.abortController?.signal.addEventListener("abort", () => out.close());
     if (typeof prompt !== "string") {
@@ -368,6 +369,72 @@ describe("AgentRunner 生命周期", () => {
       agentCanvasPolicyPrompt("private-prompt-agent"),
       "new private rules",
       "先写测试",
+    ]);
+  });
+
+  it("branch switch prompt is injected once on the next business input", async () => {
+    const ctl = makeControllableQuery();
+    const runner = new AgentRunner("branch-switch-agent", { query: ctl.query });
+
+    runner.updateSettings(
+      {
+        branchWorkspaceId: "branch_2",
+        branch: "feature/a",
+        cwd: "/repo-feature-a",
+      },
+      {
+        id: "agent-canvas:branch-switch:main->feature/a",
+        name: "Agent Canvas branch 切换说明",
+        content: "从 main 切换到 feature/a\n- M src/app.ts",
+        kind: "shared",
+      },
+    );
+    runner.start({
+      ...(runner.snapshot().config ?? {}),
+      prompt: "after switch",
+    });
+    await flush();
+
+    expect(ctl.getOptions()?.cwd).toBe("/repo-feature-a");
+    expect(readablePromptContents(ctl.inputs[0])).toEqual([
+      agentCanvasPolicyPrompt("branch-switch-agent"),
+      "从 main 切换到 feature/a\n- M src/app.ts",
+    ]);
+  });
+
+  it("waiting_input branch switch resumes next send with the new cwd", async () => {
+    const ctl = makeControllableQuery();
+    const runner = new AgentRunner("branch-resume-agent", { query: ctl.query });
+
+    runner.start({ prompt: "first", branch: "main", cwd: "/repo-main" });
+    ctl.emit(SYSTEM_INIT);
+    ctl.emit(resultMsg());
+    await flush();
+    expect(runner.getStatus()).toBe("waiting_input");
+    expect(runner.snapshot().sessionId).toBe("s1");
+
+    runner.updateSettings(
+      {
+        branchWorkspaceId: "branch_2",
+        branch: "feature/a",
+        cwd: "/repo-feature-a",
+      },
+      {
+        id: "agent-canvas:branch-switch:main->feature/a",
+        name: "Agent Canvas branch 切换说明",
+        content: "从 main 切换到 feature/a",
+        kind: "shared",
+      },
+    );
+    expect(runner.getStatus()).toBe("waiting_input");
+
+    runner.send("after branch switch");
+    await flush();
+    expect(ctl.getOptions()?.cwd).toBe("/repo-feature-a");
+    expect(ctl.getOptions()?.resume).toBe("s1");
+    expect(readablePromptContents(ctl.inputs.at(-1))).toEqual([
+      agentCanvasPolicyPrompt("branch-resume-agent"),
+      "从 main 切换到 feature/a",
     ]);
   });
 

@@ -2,6 +2,7 @@ import type {
   AgentFileAccess,
   AgentEvent,
   AgentEventEnvelope,
+  AgentPromptReference,
   AgentSettings,
   AgentSnapshot,
   AgentStartConfig,
@@ -112,17 +113,25 @@ export class AgentManager {
     return this.runners.has(id) ? this.snapshotOf(id) : undefined;
   }
 
-  updateSettings(id: string, input: UpdateAgentSettingsInput): AgentSnapshot {
+  updateSettings(
+    id: string,
+    input: UpdateAgentSettingsInput,
+    options: { branchSwitchPrompt?: AgentPromptReference } = {},
+  ): AgentSnapshot {
     const runner = this.runners.get(id);
     if (!runner) throw new Error(`未知 agent: ${id}`);
+    const changesBranch = input.branchWorkspaceId !== undefined || input.branch !== undefined;
+    if (changesBranch && runner.getStatus() !== "idle" && runner.getStatus() !== "waiting_input") {
+      throw new Error("只有待输入或尚未启动的活跃 agent 可以切换 branch");
+    }
     const draft = this.draftConfigs.get(id) ?? {};
-    const next =
-      input.systemPrompt === undefined
-        ? draft
-        : { ...draft, systemPrompt: input.systemPrompt };
+    const next = {
+      ...draft,
+      ...definedSettings(input),
+    };
     this.draftConfigs.set(id, next);
-    if (input.systemPrompt !== undefined) {
-      runner.updateSettings({ systemPrompt: input.systemPrompt });
+    if (Object.keys(input).length > 0 || options.branchSwitchPrompt) {
+      runner.updateSettings(definedSettings(input), options.branchSwitchPrompt);
     }
     return this.snapshotOf(id);
   }
@@ -241,6 +250,16 @@ function normalizeSettings(
     scratchDirectory: settings.scratchDirectory,
     systemPrompt: settings.systemPrompt ?? "",
   };
+}
+
+function definedSettings(input: UpdateAgentSettingsInput): Partial<AgentStartConfig> {
+  const next: Partial<AgentStartConfig> = {};
+  if (input.systemPrompt !== undefined) next.systemPrompt = input.systemPrompt;
+  if (input.branchWorkspaceId !== undefined) next.branchWorkspaceId = input.branchWorkspaceId;
+  if (input.branch !== undefined) next.branch = input.branch;
+  if (input.cwd !== undefined) next.cwd = input.cwd;
+  if (input.scratchDirectory !== undefined) next.scratchDirectory = input.scratchDirectory;
+  return next;
 }
 
 function mergeDefined(

@@ -4,13 +4,17 @@ import type {
   AgentSettings,
   AgentSnapshot,
   AgentStartConfig,
+  BranchOption,
   BranchWorkspace,
+  CanvasProjectSummary,
   CanvasFileConnection,
   CanvasFileNode,
   CanvasPromptConnection,
   CanvasPromptNode,
+  ConnectGitHubInput,
   CreateBranchWorkspaceInput,
   CreateCanvasFileInput,
+  CreateCanvasProjectInput,
   CreateCanvasPromptInput,
   FileConnectionAccess,
   ForkOrigin,
@@ -39,9 +43,28 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   list: () => call<{ agents: AgentSnapshot[] }>("/agents").then((r) => r.agents),
   config: () => call<{ defaultCwd: string; projectRoot: string }>("/config"),
+  listCanvasProjects: () =>
+    call<{ projects: CanvasProjectSummary[] }>("/canvas-projects").then((r) => r.projects),
+  createCanvasProject: (input: CreateCanvasProjectInput) =>
+    call<{ project: CanvasProjectSummary; workspace: WorkspaceProject }>("/canvas-projects", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  openCanvasProject: (id: string) =>
+    call<{ workspace: WorkspaceProject }>("/canvas-projects/open", {
+      method: "POST",
+      body: JSON.stringify({ id }),
+    }).then((r) => r.workspace),
   workspace: () => call<WorkspaceProject>("/workspace"),
+  connectWorkspace: (input: ConnectGitHubInput) =>
+    call<WorkspaceProject>("/workspace/connect", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
   listBranches: () =>
     call<{ branches: BranchWorkspace[] }>("/workspace/branches").then((r) => r.branches),
+  listBranchOptions: () =>
+    call<{ branches: BranchOption[] }>("/workspace/branch-options").then((r) => r.branches),
   createBranch: (input: CreateBranchWorkspaceInput) =>
     call<{ branch: BranchWorkspace }>("/workspace/branches", {
       method: "POST",

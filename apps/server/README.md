@@ -45,9 +45,13 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 | 方法 路径 | 说明 |
 | --- | --- |
 | `GET /api/health` | 健康检查 |
+| `GET /api/canvas-projects` | 列出可打开的 canvas 项目 |
+| `POST /api/canvas-projects` | body=`{ name }`，新建并打开 canvas 项目 |
+| `POST /api/canvas-projects/open` | body=`{ id }`，打开已有 canvas 项目 |
 | `GET /api/workspace` | 当前 AppData 项目、GitHub/repo 连接、branch workspace 与共享资源快照 |
 | `POST /api/workspace/connect` | body=`{ remoteUrl?, localPath?, defaultBranch? }`，把 GitHub/本地 repo clone 到 AppData 项目目录 |
 | `GET /api/workspace/branches` | 列出 branch workspaces |
+| `GET /api/workspace/branch-options` | 列出远端 branch 与已创建 workspace 的合并选项，`hasWorkspace=false` 表示尚未拉取 |
 | `POST /api/workspace/branches` | body=`{ branch, baseBranch? }`，创建 branch workspace |
 | `GET /api/workspace/shared-resources` | 列出项目级共享资源 |
 | `POST /api/workspace/shared-resources` | body=`{ name, mountPath, access?, sourcePath? }`，创建共享资源并映射到所有 branch workspace |
@@ -120,8 +124,9 @@ npm run smoke --workspace apps/server
 
 ## GitHub / Branch Workspace / 三类文件
 
-- Agent Canvas 项目根默认位于用户本地数据目录 `agent_canvas/projects/<workspace-key>/`，可用 `AGENT_CANVAS_PROJECT_ROOT` 覆盖。默认 branch 使用 AppData 内的 clone，其他 branch 使用 `git worktree` 放在同一项目根下。
-- 新建 Agent 推荐传 `branchWorkspaceId`，后端据此把 `cwd` 解析为对应 branch workspace；旧的裸 `cwd` 仍保留兼容。
+- Agent Canvas 项目根默认位于用户本地数据目录 `agent_canvas/projects/<project-id>/`。正常启动先由前端选择或新建 canvas 项目，再手动连接 GitHub repo；`AGENT_CANVAS_PROJECT_ROOT` 仅用于测试/调试时覆盖并自动打开项目。
+- 连接 repo 只 clone 默认 branch，不会把远端所有 branch 全部拉成 worktree。新建 Agent 或切换 Agent branch 选中某个未创建 workspace 的 branch 时，后端才 fetch 该 branch 并创建专属 `git worktree`。
+- 新建 Agent 推荐传 `branchWorkspaceId` 或 `branch`；后端据此懒创建/解析为对应 branch workspace，并把 `cwd` 写成 worktree 路径。旧的裸 `cwd` 仅保留兼容。
 - 三类文件分开管理：仓库文件在各 branch workspace 中并默认需要 commit；共享资源真实目录在项目根的 `shared/` 中，通过 junction/symlink 映射进每个 branch；临时文件在 `<worktree>/.agent-tmp/<agent-id>/`，写入本地 git exclude。
 - 共享资源有 `readOnly/readWrite`。`readOnly` 只进入可读目录和上下文说明；`readWrite` 才加入 provider 可写目录。junction/symlink 不是跨平台强只读边界，因此内置工作区规则提示词也会要求 Agent 未经明确授权不得修改只读共享资源。
 
@@ -152,7 +157,7 @@ npm run smoke --workspace apps/server
 
 - 进程入口用 `AGENT_CANVAS_WORKSPACE_ROOT ?? INIT_CWD ?? process.cwd()` 解析默认源仓库目录；WorkspaceManager 会把实际 branch workspace 放到 AppData 项目根。`GET /api/config` 返回 `defaultCwd` 和 `projectRoot`。
 - `POST /api/agents` 支持 `provider/model/branchWorkspaceId/cwd/systemPrompt`。新工作流中 `branchWorkspaceId` 决定 `cwd`；`cwd` 只保留兼容和快照展示。fork 会复制父 Agent 的 provider、模型、branch/cwd 和私有系统提示词。
-- `PATCH /api/agents/:id/settings` 只允许更新 `systemPrompt`。已创建 Agent 的 provider、模型和 branch/workdir 不在该接口中变更。
+- `PATCH /api/agents/:id/settings` 可更新 `systemPrompt`，也可在 `idle` / `waiting_input` 状态切换到已有或新建 branch。切换后下一次业务输入会注入 branch 切换说明和 `git diff --name-status <old> <new>` 文件列表；`waiting_input` 下会脱开旧空闲会话，下次输入按新 `cwd` resume。
 - `systemPrompt` 是当前 Agent 私有提示词，不传给 Claude/Codex 原生 system prompt，而是在 `AgentRunner` 中按提示词节点同样的可读提示词机制拼接到业务输入。新 Agent 首轮、手动 compact 后、自动 compact 后、以及运行中更新设置后的下一条业务输入会重新注入。
 - Agent Canvas 内置工作区规则不属于用户可编辑的 `systemPrompt`，即使用户没有设置私有系统提示词也会注入；它约束共享文件默认只读、临时文件只写 `.agent-tmp/<agent-id>/`、其余非共享非临时修改都视为需要 commit 的仓库文件。
 - `POST /api/directories/pick` 通过本机目录选择器返回用户选中的目录；Windows 使用 PowerShell + `System.Windows.Forms.FolderBrowserDialog`，其他平台暂返回明确错误并允许前端继续手动输入路径。

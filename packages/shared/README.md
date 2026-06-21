@@ -43,11 +43,13 @@ npm test --workspace packages/shared        # vitest
 
 ## Agent 设置模型
 
-`src/events.ts` 定义 `AgentSettings`、`CreateAgentInput` 和 `UpdateAgentSettingsInput`。创建 Agent 可带 provider、模型、`branchWorkspaceId`/`cwd` 和私有系统提示词；新工作流中 branch workspace 决定实际工作目录，`cwd` 保留兼容与快照展示。更新已创建 Agent 时只允许调整私有系统提示词。`AgentStartConfig.systemPrompt` 只表示画布私有提示词，会按提示词节点方式拼接到业务输入中。
+`src/events.ts` 定义 `AgentSettings`、`CreateAgentInput` 和 `UpdateAgentSettingsInput`。创建 Agent 可带 provider、模型、`branchWorkspaceId`/`branch` 和私有系统提示词；新工作流中 branch workspace 决定实际工作目录，`cwd` 保留兼容与快照展示。更新已创建 Agent 时可调整私有系统提示词，并可在后端允许的活跃状态切换 branch。`AgentStartConfig.systemPrompt` 只表示画布私有提示词，会按提示词节点方式拼接到业务输入中。
 
 ## Workspace 模型
 
-`src/workspaces.ts` 定义 GitHub/repo 连接、`BranchWorkspace`、`SharedResourceMount` 和创建输入。三类文件约定为：仓库文件在 branch worktree 内并默认需要 commit；共享资源位于项目级共享目录并映射进各 branch；Agent 临时文件位于 `.agent-tmp/<agent-id>/` 且不提交。
+`src/workspaces.ts` 定义 canvas 项目索引、GitHub/repo 连接、`BranchOption`、`BranchWorkspace`、`SharedResourceMount` 和创建输入。三类文件约定为：仓库文件在 branch worktree 内并默认需要 commit；共享资源位于项目级共享目录并映射进各 branch；Agent 临时文件位于 `.agent-tmp/<agent-id>/` 且不提交。
+
+`BranchOption.hasWorkspace=false` 表示远端已有但本地尚未创建专属 worktree；后端在创建 Agent 或切换 Agent branch 时才懒创建该 workspace。
 
 `AgentFileAccess` 额外包含 `readableDirectories` 和 `sharedResources`。`readOnly` 共享资源只进入可读目录和上下文说明；`readWrite` 共享资源才加入 `writableDirectories`。
 

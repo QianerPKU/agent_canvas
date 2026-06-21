@@ -2,6 +2,7 @@ import type {
   AgentFileAccess,
   AgentEvent,
   AgentPromptAccess,
+  AgentPromptReference,
   AgentProvider,
   AgentStartConfig,
   AgentStatus,
@@ -67,7 +68,10 @@ export class AgentRunner {
   private compactPending = false;
   private promptInjectionPending = false;
   private policyPromptInjectionPending = false;
+  private pendingInjectedPrompts: AgentPromptReference[] = [];
   private pendingQueuedInputs: string[] = [];
+  private suppressAbortStatus = false;
+  private suppressNaturalEndStatus = false;
   private readonly createdAt: number;
 
   constructor(id: string, deps: AgentRunnerDeps) {
@@ -104,13 +108,34 @@ export class AgentRunner {
     };
   }
 
-  updateSettings(settings: Pick<AgentStartConfig, "systemPrompt">): void {
+  updateSettings(
+    settings: Partial<
+      Pick<
+        AgentStartConfig,
+        "systemPrompt" | "branchWorkspaceId" | "branch" | "cwd" | "scratchDirectory"
+      >
+    >,
+    pendingPrompt?: AgentPromptReference,
+  ): void {
     this.config = {
       ...(this.config ?? { prompt: "" }),
-      systemPrompt: settings.systemPrompt ?? "",
+      ...definedSettings(settings),
     };
-    if (this.status !== "idle") {
+    if (settings.systemPrompt !== undefined && this.status !== "idle") {
       this.promptInjectionPending = true;
+    }
+    if (pendingPrompt) {
+      this.pendingInjectedPrompts.push(pendingPrompt);
+      this.policyPromptInjectionPending = true;
+    }
+    if (
+      this.status === "waiting_input" &&
+      this.sessionId &&
+      (settings.branchWorkspaceId !== undefined ||
+        settings.branch !== undefined ||
+        settings.cwd !== undefined)
+    ) {
+      this.detachIdleSessionForNextStart();
     }
   }
 
@@ -164,6 +189,15 @@ export class AgentRunner {
 
   /** 运行中追加一条指令（流式输入干预）。 */
   send(text: string): void {
+    if (
+      this.status === "waiting_input" &&
+      (!this.inputQueue || this.inputQueue.isClosed) &&
+      this.config?.resume
+    ) {
+      this.status = "idle";
+      this.start({ ...this.config, prompt: text });
+      return;
+    }
     if (!this.inputQueue || this.inputQueue.isClosed || isTerminalStatus(this.status)) {
       throw new Error(`agent ${this.id} 当前不可接收输入（${this.status}）`);
     }
@@ -264,10 +298,18 @@ export class AgentRunner {
         }
       }
       // 迭代自然结束：若仍非终态，视为完成
+      if (this.suppressNaturalEndStatus) {
+        this.suppressNaturalEndStatus = false;
+        return;
+      }
       if (!isTerminalStatus(this.status)) {
         this.setStatus("done");
       }
     } catch (err) {
+      if (this.suppressAbortStatus) {
+        this.suppressAbortStatus = false;
+        return;
+      }
       if (this.abortController?.signal.aborted) {
         // 由 stop() 主动中止
         if (!isTerminalStatus(this.status)) this.setStatus("stopped");
@@ -376,6 +418,8 @@ export class AgentRunner {
       };
     const includeReadable = this.promptInjectionPending;
     const includePolicy = this.policyPromptInjectionPending || includeReadable;
+    const pendingPrompts = this.pendingInjectedPrompts;
+    this.pendingInjectedPrompts = [];
     this.promptInjectionPending = false;
     this.policyPromptInjectionPending = false;
     const next = includeReadable
@@ -384,7 +428,7 @@ export class AgentRunner {
           ...access,
           readablePrompts: [],
         };
-    if (!includeReadable && !includePolicy) return next;
+    if (!includeReadable && !includePolicy && pendingPrompts.length === 0) return next;
     const readablePrompts = [...next.readablePrompts];
     const systemPrompt = this.config?.systemPrompt?.trim();
     if (includeReadable && systemPrompt) {
@@ -394,6 +438,9 @@ export class AgentRunner {
         content: systemPrompt,
         kind: "normal",
       });
+    }
+    if (pendingPrompts.length > 0) {
+      readablePrompts.unshift(...pendingPrompts);
     }
     if (includePolicy) {
       readablePrompts.unshift({
@@ -417,10 +464,45 @@ export class AgentRunner {
       readablePrompts: [],
     };
   }
+
+  private detachIdleSessionForNextStart(): void {
+    const resume = this.sessionId;
+    this.inputQueue?.close();
+    this.inputQueue = undefined;
+    this.compactPending = false;
+    this.pendingQueuedInputs = [];
+    this.suppressAbortStatus = true;
+    this.suppressNaturalEndStatus = true;
+    this.abortController?.abort();
+    void this.handle?.terminate?.();
+    this.handle = undefined;
+    this.config = {
+      ...(this.config ?? { prompt: "" }),
+      resume,
+    };
+    this.setStatus("waiting_input");
+  }
 }
 
 function normalizeProvider(provider: AgentProvider | undefined): AgentProvider {
   return provider ?? "claude";
+}
+
+function definedSettings(
+  settings: Partial<
+    Pick<
+      AgentStartConfig,
+      "systemPrompt" | "branchWorkspaceId" | "branch" | "cwd" | "scratchDirectory"
+    >
+  >,
+): Partial<AgentStartConfig> {
+  const next: Partial<AgentStartConfig> = {};
+  for (const [key, value] of Object.entries(settings) as Array<
+    [keyof AgentStartConfig, AgentStartConfig[keyof AgentStartConfig]]
+  >) {
+    if (value !== undefined) next[key] = value as never;
+  }
+  return next;
 }
 
 function toUserInput(

@@ -4,16 +4,18 @@
 
 ## 目录布局
 
-默认项目根目录位于用户本地数据目录：
+项目索引和项目根目录位于用户本地数据目录。正常启动时不会自动打开或连接仓库，前端需要先选择已有项目或新建项目：
 
 ```text
-%LOCALAPPDATA%/agent_canvas/projects/<workspace-key>/
+%LOCALAPPDATA%/agent_canvas/projects/index.json
+%LOCALAPPDATA%/agent_canvas/projects/<project-id>/
+  workspace.json                 # 当前 repo/branch/shared resource 状态
   repos/<repo-id>/repo/          # 默认 branch 的 AppData clone
   worktrees/<repo-id>/<branch>/  # 其他 branch 的 git worktree
   shared/<repo-id>/<resource>/   # 项目级共享资源真实目录
 ```
 
-`AGENT_CANVAS_PROJECT_ROOT` 可覆盖项目根目录，主要用于测试或调试。
+`AGENT_CANVAS_PROJECT_ROOT` 可覆盖并自动打开项目根目录，主要用于测试或调试。
 
 ## 三类文件
 
@@ -23,9 +25,18 @@
 
 ## Git 与 GitHub
 
+- `GET/POST /api/canvas-projects` 管理 canvas 项目；`POST /api/canvas-projects/open` 打开已有项目。打开项目不会自动连接 GitHub repo。
 - `POST /api/workspace/connect` 使用远端 URL 或本地路径 clone 到 AppData 项目目录。
-- 默认 branch 直接使用 AppData clone；其他 branch 使用 `git worktree add -B <branch> <path> <baseBranch>`。
+- 默认 branch 直接使用 AppData clone；其他 branch 不会在连接时全部拉取。只有创建 Agent 或切换 Agent branch 选中了某个尚未创建 workspace 的 branch 时，才会 `fetch` 该 branch 并执行 `git worktree add -B <branch> <path> <startPoint>`。
+- `GET /api/workspace/branch-options` 会合并远端 branch 与已创建的本地 branch workspace；`hasWorkspace=false` 表示还没有专属 worktree。
 - GitHub 连接当前保存 remote URL、owner/repo 和默认 branch；PR/status 同步后续再加。
+
+## Agent Branch 切换
+
+- `PATCH /api/agents/:id/settings` 可以在 `idle` 或 `waiting_input` 状态切换 branch；`running`、`done`、`stopped`、`terminated`、`error` 不允许切换。
+- 切换到尚未创建 workspace 的 branch 时，会先懒创建对应 worktree。
+- 切换后下一次业务输入会注入一条 Agent Canvas 系统提示，说明从哪个 branch 切到哪个 branch，并附带 `git diff --name-status <old> <new>` 文件列表。
+- 如果 agent 正在 `waiting_input`，切换 branch 会脱开当前空闲会话；下一次输入会用新 branch 的 `cwd` 重新启动并 resume 原 session，避免在旧 worktree 的 CLI 进程里假装切换目录。
 
 ## 共享资源权限
 

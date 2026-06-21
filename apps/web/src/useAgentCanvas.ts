@@ -36,7 +36,13 @@ export interface AgentActions {
   /** 新建一个 agent（出现一个 idle 起始节点）。 */
   create: (settings: AgentSettings) => Promise<void>;
   /** 更新已创建 agent 的可变设置。 */
-  updateSettings: (agentId: string, settings: Pick<AgentSettings, "systemPrompt">) => Promise<void>;
+  updateSettings: (
+    agentId: string,
+    settings: Pick<
+      AgentSettings,
+      "systemPrompt" | "branchWorkspaceId" | "branch" | "cwd" | "scratchDirectory"
+    >,
+  ) => Promise<void>;
   /** 在末尾 idle 轮提交输入：首轮→start，续轮→send（自动判断）。 */
   submit: (agentId: string, text: string) => Promise<void>;
   /** 尽快引导当前正在运行的一轮。 */

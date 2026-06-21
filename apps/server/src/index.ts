@@ -20,6 +20,7 @@ const manager = new AgentManager({
 const workspaceManager = new WorkspaceManager({
   defaultSourcePath: WORKSPACE_ROOT,
   projectRoot: process.env.AGENT_CANVAS_PROJECT_ROOT,
+  autoOpenDefault: !!process.env.AGENT_CANVAS_PROJECT_ROOT,
 });
 const fileManager = new FileManager({
   workspaceRoot: WORKSPACE_ROOT,

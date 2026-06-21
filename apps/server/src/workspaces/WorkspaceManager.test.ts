@@ -6,6 +6,31 @@ import path from "node:path";
 import { WorkspaceManager, type GitRunner } from "./WorkspaceManager.js";
 
 describe("WorkspaceManager", () => {
+  it("creates and opens explicit canvas projects", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-projects-"));
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot: path.join(root, "projects"),
+        autoOpenDefault: false,
+        now: () => 456,
+      });
+
+      await expect(manager.project()).rejects.toThrow("尚未打开 canvas 项目");
+      const created = await manager.createCanvasProject({ name: "Demo Canvas" });
+      expect(created).toMatchObject({
+        name: "Demo Canvas",
+        projectRoot: path.join(root, "projects", "Demo-Canvas-co"),
+      });
+      expect(await manager.listCanvasProjects()).toEqual([created]);
+      const opened = await manager.openCanvasProject({ id: created.id });
+      expect(opened.canvasProject).toMatchObject({ id: created.id, name: "Demo Canvas" });
+      expect(opened.repo).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("connects a repo into app data, creates branch workspaces and maps shared resources", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-workspaces-"));
     const source = path.join(root, "source-repo");
@@ -15,6 +40,12 @@ describe("WorkspaceManager", () => {
     const runGit: GitRunner = async (args, options) => {
       if (args[0] === "remote") return "https://github.com/acme/demo.git";
       if (args[0] === "branch") return "main";
+      if (args[0] === "ls-remote") {
+        return [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/main",
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/heads/feature/remote",
+        ].join("\n");
+      }
       if (args[0] === "clone") {
         await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
         return "";
@@ -38,7 +69,10 @@ describe("WorkspaceManager", () => {
         now: () => 123,
       });
 
-      const project = await manager.project();
+      const disconnected = await manager.project();
+      expect(disconnected.repo).toBeUndefined();
+
+      const project = await manager.connect({ localPath: source });
       expect(project.projectRoot).toBe(projectRoot);
       expect(project.repo).toMatchObject({
         remoteUrl: "https://github.com/acme/demo.git",
@@ -53,6 +87,10 @@ describe("WorkspaceManager", () => {
         scratchRoot: path.join(projectRoot, "repos", "repo_1", "repo", ".agent-tmp"),
         isDefault: true,
       });
+      expect(await manager.listBranchOptions()).toEqual([
+        expect.objectContaining({ branch: "feature/remote", hasWorkspace: false }),
+        expect.objectContaining({ branch: "main", hasWorkspace: true }),
+      ]);
 
       const feature = await manager.createBranch({ branch: "feature/data" });
       expect(feature).toMatchObject({
@@ -60,6 +98,9 @@ describe("WorkspaceManager", () => {
         worktreePath: path.join(projectRoot, "worktrees", "repo_1", "feature-data"),
         isDefault: false,
       });
+      expect(await manager.listBranchOptions()).toContainEqual(
+        expect.objectContaining({ branch: "feature/data", hasWorkspace: true }),
+      );
 
       const dataset = await manager.createSharedResource({
         name: "dataset",

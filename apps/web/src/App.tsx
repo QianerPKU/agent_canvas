@@ -9,14 +9,17 @@ import {
   type Connection,
   type Edge,
 } from "@xyflow/react";
-import { FilePlus2, MessageSquarePlus, X } from "lucide-react";
+import { FilePlus2, FolderOpen, GitBranch, Link, MessageSquarePlus, Plus, X } from "lucide-react";
 import { api } from "./api.js";
 import type {
+  BranchOption,
   BranchWorkspace,
+  CanvasProjectSummary,
   CanvasFileConnection,
   CanvasFileNode,
   CanvasPromptConnection,
   CanvasPromptNode,
+  WorkspaceProject,
 } from "@agent-canvas/shared";
 import "@xyflow/react/dist/style.css";
 import { useAgentCanvas, type AgentActions, type FileActions } from "./useAgentCanvas.js";
@@ -324,23 +327,75 @@ export default function App(): React.ReactElement {
   const [creatingFile, setCreatingFile] = useState(false);
   const [creatingPrompt, setCreatingPrompt] = useState(false);
   const [agentSettingsTarget, setAgentSettingsTarget] = useState<AgentSettingsTarget>();
-  const [branches, setBranches] = useState<BranchWorkspace[]>([]);
+  const [projects, setProjects] = useState<CanvasProjectSummary[]>([]);
+  const [workspace, setWorkspace] = useState<WorkspaceProject>();
+  const [projectError, setProjectError] = useState<string>();
+  const [branches, setBranches] = useState<BranchOption[]>([]);
   const openFile = files.find((file) => file.id === openFileId);
   const settingsAgent =
     agentSettingsTarget?.mode === "edit" ? agents[agentSettingsTarget.agentId] : undefined;
 
   useEffect(() => {
     let cancelled = false;
-    void api.listBranches().then(
-      (nextBranches) => {
-        if (!cancelled) setBranches(nextBranches);
+    void api.listCanvasProjects().then(
+      (nextProjects) => {
+        if (!cancelled) setProjects(nextProjects);
       },
-      () => undefined,
+      (error) => {
+        if (!cancelled) setProjectError(error instanceof Error ? error.message : String(error));
+      },
     );
     return () => {
       cancelled = true;
     };
   }, []);
+
+  const refreshBranchOptions = useCallback(async () => {
+    const nextBranches = await api.listBranchOptions();
+    setBranches(nextBranches);
+    return nextBranches;
+  }, []);
+
+  const openProject = useCallback(
+    async (id: string) => {
+      setProjectError(undefined);
+      try {
+        const nextWorkspace = await api.openCanvasProject(id);
+        setWorkspace(nextWorkspace);
+        setProjects(await api.listCanvasProjects());
+        setBranches(nextWorkspace.repo ? await api.listBranchOptions() : []);
+      } catch (error) {
+        setProjectError(error instanceof Error ? error.message : String(error));
+      }
+    },
+    [],
+  );
+
+  const createProject = useCallback(async (name: string) => {
+    setProjectError(undefined);
+    try {
+      const { workspace: nextWorkspace } = await api.createCanvasProject({ name });
+      setWorkspace(nextWorkspace);
+      setProjects(await api.listCanvasProjects());
+      setBranches([]);
+    } catch (error) {
+      setProjectError(error instanceof Error ? error.message : String(error));
+    }
+  }, []);
+
+  const connectRepo = useCallback(
+    async (input: { remoteUrl: string; defaultBranch?: string }) => {
+      setProjectError(undefined);
+      try {
+        const nextWorkspace = await api.connectWorkspace(input);
+        setWorkspace(nextWorkspace);
+        await refreshBranchOptions();
+      } catch (error) {
+        setProjectError(error instanceof Error ? error.message : String(error));
+      }
+    },
+    [refreshBranchOptions],
+  );
 
   const openFileEditor = useCallback((fileId: string) => {
     setFileOpenError(undefined);
@@ -366,13 +421,9 @@ export default function App(): React.ReactElement {
 
   const createBranch = useCallback(async (branch: string) => {
     const created = await api.createBranch({ branch });
-    setBranches((current) =>
-      current.some((candidate) => candidate.id === created.id)
-        ? current
-        : [...current, created],
-    );
+    await refreshBranchOptions();
     return created;
-  }, []);
+  }, [refreshBranchOptions]);
 
   useEffect(() => {
     setNodes((current) =>
@@ -464,6 +515,30 @@ export default function App(): React.ReactElement {
     [fileActions, promptActions],
   );
 
+  if (!workspace) {
+    return (
+      <ProjectGate
+        connected={connected}
+        projects={projects}
+        error={projectError}
+        onOpen={openProject}
+        onCreate={createProject}
+      />
+    );
+  }
+
+  if (!workspace.repo) {
+    return (
+      <RepoConnectGate
+        connected={connected}
+        project={workspace.canvasProject}
+        projectRoot={workspace.projectRoot}
+        error={projectError}
+        onConnect={connectRepo}
+      />
+    );
+  }
+
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -472,7 +547,7 @@ export default function App(): React.ReactElement {
           {connected ? "● 已连接后端" : "● 未连接"}
         </span>
         <span className="app-header__hint">
-          节点代表一轮对话，资源连线控制当前 Agent 的读写权限
+          {workspace.canvasProject?.name ?? "未命名项目"} · {workspace.repo.remoteUrl}
         </span>
         <button
           className="header-button header-button--secondary"
@@ -531,6 +606,7 @@ export default function App(): React.ReactElement {
           onCreateBranch={createBranch}
           onCreate={async (settings) => {
             await actions.create(settings);
+            await refreshBranchOptions();
           }}
           onClose={() => setAgentSettingsTarget(undefined)}
         />
@@ -539,6 +615,11 @@ export default function App(): React.ReactElement {
         <AgentSettingsDialog
           mode="edit"
           agent={settingsAgent}
+          branches={branches}
+          canChangeBranch={
+            settingsAgent.status === "idle" || settingsAgent.status === "waiting_input"
+          }
+          onCreateBranch={createBranch}
           onUpdate={actions.updateSettings}
           onClose={() => setAgentSettingsTarget(undefined)}
         />
@@ -575,6 +656,156 @@ export default function App(): React.ReactElement {
           </button>
         </div>
       )}
+    </div>
+  );
+}
+
+function ProjectGate({
+  connected,
+  projects,
+  error,
+  onOpen,
+  onCreate,
+}: {
+  connected: boolean;
+  projects: CanvasProjectSummary[];
+  error?: string;
+  onOpen: (id: string) => Promise<void>;
+  onCreate: (name: string) => Promise<void>;
+}): React.ReactElement {
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const create = async () => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setBusy(true);
+    try {
+      await onCreate(trimmed);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="project-gate">
+      <header className="project-gate__header">
+        <strong>agent_canvas</strong>
+        <span className={connected ? "connection-state is-connected" : "connection-state"}>
+          {connected ? "● 已连接后端" : "● 未连接"}
+        </span>
+      </header>
+      <main className="project-gate__panel">
+        <section className="project-gate__section">
+          <h1>打开 Canvas 项目</h1>
+          <div className="project-list">
+            {projects.map((project) => (
+              <button
+                key={project.id}
+                className="project-row"
+                onClick={() => void onOpen(project.id)}
+              >
+                <FolderOpen size={18} />
+                <span>
+                  <strong>{project.name}</strong>
+                  <small>{project.projectRoot}</small>
+                </span>
+              </button>
+            ))}
+            {projects.length === 0 && <p className="project-empty">暂无项目</p>}
+          </div>
+        </section>
+        <section className="project-gate__section">
+          <h2>新建 Canvas 项目</h2>
+          <div className="project-create">
+            <input
+              aria-label="Canvas 项目名称"
+              value={name}
+              placeholder="项目名称"
+              onChange={(event) => setName(event.target.value)}
+            />
+            <button disabled={busy || !name.trim()} onClick={() => void create()}>
+              <Plus size={16} />
+              新建
+            </button>
+          </div>
+        </section>
+        {error && <div className="file-dialog__error">{error}</div>}
+      </main>
+    </div>
+  );
+}
+
+function RepoConnectGate({
+  connected,
+  project,
+  projectRoot,
+  error,
+  onConnect,
+}: {
+  connected: boolean;
+  project?: CanvasProjectSummary;
+  projectRoot: string;
+  error?: string;
+  onConnect: (input: { remoteUrl: string; defaultBranch?: string }) => Promise<void>;
+}): React.ReactElement {
+  const [remoteUrl, setRemoteUrl] = useState("");
+  const [defaultBranch, setDefaultBranch] = useState("main");
+  const [busy, setBusy] = useState(false);
+  const connect = async () => {
+    const trimmed = remoteUrl.trim();
+    if (!trimmed) return;
+    setBusy(true);
+    try {
+      await onConnect({
+        remoteUrl: trimmed,
+        defaultBranch: defaultBranch.trim() || undefined,
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="project-gate">
+      <header className="project-gate__header">
+        <strong>agent_canvas</strong>
+        <span className={connected ? "connection-state is-connected" : "connection-state"}>
+          {connected ? "● 已连接后端" : "● 未连接"}
+        </span>
+      </header>
+      <main className="project-gate__panel project-gate__panel--narrow">
+        <section className="project-gate__section">
+          <h1>{project?.name ?? "Canvas 项目"}</h1>
+          <p className="project-path">{projectRoot}</p>
+        </section>
+        <section className="project-gate__section">
+          <h2>连接 GitHub Repo</h2>
+          <label className="file-dialog__field">
+            <span>Repo URL</span>
+            <input
+              aria-label="GitHub repo URL"
+              value={remoteUrl}
+              placeholder="git@github.com:OWNER/REPO.git"
+              onChange={(event) => setRemoteUrl(event.target.value)}
+            />
+          </label>
+          <label className="file-dialog__field">
+            <span>默认 branch</span>
+            <input
+              aria-label="默认 branch"
+              value={defaultBranch}
+              onChange={(event) => setDefaultBranch(event.target.value)}
+            />
+          </label>
+          <button
+            className="project-connect-button"
+            disabled={busy || !remoteUrl.trim()}
+            onClick={() => void connect()}
+          >
+            <Link size={16} />
+            连接
+          </button>
+        </section>
+        {error && <div className="file-dialog__error">{error}</div>}
+      </main>
     </div>
   );
 }

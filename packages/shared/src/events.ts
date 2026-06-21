@@ -57,8 +57,12 @@ export interface AgentSettings {
 export interface CreateAgentInput extends AgentSettings {}
 
 export interface UpdateAgentSettingsInput {
-  /** 已创建 agent 只允许调整私有系统提示词。 */
+  /** 已创建 agent 可调整私有系统提示词；branch 只允许在当前最新活跃对话上切换。 */
   systemPrompt?: string;
+  branchWorkspaceId?: string;
+  branch?: string;
+  cwd?: string;
+  scratchDirectory?: string;
 }
 
 /** token 使用量（来自 SDK result.usage）。 */

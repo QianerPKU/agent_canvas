@@ -6,6 +6,7 @@ import {
   isCodexModel,
   type AgentProvider,
   type AgentSettings,
+  type BranchOption,
   type BranchWorkspace,
   type CodexModel,
 } from "@agent-canvas/shared";
@@ -14,7 +15,7 @@ import type { AgentView } from "../agentStore.js";
 type AgentSettingsDialogProps =
   | {
       mode: "create";
-      branches: BranchWorkspace[];
+      branches: BranchOption[];
       onCreate: (settings: AgentSettings) => Promise<void>;
       onCreateBranch: (branch: string) => Promise<BranchWorkspace>;
       onClose: () => void;
@@ -22,7 +23,13 @@ type AgentSettingsDialogProps =
   | {
       mode: "edit";
       agent: AgentView;
-      onUpdate: (agentId: string, settings: Pick<AgentSettings, "systemPrompt">) => Promise<void>;
+      branches: BranchOption[];
+      canChangeBranch: boolean;
+      onCreateBranch: (branch: string) => Promise<BranchWorkspace>;
+      onUpdate: (
+        agentId: string,
+        settings: Pick<AgentSettings, "systemPrompt" | "branchWorkspaceId" | "branch" | "cwd">,
+      ) => Promise<void>;
       onClose: () => void;
     };
 
@@ -31,33 +38,33 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
   const agent = props.mode === "edit" ? props.agent : undefined;
   const [provider, setProvider] = useState<AgentProvider>(agent?.provider ?? "claude");
   const [model, setModel] = useState<CodexModel>(codexModel(agent?.model));
-  const [branchWorkspaceId, setBranchWorkspaceId] = useState(
-    agent?.branchWorkspaceId ?? (props.mode === "create" ? props.branches[0]?.id ?? "" : ""),
+  const [branchName, setBranchName] = useState(
+    agent?.branch ?? (props.mode === "create" ? props.branches[0]?.branch ?? "" : ""),
   );
-  const [extraBranches, setExtraBranches] = useState<BranchWorkspace[]>([]);
+  const [extraBranches, setExtraBranches] = useState<BranchOption[]>([]);
   const [newBranch, setNewBranch] = useState("");
   const [systemPrompt, setSystemPrompt] = useState(agent?.systemPrompt ?? "");
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [creatingBranch, setCreatingBranch] = useState(false);
-  const branches =
-    props.mode === "create" ? [...props.branches, ...extraBranches] : [];
-  const selectedBranch = branches.find((branch) => branch.id === branchWorkspaceId);
+  const canChangeBranch = props.mode === "create" || props.canChangeBranch;
+  const branches = [...props.branches, ...extraBranches];
+  const selectedBranch = branches.find((branch) => branch.branch === branchName);
 
   useEffect(() => {
     if (!isCreate && agent) {
       setProvider(agent.provider ?? "claude");
       setModel(codexModel(agent.model));
-      setBranchWorkspaceId(agent.branchWorkspaceId ?? "");
+      setBranchName(agent.branch ?? "");
       setSystemPrompt(agent.systemPrompt ?? "");
     }
   }, [agent, isCreate]);
 
   useEffect(() => {
-    if (props.mode === "create" && !branchWorkspaceId && props.branches[0]) {
-      setBranchWorkspaceId(props.branches[0].id);
+    if (props.mode === "create" && !branchName && props.branches[0]) {
+      setBranchName(props.branches[0].branch);
     }
-  }, [branchWorkspaceId, props]);
+  }, [branchName, props]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -76,13 +83,22 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
         await props.onCreate({
           provider,
           model: provider === "codex" ? model : undefined,
-          branchWorkspaceId,
+          branchWorkspaceId: selectedBranch?.branchWorkspaceId,
           branch: selectedBranch?.branch,
           cwd: selectedBranch?.worktreePath,
           systemPrompt,
         });
       } else {
-        await props.onUpdate(props.agent.id, { systemPrompt });
+        await props.onUpdate(props.agent.id, {
+          systemPrompt,
+          ...(canChangeBranch
+            ? {
+                branchWorkspaceId: selectedBranch?.branchWorkspaceId,
+                branch: selectedBranch?.branch ?? branchName,
+                cwd: selectedBranch?.worktreePath,
+              }
+            : {}),
+        });
       }
       props.onClose();
     } catch (reason) {
@@ -94,17 +110,24 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
 
   const createBranch = async () => {
     const branch = newBranch.trim();
-    if (!branch || props.mode !== "create") return;
+    if (!branch || !canChangeBranch) return;
     setCreatingBranch(true);
     setError("");
     try {
       const created = await props.onCreateBranch(branch);
+      const option: BranchOption = {
+        branch: created.branch,
+        branchWorkspaceId: created.id,
+        worktreePath: created.worktreePath,
+        hasWorkspace: true,
+        isDefault: created.isDefault,
+      };
       setExtraBranches((current) =>
-        current.some((candidate) => candidate.id === created.id)
+        current.some((candidate) => candidate.branch === option.branch)
           ? current
-          : [...current, created],
+          : [...current, option],
       );
-      setBranchWorkspaceId(created.id);
+      setBranchName(option.branch);
       setNewBranch("");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -159,53 +182,45 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
           </label>
         )}
 
-        {isCreate ? (
-          <fieldset>
-            <legend>Branch</legend>
+        <fieldset>
+          <legend>Branch</legend>
+          <div className="file-dialog__path">
             <select
               aria-label="Agent branch"
-              value={branchWorkspaceId}
-              onChange={(event) => setBranchWorkspaceId(event.target.value)}
+              value={branchName}
+              disabled={!canChangeBranch}
+              onChange={(event) => setBranchName(event.target.value)}
             >
               {branches.map((branch) => (
-                <option key={branch.id} value={branch.id}>
+                <option key={branch.branch} value={branch.branch}>
                   {branch.branch}
+                  {branch.hasWorkspace ? "" : "（未拉取）"}
                 </option>
               ))}
             </select>
-            <div className="agent-dialog__branch-create">
-              <input
-                aria-label="新建 branch"
-                value={newBranch}
-                placeholder="feature/name"
-                onChange={(event) => setNewBranch(event.target.value)}
-              />
-              <button
-                type="button"
-                className="icon-button"
-                title="创建 branch"
-                disabled={creatingBranch || !newBranch.trim()}
-                onClick={() => void createBranch()}
-              >
-                <Plus size={15} />
-              </button>
-            </div>
-          </fieldset>
-        ) : (
-          <label className="file-dialog__field">
-            <span>Branch</span>
-            <div className="file-dialog__path">
-              <input
-                aria-label="Agent branch"
-                value={agent?.branch ?? agent?.cwd ?? ""}
-                readOnly
-              />
-              <span className="agent-dialog__branch-icon">
-                <GitBranch size={15} />
-              </span>
-            </div>
-          </label>
-        )}
+            <span className="agent-dialog__branch-icon">
+              <GitBranch size={15} />
+            </span>
+          </div>
+          <div className="agent-dialog__branch-create">
+            <input
+              aria-label="新建 branch"
+              value={newBranch}
+              placeholder="feature/name"
+              disabled={!canChangeBranch}
+              onChange={(event) => setNewBranch(event.target.value)}
+            />
+            <button
+              type="button"
+              className="icon-button"
+              title="创建 branch"
+              disabled={creatingBranch || !newBranch.trim() || !canChangeBranch}
+              onClick={() => void createBranch()}
+            >
+              <Plus size={15} />
+            </button>
+          </div>
+        </fieldset>
 
         <label className="file-dialog__field">
           <span>私有系统提示词</span>
@@ -226,7 +241,7 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
           <button
             type="submit"
             className="file-dialog__primary"
-            disabled={submitting || (isCreate && !branchWorkspaceId)}
+            disabled={submitting || (isCreate && !branchName)}
           >
             {isCreate ? "创建" : "保存"}
           </button>

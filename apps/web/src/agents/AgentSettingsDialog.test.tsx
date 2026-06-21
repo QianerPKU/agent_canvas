@@ -9,13 +9,11 @@ afterEach(cleanup);
 describe("AgentSettingsDialog", () => {
   const branches = [
     {
-      id: "branch_1",
-      repoId: "repo_1",
       branch: "main",
+      branchWorkspaceId: "branch_1",
       worktreePath: "E:\\project\\repo",
-      scratchRoot: "E:\\project\\repo\\.agent-tmp",
+      hasWorkspace: true,
       isDefault: true,
-      createdAt: 1,
     },
   ];
 
@@ -104,12 +102,15 @@ describe("AgentSettingsDialog", () => {
       <AgentSettingsDialog
         mode="edit"
         agent={agent}
+        branches={branches}
+        canChangeBranch={false}
+        onCreateBranch={vi.fn()}
         onUpdate={onUpdate}
         onClose={vi.fn()}
       />,
     );
 
-    expect((screen.getByLabelText("Agent branch") as HTMLInputElement).readOnly).toBe(true);
+    expect((screen.getByLabelText("Agent branch") as HTMLSelectElement).disabled).toBe(true);
     fireEvent.change(screen.getByLabelText("Agent 私有系统提示词"), {
       target: { value: "new prompt" },
     });
@@ -118,6 +119,52 @@ describe("AgentSettingsDialog", () => {
     await waitFor(() =>
       expect(onUpdate).toHaveBeenCalledWith("agent_1", {
         systemPrompt: "new prompt",
+      }),
+    );
+  });
+
+  it("编辑活跃 Agent 时可以切换到已有 branch", async () => {
+    const onUpdate = vi.fn().mockResolvedValue(undefined);
+    const agent = newAgentView("agent_1", {
+      provider: "claude",
+      branchWorkspaceId: "branch_1",
+      branch: "main",
+      cwd: "E:\\repo",
+      systemPrompt: "old",
+      status: "waiting_input",
+    });
+    render(
+      <AgentSettingsDialog
+        mode="edit"
+        agent={agent}
+        branches={[
+          ...branches,
+          {
+            branch: "feature/a",
+            branchWorkspaceId: "branch_2",
+            worktreePath: "E:\\project\\feature-a",
+            hasWorkspace: true,
+            isDefault: false,
+          },
+        ]}
+        canChangeBranch
+        onCreateBranch={vi.fn()}
+        onUpdate={onUpdate}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Agent branch"), {
+      target: { value: "feature/a" },
+    });
+    fireEvent.click(screen.getByText("保存"));
+
+    await waitFor(() =>
+      expect(onUpdate).toHaveBeenCalledWith("agent_1", {
+        systemPrompt: "old",
+        branchWorkspaceId: "branch_2",
+        branch: "feature/a",
+        cwd: "E:\\project\\feature-a",
       }),
     );
   });

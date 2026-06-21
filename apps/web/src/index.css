@@ -75,6 +75,116 @@ body {
   background: #fff;
 }
 
+.project-gate {
+  width: 100vw;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: #f3f4f6;
+}
+
+.project-gate__header {
+  min-height: 54px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px;
+  border-bottom: 1px solid #d8dee8;
+  background: #fff;
+}
+
+.project-gate__panel {
+  width: min(920px, calc(100vw - 32px));
+  margin: 28px auto;
+  display: grid;
+  gap: 18px;
+}
+
+.project-gate__panel--narrow {
+  width: min(620px, calc(100vw - 32px));
+}
+
+.project-gate__section {
+  display: grid;
+  gap: 12px;
+}
+
+.project-gate__section h1,
+.project-gate__section h2 {
+  margin: 0;
+  color: #111827;
+  font-size: 18px;
+  line-height: 1.3;
+}
+
+.project-gate__section h2 {
+  font-size: 14px;
+}
+
+.project-list {
+  display: grid;
+  gap: 8px;
+}
+
+.project-row {
+  min-height: 56px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 1px solid #d8dee8;
+  border-radius: 6px;
+  color: #111827;
+  background: #fff;
+  cursor: pointer;
+  text-align: left;
+}
+
+.project-row span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.project-row small,
+.project-path,
+.project-empty {
+  margin: 0;
+  color: #64748b;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.project-create {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.project-create input,
+.project-gate input {
+  min-height: 34px;
+  padding: 6px 9px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font: inherit;
+}
+
+.project-create button,
+.project-connect-button {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px solid #1d4ed8;
+  border-radius: 6px;
+  color: #fff;
+  background: #2563eb;
+  cursor: pointer;
+}
+
 .canvas-wrap {
   flex: 1;
   min-height: 0;

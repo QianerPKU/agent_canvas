@@ -51,7 +51,7 @@ npm run dev --workspace apps/server     # 终端 1：后端 :4317
 npm run dev --workspace apps/web        # 终端 2：前端 :5317
 ```
 
-打开 http://localhost:5317 → 顶栏「＋ 新建 agent」→ 节点里输入任务 → ▶ 启动 → 实时看输出，可停止、排队下一轮或引导当前轮。
+打开 http://localhost:5317 → 选择/新建 canvas 项目 → 连接 GitHub repo → 顶栏「＋ 新建 Agent」→ 节点里输入任务 → ▶ 启动 → 实时看输出，可停止、排队下一轮或引导当前轮。
 
 ## 测试（CLAUDE.md 原则 #1）
 
@@ -75,8 +75,9 @@ npm test --workspace apps/web
 
 ## Agent 设置
 
-- 顶栏“新建 Agent”先打开设置窗口，再创建空闲 Agent。窗口中可选择 Claude Code/Codex、Codex 模型、branch workspace 和当前 Agent 私有系统提示词。
-- Branch 列表来自后端 `GET /api/workspace/branches`，弹窗里可创建新 branch。Agent 不再手动选择工作目录，实际 `cwd` 由后端根据 `branchWorkspaceId` 解析。
-- 已创建 Agent 的最新节点头部显示齿轮按钮，打开后只允许修改私有系统提示词；provider、模型和 branch 保持锁定。
+- 顶栏“新建 Agent”先打开设置窗口，再创建空闲 Agent。窗口中可选择 Claude Code/Codex、Codex 模型、branch 和当前 Agent 私有系统提示词。
+- Branch 列表来自后端 `GET /api/workspace/branch-options`，会展示远端已有但尚未创建 worktree 的 branch；选择这类 branch 创建 Agent 时，后端才 fetch 并创建专属 workspace。弹窗里也可新建 branch。
+- 已创建 Agent 的最新节点头部显示齿轮按钮，打开后可修改私有系统提示词；当 Agent 处于 `idle` 或 `waiting_input` 时也可切换 branch。切换后的下一次对话由后端注入 branch 切换说明和 diff 文件列表。
+- `terminated` 和历史轮次不能切换 branch；运行中或已结束状态的 branch 控件禁用。
 - 首轮对话节点不再提供 provider/model 选择，启动时直接使用 Agent 创建时保存的设置。
 - 新建文件节点固定放在隔离目录；项目内需要 commit 的文件应由 Agent 在所选 branch workspace 中直接创建。

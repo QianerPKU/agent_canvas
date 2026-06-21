@@ -92,6 +92,7 @@ describe("HTTP server", () => {
       projectRoot,
       runGit,
     });
+    await workspaceManager.connect({ localPath: root });
     const fileManager = new FileManager({
       workspaceRoot: root,
       isolatedRoot: path.join(root, "isolated"),
@@ -171,6 +172,31 @@ describe("HTTP server", () => {
     });
   });
 
+  it("updates an idle agent to another branch workspace", async () => {
+    const feature = await request(port, "POST", "/api/workspace/branches", {
+      branch: "feature/settings-switch",
+    });
+    expect(feature.status).toBe(201);
+
+    const created = await request(port, "POST", "/api/agents", {
+      branch: "main",
+      systemPrompt: "switchable",
+    });
+    expect(created.status).toBe(201);
+
+    const updated = await request(port, "PATCH", `/api/agents/${created.json.id}/settings`, {
+      branchWorkspaceId: feature.json.branch.id,
+      systemPrompt: "switchable",
+    });
+    expect(updated.status).toBe(200);
+    expect(updated.json.config).toMatchObject({
+      branchWorkspaceId: feature.json.branch.id,
+      branch: "feature/settings-switch",
+      cwd: feature.json.branch.worktreePath,
+      systemPrompt: "switchable",
+    });
+  });
+
   it("POST /api/agents 新建，GET /api/agents 能列出", async () => {
     const created = await request(port, "POST", "/api/agents");
     expect(created.status).toBe(201);
@@ -197,7 +223,7 @@ describe("HTTP server", () => {
     expect(snapshot.config).toMatchObject({
       provider: "codex",
       model: "gpt-5.4-mini",
-      cwd: path.join(root, "agent-work"),
+      cwd: path.join(projectRoot, "repos", "repo_1", "repo"),
       systemPrompt: "private rules",
     });
 
@@ -206,7 +232,7 @@ describe("HTTP server", () => {
     });
     expect(updated.status).toBe(200);
     expect(updated.json.config.systemPrompt).toBe("updated private rules");
-    expect(updated.json.config.cwd).toBe(path.join(root, "agent-work"));
+    expect(updated.json.config.cwd).toBe(path.join(projectRoot, "repos", "repo_1", "repo"));
   });
 
   it("对未知 agent start → 404", async () => {

@@ -2,14 +2,18 @@ import http from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import type {
   AgentFileAccess,
+  AgentPromptReference,
   AgentSettings,
   AgentStartConfig,
+  BranchDiffSummary,
   ConnectGitHubInput,
   CreateBranchWorkspaceInput,
   CreateAgentInput,
+  CreateCanvasProjectInput,
   CreateCanvasFileInput,
   CreateCanvasPromptInput,
   CreateSharedResourceInput,
+  OpenCanvasProjectInput,
   ServerFrame,
   UpdateAgentSettingsInput,
   UpdateCanvasFileInput,
@@ -130,6 +134,31 @@ async function handleHttp(
     return sendJson(res, 200, { defaultCwd, projectRoot: workspaceManager.root() });
   }
 
+  if (method === "GET" && path === "/api/canvas-projects") {
+    return sendJson(res, 200, { projects: await workspaceManager.listCanvasProjects() });
+  }
+
+  if (method === "POST" && path === "/api/canvas-projects") {
+    const body = await readJson<CreateCanvasProjectInput>(req);
+    if (!body?.name) return sendJson(res, 400, { error: "缺少项目名称" });
+    try {
+      const project = await workspaceManager.createCanvasProject(body);
+      return sendJson(res, 201, { project, workspace: await workspaceManager.project() });
+    } catch (error) {
+      return sendJson(res, 400, { error: errMsg(error) });
+    }
+  }
+
+  if (method === "POST" && path === "/api/canvas-projects/open") {
+    const body = await readJson<OpenCanvasProjectInput>(req);
+    if (!body?.id) return sendJson(res, 400, { error: "缺少项目 id" });
+    try {
+      return sendJson(res, 200, { workspace: await workspaceManager.openCanvasProject(body) });
+    } catch (error) {
+      return sendJson(res, 404, { error: errMsg(error) });
+    }
+  }
+
   if (method === "GET" && path === "/api/workspace") {
     try {
       return sendJson(res, 200, await workspaceManager.project());
@@ -150,6 +179,14 @@ async function handleHttp(
   if (method === "GET" && path === "/api/workspace/branches") {
     try {
       return sendJson(res, 200, { branches: await workspaceManager.listBranches() });
+    } catch (error) {
+      return sendJson(res, 409, { error: errMsg(error) });
+    }
+  }
+
+  if (method === "GET" && path === "/api/workspace/branch-options") {
+    try {
+      return sendJson(res, 200, { branches: await workspaceManager.listBranchOptions() });
     } catch (error) {
       return sendJson(res, 409, { error: errMsg(error) });
     }
@@ -206,13 +243,16 @@ async function handleHttp(
 
   if (method === "POST" && path === "/api/agents") {
     const body = await readJson<CreateAgentInput>(req);
-    if (body?.branchWorkspaceId) await workspaceManager.project();
-    const settings = normalizeAgentSettings(
-      body?.branchWorkspaceId ? workspaceManager.resolveAgentSettings(body) : body,
-      defaultCwd,
-    );
-    const runner = manager.create(settings);
-    return sendJson(res, 201, { id: runner.id });
+    try {
+      const settings = normalizeAgentSettings(
+        await resolveAgentWorkspaceSettings(workspaceManager, body, defaultCwd, true),
+        defaultCwd,
+      );
+      const runner = manager.create(settings);
+      return sendJson(res, 201, { id: runner.id });
+    } catch (error) {
+      return sendJson(res, 400, { error: errMsg(error) });
+    }
   }
 
   if (method === "GET" && path === "/api/files") {
@@ -413,7 +453,27 @@ async function handleHttp(
     if (method === "PATCH" && action === "settings") {
       const body = await readJson<UpdateAgentSettingsInput>(req);
       try {
-        return sendJson(res, 200, manager.updateSettings(id, body ?? {}));
+        const currentConfig = manager.configOf(id);
+        const branchChanged =
+          body?.branchWorkspaceId !== undefined || body?.branch !== undefined;
+        const settings = branchChanged
+          ? await resolveAgentWorkspaceSettings(
+              workspaceManager,
+              { ...currentConfig, ...(body ?? {}) },
+              defaultCwd,
+              true,
+            )
+          : body ?? {};
+        const diff = branchChanged
+          ? await workspaceManager.diffBetweenBranches(currentConfig?.branch, settings.branch)
+          : undefined;
+        return sendJson(
+          res,
+          200,
+          manager.updateSettings(id, settings, {
+            branchSwitchPrompt: branchChanged ? branchSwitchPrompt(diff) : undefined,
+          }),
+        );
       } catch (error) {
         return sendJson(res, 400, { error: errMsg(error) });
       }
@@ -522,6 +582,59 @@ function send(ws: WebSocket, frame: ServerFrame): void {
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+async function resolveAgentWorkspaceSettings<T extends AgentSettings>(
+  workspaceManager: WorkspaceManager,
+  input: T | undefined,
+  defaultCwd: string,
+  requireWorkspace: boolean,
+): Promise<T> {
+  const settings = { ...(input ?? {}) } as T;
+  if (requireWorkspace || settings.branchWorkspaceId || settings.branch) {
+    await workspaceManager.project();
+  }
+  let workspace =
+    settings.branchWorkspaceId ? workspaceManager.branchOf(settings.branchWorkspaceId) : undefined;
+  if (!workspace && settings.branch) {
+    workspace = await workspaceManager.createBranch({ branch: settings.branch });
+  }
+  if (!workspace && requireWorkspace) {
+    workspace = workspaceManager.defaultBranch();
+  }
+  if (!workspace && requireWorkspace) {
+    throw new Error("请先打开 canvas 项目并连接 GitHub repo");
+  }
+  if (!workspace) {
+    return {
+      ...settings,
+      cwd: settings.cwd?.trim() || defaultCwd,
+    };
+  }
+  return {
+    ...settings,
+    branchWorkspaceId: workspace.id,
+    branch: workspace.branch,
+    cwd: workspace.worktreePath,
+  };
+}
+
+function branchSwitchPrompt(diff: BranchDiffSummary | undefined): AgentPromptReference | undefined {
+  if (!diff) return undefined;
+  const files =
+    diff.files.length === 0
+      ? "- 无文件差异"
+      : diff.files.map((file) => `- ${file.status} ${file.path}`).join("\n");
+  return {
+    id: `agent-canvas:branch-switch:${diff.fromBranch}->${diff.toBranch}`,
+    name: "Agent Canvas branch 切换说明",
+    kind: "shared",
+    content:
+      `Agent Canvas 已将你的工作 branch 从 \`${diff.fromBranch}\` 切换到 \`${diff.toBranch}\`。\n` +
+      "下一次对话必须以新的 branch workspace 为准，不要继续在旧 branch 目录中工作。\n\n" +
+      "两个 branch 当前的 git diff 文件列表（name-status）：\n" +
+      files,
+  };
 }
 
 function normalizeAgentSettings(
