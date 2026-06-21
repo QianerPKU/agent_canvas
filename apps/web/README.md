@@ -19,6 +19,7 @@
 | `src/useAgentCanvas.ts` | React hook：订阅 `/ws`、折叠出 `agents` 表、暴露动作（create/submit/steer/stop/compact/terminate/fork）、断线自动重连 |
 | `src/nodes/TurnNode.tsx` | 自定义节点（一轮）：状态徽标 + provider/model 选择 + 输出滚动区；支持边缘缩放、最小化/恢复，最新节点提供运行中排队/引导、Compact/Terminate |
 | `src/history/` | 点击节点后打开的累计历史窗口；按目标轮截断并展示用户输入、provider 思考、答复、完整工具调用/结果与状态 |
+| `src/pullRequests/` | PR 流程面板：发起审查、展示流程状态，并兜底登记 PR 已创建/已合并 |
 | `src/App.tsx` | 画布装配：对话树布局（每 agent 一列、轮次向下、fork 另起列对齐锚点轮）+ 轮链边 + fork 边 |
 
 ## 数据流
@@ -32,6 +33,7 @@
 ```
 
 - **命令走 REST，事件走 WS**，单向清晰。`submit` 自动判断首轮 start / 续轮 send；运行中 submit 默认排队到下一轮，`steer` 按钮引导当前 in-flight turn。
+- PR 流程也走同一套 REST + WS：`useAgentCanvas` 读取 `hello.prFlows` 并监听 `pr_flow` 帧；顶栏 PR 面板调用 `/api/pr-flows` 发起流程。具体 `git`/`gh`/冲突处理仍由提 PR 的 agent 自己执行。
 - 新建 / fork 后后端不发事件，前端**乐观插入**节点（fork 带 `forkOrigin` 以画连线）。
 - Codex 的 `agentMessage` 流式 delta 按消息 UUID 合并到同一输出段落，避免每个小片段被渲染成独立短行。
 - 每个 agent 的最新运行节点显示输入框：`排队` 会把提示词排到当前轮 result 后执行，`引导` 会尽快追加到当前运行轮，`停止` 保留中止能力。

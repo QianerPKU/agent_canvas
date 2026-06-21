@@ -14,6 +14,8 @@ import type {
   CreateCanvasPromptInput,
   CreateSharedResourceInput,
   OpenCanvasProjectInput,
+  PullRequestCreatedInput,
+  CreatePullRequestFlowInput,
   ServerFrame,
   UpdateAgentSettingsInput,
   UpdateCanvasFileInput,
@@ -24,6 +26,7 @@ import { pickDirectory as defaultPickDirectory, type PickDirectory } from "./fil
 import { FileManager } from "./files/FileManager.js";
 import { openFileInVscode } from "./files/VscodeFileOpener.js";
 import { PromptManager } from "./prompts/PromptManager.js";
+import { PullRequestFlowManager } from "./pullRequests/PullRequestFlowManager.js";
 import { WorkspaceManager } from "./workspaces/WorkspaceManager.js";
 
 export interface CreateServerResult {
@@ -33,6 +36,7 @@ export interface CreateServerResult {
   fileManager: FileManager;
   promptManager: PromptManager;
   workspaceManager: WorkspaceManager;
+  pullRequestFlowManager: PullRequestFlowManager;
 }
 
 export interface CreateServerOptions {
@@ -41,6 +45,7 @@ export interface CreateServerOptions {
   pickDirectory?: PickDirectory;
   promptManager?: PromptManager;
   workspaceManager?: WorkspaceManager;
+  pullRequestFlowManager?: PullRequestFlowManager;
 }
 
 /**
@@ -69,6 +74,8 @@ export function createServer(
     new PromptManager({
       workspaceRoot: defaultCwd,
     });
+  const pullRequestFlowManager =
+    options.pullRequestFlowManager ?? new PullRequestFlowManager({ host: manager });
   manager.setPromptAccessResolver((agentId) => promptManager.accessFor(agentId));
   const httpServer = http.createServer((req, res) => {
     handleHttp(
@@ -78,6 +85,7 @@ export function createServer(
       fileManager,
       promptManager,
       workspaceManager,
+      pullRequestFlowManager,
       defaultCwd,
       options.openFile ?? openFileInVscode,
       options.pickDirectory ?? defaultPickDirectory,
@@ -89,11 +97,12 @@ export function createServer(
   const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
   wss.on("connection", (ws: WebSocket) => {
     // 连接即下发当前快照
-    send(ws, { type: "hello", agents: manager.list() });
+    send(ws, { type: "hello", agents: manager.list(), prFlows: pullRequestFlowManager.list() });
   });
 
   // 把 manager 的事件广播到所有 WS 客户端
   manager.onEvent((envelope) => {
+    void pullRequestFlowManager.handleAgentEvent(envelope);
     const frame: ServerFrame = { type: "event", envelope };
     const data = JSON.stringify(frame);
     for (const client of wss.clients) {
@@ -101,7 +110,23 @@ export function createServer(
     }
   });
 
-  return { httpServer, wss, manager, fileManager, promptManager, workspaceManager };
+  pullRequestFlowManager.onFlow((flow) => {
+    const frame: ServerFrame = { type: "pr_flow", flow };
+    const data = JSON.stringify(frame);
+    for (const client of wss.clients) {
+      if (client.readyState === client.OPEN) client.send(data);
+    }
+  });
+
+  return {
+    httpServer,
+    wss,
+    manager,
+    fileManager,
+    promptManager,
+    workspaceManager,
+    pullRequestFlowManager,
+  };
 }
 
 async function handleHttp(
@@ -111,6 +136,7 @@ async function handleHttp(
   fileManager: FileManager,
   promptManager: PromptManager,
   workspaceManager: WorkspaceManager,
+  pullRequestFlowManager: PullRequestFlowManager,
   defaultCwd: string,
   openFile: (filePath: string) => Promise<void>,
   pickDirectory: PickDirectory,
@@ -239,6 +265,57 @@ async function handleHttp(
 
   if (method === "GET" && path === "/api/agents") {
     return sendJson(res, 200, { agents: manager.list() });
+  }
+
+  if (method === "GET" && path === "/api/pr-flows") {
+    return sendJson(res, 200, { flows: pullRequestFlowManager.list() });
+  }
+
+  if (method === "POST" && path === "/api/pr-flows") {
+    const body = await readJson<CreatePullRequestFlowInput>(req);
+    try {
+      return sendJson(res, 201, {
+        flow: await pullRequestFlowManager.create(body ?? ({} as CreatePullRequestFlowInput)),
+      });
+    } catch (error) {
+      return sendJson(res, 400, { error: errMsg(error) });
+    }
+  }
+
+  const prFlowMatch = path.match(/^\/api\/pr-flows\/([^/]+)(?:\/([^/]+))?$/);
+  if (prFlowMatch) {
+    const id = decodeURIComponent(prFlowMatch[1]!);
+    const action = prFlowMatch[2];
+    if (method === "GET" && !action) {
+      const flow = pullRequestFlowManager.get(id);
+      return flow
+        ? sendJson(res, 200, { flow })
+        : sendJson(res, 404, { error: `unknown PR flow: ${id}` });
+    }
+    if (method === "POST" && action === "pr-created") {
+      const body = await readJson<PullRequestCreatedInput>(req);
+      try {
+        return sendJson(res, 200, {
+          flow: await pullRequestFlowManager.recordPrCreated(id, body ?? {}),
+        });
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
+    }
+    if (method === "POST" && action === "merged") {
+      try {
+        return sendJson(res, 200, { flow: pullRequestFlowManager.recordMerged(id) });
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
+    }
+    if (method === "POST" && action === "cancel") {
+      try {
+        return sendJson(res, 200, { flow: pullRequestFlowManager.cancel(id) });
+      } catch (error) {
+        return sendJson(res, 404, { error: errMsg(error) });
+      }
+    }
   }
 
   if (method === "POST" && path === "/api/agents") {

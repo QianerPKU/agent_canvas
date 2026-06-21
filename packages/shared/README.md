@@ -53,6 +53,14 @@ npm test --workspace packages/shared        # vitest
 
 `AgentFileAccess` 额外包含 `readableDirectories` 和 `sharedResources`。`readOnly` 共享资源只进入可读目录和上下文说明；`readWrite` 共享资源才加入 `writableDirectories`。
 
+## PR 流程模型
+
+`src/pullRequests.ts` 定义 PR 审查与授权流程的共享类型：`CreatePullRequestFlowInput`、`PullRequestFlowSnapshot`、`PullRequestReviewRequest`、`PullRequestReviewResponse` 和 `PullRequestFlowStatus`。
+
+流程状态只表达程序控制的审查/授权边界：源 branch preflight、提 PR 授权、目标 branch merge 审查、合并授权、失败、超时或取消。它不限制 agent 自行 commit，也不描述具体 `git`/`gh` 命令。
+
+`ServerFrame` 的 `hello` 帧可携带 `prFlows` 快照，后续 `pr_flow` 帧推送单个流程更新。
+
 ## 提示词节点模型
 
 `src/prompts.ts` 定义纯文本 `CanvasPromptNode`、普通节点连线、共享读写开关，以及服务端解析后的 `AgentPromptAccess`。读权限把文本直接拼接进 Agent 上下文，写权限授权 Agent 修改节点的内部文本载体；可读提示词已由服务端按稳定顺序排列。

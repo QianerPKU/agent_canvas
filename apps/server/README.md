@@ -15,6 +15,7 @@
 | `src/AgentRunner.ts` | 单 agent 生命周期 + 状态机（`idle→starting→running↔waiting_input→done/stopped/error`） |
 | `src/AgentManager.ts` | 多 agent 注册表：分配 id、维护单调 `seq`、包 `AgentEventEnvelope` 广播、内存事件历史 |
 | `src/workspaces/WorkspaceManager.ts` | AppData 项目根、GitHub/repo clone、branch worktree、共享资源映射和 Agent 临时目录 |
+| `src/pullRequests/PullRequestFlowManager.ts` | PR 审查与授权状态机：活跃 agent 审查、JSON 校验/重试、超时、授权信号 |
 | `src/server.ts` | HTTP(REST) + WebSocket 装配 |
 | `src/index.ts` | 入口：实例化 manager（注入 Claude/Codex query）并监听端口 |
 
@@ -67,6 +68,13 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 | `POST /api/agents/:id/fork` | body=`{ anchorUuid, model? }`，从该 agent 某轮 fork 出新 agent，可为 Codex fork 指定模型，返回 `{ id, origin }` |
 | `POST /api/agents/:id/stop` | 中止 |
 | `POST /api/agents/:id/terminate` | 关闭底层 CLI / Query，进入 `terminated` |
+
+## PR 流程
+
+- `PullRequestFlowManager` 只控制流程状态：找出源/目标 branch 上的活跃 agent、发送审查请求、校验固定 JSON、重试、10 分钟超时、聚合意见和发放授权信号。
+- 程序不限制 commit，也不执行具体 `git`/`gh` 命令。提 PR 的 agent 在收到 `create_pr` 授权后可自由处理冲突、更新源 branch 并创建 PR；目标审查通过后再收到 `merge_pr` 授权并自行合并。
+- `GET /api/pr-flows` 列出流程；`POST /api/pr-flows` 发起源 branch preflight；`POST /api/pr-flows/:id/pr-created` 可兜底登记 PR 已创建并进入目标 branch 审查；`POST /api/pr-flows/:id/merged` 可兜底登记已合并；`POST /api/pr-flows/:id/cancel` 取消流程。
+- WebSocket `hello` 帧会带上 `prFlows` 快照，后续状态变化通过 `pr_flow` 帧推送。
 
 ## 多轮对话与 fork（对话历史分叉）
 

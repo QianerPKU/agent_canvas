@@ -16,8 +16,11 @@ import type {
   CreateCanvasFileInput,
   CreateCanvasProjectInput,
   CreateCanvasPromptInput,
+  CreatePullRequestFlowInput,
   FileConnectionAccess,
   ForkOrigin,
+  PullRequestCreatedInput,
+  PullRequestFlowSnapshot,
   PromptConnectionAccess,
   UpdateAgentSettingsInput,
   UpdateCanvasFileInput,
@@ -70,6 +73,26 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }).then((r) => r.branch),
+  listPullRequestFlows: () =>
+    call<{ flows: PullRequestFlowSnapshot[] }>("/pr-flows").then((r) => r.flows),
+  createPullRequestFlow: (input: CreatePullRequestFlowInput) =>
+    call<{ flow: PullRequestFlowSnapshot }>("/pr-flows", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }).then((r) => r.flow),
+  recordPullRequestCreated: (id: string, input: PullRequestCreatedInput) =>
+    call<{ flow: PullRequestFlowSnapshot }>(`/pr-flows/${encodeURIComponent(id)}/pr-created`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }).then((r) => r.flow),
+  recordPullRequestMerged: (id: string) =>
+    call<{ flow: PullRequestFlowSnapshot }>(`/pr-flows/${encodeURIComponent(id)}/merged`, {
+      method: "POST",
+    }).then((r) => r.flow),
+  cancelPullRequestFlow: (id: string) =>
+    call<{ flow: PullRequestFlowSnapshot }>(`/pr-flows/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+    }).then((r) => r.flow),
   history: (id: string) =>
     call<{ events: AgentEventEnvelope[] }>(`/agents/${id}/history`).then((r) => r.events),
   create: (settings: AgentSettings) =>

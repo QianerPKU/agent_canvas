@@ -69,10 +69,13 @@ body {
 }
 
 .header-button--secondary {
-  margin-left: auto;
   border-color: #cbd5e1;
   color: #334155;
   background: #fff;
+}
+
+.app-header__hint + .header-button--secondary {
+  margin-left: auto;
 }
 
 .project-gate {
@@ -601,6 +604,141 @@ button:disabled {
 
 .agent-dialog {
   width: min(520px, calc(100vw - 32px));
+}
+
+.pr-dialog {
+  width: min(760px, calc(100vw - 32px));
+}
+
+.pr-dialog__body {
+  max-height: min(760px, calc(100vh - 130px));
+  overflow: auto;
+  padding-bottom: 14px;
+}
+
+.pr-dialog__section {
+  display: grid;
+  gap: 10px;
+  padding-top: 4px;
+}
+
+.pr-dialog__section--flows {
+  padding: 14px 16px 0;
+}
+
+.pr-dialog__grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
+}
+
+.pr-dialog__footer {
+  display: flex;
+  justify-content: flex-end;
+  padding: 12px 16px 0;
+}
+
+.pr-dialog__footer button,
+.pr-flow-row button {
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 5px;
+  color: #334155;
+  background: #fff;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.pr-dialog__footer .file-dialog__primary {
+  border-color: #1d4ed8;
+  color: #fff;
+  background: #2563eb;
+}
+
+.pr-dialog__empty {
+  margin: 0;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.pr-flow-row {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #d8dee8;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.pr-flow-row header,
+.pr-flow-row footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pr-flow-row header strong {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.pr-flow-row header span {
+  flex: none;
+  padding: 2px 6px;
+  border-radius: 4px;
+  color: #0f172a;
+  background: #e2e8f0;
+  font-size: 11px;
+}
+
+.pr-flow-row__meta,
+.pr-flow-row p,
+.pr-flow-row__review small {
+  margin: 0;
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.pr-flow-row__review {
+  display: grid;
+  grid-template-columns: minmax(80px, auto) auto minmax(0, 1fr);
+  gap: 6px;
+  align-items: center;
+  padding: 6px;
+  border-radius: 5px;
+  background: #f8fafc;
+  font-size: 11px;
+}
+
+.pr-flow-row__review span {
+  color: #1d4ed8;
+}
+
+.pr-flow-row__inline {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 76px auto;
+  gap: 6px;
+}
+
+.pr-flow-row__inline input {
+  min-width: 0;
+  height: 30px;
+  padding: 4px 7px;
+  border: 1px solid #cbd5e1;
+  border-radius: 5px;
+  font: inherit;
+  font-size: 12px;
+}
+
+.pr-flow-row footer {
+  justify-content: flex-end;
 }
 
 .file-dialog > header {

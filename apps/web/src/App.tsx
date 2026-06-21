@@ -9,7 +9,15 @@ import {
   type Connection,
   type Edge,
 } from "@xyflow/react";
-import { FilePlus2, FolderOpen, GitBranch, Link, MessageSquarePlus, Plus, X } from "lucide-react";
+import {
+  FilePlus2,
+  FolderOpen,
+  GitPullRequest,
+  Link,
+  MessageSquarePlus,
+  Plus,
+  X,
+} from "lucide-react";
 import { api } from "./api.js";
 import type {
   BranchOption,
@@ -35,6 +43,7 @@ import { FileContentWindow } from "./files/FileContentWindow.js";
 import { AgentSettingsDialog } from "./agents/AgentSettingsDialog.js";
 import { CreatePromptDialog } from "./prompts/CreatePromptDialog.js";
 import { PromptNode, type PromptNodeType } from "./prompts/PromptNode.js";
+import { PullRequestDialog } from "./pullRequests/PullRequestDialog.js";
 import type { PromptActions } from "./useAgentCanvas.js";
 
 const nodeTypes = { turn: TurnNode, file: FileNode, prompt: PromptNode };
@@ -314,10 +323,12 @@ export default function App(): React.ReactElement {
     fileConnections,
     prompts,
     promptConnections,
+    prFlows,
     connected,
     actions,
     fileActions,
     promptActions,
+    prActions,
   } = useAgentCanvas();
   const [nodes, setNodes, onNodesChange] = useNodesState<CanvasNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
@@ -326,6 +337,7 @@ export default function App(): React.ReactElement {
   const [fileOpenError, setFileOpenError] = useState<string>();
   const [creatingFile, setCreatingFile] = useState(false);
   const [creatingPrompt, setCreatingPrompt] = useState(false);
+  const [showingPullRequests, setShowingPullRequests] = useState(false);
   const [agentSettingsTarget, setAgentSettingsTarget] = useState<AgentSettingsTarget>();
   const [projects, setProjects] = useState<CanvasProjectSummary[]>([]);
   const [workspace, setWorkspace] = useState<WorkspaceProject>();
@@ -551,6 +563,13 @@ export default function App(): React.ReactElement {
         </span>
         <button
           className="header-button header-button--secondary"
+          onClick={() => setShowingPullRequests(true)}
+        >
+          <GitPullRequest size={15} />
+          PR
+        </button>
+        <button
+          className="header-button header-button--secondary"
           onClick={() => setCreatingPrompt(true)}
         >
           <MessageSquarePlus size={15} />
@@ -630,6 +649,15 @@ export default function App(): React.ReactElement {
             await promptActions.create(input);
           }}
           onClose={() => setCreatingPrompt(false)}
+        />
+      )}
+      {showingPullRequests && (
+        <PullRequestDialog
+          agents={agents}
+          branches={branches}
+          flows={prFlows}
+          actions={prActions}
+          onClose={() => setShowingPullRequests(false)}
         />
       )}
       {historyTarget && (

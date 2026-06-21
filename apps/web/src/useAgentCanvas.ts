@@ -13,7 +13,10 @@ import type {
   CanvasPromptNode,
   CreateCanvasFileInput,
   CreateCanvasPromptInput,
+  CreatePullRequestFlowInput,
   FileConnectionAccess,
+  PullRequestCreatedInput,
+  PullRequestFlowSnapshot,
   PromptConnectionAccess,
   ServerFrame,
   UpdateCanvasFileInput,
@@ -63,10 +66,12 @@ export interface UseAgentCanvas {
   fileConnections: CanvasFileConnection[];
   prompts: CanvasPromptNode[];
   promptConnections: CanvasPromptConnection[];
+  prFlows: PullRequestFlowSnapshot[];
   connected: boolean;
   actions: AgentActions;
   fileActions: FileActions;
   promptActions: PromptActions;
+  prActions: PullRequestActions;
 }
 
 export interface FileActions {
@@ -91,6 +96,13 @@ export interface PromptActions {
   disconnect: (connectionId: string) => Promise<void>;
 }
 
+export interface PullRequestActions {
+  create: (input: CreatePullRequestFlowInput) => Promise<void>;
+  recordCreated: (id: string, input: PullRequestCreatedInput) => Promise<void>;
+  recordMerged: (id: string) => Promise<void>;
+  cancel: (id: string) => Promise<void>;
+}
+
 function wsUrl(): string {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   return `${proto}://${location.host}/ws`;
@@ -102,6 +114,7 @@ export function useAgentCanvas(): UseAgentCanvas {
   const [fileConnections, setFileConnections] = useState<CanvasFileConnection[]>([]);
   const [prompts, setPrompts] = useState<CanvasPromptNode[]>([]);
   const [promptConnections, setPromptConnections] = useState<CanvasPromptConnection[]>([]);
+  const [prFlows, setPrFlows] = useState<PullRequestFlowSnapshot[]>([]);
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   // 始终指向最新 agents，供 submit 判断 start/send（避免闭包过期）
@@ -131,8 +144,11 @@ export function useAgentCanvas(): UseAgentCanvas {
         }
         if (frame.type === "hello") {
           setAgents(applyHello(frame.agents));
+          setPrFlows(frame.prFlows ?? []);
         } else if (frame.type === "event") {
           setAgents((prev) => applyEnvelope(prev, frame.envelope));
+        } else if (frame.type === "pr_flow") {
+          setPrFlows((prev) => upsertFlow(prev, frame.flow));
         }
       };
     };
@@ -154,13 +170,15 @@ export function useAgentCanvas(): UseAgentCanvas {
       api.listFileConnections(),
       api.listPrompts(),
       api.listPromptConnections(),
+      api.listPullRequestFlows(),
     ]).then(
-      ([nextFiles, nextConnections, nextPrompts, nextPromptConnections]) => {
+      ([nextFiles, nextConnections, nextPrompts, nextPromptConnections, nextPrFlows]) => {
         if (closed) return;
         setFiles(nextFiles);
         setFileConnections(nextConnections);
         setPrompts(nextPrompts);
         setPromptConnections(nextPromptConnections);
+        setPrFlows(nextPrFlows);
       },
       () => undefined,
     );
@@ -327,15 +345,48 @@ export function useAgentCanvas(): UseAgentCanvas {
     [],
   );
 
+  const prActions = useMemo<PullRequestActions>(
+    () => ({
+      create: async (input) => {
+        const flow = await api.createPullRequestFlow(input);
+        setPrFlows((current) => upsertFlow(current, flow));
+      },
+      recordCreated: async (id, input) => {
+        const flow = await api.recordPullRequestCreated(id, input);
+        setPrFlows((current) => upsertFlow(current, flow));
+      },
+      recordMerged: async (id) => {
+        const flow = await api.recordPullRequestMerged(id);
+        setPrFlows((current) => upsertFlow(current, flow));
+      },
+      cancel: async (id) => {
+        const flow = await api.cancelPullRequestFlow(id);
+        setPrFlows((current) => upsertFlow(current, flow));
+      },
+    }),
+    [],
+  );
+
   return {
     agents,
     files,
     fileConnections,
     prompts,
     promptConnections,
+    prFlows,
     connected,
     actions,
     fileActions,
     promptActions,
+    prActions,
   };
+}
+
+function upsertFlow(
+  flows: PullRequestFlowSnapshot[],
+  flow: PullRequestFlowSnapshot,
+): PullRequestFlowSnapshot[] {
+  return flows.some((candidate) => candidate.id === flow.id)
+    ? flows.map((candidate) => (candidate.id === flow.id ? flow : candidate))
+    : [flow, ...flows];
 }
