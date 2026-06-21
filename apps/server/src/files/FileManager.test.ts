@@ -13,7 +13,6 @@ describe("FileManager", () => {
     manager = new FileManager({
       workspaceRoot: root,
       isolatedRoot: path.join(root, "isolated"),
-      resolveAgentCwd: () => path.join(root, "agent-workspace"),
       now: () => 100,
     });
   });
@@ -45,18 +44,15 @@ describe("FileManager", () => {
     expect(await readFile(renamed.path, "utf-8")).toBe("hello file node");
   });
 
-  it("可在显式工作目录中创建文件而不绑定 agent", async () => {
-    const directory = path.join(root, "manual-workdir");
+  it("文件节点固定创建在隔离目录中", async () => {
     const file = await manager.create({
       name: "brief",
       extension: "md",
-      storage: "agent",
-      directory,
       kind: "normal",
     });
 
-    expect(file.path).toBe(path.join(directory, "brief.md"));
-    expect(file.agentId).toBeUndefined();
+    expect(file.path).toBe(path.join(root, "isolated", file.id, "brief.md"));
+    expect(file.storage).toBe("isolated");
   });
 
   it("共享读写开关对全部 Agent 生效", async () => {

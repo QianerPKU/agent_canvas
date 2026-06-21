@@ -245,7 +245,7 @@ export function FileNode({ id, data }: NodeProps<FileNodeType>): React.ReactElem
       </div>
 
       <div className="file-node__footer nodrag">
-        <span>{file.storage === "agent" ? "工作目录" : "隔离目录"}</span>
+        <span>隔离文件</span>
         {file.kind === "shared" ? (
           <div className="file-node__toggles">
             <label>

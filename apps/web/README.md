@@ -66,10 +66,10 @@ npm test --workspace apps/web
 
 ## 文件节点
 
-- 顶栏“新建文件”选择文件名、后缀、普通/共享类型以及 Agent 工作目录/隔离目录。
+- 顶栏“新建文件”选择文件名、后缀和普通/共享类型；文件节点固定创建在后端隔离文件夹中，不进入任何 branch workspace。
 - 普通文件右侧“读”输出连接 Agent 左侧“读入”；Agent 右侧“写出”连接文件左侧“写”输入。
 - 文件连接绑定 Agent 而非单轮，完成一轮后自动指向最新轮次；fork 时复制父 Agent 的连接。
-- 共享文件不画连线，使用节点底部的“全局读/全局写”开关。
+- 共享文件不画连线，使用节点底部的“全局读/全局写”开关。这里的共享是画布级全局文件引用授权，不是跨 branch 共享资源映射。
 - 文本、Markdown、CSV、常见源码和图片显示预览；其他格式只显示文件名。预览定时刷新以反映 Agent 修改。
 - `src/files/README.md` 记录组件边界、Handle、重命名、缩放和最小化语义。
 
@@ -79,4 +79,4 @@ npm test --workspace apps/web
 - Branch 列表来自后端 `GET /api/workspace/branches`，弹窗里可创建新 branch。Agent 不再手动选择工作目录，实际 `cwd` 由后端根据 `branchWorkspaceId` 解析。
 - 已创建 Agent 的最新节点头部显示齿轮按钮，打开后只允许修改私有系统提示词；provider、模型和 branch 保持锁定。
 - 首轮对话节点不再提供 provider/model 选择，启动时直接使用 Agent 创建时保存的设置。
-- 新建文件节点默认放在工作目录中，也支持手动输入或浏览调整目录；隔离目录仍可通过存放位置切换。
+- 新建文件节点固定放在隔离目录；项目内需要 commit 的文件应由 Agent 在所选 branch workspace 中直接创建。

@@ -1,7 +1,7 @@
 import type { AgentSharedResourceReference } from "./workspaces.js";
 
 export type CanvasFileKind = "normal" | "shared";
-export type CanvasFileStorage = "agent" | "isolated";
+export type CanvasFileStorage = "isolated";
 export type FilePreviewKind = "text" | "markdown" | "csv" | "image" | "none";
 export type FileConnectionAccess = "read" | "write";
 
@@ -12,7 +12,6 @@ export interface CanvasFileNode {
   filename: string;
   path: string;
   storage: CanvasFileStorage;
-  agentId?: string;
   kind: CanvasFileKind;
   sharedRead: boolean;
   sharedWrite: boolean;
@@ -25,10 +24,8 @@ export interface CanvasFileNode {
 export interface CreateCanvasFileInput {
   name: string;
   extension?: string;
-  storage: CanvasFileStorage;
-  /** storage=agent 时可显式指定工作目录；未指定时回退到所选 agent/default cwd。 */
-  directory?: string;
-  agentId?: string;
+  /** 文件节点固定使用隔离目录；保留字段便于旧调用方显式传 isolated。 */
+  storage?: CanvasFileStorage;
   kind: CanvasFileKind;
 }
 

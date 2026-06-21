@@ -6,14 +6,11 @@ import { CreateFileDialog } from "./CreateFileDialog.js";
 afterEach(cleanup);
 
 describe("CreateFileDialog", () => {
-  it("默认在工作目录中创建共享 Markdown 文件", async () => {
+  it("固定在隔离目录中创建共享 Markdown 文件", async () => {
     const onCreate = vi.fn().mockResolvedValue(undefined);
     const onClose = vi.fn();
-    const defaultDirectory = "E:\\work";
     render(
       <CreateFileDialog
-        defaultDirectory={defaultDirectory}
-        onBrowseDirectory={vi.fn()}
         onCreate={onCreate}
         onClose={onClose}
       />,
@@ -31,32 +28,9 @@ describe("CreateFileDialog", () => {
         name: "brief",
         extension: "markdown",
         kind: "shared",
-        storage: "agent",
-        directory: defaultDirectory,
+        storage: "isolated",
       }),
     );
     expect(onClose).toHaveBeenCalled();
-  });
-
-  it("支持浏览并替换工作目录", async () => {
-    const onCreate = vi.fn().mockResolvedValue(undefined);
-    const defaultDirectory = "E:\\work";
-    const selectedDirectory = "D:\\target";
-    render(
-      <CreateFileDialog
-        defaultDirectory={defaultDirectory}
-        onBrowseDirectory={vi.fn().mockResolvedValue(selectedDirectory)}
-        onCreate={onCreate}
-        onClose={vi.fn()}
-      />,
-    );
-
-    fireEvent.click(screen.getByTitle("浏览目录"));
-
-    await waitFor(() => {
-      expect((screen.getByLabelText("文件工作目录") as HTMLInputElement).value).toBe(
-        selectedDirectory,
-      );
-    });
   });
 });

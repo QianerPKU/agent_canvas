@@ -23,7 +23,6 @@ const workspaceManager = new WorkspaceManager({
 });
 const fileManager = new FileManager({
   workspaceRoot: WORKSPACE_ROOT,
-  resolveAgentCwd: (agentId) => manager.configOf(agentId)?.cwd,
 });
 const promptManager = new PromptManager({ workspaceRoot: WORKSPACE_ROOT });
 const { httpServer } = createServer(manager, fileManager, {

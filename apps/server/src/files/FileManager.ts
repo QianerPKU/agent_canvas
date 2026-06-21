@@ -15,7 +15,6 @@ import type {
 export interface FileManagerOptions {
   workspaceRoot?: string;
   isolatedRoot?: string;
-  resolveAgentCwd?: (agentId: string) => string | undefined;
   now?: () => number;
 }
 
@@ -24,7 +23,6 @@ export class FileManager {
   private readonly connections = new Map<string, CanvasFileConnection>();
   private readonly workspaceRoot: string;
   private readonly isolatedRoot: string;
-  private readonly resolveAgentCwd: (agentId: string) => string | undefined;
   private readonly now: () => number;
   private fileCounter = 0;
   private connectionCounter = 0;
@@ -34,7 +32,6 @@ export class FileManager {
     this.isolatedRoot = path.resolve(
       options.isolatedRoot ?? defaultIsolatedRoot(this.workspaceRoot),
     );
-    this.resolveAgentCwd = options.resolveAgentCwd ?? (() => undefined);
     this.now = options.now ?? Date.now;
   }
 
@@ -64,8 +61,7 @@ export class FileManager {
       extension,
       filename,
       path: filePath,
-      storage: input.storage,
-      agentId: input.storage === "agent" ? input.agentId : undefined,
+      storage: "isolated",
       kind: input.kind,
       sharedRead: false,
       sharedWrite: false,
@@ -228,11 +224,10 @@ export class FileManager {
   }
 
   private storageDirectory(id: string, input: CreateCanvasFileInput): string {
-    if (input.storage === "isolated") return path.join(this.isolatedRoot, id);
-    if (input.directory?.trim()) return path.resolve(input.directory);
-    if (!input.agentId) throw new Error("存放到 agent 工作目录时必须选择 agent");
-    const cwd = this.resolveAgentCwd(input.agentId) ?? this.workspaceRoot;
-    return path.resolve(cwd);
+    if (input.storage && input.storage !== "isolated") {
+      throw new Error("文件节点固定使用隔离目录");
+    }
+    return path.join(this.isolatedRoot, id);
   }
 
   private requireFile(id: string): CanvasFileNode {

@@ -95,7 +95,6 @@ describe("HTTP server", () => {
     const fileManager = new FileManager({
       workspaceRoot: root,
       isolatedRoot: path.join(root, "isolated"),
-      resolveAgentCwd: () => root,
     });
     const promptManager = new PromptManager({
       workspaceRoot: root,
@@ -279,18 +278,24 @@ describe("HTTP server", () => {
     expect(r.status).toBe(404);
   });
 
-  it("creates file nodes in an explicit work directory without selecting an agent", async () => {
-    const directory = path.join(root, "picked-workdir");
+  it("creates file nodes only in isolated storage", async () => {
     const created = await request(port, "POST", "/api/files", {
       name: "brief",
       extension: "md",
-      storage: "agent",
-      directory,
       kind: "normal",
     });
     expect(created.status).toBe(201);
-    expect(created.json.file.path).toBe(path.join(directory, "brief.md"));
-    expect(created.json.file.agentId).toBeUndefined();
+    expect(created.json.file.path).toBe(
+      path.join(root, "isolated", created.json.file.id, "brief.md"),
+    );
+    expect(created.json.file.storage).toBe("isolated");
+
+    const rejected = await request(port, "POST", "/api/files", {
+      name: "bad",
+      storage: "agent",
+      kind: "normal",
+    });
+    expect(rejected.status).toBe(400);
   });
 
   it("文件节点 REST 支持创建、重命名、预览与普通读连线", async () => {

@@ -1,34 +1,19 @@
 import { useEffect, useState } from "react";
-import { FilePlus2, FolderOpen, X } from "lucide-react";
-import type {
-  CanvasFileKind,
-  CanvasFileStorage,
-  CreateCanvasFileInput,
-} from "@agent-canvas/shared";
+import { FilePlus2, X } from "lucide-react";
+import type { CanvasFileKind, CreateCanvasFileInput } from "@agent-canvas/shared";
 
 export function CreateFileDialog({
-  defaultDirectory,
-  onBrowseDirectory,
   onCreate,
   onClose,
 }: {
-  defaultDirectory: string;
-  onBrowseDirectory: (initialDirectory?: string) => Promise<string | undefined>;
   onCreate: (input: CreateCanvasFileInput) => Promise<void>;
   onClose: () => void;
 }): React.ReactElement {
   const [name, setName] = useState("");
   const [extension, setExtension] = useState("txt");
   const [kind, setKind] = useState<CanvasFileKind>("normal");
-  const [storage, setStorage] = useState<CanvasFileStorage>("agent");
-  const [directory, setDirectory] = useState(defaultDirectory);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const [browsing, setBrowsing] = useState(false);
-
-  useEffect(() => {
-    if (!directory && defaultDirectory) setDirectory(defaultDirectory);
-  }, [defaultDirectory, directory]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -47,27 +32,13 @@ export function CreateFileDialog({
         name: name.trim(),
         extension,
         kind,
-        storage,
-        directory: storage === "agent" ? directory.trim() : undefined,
+        storage: "isolated",
       });
       onClose();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
       setSubmitting(false);
-    }
-  };
-
-  const browseDirectory = async () => {
-    setBrowsing(true);
-    setError("");
-    try {
-      const selected = await onBrowseDirectory(directory || defaultDirectory);
-      if (selected) setDirectory(selected);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setBrowsing(false);
     }
   };
 
@@ -113,40 +84,6 @@ export function CreateFileDialog({
           />
         </fieldset>
 
-        <fieldset>
-          <legend>存放位置</legend>
-          <Segmented
-            value={storage}
-            options={[
-              ["agent", "工作目录"],
-              ["isolated", "隔离目录"],
-            ]}
-            onChange={(value) => setStorage(value as CanvasFileStorage)}
-          />
-        </fieldset>
-
-        {storage === "agent" && (
-          <label className="file-dialog__field">
-            <span>工作目录</span>
-            <div className="file-dialog__path">
-              <input
-                aria-label="文件工作目录"
-                value={directory}
-                onChange={(event) => setDirectory(event.target.value)}
-              />
-              <button
-                type="button"
-                className="icon-button"
-                title="浏览目录"
-                disabled={browsing}
-                onClick={() => void browseDirectory()}
-              >
-                <FolderOpen size={15} />
-              </button>
-            </div>
-          </label>
-        )}
-
         {error && <div className="file-dialog__error">{error}</div>}
         <footer>
           <button type="button" onClick={onClose}>
@@ -155,7 +92,7 @@ export function CreateFileDialog({
           <button
             type="submit"
             className="file-dialog__primary"
-            disabled={!name.trim() || submitting || (storage === "agent" && !directory.trim())}
+            disabled={!name.trim() || submitting}
           >
             创建
           </button>

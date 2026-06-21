@@ -51,7 +51,6 @@ export function createServer(
   const defaultCwd = options.defaultCwd ?? process.cwd();
   fileManager ??= new FileManager({
     workspaceRoot: defaultCwd,
-    resolveAgentCwd: (agentId) => manager.configOf(agentId)?.cwd,
   });
   const workspaceManager =
     options.workspaceManager ?? new WorkspaceManager({ defaultSourcePath: defaultCwd });
@@ -224,13 +223,10 @@ async function handleHttp(
     const body = await readJson<CreateCanvasFileInput>(req);
     if (
       !body?.name ||
-      !["agent", "isolated"].includes(body.storage) ||
+      (body.storage !== undefined && body.storage !== "isolated") ||
       !["normal", "shared"].includes(body.kind)
     ) {
-      return sendJson(res, 400, { error: "缺少文件名、存储位置或节点类型" });
-    }
-    if (body.storage === "agent" && body.agentId && !manager.get(body.agentId)) {
-      return sendJson(res, 400, { error: "请选择有效的 agent 工作目录" });
+      return sendJson(res, 400, { error: "缺少文件名、节点类型，或文件节点存储位置不是隔离目录" });
     }
     try {
       return sendJson(res, 201, { file: await fileManager.create(body) });

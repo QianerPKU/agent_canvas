@@ -32,3 +32,4 @@
 - `readOnly` 共享资源只进入 `readableDirectories` 和上下文说明，不加入 provider 的可写目录。
 - `readWrite` 共享资源会额外加入 `writableDirectories`，Codex 的 `workspaceWrite.writableRoots` 和 Claude 的额外目录授权会据此放行。
 - junction/symlink 本身不是跨平台硬只读边界；因此内置工作区规则提示词会要求 Agent 未经用户明确授权不得修改 `readOnly` 资源。
+- 这里的共享资源不同于文件节点的共享开关。文件节点始终位于画布隔离文件夹，`sharedRead/sharedWrite` 只是把该隔离文件引用授权给全部 Agent，不做 branch 间重映射。

@@ -108,7 +108,7 @@ npm run smoke --workspace apps/server
 ## 文件节点
 
 - `src/files/FileManager.ts` 管理节点元数据、真实文件、共享权限和普通读写连线。
-- Agent 工作目录存储直接在所选工作区创建文件；隔离存储使用用户本地数据目录，并让每个文件节点独占目录。
+- 文件节点固定使用用户本地数据目录中的隔离存储，并让每个文件节点独占目录；不再创建到 Agent/branch 工作目录中。
 - `GET/POST /api/files` 列出/创建；`PATCH /api/files/:id` 重命名或更新共享开关；`content/raw` 子路径提供预览与原始内容。
 - `POST /api/files/:id/open` 使用 VS Code CLI 打开真实文件，并等待 CLI 返回实际退出状态。Windows 会检查标准安装位置和 PATH 中的 `code.cmd`；自定义位置可设置 `AGENT_CANVAS_VSCODE_PATH` 为 `code.cmd` 完整路径，也可传 `Code.exe` 并自动解析同目录下的 `bin\code.cmd`。
 - `GET/POST /api/file-connections` 与 `DELETE /api/file-connections/:id` 管理普通节点连线。
@@ -116,6 +116,7 @@ npm run smoke --workspace apps/server
 - Claude 使用 `@绝对路径`、`additionalDirectories`，并通过 `applyFlagSettings()` 在流式会话下一轮动态刷新写目录。
 - `AgentRunner` 在首轮和每次 `send` 前重新解析文件权限；因此 Claude/Codex 的每个完整业务请求都会携带该轮最新的可读文件引用和可写目标。`compact` 是 CLI 控制指令，不附加业务文件引用。
 - 写权限是 CLI 的目录粒度，而且可写目录天然也可读；隔离文件采用单节点目录来缩小授权范围。读连线负责显式引用和画布层授权，不等同于操作系统级读取隔离。
+- 文件节点的“共享”是画布级全局读写授权，不做 branch 间重映射；跨 branch 的数据集/权重共享资源由 `WorkspaceManager` 管理。
 
 ## GitHub / Branch Workspace / 三类文件
 

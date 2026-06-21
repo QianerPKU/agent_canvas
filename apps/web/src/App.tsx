@@ -324,7 +324,6 @@ export default function App(): React.ReactElement {
   const [creatingFile, setCreatingFile] = useState(false);
   const [creatingPrompt, setCreatingPrompt] = useState(false);
   const [agentSettingsTarget, setAgentSettingsTarget] = useState<AgentSettingsTarget>();
-  const [defaultCwd, setDefaultCwd] = useState("");
   const [branches, setBranches] = useState<BranchWorkspace[]>([]);
   const openFile = files.find((file) => file.id === openFileId);
   const settingsAgent =
@@ -332,12 +331,6 @@ export default function App(): React.ReactElement {
 
   useEffect(() => {
     let cancelled = false;
-    void api.config().then(
-      (config) => {
-        if (!cancelled) setDefaultCwd(config.defaultCwd);
-      },
-      () => undefined,
-    );
     void api.listBranches().then(
       (nextBranches) => {
         if (!cancelled) setBranches(nextBranches);
@@ -369,11 +362,6 @@ export default function App(): React.ReactElement {
 
   const openAgentSettings = useCallback((agentId: string) => {
     setAgentSettingsTarget({ mode: "edit", agentId });
-  }, []);
-
-  const pickDirectory = useCallback(async (initialDirectory?: string) => {
-    const result = await api.pickDirectory(initialDirectory);
-    return result.path ?? undefined;
   }, []);
 
   const createBranch = useCallback(async (branch: string) => {
@@ -530,8 +518,6 @@ export default function App(): React.ReactElement {
 
       {creatingFile && (
         <CreateFileDialog
-          defaultDirectory={defaultCwd}
-          onBrowseDirectory={pickDirectory}
           onCreate={async (input) => {
             await fileActions.create(input);
           }}
