@@ -30,7 +30,8 @@ export function agentCanvasPolicyPrompt(agentId: string): string {
 - 当前 agent id 是 ${agentId}。
 - 当用户在对话中要求你提 PR、创建 PR、发起 PR、把当前 branch 合到某个目标 branch，或表达同等意图时，必须先走 Agent Canvas PR pipeline；不要直接绕过流程运行 gh pr create、gh pr merge 或其他合并命令。
 - Agent Canvas API base 是 ${apiBase}。如果环境变量 AGENT_CANVAS_API 存在，以该变量为准。
-- 发起流程时调用 POST ${apiBase}/pr-flows，请求体至少包含 proposerAgentId、targetBranch、summary；可选包含 title、sourceBranch、files。proposerAgentId 必须使用当前 agent id：${agentId}。
+- 发起流程前先用 git diff / git status 确认这次 PR 具体涉及哪些文件；如果目标 branch 已知，优先查看 git diff --name-status <targetBranch>...HEAD。
+- 发起流程时调用 POST ${apiBase}/pr-flows，请求体至少包含 proposerAgentId、targetBranch、summary、files。可选包含 title、sourceBranch。proposerAgentId 必须使用当前 agent id：${agentId}，files 必须列出这次 PR 的具体文件路径。
 - 如果目标 branch 不明确，先向用户确认；如果用户已经明确目标 branch，可以直接发起流程。
 - PowerShell 示例：
 ~~~powershell
@@ -49,7 +50,9 @@ Invoke-RestMethod -Method Post -Uri "${apiBase}/pr-flows" -ContentType "applicat
   "agentCanvasPrEvent": "pr_created",
   "flowId": "pr_flow_x",
   "prNumber": 0,
-  "prUrl": "https://github.com/OWNER/REPO/pull/0"
+  "prUrl": "https://github.com/OWNER/REPO/pull/0",
+  "files": ["src/example.ts"],
+  "fileChanges": [{ "status": "M", "path": "src/example.ts" }]
 }
 ~~~
 - 只有收到 merge_pr 授权后，才可以执行合并。合并完成后，在对话中只输出一个 JSON 对象登记结果：

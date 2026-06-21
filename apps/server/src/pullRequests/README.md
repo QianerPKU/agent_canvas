@@ -4,6 +4,8 @@
 
 流程可以由前端 PR 面板发起，也可以由提 PR 的 agent 自己发起。`agentCanvasPolicyPrompt` 会把 `POST /api/pr-flows` 的使用协议注入给每个 agent，因此用户在 agent 对话框里直接要求“提 PR”时，agent 应先调用该接口进入 Agent Canvas 审查流程。
 
+每次审查请求都会包含具体变更文件。默认 server 通过 `WorkspaceManager.diffPullRequestFiles()` 计算 `git diff --name-status <target>...<source>` 并写入 `changedFiles`；如果发起流程时显式传入 `files`，则按这次 PR 的文件范围审查并补齐对应状态。无法确定任何变更文件时，后端会拒绝创建 PR flow。
+
 ## 流程
 
 1. 用户通过 `POST /api/pr-flows` 发起流程，指定提 PR 的 agent、目标 branch、概括和可选文件范围。
@@ -40,7 +42,9 @@ PR 创建输出：
   "agentCanvasPrEvent": "pr_created",
   "flowId": "pr_flow_1",
   "prNumber": 12,
-  "prUrl": "https://github.com/OWNER/REPO/pull/12"
+  "prUrl": "https://github.com/OWNER/REPO/pull/12",
+  "files": ["src/example.ts"],
+  "fileChanges": [{ "status": "M", "path": "src/example.ts" }]
 }
 ```
 

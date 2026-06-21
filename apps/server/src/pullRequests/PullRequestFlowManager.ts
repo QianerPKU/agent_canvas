@@ -1,6 +1,7 @@
 import type {
   AgentEventEnvelope,
   AgentSnapshot,
+  PullRequestChangedFile,
   PullRequestCreatedInput,
   PullRequestCreatedInfo,
   PullRequestFlowSnapshot,
@@ -26,6 +27,7 @@ export interface PullRequestAgentHost {
 
 export interface PullRequestFlowManagerOptions {
   host: PullRequestAgentHost;
+  resolveChangedFiles?: ResolvePullRequestChangedFiles;
   now?: () => number;
   reviewTimeoutMs?: number;
   reviewRetryLimit?: number;
@@ -34,6 +36,17 @@ export interface PullRequestFlowManagerOptions {
 }
 
 type FlowListener = (flow: PullRequestFlowSnapshot) => void;
+
+export interface ResolvePullRequestChangedFilesContext {
+  proposerAgentId: string;
+  sourceBranch: string;
+  targetBranch: string;
+  sourceCwd?: string;
+}
+
+export interface ResolvePullRequestChangedFiles {
+  (context: ResolvePullRequestChangedFilesContext): Promise<PullRequestChangedFile[] | undefined>;
+}
 
 interface ParsedReview {
   agentCanvasPrReview: true;
@@ -54,6 +67,7 @@ interface ParsedAgentEvent {
   title?: string;
   summary?: string;
   files?: string[];
+  fileChanges?: PullRequestChangedFile[];
 }
 
 const DEFAULT_REVIEW_TIMEOUT_MS = 10 * 60 * 1000;
@@ -69,6 +83,7 @@ const CLOSED_STATUSES: PullRequestFlowStatus[] = [
 
 export class PullRequestFlowManager {
   private readonly host: PullRequestAgentHost;
+  private readonly resolveChangedFiles?: ResolvePullRequestChangedFiles;
   private readonly now: () => number;
   private readonly reviewTimeoutMs: number;
   private readonly reviewRetryLimit: number;
@@ -81,6 +96,7 @@ export class PullRequestFlowManager {
 
   constructor(options: PullRequestFlowManagerOptions) {
     this.host = options.host;
+    this.resolveChangedFiles = options.resolveChangedFiles;
     this.now = options.now ?? Date.now;
     this.reviewTimeoutMs = options.reviewTimeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
     this.reviewRetryLimit = options.reviewRetryLimit ?? DEFAULT_REVIEW_RETRY_LIMIT;
@@ -112,6 +128,17 @@ export class PullRequestFlowManager {
     }
     const sourceBranch = input.sourceBranch?.trim() || proposer.config.branch;
     if (!sourceBranch) throw new Error("missing sourceBranch");
+    const fileChanges = await this.changedFilesFor({
+      proposerAgentId: input.proposerAgentId,
+      sourceBranch,
+      targetBranch: input.targetBranch.trim(),
+      sourceCwd: proposer.config.cwd,
+      files: input.files,
+    });
+    if (fileChanges.length === 0) {
+      throw new Error("PR flow requires a concrete changed file list");
+    }
+    const files = pathsFromFileChanges(fileChanges);
 
     const flow: PullRequestFlowSnapshot = {
       id: `pr_flow_${++this.counter}`,
@@ -120,7 +147,8 @@ export class PullRequestFlowManager {
       targetBranch: input.targetBranch.trim(),
       title: input.title?.trim() || undefined,
       summary: input.summary.trim(),
-      files: uniqueStrings(input.files ?? []),
+      files,
+      fileChanges,
       status: "source_review_collecting",
       createdAt: this.now(),
       updatedAt: this.now(),
@@ -141,17 +169,22 @@ export class PullRequestFlowManager {
     if (flow.status !== "create_pr_authorized") {
       throw new Error("PR can only be recorded after create_pr authorization");
     }
+    const fileChanges = updatedFileChangesForPr(flow, input);
+    const files = pathsFromFileChanges(fileChanges);
     const pr: PullRequestCreatedInfo = {
       prNumber: input.prNumber,
       prUrl: input.prUrl?.trim() || undefined,
       title: input.title?.trim() || flow.title,
       summary: input.summary?.trim() || flow.summary,
-      files: uniqueStrings(input.files?.length ? input.files : flow.files),
+      files,
+      fileChanges,
       reportedByAgentId,
       createdAt: this.now(),
     };
     this.save({
       ...flow,
+      files,
+      fileChanges,
       pr,
       status: "target_review_collecting",
       currentStage: "target_merge",
@@ -424,6 +457,19 @@ export class PullRequestFlowManager {
       .filter((agent) => agent.config.branch === branch && isActiveAgentStatus(agent.status));
   }
 
+  private async changedFilesFor(
+    input: ResolvePullRequestChangedFilesContext & { files?: string[] },
+  ): Promise<PullRequestChangedFile[]> {
+    const explicitFiles = uniqueStrings(input.files ?? []);
+    const resolved = this.resolveChangedFiles
+      ? normalizeFileChanges(await this.resolveChangedFiles(input))
+      : [];
+    if (explicitFiles.length > 0) {
+      return fileChangesForExplicitFiles(explicitFiles, resolved);
+    }
+    return resolved;
+  }
+
   private async deliverToAgent(agentId: string, text: string): Promise<void> {
     const runner = this.host.get(agentId);
     if (!runner) throw new Error(`unknown agent: ${agentId}`);
@@ -603,6 +649,7 @@ function parseAgentPrEvent(text: string): ParsedAgentEvent | undefined {
       title: typeof candidate.title === "string" ? candidate.title : undefined,
       summary: typeof candidate.summary === "string" ? candidate.summary : undefined,
       files: stringArray(candidate.files),
+      fileChanges: fileChangeArray(candidate.fileChanges),
     };
   }
   return undefined;
@@ -678,12 +725,62 @@ function stringArray(value: unknown): string[] {
   return uniqueStrings(value.filter((item): item is string => typeof item === "string"));
 }
 
+function fileChangeArray(value: unknown): PullRequestChangedFile[] {
+  if (!Array.isArray(value)) return [];
+  return normalizeFileChanges(
+    value
+      .filter(isRecord)
+      .map((item) => ({
+        status: typeof item.status === "string" ? item.status : "",
+        path: typeof item.path === "string" ? item.path : "",
+      })),
+  );
+}
+
+function normalizeFileChanges(
+  files: PullRequestChangedFile[] | undefined,
+): PullRequestChangedFile[] {
+  const seen = new Set<string>();
+  const result: PullRequestChangedFile[] = [];
+  for (const file of files ?? []) {
+    const path = file.path.trim();
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    result.push({ status: file.status.trim() || "?", path });
+  }
+  return result;
+}
+
+function fileChangesForExplicitFiles(
+  files: string[],
+  resolved: PullRequestChangedFile[],
+): PullRequestChangedFile[] {
+  const byPath = new Map(resolved.map((file) => [file.path, file]));
+  return files.map((path) => byPath.get(path) ?? { status: "specified", path });
+}
+
+function updatedFileChangesForPr(
+  flow: PullRequestFlowSnapshot,
+  input: PullRequestCreatedInput,
+): PullRequestChangedFile[] {
+  const reportedChanges = normalizeFileChanges(input.fileChanges);
+  if (reportedChanges.length > 0) return reportedChanges;
+  const reportedFiles = uniqueStrings(input.files ?? []);
+  if (reportedFiles.length > 0) return fileChangesForExplicitFiles(reportedFiles, flow.fileChanges);
+  return flow.fileChanges;
+}
+
+function pathsFromFileChanges(files: PullRequestChangedFile[]): string[] {
+  return uniqueStrings(files.map((file) => file.path));
+}
+
 function uniqueStrings(items: string[]): string[] {
   return [...new Set(items.map((item) => item.trim()).filter(Boolean))];
 }
 
 function reviewPrompt(flow: PullRequestFlowSnapshot, stage: PullRequestReviewStage): string {
   const files = formatFiles(flow.files);
+  const fileChanges = formatFileChanges(flow.fileChanges);
   const label = stage === "source_preflight" ? "source branch preflight" : "target branch merge";
   const prInfo =
     stage === "target_merge" && flow.pr
@@ -696,8 +793,10 @@ function reviewPrompt(flow: PullRequestFlowSnapshot, stage: PullRequestReviewSta
     `targetBranch: ${flow.targetBranch}`,
     `title: ${flow.title ?? "(untitled)"}`,
     `summary: ${flow.summary}`,
-    `files:`,
+    "files:",
     files,
+    "changedFiles (git diff --name-status):",
+    fileChanges,
     prInfo,
     "Review the current state. You may inspect the repository as needed.",
     "Return exactly one JSON object matching this schema, with no extra prose:",
@@ -744,8 +843,10 @@ function createPrAuthorizationPrompt(
     `targetBranch: ${flow.targetBranch}`,
     `title: ${flow.title ?? "(choose a suitable title)"}`,
     `summary: ${flow.summary}`,
-    `files:`,
+    "files:",
     formatFiles(flow.files),
+    "changedFiles (git diff --name-status):",
+    formatFileChanges(flow.fileChanges),
     "",
     "You have full freedom to choose the git/GitHub commands, update the source branch, and resolve conflicts before opening the PR.",
     "Do not merge the PR yet. After the PR exists, report exactly one JSON object:",
@@ -758,6 +859,7 @@ function createPrAuthorizationPrompt(
         title: flow.title ?? "",
         summary: flow.summary,
         files: flow.files,
+        fileChanges: flow.fileChanges,
       },
       null,
       2,
@@ -825,7 +927,11 @@ function reviewSummary(responses: PullRequestReviewResponse[]): string {
 }
 
 function formatFiles(files: string[]): string {
-  return files.length ? files.map((file) => `- ${file}`).join("\n") : "- (not scoped)";
+  return files.map((file) => `- ${file}`).join("\n");
+}
+
+function formatFileChanges(files: PullRequestChangedFile[]): string {
+  return files.map((file) => `- ${file.status} ${file.path}`).join("\n");
 }
 
 function errorMessage(error: unknown): string {

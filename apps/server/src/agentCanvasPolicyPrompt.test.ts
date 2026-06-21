@@ -13,11 +13,14 @@ describe("agentCanvasPolicyPrompt", () => {
     const prompt = agentCanvasPolicyPrompt("agent_42");
 
     expect(prompt).toContain("PR pipeline 规则");
+    expect(prompt).toContain("git diff --name-status <targetBranch>...HEAD");
     expect(prompt).toContain("POST http://127.0.0.1:4317/api/pr-flows");
+    expect(prompt).toContain("summary、files");
     expect(prompt).toContain('proposerAgentId = "agent_42"');
     expect(prompt).toContain("create_pr 授权");
     expect(prompt).toContain("merge_pr 授权");
     expect(prompt).toContain('"agentCanvasPrEvent": "pr_created"');
+    expect(prompt).toContain('"fileChanges": [{ "status": "M", "path": "src/example.ts" }]');
     expect(prompt).toContain('"agentCanvasPrEvent": "merged"');
   });
 

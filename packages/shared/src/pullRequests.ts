@@ -29,12 +29,18 @@ export interface CreatePullRequestFlowInput {
   files?: string[];
 }
 
+export interface PullRequestChangedFile {
+  status: string;
+  path: string;
+}
+
 export interface PullRequestCreatedInput {
   prNumber?: number;
   prUrl?: string;
   title?: string;
   summary?: string;
   files?: string[];
+  fileChanges?: PullRequestChangedFile[];
 }
 
 export interface PullRequestReviewResponse {
@@ -61,6 +67,8 @@ export interface PullRequestReviewRequest {
 }
 
 export interface PullRequestCreatedInfo extends PullRequestCreatedInput {
+  files: string[];
+  fileChanges: PullRequestChangedFile[];
   reportedByAgentId?: string;
   createdAt: number;
 }
@@ -79,6 +87,7 @@ export interface PullRequestFlowSnapshot {
   title?: string;
   summary: string;
   files: string[];
+  fileChanges: PullRequestChangedFile[];
   status: PullRequestFlowStatus;
   createdAt: number;
   updatedAt: number;

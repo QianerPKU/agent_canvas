@@ -53,6 +53,8 @@ describe("PullRequestFlowManager integration", () => {
         host: agentManager,
         now: nextNow,
         reviewTimeoutMs: 30_000,
+        resolveChangedFiles: async ({ sourceBranch, targetBranch }) =>
+          (await workspaceManager.diffPullRequestFiles(sourceBranch, targetBranch))?.files ?? [],
       });
       agentManager.onEvent((envelope) => {
         void prManager.handleAgentEvent(envelope);
@@ -71,8 +73,9 @@ describe("PullRequestFlowManager integration", () => {
         targetBranch: "main",
         summary: "Complex local PR flow",
         title: "Complex PR",
-        files: ["src/feature.ts", "README.md"],
       });
+      expect(flow.files).toEqual(["src/feature.ts"]);
+      expect(flow.fileChanges).toEqual([{ status: "M", path: "src/feature.ts" }]);
 
       await waitUntil(() => proposer.session.steered.length === 1);
       await waitUntil(() => sourceRunning.session.steered.length === 1);
@@ -82,6 +85,9 @@ describe("PullRequestFlowManager integration", () => {
       );
       expect(inputText(sourceRunning.session.steered[0])).toContain(
         "sourceBranch: feature/pr-flow",
+      );
+      expect(inputText(sourceRunning.session.steered[0])).toContain(
+        "changedFiles (git diff --name-status):\n- M src/feature.ts",
       );
       expect(inputText(sourceWaiting.session.inputs.at(-1))).toContain(
         "\"stage\": \"source_preflight\"",

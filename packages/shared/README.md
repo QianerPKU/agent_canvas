@@ -59,6 +59,8 @@ npm test --workspace packages/shared        # vitest
 
 流程状态只表达程序控制的审查/授权边界：源 branch preflight、提 PR 授权、目标 branch merge 审查、合并授权、失败、超时或取消。它不限制 agent 自行 commit，也不描述具体 `git`/`gh` 命令。
 
+`PullRequestFlowSnapshot.fileChanges` 使用 `PullRequestChangedFile` 记录这次 PR 的具体文件变化（`git diff --name-status` 的 `status + path`）。后端发给审查 agent 的 source/target review 提示必须包含该列表；`files` 保留为路径范围的简化列表。
+
 `ServerFrame` 的 `hello` 帧可携带 `prFlows` 快照，后续 `pr_flow` 帧推送单个流程更新。
 
 ## 提示词节点模型

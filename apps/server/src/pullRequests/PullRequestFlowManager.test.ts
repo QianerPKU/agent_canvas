@@ -109,7 +109,10 @@ describe("PullRequestFlowManager", () => {
     });
 
     expect(flow.status).toBe("source_review_collecting");
+    expect(flow.fileChanges).toEqual([{ status: "specified", path: "src/a.ts" }]);
     expect(proposer.sent[0]).toContain("sourceBranch: feature/a");
+    expect(proposer.sent[0]).toContain("changedFiles (git diff --name-status):");
+    expect(proposer.sent[0]).toContain("- specified src/a.ts");
     expect(proposer.sent[0]).toContain("\"stage\": \"source_preflight\"");
 
     now += 1;
@@ -138,6 +141,7 @@ describe("PullRequestFlowManager", () => {
     flow = manager.get(flow.id)!;
     expect(flow.status).toBe("target_review_collecting");
     expect(targetReviewer.sent.at(-1)).toContain("\"stage\": \"target_merge\"");
+    expect(targetReviewer.sent.at(-1)).toContain("- specified src/a.ts");
 
     now += 1;
     targetReviewer.setStatus("waiting_input");
@@ -163,6 +167,7 @@ describe("PullRequestFlowManager", () => {
       proposerAgentId: "agent_1",
       targetBranch: "main",
       summary: "Needs review",
+      files: ["src/retry.ts"],
     });
 
     now += 1;
@@ -199,11 +204,51 @@ describe("PullRequestFlowManager", () => {
       proposerAgentId: "agent_1",
       targetBranch: "main",
       summary: "Timeout flow",
+      files: ["src/timeout.ts"],
     });
     now = 11;
     vi.advanceTimersByTime(11);
 
     expect(manager.get(flow.id)?.status).toBe("timed_out");
+  });
+
+  it("resolves changed files when a flow is created without explicit files", async () => {
+    let now = 3000;
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/a", "waiting_input");
+    const manager = new PullRequestFlowManager({
+      host,
+      now: () => now,
+      resolveChangedFiles: async ({ sourceBranch, targetBranch }) => {
+        expect(sourceBranch).toBe("feature/a");
+        expect(targetBranch).toBe("main");
+        return [{ status: "M", path: "src/resolved.ts" }];
+      },
+    });
+
+    const flow = await manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "main",
+      summary: "Resolved files",
+    });
+
+    expect(flow.files).toEqual(["src/resolved.ts"]);
+    expect(flow.fileChanges).toEqual([{ status: "M", path: "src/resolved.ts" }]);
+    expect(proposer.sent[0]).toContain("- M src/resolved.ts");
+  });
+
+  it("rejects PR flows when no changed files can be determined", async () => {
+    const host = new FakeHost();
+    host.addAgent("agent_1", "feature/a", "waiting_input");
+    const manager = new PullRequestFlowManager({ host });
+
+    await expect(
+      manager.create({
+        proposerAgentId: "agent_1",
+        targetBranch: "main",
+        summary: "No files",
+      }),
+    ).rejects.toThrow("concrete changed file list");
   });
 });
 

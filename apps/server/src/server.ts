@@ -75,7 +75,12 @@ export function createServer(
       workspaceRoot: defaultCwd,
     });
   const pullRequestFlowManager =
-    options.pullRequestFlowManager ?? new PullRequestFlowManager({ host: manager });
+    options.pullRequestFlowManager ??
+    new PullRequestFlowManager({
+      host: manager,
+      resolveChangedFiles: async ({ sourceBranch, targetBranch }) =>
+        (await workspaceManager.diffPullRequestFiles(sourceBranch, targetBranch))?.files ?? [],
+    });
   manager.setPromptAccessResolver((agentId) => promptManager.accessFor(agentId));
   const httpServer = http.createServer((req, res) => {
     handleHttp(

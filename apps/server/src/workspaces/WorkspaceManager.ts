@@ -273,12 +273,33 @@ export class WorkspaceManager {
     fromBranch: string | undefined,
     toBranch: string | undefined,
   ): Promise<BranchDiffSummary | undefined> {
+    if (!fromBranch || !toBranch) return undefined;
+    return this.diffBranchRefs(fromBranch, toBranch, fromBranch, toBranch);
+  }
+
+  async diffPullRequestFiles(
+    sourceBranch: string | undefined,
+    targetBranch: string | undefined,
+  ): Promise<BranchDiffSummary | undefined> {
+    if (!sourceBranch || !targetBranch) return undefined;
+    return this.diffBranchRefs(
+      targetBranch,
+      sourceBranch,
+      `${targetBranch}...${sourceBranch}`,
+    );
+  }
+
+  private async diffBranchRefs(
+    fromBranch: string | undefined,
+    toBranch: string | undefined,
+    ...refs: string[]
+  ): Promise<BranchDiffSummary | undefined> {
     await this.ensureProjectOpen();
     await this.loadStateIfNeeded();
     const repo = this.state.repo;
     if (!repo || !fromBranch || !toBranch || fromBranch === toBranch) return undefined;
     try {
-      const output = await this.runGit(["diff", "--name-status", fromBranch, toBranch], {
+      const output = await this.runGit(["diff", "--name-status", ...refs], {
         cwd: repo.localRepoPath,
       });
       return {
