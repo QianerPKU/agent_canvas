@@ -14,6 +14,7 @@
 | `src/util/AsyncMessageQueue.ts` | 可动态 push、可关闭的异步队列；作为流式输入源，实现"中途干预" |
 | `src/AgentRunner.ts` | 单 agent 生命周期 + 状态机（`idle→starting→running↔waiting_input→done/stopped/error`） |
 | `src/AgentManager.ts` | 多 agent 注册表：分配 id、维护单调 `seq`、包 `AgentEventEnvelope` 广播、内存事件历史 |
+| `src/workspaces/WorkspaceManager.ts` | AppData 项目根、GitHub/repo clone、branch worktree、共享资源映射和 Agent 临时目录 |
 | `src/server.ts` | HTTP(REST) + WebSocket 装配 |
 | `src/index.ts` | 入口：实例化 manager（注入 Claude/Codex query）并监听端口 |
 
@@ -44,6 +45,12 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 | 方法 路径 | 说明 |
 | --- | --- |
 | `GET /api/health` | 健康检查 |
+| `GET /api/workspace` | 当前 AppData 项目、GitHub/repo 连接、branch workspace 与共享资源快照 |
+| `POST /api/workspace/connect` | body=`{ remoteUrl?, localPath?, defaultBranch? }`，把 GitHub/本地 repo clone 到 AppData 项目目录 |
+| `GET /api/workspace/branches` | 列出 branch workspaces |
+| `POST /api/workspace/branches` | body=`{ branch, baseBranch? }`，创建 branch workspace |
+| `GET /api/workspace/shared-resources` | 列出项目级共享资源 |
+| `POST /api/workspace/shared-resources` | body=`{ name, mountPath, access?, sourcePath? }`，创建共享资源并映射到所有 branch workspace |
 | `GET /api/agents` | 列出全部 agent 快照 |
 | `POST /api/agents` | 新建 agent，返回 `{ id }` |
 | `GET /api/agents/:id` | 单个快照 |
@@ -110,6 +117,13 @@ npm run smoke --workspace apps/server
 - `AgentRunner` 在首轮和每次 `send` 前重新解析文件权限；因此 Claude/Codex 的每个完整业务请求都会携带该轮最新的可读文件引用和可写目标。`compact` 是 CLI 控制指令，不附加业务文件引用。
 - 写权限是 CLI 的目录粒度，而且可写目录天然也可读；隔离文件采用单节点目录来缩小授权范围。读连线负责显式引用和画布层授权，不等同于操作系统级读取隔离。
 
+## GitHub / Branch Workspace / 三类文件
+
+- Agent Canvas 项目根默认位于用户本地数据目录 `agent_canvas/projects/<workspace-key>/`，可用 `AGENT_CANVAS_PROJECT_ROOT` 覆盖。默认 branch 使用 AppData 内的 clone，其他 branch 使用 `git worktree` 放在同一项目根下。
+- 新建 Agent 推荐传 `branchWorkspaceId`，后端据此把 `cwd` 解析为对应 branch workspace；旧的裸 `cwd` 仍保留兼容。
+- 三类文件分开管理：仓库文件在各 branch workspace 中并默认需要 commit；共享资源真实目录在项目根的 `shared/` 中，通过 junction/symlink 映射进每个 branch；临时文件在 `<worktree>/.agent-tmp/<agent-id>/`，写入本地 git exclude。
+- 共享资源有 `readOnly/readWrite`。`readOnly` 只进入可读目录和上下文说明；`readWrite` 才加入 provider 可写目录。junction/symlink 不是跨平台强只读边界，因此内置工作区规则提示词也会要求 Agent 未经明确授权不得修改只读共享资源。
+
 ## 提示词节点
 
 - `src/prompts/PromptManager.ts` 管理纯文本提示词节点、普通读写连线、共享读写开关和内部可写文本载体。
@@ -133,11 +147,11 @@ npm run smoke --workspace apps/server
 - https://docs.anthropic.com/en/docs/claude-code/common-workflows
 - https://docs.anthropic.com/en/docs/claude-code/cli-reference
 
-## Agent 设置与工作目录
+## Agent 设置与 Branch
 
-- 进程入口用 `AGENT_CANVAS_WORKSPACE_ROOT ?? INIT_CWD ?? process.cwd()` 解析画布默认工作目录，避免从 npm workspace 启动时误把 `apps/server` 当作项目根目录。`GET /api/config` 会把这个 `defaultCwd` 交给前端。
-- `POST /api/agents` 支持 `provider/model/cwd/systemPrompt`。新 Agent 创建后还未启动时，这些设置保存在快照配置里；fork 会复制父 Agent 的 provider、模型、工作目录和私有系统提示词。
-- `PATCH /api/agents/:id/settings` 只允许更新 `systemPrompt`。已创建 Agent 的 provider、模型和工作目录不在该接口中变更。
+- 进程入口用 `AGENT_CANVAS_WORKSPACE_ROOT ?? INIT_CWD ?? process.cwd()` 解析默认源仓库目录；WorkspaceManager 会把实际 branch workspace 放到 AppData 项目根。`GET /api/config` 返回 `defaultCwd` 和 `projectRoot`。
+- `POST /api/agents` 支持 `provider/model/branchWorkspaceId/cwd/systemPrompt`。新工作流中 `branchWorkspaceId` 决定 `cwd`；`cwd` 只保留兼容和快照展示。fork 会复制父 Agent 的 provider、模型、branch/cwd 和私有系统提示词。
+- `PATCH /api/agents/:id/settings` 只允许更新 `systemPrompt`。已创建 Agent 的 provider、模型和 branch/workdir 不在该接口中变更。
 - `systemPrompt` 是当前 Agent 私有提示词，不传给 Claude/Codex 原生 system prompt，而是在 `AgentRunner` 中按提示词节点同样的可读提示词机制拼接到业务输入。新 Agent 首轮、手动 compact 后、自动 compact 后、以及运行中更新设置后的下一条业务输入会重新注入。
 - Agent Canvas 内置工作区规则不属于用户可编辑的 `systemPrompt`，即使用户没有设置私有系统提示词也会注入；它约束共享文件默认只读、临时文件只写 `.agent-tmp/<agent-id>/`、其余非共享非临时修改都视为需要 commit 的仓库文件。
 - `POST /api/directories/pick` 通过本机目录选择器返回用户选中的目录；Windows 使用 PowerShell + `System.Windows.Forms.FolderBrowserDialog`，其他平台暂返回明确错误并允许前端继续手动输入路径。

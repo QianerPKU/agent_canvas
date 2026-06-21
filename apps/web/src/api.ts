@@ -4,10 +4,12 @@ import type {
   AgentSettings,
   AgentSnapshot,
   AgentStartConfig,
+  BranchWorkspace,
   CanvasFileConnection,
   CanvasFileNode,
   CanvasPromptConnection,
   CanvasPromptNode,
+  CreateBranchWorkspaceInput,
   CreateCanvasFileInput,
   CreateCanvasPromptInput,
   FileConnectionAccess,
@@ -16,6 +18,7 @@ import type {
   UpdateAgentSettingsInput,
   UpdateCanvasFileInput,
   UpdateCanvasPromptInput,
+  WorkspaceProject,
 } from "@agent-canvas/shared";
 
 const BASE = "/api";
@@ -35,7 +38,15 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   list: () => call<{ agents: AgentSnapshot[] }>("/agents").then((r) => r.agents),
-  config: () => call<{ defaultCwd: string }>("/config"),
+  config: () => call<{ defaultCwd: string; projectRoot: string }>("/config"),
+  workspace: () => call<WorkspaceProject>("/workspace"),
+  listBranches: () =>
+    call<{ branches: BranchWorkspace[] }>("/workspace/branches").then((r) => r.branches),
+  createBranch: (input: CreateBranchWorkspaceInput) =>
+    call<{ branch: BranchWorkspace }>("/workspace/branches", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }).then((r) => r.branch),
   history: (id: string) =>
     call<{ events: AgentEventEnvelope[] }>(`/agents/${id}/history`).then((r) => r.events),
   create: (settings: AgentSettings) =>

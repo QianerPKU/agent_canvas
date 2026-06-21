@@ -7,13 +7,25 @@ import { newAgentView } from "../agentStore.js";
 afterEach(cleanup);
 
 describe("AgentSettingsDialog", () => {
-  it("新建时提交运行器、工作目录和私有系统提示词", async () => {
+  const branches = [
+    {
+      id: "branch_1",
+      repoId: "repo_1",
+      branch: "main",
+      worktreePath: "E:\\project\\repo",
+      scratchRoot: "E:\\project\\repo\\.agent-tmp",
+      isDefault: true,
+      createdAt: 1,
+    },
+  ];
+
+  it("新建时提交运行器、branch 和私有系统提示词", async () => {
     const onCreate = vi.fn().mockResolvedValue(undefined);
     render(
       <AgentSettingsDialog
         mode="create"
-        defaultCwd="E:\\repo"
-        onPickDirectory={vi.fn()}
+        branches={branches}
+        onCreateBranch={vi.fn()}
         onCreate={onCreate}
         onClose={vi.fn()}
       />,
@@ -22,9 +34,6 @@ describe("AgentSettingsDialog", () => {
     fireEvent.click(screen.getByText("Codex"));
     fireEvent.change(screen.getByLabelText("Codex 模型"), {
       target: { value: "gpt-5.4-mini" },
-    });
-    fireEvent.change(screen.getByLabelText("Agent 工作目录"), {
-      target: { value: "D:\\experiment" },
     });
     fireEvent.change(screen.getByLabelText("Agent 私有系统提示词"), {
       target: { value: "只修改测试相关文件" },
@@ -35,9 +44,50 @@ describe("AgentSettingsDialog", () => {
       expect(onCreate).toHaveBeenCalledWith({
         provider: "codex",
         model: "gpt-5.4-mini",
-        cwd: "D:\\experiment",
+        branchWorkspaceId: "branch_1",
+        branch: "main",
+        cwd: "E:\\project\\repo",
         systemPrompt: "只修改测试相关文件",
       }),
+    );
+  });
+
+  it("新建时可以创建并选择 branch", async () => {
+    const onCreateBranch = vi.fn().mockResolvedValue({
+      id: "branch_2",
+      repoId: "repo_1",
+      branch: "feature/a",
+      worktreePath: "E:\\project\\feature-a",
+      scratchRoot: "E:\\project\\feature-a\\.agent-tmp",
+      isDefault: false,
+      createdAt: 2,
+    });
+    const onCreate = vi.fn().mockResolvedValue(undefined);
+    render(
+      <AgentSettingsDialog
+        mode="create"
+        branches={branches}
+        onCreateBranch={onCreateBranch}
+        onCreate={onCreate}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("新建 branch"), {
+      target: { value: "feature/a" },
+    });
+    fireEvent.click(screen.getByTitle("创建 branch"));
+    await waitFor(() => expect(onCreateBranch).toHaveBeenCalledWith("feature/a"));
+
+    fireEvent.click(screen.getByText("创建"));
+    await waitFor(() =>
+      expect(onCreate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          branchWorkspaceId: "branch_2",
+          branch: "feature/a",
+          cwd: "E:\\project\\feature-a",
+        }),
+      ),
     );
   });
 
@@ -45,6 +95,8 @@ describe("AgentSettingsDialog", () => {
     const onUpdate = vi.fn().mockResolvedValue(undefined);
     const agent = newAgentView("agent_1", {
       provider: "claude",
+      branchWorkspaceId: "branch_1",
+      branch: "main",
       cwd: "E:\\repo",
       systemPrompt: "old",
     });
@@ -52,14 +104,12 @@ describe("AgentSettingsDialog", () => {
       <AgentSettingsDialog
         mode="edit"
         agent={agent}
-        defaultCwd="E:\\repo"
-        onPickDirectory={vi.fn()}
         onUpdate={onUpdate}
         onClose={vi.fn()}
       />,
     );
 
-    expect((screen.getByLabelText("Agent 工作目录") as HTMLInputElement).readOnly).toBe(true);
+    expect((screen.getByLabelText("Agent branch") as HTMLInputElement).readOnly).toBe(true);
     fireEvent.change(screen.getByLabelText("Agent 私有系统提示词"), {
       target: { value: "new prompt" },
     });

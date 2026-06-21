@@ -31,10 +31,19 @@ describe("realQuery file access", () => {
         readableFiles: [
           { name: "first.md", path: "C:/shared/first.md", previewKind: "markdown" },
         ],
+        readableDirectories: ["C:/datasets/raw"],
         writableFiles: [
           { name: "first-output.md", path: "C:/shared/first-output.md", previewKind: "markdown" },
         ],
         writableDirectories: ["C:/shared/first-output"],
+        sharedResources: [
+          {
+            name: "raw dataset",
+            mountPath: "C:/repo/data/raw",
+            sourcePath: "C:/datasets/raw",
+            access: "readOnly",
+          },
+        ],
       },
       promptAccess: {
         readablePrompts: [
@@ -58,6 +67,7 @@ describe("realQuery file access", () => {
     const firstContent = String(first.value?.message.content);
     expect(firstContent.indexOf("先写测试")).toBeLessThan(firstContent.indexOf("检查第一轮文件"));
     expect(firstContent.indexOf("保持简单")).toBeLessThan(firstContent.indexOf("检查第一轮文件"));
+    expect(firstContent).toContain("raw dataset [readOnly]: C:/repo/data/raw -> C:/datasets/raw");
     expect(firstContent).toContain("@C:/shared/first.md");
     expect(firstContent).toContain("C:/shared/first-output.md");
     expect(firstContent).toContain("C:/prompts/prompt_3.txt");
@@ -85,7 +95,7 @@ describe("realQuery file access", () => {
     expect(second.value?.message.content).not.toContain("@C:/shared/first.md");
     expect(sdk.applyFlagSettings).toHaveBeenNthCalledWith(1, {
       permissions: {
-        additionalDirectories: ["C:/shared/first-output", "C:/prompts"],
+        additionalDirectories: ["C:/datasets/raw", "C:/shared/first-output", "C:/prompts"],
       },
     });
     expect(sdk.applyFlagSettings).toHaveBeenNthCalledWith(2, {

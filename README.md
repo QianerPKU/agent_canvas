@@ -6,7 +6,8 @@
 
 - **画布即控制台**：可实时监控（输出流 / 工具调用 / token 与花费 / 状态）并可干预（追加指令 / 停止）。
 - **节点 = 一轮对话（对话树）**：一个 agent = 一条轮次链；每轮 = 一次用户输入 + 一次完整答复，完成后**自动延伸出待输入的新节点**。从任意完成轮可 **fork** 出一个独立新 agent：Claude 走 `forkSession + resumeSessionAt`，Codex 走 app-server 的 `thread/fork`。fork 不绑定 git。
-- **区域 = 分支**：画布用背景色切分成若干**区域**，每个区域对应一个 git branch（背后一个 git worktree）。agent 模块可被拖动到不同区域，从而在对应分支里工作；纯做实验的 agent 不必各自占用分支。*(里程碑 2/3 实现)*
+- **Branch workspace = 分支工作目录**：每个 branch 对应 AppData 项目根下的一个工作目录（默认分支为 clone，其他分支为 git worktree）。新建 agent 时选择 branch；后续画布区域会复用同一模型。
+- **三类文件**：仓库文件正常随 branch commit；数据集/模型权重等共享资源放在项目级共享目录并映射进各 branch；agent 临时文件只放 `.agent-tmp/<agent-id>/` 且不提交。
 - **提示词模块化 + fork/版本**：提示词按 agent 类型模块化管理，支持 fork 与版本分支。*(里程碑 2 实现)*
 
 ## 技术栈

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { AgentManager } from "./AgentManager.js";
@@ -9,6 +9,7 @@ import { createServer } from "./server.js";
 import { FileManager } from "./files/FileManager.js";
 import { PromptManager } from "./prompts/PromptManager.js";
 import type { QueryFn } from "./sdk/types.js";
+import { WorkspaceManager, type GitRunner } from "./workspaces/WorkspaceManager.js";
 
 /** 立即结束消息流的假 query：足以测 HTTP 路由，不触达模型。 */
 const emptyQuery: QueryFn = () => ({
@@ -59,6 +60,7 @@ describe("HTTP server", () => {
   let server: http.Server;
   let port = 0;
   let root = "";
+  let projectRoot = "";
   const openFile = vi.fn<(filePath: string) => Promise<void>>().mockResolvedValue(undefined);
   const pickDirectory = vi
     .fn<(initialDirectory?: string) => Promise<string | undefined>>()
@@ -67,6 +69,29 @@ describe("HTTP server", () => {
   beforeAll(async () => {
     const manager = new AgentManager({ query: emptyQuery });
     root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-server-"));
+    projectRoot = path.join(root, "project");
+    const runGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return "https://github.com/acme/demo.git";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        await writeFile(path.join(String(args[2]), ".gitkeep"), "");
+        return "";
+      }
+      if (args[0] === "worktree" && args[1] === "add") {
+        await mkdir(path.join(String(args[4]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      return "";
+    };
+    const workspaceManager = new WorkspaceManager({
+      defaultSourcePath: root,
+      projectRoot,
+      runGit,
+    });
     const fileManager = new FileManager({
       workspaceRoot: root,
       isolatedRoot: path.join(root, "isolated"),
@@ -81,6 +106,7 @@ describe("HTTP server", () => {
       openFile,
       pickDirectory,
       promptManager,
+      workspaceManager,
     }));
     await new Promise<void>((r) => server.listen(0, r));
     port = (server.address() as AddressInfo).port;
@@ -99,13 +125,51 @@ describe("HTTP server", () => {
 
   it("exposes default cwd and directory picker", async () => {
     const config = await request(port, "GET", "/api/config");
-    expect(config).toEqual({ status: 200, json: { defaultCwd: root } });
+    expect(config).toEqual({ status: 200, json: { defaultCwd: root, projectRoot } });
 
     const picked = await request(port, "POST", "/api/directories/pick", {
       initialDirectory: root,
     });
     expect(picked).toEqual({ status: 200, json: { path: "C:\\picked" } });
     expect(pickDirectory).toHaveBeenCalledWith(root);
+  });
+
+  it("exposes GitHub workspace branches and creates agents on a selected branch", async () => {
+    const branches = await request(port, "GET", "/api/workspace/branches");
+    expect(branches.status).toBe(200);
+    expect(branches.json.branches[0]).toMatchObject({
+      branch: "main",
+      worktreePath: path.join(projectRoot, "repos", "repo_1", "repo"),
+    });
+
+    const feature = await request(port, "POST", "/api/workspace/branches", {
+      branch: "feature/server-test",
+    });
+    expect(feature.status).toBe(201);
+
+    const resource = await request(port, "POST", "/api/workspace/shared-resources", {
+      name: "dataset",
+      mountPath: "data/raw",
+      access: "readOnly",
+    });
+    expect(resource.status).toBe(201);
+
+    const created = await request(port, "POST", "/api/agents", {
+      branchWorkspaceId: feature.json.branch.id,
+      systemPrompt: "branch rules",
+    });
+    expect(created.status).toBe(201);
+
+    const listed = await request(port, "GET", "/api/agents");
+    const snapshot = listed.json.agents.find(
+      (agent: { id: string }) => agent.id === created.json.id,
+    );
+    expect(snapshot.config).toMatchObject({
+      branchWorkspaceId: feature.json.branch.id,
+      branch: "feature/server-test",
+      cwd: feature.json.branch.worktreePath,
+      systemPrompt: "branch rules",
+    });
   });
 
   it("POST /api/agents 新建，GET /api/agents 能列出", async () => {

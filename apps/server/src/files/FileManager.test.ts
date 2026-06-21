@@ -93,10 +93,12 @@ describe("FileManager", () => {
       readableFiles: [
         expect.objectContaining({ name: "input.json", path: file.path }),
       ],
+      readableDirectories: [],
       writableFiles: [
         expect.objectContaining({ name: "input.json", path: file.path }),
       ],
       writableDirectories: [path.dirname(file.path)],
+      sharedResources: [],
     });
     expect(manager.listConnections().filter((item) => item.agentId === "agent_2")).toHaveLength(2);
   });

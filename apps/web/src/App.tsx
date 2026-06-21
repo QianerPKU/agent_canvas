@@ -12,6 +12,7 @@ import {
 import { FilePlus2, MessageSquarePlus, X } from "lucide-react";
 import { api } from "./api.js";
 import type {
+  BranchWorkspace,
   CanvasFileConnection,
   CanvasFileNode,
   CanvasPromptConnection,
@@ -324,6 +325,7 @@ export default function App(): React.ReactElement {
   const [creatingPrompt, setCreatingPrompt] = useState(false);
   const [agentSettingsTarget, setAgentSettingsTarget] = useState<AgentSettingsTarget>();
   const [defaultCwd, setDefaultCwd] = useState("");
+  const [branches, setBranches] = useState<BranchWorkspace[]>([]);
   const openFile = files.find((file) => file.id === openFileId);
   const settingsAgent =
     agentSettingsTarget?.mode === "edit" ? agents[agentSettingsTarget.agentId] : undefined;
@@ -333,6 +335,12 @@ export default function App(): React.ReactElement {
     void api.config().then(
       (config) => {
         if (!cancelled) setDefaultCwd(config.defaultCwd);
+      },
+      () => undefined,
+    );
+    void api.listBranches().then(
+      (nextBranches) => {
+        if (!cancelled) setBranches(nextBranches);
       },
       () => undefined,
     );
@@ -366,6 +374,16 @@ export default function App(): React.ReactElement {
   const pickDirectory = useCallback(async (initialDirectory?: string) => {
     const result = await api.pickDirectory(initialDirectory);
     return result.path ?? undefined;
+  }, []);
+
+  const createBranch = useCallback(async (branch: string) => {
+    const created = await api.createBranch({ branch });
+    setBranches((current) =>
+      current.some((candidate) => candidate.id === created.id)
+        ? current
+        : [...current, created],
+    );
+    return created;
   }, []);
 
   useEffect(() => {
@@ -523,8 +541,8 @@ export default function App(): React.ReactElement {
       {agentSettingsTarget?.mode === "create" && (
         <AgentSettingsDialog
           mode="create"
-          defaultCwd={defaultCwd}
-          onPickDirectory={pickDirectory}
+          branches={branches}
+          onCreateBranch={createBranch}
           onCreate={async (settings) => {
             await actions.create(settings);
           }}
@@ -535,8 +553,6 @@ export default function App(): React.ReactElement {
         <AgentSettingsDialog
           mode="edit"
           agent={settingsAgent}
-          defaultCwd={defaultCwd}
-          onPickDirectory={pickDirectory}
           onUpdate={actions.updateSettings}
           onClose={() => setAgentSettingsTarget(undefined)}
         />

@@ -18,7 +18,7 @@
 | `UserInputMode` | 运行中输入模式：`queued` 表示排到下一轮，`steer` 表示引导当前 in-flight turn；未设置表示普通轮次输入 |
 | `AgentEvent` | 归一化事件的可辨识联合（判别字段 `kind`）：`status / user_input / compact / system_init / thinking / assistant_text / tool_use / tool_result / result / error` |
 | `AgentEventEnvelope` | 传输信封：`{ agentId, seq, at, event }`，带单调序号便于回放/补齐 |
-| `AgentStartConfig` | 启动 agent 的配置（provider、prompt、cwd、model、权限模式、`zoneId` 占位等） |
+| `AgentStartConfig` | 启动 agent 的配置（provider、prompt、branch workspace/cwd、model、权限模式、`zoneId` 占位等） |
 | `ClientCommand` | 客户端→服务端命令：`start / stop / compact / terminate / send / steer / resume` |
 | `AgentSnapshot` | agent 当前快照（REST 列表、重连补齐） |
 
@@ -43,7 +43,13 @@ npm test --workspace packages/shared        # vitest
 
 ## Agent 设置模型
 
-`src/events.ts` 定义 `AgentSettings`、`CreateAgentInput` 和 `UpdateAgentSettingsInput`。创建 Agent 可带 provider、模型、工作目录和私有系统提示词；更新已创建 Agent 时只允许调整私有系统提示词。`AgentStartConfig.systemPrompt` 只表示画布私有提示词，会按提示词节点方式拼接到业务输入中。
+`src/events.ts` 定义 `AgentSettings`、`CreateAgentInput` 和 `UpdateAgentSettingsInput`。创建 Agent 可带 provider、模型、`branchWorkspaceId`/`cwd` 和私有系统提示词；新工作流中 branch workspace 决定实际工作目录，`cwd` 保留兼容与快照展示。更新已创建 Agent 时只允许调整私有系统提示词。`AgentStartConfig.systemPrompt` 只表示画布私有提示词，会按提示词节点方式拼接到业务输入中。
+
+## Workspace 模型
+
+`src/workspaces.ts` 定义 GitHub/repo 连接、`BranchWorkspace`、`SharedResourceMount` 和创建输入。三类文件约定为：仓库文件在 branch worktree 内并默认需要 commit；共享资源位于项目级共享目录并映射进各 branch；Agent 临时文件位于 `.agent-tmp/<agent-id>/` 且不提交。
+
+`AgentFileAccess` 额外包含 `readableDirectories` 和 `sharedResources`。`readOnly` 共享资源只进入可读目录和上下文说明；`readWrite` 共享资源才加入 `writableDirectories`。
 
 ## 提示词节点模型
 

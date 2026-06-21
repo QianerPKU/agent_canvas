@@ -216,12 +216,14 @@ export class FileManager {
         path: file.path,
         previewKind: file.previewKind,
       })),
+      readableDirectories: [],
       writableFiles: [...writable.values()].map((file) => ({
         name: file.filename,
         path: file.path,
         previewKind: file.previewKind,
       })),
       writableDirectories: [...writableDirectories],
+      sharedResources: [],
     };
   }
 

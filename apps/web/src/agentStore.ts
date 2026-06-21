@@ -51,7 +51,10 @@ export interface AgentView {
   provider?: AgentProvider;
   sessionId?: string;
   model?: string;
+  branchWorkspaceId?: string;
+  branch?: string;
   cwd?: string;
+  scratchDirectory?: string;
   systemPrompt?: string;
   status: AgentStatus;
   turns: Turn[];
@@ -85,7 +88,10 @@ export function applyHello(agents: AgentSnapshot[]): AgentMap {
       status: a.status,
       sessionId: a.sessionId,
       model: a.config.model,
+      branchWorkspaceId: a.config.branchWorkspaceId,
+      branch: a.config.branch,
       cwd: a.config.cwd,
+      scratchDirectory: a.config.scratchDirectory,
       systemPrompt: a.config.systemPrompt,
       forkOrigin: a.forkOrigin,
       createdAt: a.createdAt,
@@ -109,7 +115,10 @@ export function insertForked(
     [id]: newAgentView(id, {
       provider: parent?.provider,
       model: model ?? parent?.model,
+      branchWorkspaceId: parent?.branchWorkspaceId,
+      branch: parent?.branch,
       cwd: parent?.cwd,
+      scratchDirectory: parent?.scratchDirectory,
       systemPrompt: parent?.systemPrompt,
       forkOrigin: origin,
     }),
@@ -128,7 +137,10 @@ export function recordAgentSettings(
       ...prev,
       provider: settings.provider ?? prev.provider,
       model: settings.model ?? prev.model,
+      branchWorkspaceId: settings.branchWorkspaceId ?? prev.branchWorkspaceId,
+      branch: settings.branch ?? prev.branch,
       cwd: settings.cwd ?? prev.cwd,
+      scratchDirectory: settings.scratchDirectory ?? prev.scratchDirectory,
       systemPrompt: settings.systemPrompt ?? prev.systemPrompt,
     },
   };

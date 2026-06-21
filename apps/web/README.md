@@ -75,8 +75,8 @@ npm test --workspace apps/web
 
 ## Agent 设置
 
-- 顶栏“新建 Agent”先打开设置窗口，再创建空闲 Agent。窗口中可选择 Claude Code/Codex、Codex 模型、工作目录和当前 Agent 私有系统提示词。
-- 工作目录默认来自后端 `GET /api/config`，可手动输入，也可通过浏览按钮调用后端目录选择器。
-- 已创建 Agent 的最新节点头部显示齿轮按钮，打开后只允许修改私有系统提示词；provider、模型和工作目录保持锁定。
+- 顶栏“新建 Agent”先打开设置窗口，再创建空闲 Agent。窗口中可选择 Claude Code/Codex、Codex 模型、branch workspace 和当前 Agent 私有系统提示词。
+- Branch 列表来自后端 `GET /api/workspace/branches`，弹窗里可创建新 branch。Agent 不再手动选择工作目录，实际 `cwd` 由后端根据 `branchWorkspaceId` 解析。
+- 已创建 Agent 的最新节点头部显示齿轮按钮，打开后只允许修改私有系统提示词；provider、模型和 branch 保持锁定。
 - 首轮对话节点不再提供 provider/model 选择，启动时直接使用 Agent 创建时保存的设置。
 - 新建文件节点默认放在工作目录中，也支持手动输入或浏览调整目录；隔离目录仍可通过存放位置切换。

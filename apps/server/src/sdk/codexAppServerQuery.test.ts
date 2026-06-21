@@ -163,10 +163,25 @@ describe("Codex app-server query", () => {
             { name: "notes.md", path: "C:/shared/notes.md", previewKind: "markdown" },
             { name: "shot.png", path: "C:/shared/shot.png", previewKind: "image" },
           ],
+          readableDirectories: ["C:/datasets/raw", "C:/models/weights"],
           writableFiles: [
             { name: "output.csv", path: "C:/shared/output/output.csv", previewKind: "csv" },
           ],
-          writableDirectories: ["C:/shared/output"],
+          writableDirectories: ["C:/shared/output", "C:/models/weights"],
+          sharedResources: [
+            {
+              name: "raw dataset",
+              mountPath: "C:/repo/data/raw",
+              sourcePath: "C:/datasets/raw",
+              access: "readOnly",
+            },
+            {
+              name: "weights",
+              mountPath: "C:/repo/models/weights",
+              sourcePath: "C:/models/weights",
+              access: "readWrite",
+            },
+          ],
         },
         {
           readablePrompts: [
@@ -223,7 +238,10 @@ describe("Codex app-server query", () => {
       {
         type: "text",
         text:
-          "先写测试\n\n处理这些文件\n\n可写的画布文件（作为输出目标）：\n" +
+          "先写测试\n\n处理这些文件\n\n共享映射资源（除非用户明确授权，否则 readOnly 资源不能修改）：\n" +
+          "- raw dataset [readOnly]: C:/repo/data/raw -> C:/datasets/raw\n" +
+          "- weights [readWrite]: C:/repo/models/weights -> C:/models/weights\n\n" +
+          "可写的画布文件（作为输出目标）：\n" +
           "- C:/shared/output/output.csv\n\n可写的提示词节点（修改对应文本文件）：\n" +
           "- 可写规则: C:/prompts/prompt_2.txt",
         text_elements: [],
@@ -236,6 +254,7 @@ describe("Codex app-server query", () => {
       writableRoots: [
         expect.stringMatching(/C:[\\/]repo$/),
         expect.stringMatching(/C:[\\/]shared[\\/]output$/),
+        expect.stringMatching(/C:[\\/]models[\\/]weights$/),
         expect.stringMatching(/C:[\\/]prompts$/),
       ],
       networkAccess: false,

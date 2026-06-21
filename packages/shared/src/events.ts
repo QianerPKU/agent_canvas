@@ -43,7 +43,13 @@ export function isCodexModel(model: string | undefined): model is CodexModel {
 export interface AgentSettings {
   provider?: AgentProvider;
   model?: string;
+  /** Branch workspace id；新工作流中由它决定 cwd。 */
+  branchWorkspaceId?: string;
+  /** 展示用 branch 名称，由后端根据 branchWorkspaceId 填充。 */
+  branch?: string;
   cwd?: string;
+  /** 当前 Agent 的临时文件目录，通常为 <worktree>/.agent-tmp/<agent-id>。 */
+  scratchDirectory?: string;
   /** 当前 agent 私有的系统提示词；按提示词节点一样拼接进业务输入。 */
   systemPrompt?: string;
 }
@@ -128,6 +134,9 @@ export interface AgentStartConfig {
   prompt: string;
   /** 工作目录（M2 起由"区域=分支"的 worktree 决定）。 */
   cwd?: string;
+  branchWorkspaceId?: string;
+  branch?: string;
+  scratchDirectory?: string;
   model?: string;
   /** 当前 agent 私有的系统提示词；由 AgentRunner 按提示词节点方式拼接。 */
   systemPrompt?: string;

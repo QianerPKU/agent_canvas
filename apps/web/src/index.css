@@ -529,9 +529,11 @@ button:disabled {
 
 .file-dialog__field > input,
 .file-dialog__field > select,
+.file-dialog fieldset > select,
 .file-dialog__filename input,
 .file-dialog__filename select,
-.file-dialog__path input {
+.file-dialog__path input,
+.agent-dialog__branch-create input {
   height: 34px;
   min-width: 0;
   padding: 5px 8px;
@@ -569,6 +571,24 @@ button:disabled {
   width: 34px;
   height: 34px;
   border: 1px solid #cbd5e1;
+  background: #fff;
+}
+
+.agent-dialog__branch-create {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  gap: 6px;
+}
+
+.agent-dialog__branch-create .icon-button,
+.agent-dialog__branch-icon {
+  width: 34px;
+  height: 34px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid #cbd5e1;
+  border-radius: 5px;
+  color: #475569;
   background: #fff;
 }
 

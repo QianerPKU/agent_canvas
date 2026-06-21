@@ -1,3 +1,5 @@
+import type { AgentSharedResourceReference } from "./workspaces.js";
+
 export type CanvasFileKind = "normal" | "shared";
 export type CanvasFileStorage = "agent" | "isolated";
 export type FilePreviewKind = "text" | "markdown" | "csv" | "image" | "none";
@@ -52,10 +54,18 @@ export interface AgentFileReference {
 
 export interface AgentFileAccess {
   readableFiles: AgentFileReference[];
+  readableDirectories?: string[];
   writableFiles: AgentFileReference[];
   writableDirectories: string[];
+  sharedResources?: AgentSharedResourceReference[];
 }
 
 export function emptyAgentFileAccess(): AgentFileAccess {
-  return { readableFiles: [], writableFiles: [], writableDirectories: [] };
+  return {
+    readableFiles: [],
+    readableDirectories: [],
+    writableFiles: [],
+    writableDirectories: [],
+    sharedResources: [],
+  };
 }

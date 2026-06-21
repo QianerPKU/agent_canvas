@@ -12,7 +12,7 @@ import type { QueryFn, QueryPrompt, SdkUserInput } from "./types.js";
  */
 export const realQuery: QueryFn = (args) => {
   const { fileAccess, promptAccess, ...options } = args.options ?? {};
-  const additionalDirectories = writableDirectories(fileAccess, promptAccess);
+  const additionalDirectories = accessibleDirectories(fileAccess, promptAccess);
   let handle: ReturnType<typeof sdkQuery> | undefined;
   const prompt = withContext(args.prompt, async (directories) => {
     if (!handle) return;
@@ -42,7 +42,7 @@ async function* withContext(
     return;
   }
   for await (const input of prompt) {
-    await updateWritableDirectories(writableDirectories(input.fileAccess, input.promptAccess));
+    await updateWritableDirectories(accessibleDirectories(input.fileAccess, input.promptAccess));
     const content = input.message.content;
     const text =
       typeof content === "string"
@@ -86,7 +86,8 @@ function appendContext(
   promptAccess: AgentPromptAccess | undefined,
 ): string {
   const withPrompts = prependPromptContext(text, promptAccess);
-  const withReadableFiles = appendReferences(withPrompts, fileAccess?.readableFiles ?? []);
+  const withSharedResources = appendSharedResources(withPrompts, fileAccess);
+  const withReadableFiles = appendReferences(withSharedResources, fileAccess?.readableFiles ?? []);
   const writableFiles = fileAccess?.writableFiles ?? [];
   const withWritableFiles =
     writableFiles.length === 0
@@ -106,12 +107,27 @@ function prependPromptContext(text: string, access: AgentPromptAccess | undefine
   return prompts.length === 0 ? text : `${prompts.join("\n\n")}\n\n${text}`;
 }
 
-function writableDirectories(
+function appendSharedResources(
+  text: string,
+  fileAccess: AgentFileAccess | undefined,
+): string {
+  const resources = fileAccess?.sharedResources ?? [];
+  if (resources.length === 0) return text;
+  return `${text}\n\n共享映射资源（除非用户明确授权，否则 readOnly 资源不能修改）：\n${resources
+    .map(
+      (resource) =>
+        `- ${resource.name} [${resource.access}]: ${resource.mountPath} -> ${resource.sourcePath}`,
+    )
+    .join("\n")}`;
+}
+
+function accessibleDirectories(
   fileAccess: AgentFileAccess | undefined,
   promptAccess: AgentPromptAccess | undefined,
 ): string[] {
   return [
     ...new Set([
+      ...(fileAccess?.readableDirectories ?? []),
       ...(fileAccess?.writableDirectories ?? []),
       ...(promptAccess?.writableDirectories ?? []),
     ]),

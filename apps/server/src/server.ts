@@ -1,11 +1,15 @@
 import http from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import type {
+  AgentFileAccess,
   AgentSettings,
   AgentStartConfig,
+  ConnectGitHubInput,
+  CreateBranchWorkspaceInput,
   CreateAgentInput,
   CreateCanvasFileInput,
   CreateCanvasPromptInput,
+  CreateSharedResourceInput,
   ServerFrame,
   UpdateAgentSettingsInput,
   UpdateCanvasFileInput,
@@ -16,6 +20,7 @@ import { pickDirectory as defaultPickDirectory, type PickDirectory } from "./fil
 import { FileManager } from "./files/FileManager.js";
 import { openFileInVscode } from "./files/VscodeFileOpener.js";
 import { PromptManager } from "./prompts/PromptManager.js";
+import { WorkspaceManager } from "./workspaces/WorkspaceManager.js";
 
 export interface CreateServerResult {
   httpServer: http.Server;
@@ -23,6 +28,7 @@ export interface CreateServerResult {
   manager: AgentManager;
   fileManager: FileManager;
   promptManager: PromptManager;
+  workspaceManager: WorkspaceManager;
 }
 
 export interface CreateServerOptions {
@@ -30,6 +36,7 @@ export interface CreateServerOptions {
   openFile?: (filePath: string) => Promise<void>;
   pickDirectory?: PickDirectory;
   promptManager?: PromptManager;
+  workspaceManager?: WorkspaceManager;
 }
 
 /**
@@ -46,7 +53,14 @@ export function createServer(
     workspaceRoot: defaultCwd,
     resolveAgentCwd: (agentId) => manager.configOf(agentId)?.cwd,
   });
-  manager.setFileAccessResolver((agentId) => fileManager.accessFor(agentId));
+  const workspaceManager =
+    options.workspaceManager ?? new WorkspaceManager({ defaultSourcePath: defaultCwd });
+  manager.setFileAccessResolver((agentId) =>
+    mergeFileAccess(
+      fileManager.accessFor(agentId),
+      workspaceManager.accessForAgent(manager.configOf(agentId)),
+    ),
+  );
   const promptManager =
     options.promptManager ??
     new PromptManager({
@@ -60,6 +74,7 @@ export function createServer(
       manager,
       fileManager,
       promptManager,
+      workspaceManager,
       defaultCwd,
       options.openFile ?? openFileInVscode,
       options.pickDirectory ?? defaultPickDirectory,
@@ -83,7 +98,7 @@ export function createServer(
     }
   });
 
-  return { httpServer, wss, manager, fileManager, promptManager };
+  return { httpServer, wss, manager, fileManager, promptManager, workspaceManager };
 }
 
 async function handleHttp(
@@ -92,6 +107,7 @@ async function handleHttp(
   manager: AgentManager,
   fileManager: FileManager,
   promptManager: PromptManager,
+  workspaceManager: WorkspaceManager,
   defaultCwd: string,
   openFile: (filePath: string) => Promise<void>,
   pickDirectory: PickDirectory,
@@ -112,7 +128,66 @@ async function handleHttp(
   }
 
   if (method === "GET" && path === "/api/config") {
-    return sendJson(res, 200, { defaultCwd });
+    return sendJson(res, 200, { defaultCwd, projectRoot: workspaceManager.root() });
+  }
+
+  if (method === "GET" && path === "/api/workspace") {
+    try {
+      return sendJson(res, 200, await workspaceManager.project());
+    } catch (error) {
+      return sendJson(res, 409, { error: errMsg(error) });
+    }
+  }
+
+  if (method === "POST" && path === "/api/workspace/connect") {
+    const body = await readJson<ConnectGitHubInput>(req);
+    try {
+      return sendJson(res, 200, await workspaceManager.connect(body ?? {}));
+    } catch (error) {
+      return sendJson(res, 400, { error: errMsg(error) });
+    }
+  }
+
+  if (method === "GET" && path === "/api/workspace/branches") {
+    try {
+      return sendJson(res, 200, { branches: await workspaceManager.listBranches() });
+    } catch (error) {
+      return sendJson(res, 409, { error: errMsg(error) });
+    }
+  }
+
+  if (method === "POST" && path === "/api/workspace/branches") {
+    const body = await readJson<CreateBranchWorkspaceInput>(req);
+    if (!body?.branch) return sendJson(res, 400, { error: "缺少 branch" });
+    try {
+      return sendJson(res, 201, { branch: await workspaceManager.createBranch(body) });
+    } catch (error) {
+      return sendJson(res, 400, { error: errMsg(error) });
+    }
+  }
+
+  if (method === "GET" && path === "/api/workspace/shared-resources") {
+    try {
+      return sendJson(res, 200, {
+        resources: (await workspaceManager.project()).sharedResources,
+      });
+    } catch (error) {
+      return sendJson(res, 409, { error: errMsg(error) });
+    }
+  }
+
+  if (method === "POST" && path === "/api/workspace/shared-resources") {
+    const body = await readJson<CreateSharedResourceInput>(req);
+    if (!body?.name || !body.mountPath) {
+      return sendJson(res, 400, { error: "缺少共享资源名称或挂载路径" });
+    }
+    try {
+      return sendJson(res, 201, {
+        resource: await workspaceManager.createSharedResource(body),
+      });
+    } catch (error) {
+      return sendJson(res, 400, { error: errMsg(error) });
+    }
   }
 
   if (method === "POST" && path === "/api/directories/pick") {
@@ -132,7 +207,12 @@ async function handleHttp(
 
   if (method === "POST" && path === "/api/agents") {
     const body = await readJson<CreateAgentInput>(req);
-    const runner = manager.create(normalizeAgentSettings(body, defaultCwd));
+    if (body?.branchWorkspaceId) await workspaceManager.project();
+    const settings = normalizeAgentSettings(
+      body?.branchWorkspaceId ? workspaceManager.resolveAgentSettings(body) : body,
+      defaultCwd,
+    );
+    const runner = manager.create(settings);
     return sendJson(res, 201, { id: runner.id });
   }
 
@@ -348,6 +428,10 @@ async function handleHttp(
     if (method === "POST" && action === "start") {
       const body = await readJson<AgentStartConfig>(req);
       if (!body?.prompt) return sendJson(res, 400, { error: "缺少 prompt" });
+      await workspaceManager.prepareAgentWorkspace(id, {
+        ...manager.configOf(id),
+        ...body,
+      });
       manager.startAgent(id, body); // 若是 fork 产生的 agent，合并其 fork 配置
       return sendJson(res, 202, { ok: true });
     }
@@ -452,7 +536,20 @@ function normalizeAgentSettings(
   return {
     provider,
     model: provider === "codex" ? input?.model : undefined,
+    branchWorkspaceId: input?.branchWorkspaceId,
+    branch: input?.branch,
     cwd: input?.cwd?.trim() || defaultCwd,
+    scratchDirectory: input?.scratchDirectory,
     systemPrompt: input?.systemPrompt ?? "",
+  };
+}
+
+function mergeFileAccess(...items: AgentFileAccess[]): AgentFileAccess {
+  return {
+    readableFiles: items.flatMap((item) => item.readableFiles),
+    readableDirectories: [...new Set(items.flatMap((item) => item.readableDirectories ?? []))],
+    writableFiles: items.flatMap((item) => item.writableFiles),
+    writableDirectories: [...new Set(items.flatMap((item) => item.writableDirectories))],
+    sharedResources: items.flatMap((item) => item.sharedResources ?? []),
   };
 }

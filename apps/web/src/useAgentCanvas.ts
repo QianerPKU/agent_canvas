@@ -193,7 +193,10 @@ export function useAgentCanvas(): UseAgentCanvas {
                 [id]: newAgentView(id, {
                   provider: settings.provider,
                   model: settings.model,
+                  branchWorkspaceId: settings.branchWorkspaceId,
+                  branch: settings.branch,
                   cwd: settings.cwd,
+                  scratchDirectory: settings.scratchDirectory,
                   systemPrompt: settings.systemPrompt,
                 }),
               },
@@ -205,7 +208,10 @@ export function useAgentCanvas(): UseAgentCanvas {
           recordAgentSettings(prev, agentId, {
             provider: snapshot.config.provider,
             model: snapshot.config.model,
+            branchWorkspaceId: snapshot.config.branchWorkspaceId,
+            branch: snapshot.config.branch,
             cwd: snapshot.config.cwd,
+            scratchDirectory: snapshot.config.scratchDirectory,
             systemPrompt: snapshot.config.systemPrompt,
           }),
         );
@@ -221,7 +227,10 @@ export function useAgentCanvas(): UseAgentCanvas {
             prompt: text,
             provider: startProvider,
             model: startModel,
+            branchWorkspaceId: view?.branchWorkspaceId,
+            branch: view?.branch,
             cwd: view?.cwd,
+            scratchDirectory: view?.scratchDirectory,
             systemPrompt: view?.systemPrompt,
           });
         } else if (view.status === "waiting_input") {

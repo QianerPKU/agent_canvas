@@ -68,8 +68,10 @@ export class AgentManager {
       resolveFileAccess: (agentId) =>
         this.resolveFileAccess?.(agentId) ?? {
           readableFiles: [],
+          readableDirectories: [],
           writableFiles: [],
           writableDirectories: [],
+          sharedResources: [],
         },
       resolvePromptAccess: (agentId) =>
         this.resolvePromptAccess?.(agentId) ?? {
@@ -142,6 +144,8 @@ export class AgentManager {
     if (!parentSession) return undefined;
     const parentProvider = parentSnapshot.config?.provider;
     const parentCwd = parentSnapshot.config?.cwd;
+    const parentBranchWorkspaceId = parentSnapshot.config?.branchWorkspaceId;
+    const parentBranch = parentSnapshot.config?.branch;
     const parentSystemPrompt = parentSnapshot.config?.systemPrompt;
 
     const runner = this.create();
@@ -151,6 +155,8 @@ export class AgentManager {
       provider: parentProvider,
       model: model ?? parentSnapshot.config?.model,
       cwd: parentCwd,
+      branchWorkspaceId: parentBranchWorkspaceId,
+      branch: parentBranch,
       systemPrompt: parentSystemPrompt,
       resume: parentSession,
       resumeSessionAt: anchorUuid,
@@ -229,7 +235,10 @@ function normalizeSettings(
   return {
     provider: settings.provider ?? "claude",
     model: settings.model,
+    branchWorkspaceId: settings.branchWorkspaceId,
+    branch: settings.branch,
     cwd: settings.cwd?.trim() || defaultCwd,
+    scratchDirectory: settings.scratchDirectory,
     systemPrompt: settings.systemPrompt ?? "",
   };
 }

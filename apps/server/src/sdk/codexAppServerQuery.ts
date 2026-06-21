@@ -230,7 +230,7 @@ function codexInputs(turn: PromptTurn): Record<string, unknown>[] {
     {
       type: "text",
       text: appendWritableTargets(
-        prependPromptContext(turn.text, turn.promptAccess),
+        appendSharedResources(prependPromptContext(turn.text, turn.promptAccess), turn.fileAccess),
         turn.fileAccess,
         turn.promptAccess,
       ),
@@ -269,6 +269,20 @@ function appendWritableTargets(
 function prependPromptContext(text: string, access: AgentPromptAccess | undefined): string {
   const prompts = access?.readablePrompts.map((prompt) => prompt.content) ?? [];
   return prompts.length === 0 ? text : `${prompts.join("\n\n")}\n\n${text}`;
+}
+
+function appendSharedResources(
+  text: string,
+  fileAccess: AgentFileAccess | undefined,
+): string {
+  const resources = fileAccess?.sharedResources ?? [];
+  if (resources.length === 0) return text;
+  return `${text}\n\n共享映射资源（除非用户明确授权，否则 readOnly 资源不能修改）：\n${resources
+    .map(
+      (resource) =>
+        `- ${resource.name} [${resource.access}]: ${resource.mountPath} -> ${resource.sourcePath}`,
+    )
+    .join("\n")}`;
 }
 
 function sandboxPolicyFor(
