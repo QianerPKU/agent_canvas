@@ -801,11 +801,27 @@ function reviewPrompt(flow: PullRequestFlowSnapshot, stage: PullRequestReviewSta
     fileChanges,
     prInfo,
     "Review the current state. You may inspect the repository as needed.",
+    reviewImpactInstruction(stage),
     "Return exactly one JSON object matching this schema, with no extra prose:",
     reviewSchema(flow.id, stage),
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function reviewImpactInstruction(stage: PullRequestReviewStage): string {
+  if (stage === "source_preflight") {
+    return [
+      "Your primary review goal is to decide whether this PR is acceptable for your own current work.",
+      "As an agent working on the source branch, check whether the PR portion conflicts with the part you are currently working on, and whether the PR should wait until your current work is finished.",
+      "If your current work is incomplete and may affect this PR, reject or request changes and explain the impact in summary, risks, and requiredChanges.",
+    ].join("\n");
+  }
+  return [
+    "Your primary review goal is to decide whether this PR is acceptable for your own current work.",
+    "As an agent working on the target branch, check whether merging this PR would interfere with the part you are currently working on, including unfinished experiments, pending validation, or local conflicts.",
+    "If the PR would disrupt your current work or should wait until your experiment/validation is complete, reject or request changes and explain the impact in summary, risks, and requiredChanges.",
+  ].join("\n");
 }
 
 function retryPrompt(flow: PullRequestFlowSnapshot, stage: PullRequestReviewStage): string {

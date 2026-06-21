@@ -8,6 +8,8 @@
 
 每个 flow 创建时会记录 proposer agent 当前的 `sourceTurnIndex`。前端 PR 节点用这个字段固定连回发起 PR pipeline 的对话轮，避免 agent 继续运行后连线漂移到最新轮。
 
+审查 prompt 的核心目标是让每个 reviewer 反馈“这个 PR 对我当前工作是否可接受”。源 branch agent 需要判断 PR 是否和自己正在做的部分冲突、是否应等当前工作完成后再提；目标 branch agent 需要判断合入是否会影响自己正在做的工作、实验或验证。若影响不可接受，应拒绝或要求修改，并在 JSON 的 `summary/risks/requiredChanges` 中说明。
+
 ## 流程
 
 1. 用户通过 `POST /api/pr-flows` 发起流程，指定提 PR 的 agent、目标 branch、概括和可选文件范围。

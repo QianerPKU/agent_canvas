@@ -118,6 +118,8 @@ describe("PullRequestFlowManager", () => {
     expect(proposer.sent[0]).toContain("sourceBranch: feature/a");
     expect(proposer.sent[0]).toContain("changedFiles (git diff --name-status):");
     expect(proposer.sent[0]).toContain("- specified src/a.ts");
+    expect(proposer.sent[0]).toContain("conflicts with the part you are currently working on");
+    expect(proposer.sent[0]).toContain("should wait until your current work is finished");
     expect(proposer.sent[0]).toContain("\"stage\": \"source_preflight\"");
 
     now += 1;
@@ -147,6 +149,8 @@ describe("PullRequestFlowManager", () => {
     expect(flow.status).toBe("target_review_collecting");
     expect(targetReviewer.sent.at(-1)).toContain("\"stage\": \"target_merge\"");
     expect(targetReviewer.sent.at(-1)).toContain("- specified src/a.ts");
+    expect(targetReviewer.sent.at(-1)).toContain("would interfere with the part you are currently working on");
+    expect(targetReviewer.sent.at(-1)).toContain("unfinished experiments");
 
     now += 1;
     targetReviewer.setStatus("waiting_input");
