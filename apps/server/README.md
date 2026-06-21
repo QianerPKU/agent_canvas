@@ -32,6 +32,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 - **流式输入干预**：`AgentRunner` 用 `AsyncMessageQueue` 作为 `prompt` 源；首条任务入队即启动，运行中 `send()` 继续入队。Claude SDK 原生消费流式输入；Codex app-server 按 thread 连续启动 turn，并用 `turn/interrupt` 尽力中止当前 turn。
 - **provider / model 选择**：`AgentStartConfig.provider` 可为 `claude` 或 `codex`，未指定时默认 `claude`。Codex UI 提供 `gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`，模型通过 app-server 的 `thread/start` / `thread/fork` / `turn/start` 参数传递。
 - **手动 compact**：只允许在 `waiting_input` 执行。Claude 将内置 `/compact` 送入现有流式会话，并等待 manual `compact_boundary`；Codex 调用原生 `thread/compact/start`，等待 `contextCompaction` 完成。两者都投影成统一 `compact` 事件，前端把它记录为一轮完成的对话。
+- **自动 compact**：provider 在业务轮中途触发的 `compact_boundary/contextCompaction` 会投影成 `compact trigger=auto`。它不结束当前业务轮，只记录为当前轮系统事件，并标记下一条业务输入重新注入可读提示词。
 - **terminate**：调用 QueryHandle 的终止能力并关闭输入流。Claude adapter 会 interrupt 后结束 Query generator；Codex adapter 关闭并 kill 对应 app-server 子进程，状态进入 `terminated`。
 - **完整历史**：`AgentRunner` 把每次 start/send/compact 输入记录为 `user_input`；Claude thinking block 与 Codex reasoning delta/summary 统一映射为 `thinking`。`GET /api/agents/:id/history` 因而可回放用户输入、思考、答复、工具调用/结果与轮次结果。
 
@@ -68,7 +69,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 `vitest`，全部离线（不触达真实模型）：注入可手动驱动的假 `query`。
 
 - `eventMapper.test.ts`：各类 SDK 消息 → 统一事件的映射
-- `sdk/codexAppServerMapper.test.ts`：Codex app-server 通知 → SDK-like 消息
+- `sdk/codexAppServerMapper.test.ts`：Codex app-server 通知 → SDK-like 消息，包括自动 `contextCompaction`
 - `sdk/codexAppServerQuery.test.ts`：`/compact` → 原生 `thread/compact/start`，以及 app-server 进程终止
 - `AgentRunner.test.ts`：start/running/waiting_input/send/stop/done/error 全状态流转 + 流式输入
 - `util/AsyncMessageQueue.test.ts`：队列的 push/wait/close 语义
@@ -111,12 +112,14 @@ npm run smoke --workspace apps/server
 - `GET/POST /api/prompts` 列出/创建；`PATCH /api/prompts/:id` 编辑名称、文本或共享开关。
 - `GET/POST /api/prompt-connections` 与 `DELETE /api/prompt-connections/:id` 管理普通节点连线；fork 自动复制父 Agent 的提示词连线。
 - 可读提示词直接拼在用户输入之前，不传文件引用。顺序固定为共享优先、普通其次，同类按 UTF-8 字节序排列。
-- 注入时机仅为新建 Agent 的首轮，以及 compact 完成后的下一条业务输入；fork/resume 首轮继承已有上下文，不重复注入。
+- 注入时机仅为新建 Agent 的首轮，以及手动或自动 compact 完成后的下一条业务输入；fork/resume 首轮继承已有上下文，不重复注入。
 - 写权限与文件节点一致，会授权 provider 修改提示词节点的内部文本文件；前端周期读取最新文本。
 
 官方参考：
 
+- https://developers.openai.com/codex/guides/agents-md
 - https://developers.openai.com/codex/cli/slash-commands
 - https://developers.openai.com/codex/cli/reference
+- https://code.claude.com/docs/en/memory
 - https://docs.anthropic.com/en/docs/claude-code/common-workflows
 - https://docs.anthropic.com/en/docs/claude-code/cli-reference

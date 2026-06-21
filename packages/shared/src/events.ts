@@ -48,6 +48,8 @@ export interface UsageInfo {
   cacheReadInputTokens?: number;
 }
 
+export type CompactTrigger = "manual" | "auto";
+
 /**
  * 归一化后的 agent 事件（后端 → 前端，单向流）。
  * `kind` 作为可辨识联合的判别字段。
@@ -57,7 +59,7 @@ export type AgentEvent =
   | { kind: "user_input"; text: string }
   | {
       kind: "compact";
-      trigger: "manual";
+      trigger: CompactTrigger;
       preTokens?: number;
       postTokens?: number;
       durationMs?: number;

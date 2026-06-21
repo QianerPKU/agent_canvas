@@ -196,6 +196,33 @@ describe("codex app-server mapper", () => {
     ]);
   });
 
+  it("contextCompaction item maps to auto compact boundary", () => {
+    const state = createCodexAppServerMapState();
+    state.threadId = "thr_1";
+
+    expect(
+      mapCodexNotification(
+        {
+          method: "item/completed",
+          params: {
+            threadId: "thr_1",
+            turnId: "turn_1",
+            item: { type: "contextCompaction", id: "compact_1" },
+          },
+        },
+        state,
+      ),
+    ).toEqual([
+      {
+        type: "system",
+        subtype: "compact_boundary",
+        compact_metadata: { trigger: "auto" },
+        uuid: "compact_1",
+        session_id: "thr_1",
+      },
+    ]);
+  });
+
   it("token usage is attached to turn result", () => {
     const state = createCodexAppServerMapState();
     state.threadId = "thr_1";

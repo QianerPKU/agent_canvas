@@ -358,6 +358,58 @@ describe("AgentRunner 生命周期", () => {
     expect(ctl.inputs.at(-1)?.fileAccess?.readableFiles[0]?.name).toBe("input-1.txt");
   });
 
+  it("auto compact 保持当前轮运行，并在下一条业务输入重新注入提示词", async () => {
+    const promptAccess = {
+      readablePrompts: [
+        { id: "prompt_1", name: "规范", content: "先写测试", kind: "shared" as const },
+      ],
+      writablePrompts: [],
+      writableDirectories: [],
+    };
+    const ctl = makeControllableQuery();
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("auto-compact-agent", {
+      query: ctl.query,
+      resolvePromptAccess: () => promptAccess,
+    });
+    runner.on((event) => events.push(event));
+
+    runner.start({ prompt: "first" });
+    ctl.emit(SYSTEM_INIT);
+    ctl.emit(resultMsg());
+    await flush();
+
+    runner.send("second");
+    await flush();
+    expect(ctl.inputs[1]?.promptAccess?.readablePrompts).toEqual([]);
+    expect(runner.getStatus()).toBe("running");
+
+    ctl.emit({
+      type: "system",
+      subtype: "compact_boundary",
+      compact_metadata: { trigger: "auto" },
+      uuid: "compact-auto-1",
+      session_id: "s1",
+    });
+    await flush();
+    expect(runner.getStatus()).toBe("running");
+    expect(events).toContainEqual({
+      kind: "compact",
+      trigger: "auto",
+      preTokens: undefined,
+      postTokens: undefined,
+      durationMs: undefined,
+    });
+
+    ctl.emit(resultMsg());
+    await flush();
+    expect(runner.getStatus()).toBe("waiting_input");
+
+    runner.send("after auto compact");
+    await flush();
+    expect(ctl.inputs.at(-1)?.promptAccess?.readablePrompts[0]?.content).toBe("先写测试");
+  });
+
   it("提示词只在新 Agent 首轮和 compact 后下一轮注入，fork 首轮不注入", async () => {
     const promptAccess = {
       readablePrompts: [

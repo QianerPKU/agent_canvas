@@ -154,8 +154,8 @@ function HistoryEvent({ item }: { item: HistoryItem }): React.ReactElement {
     case "compact":
       return (
         <EventBlock
-          tone="result"
-          label="手动 compact"
+          tone={event.trigger === "auto" ? "system" : "result"}
+          label={event.trigger === "auto" ? "自动 compact" : "手动 compact"}
           time={time}
           content={
             event.preTokens != null && event.postTokens != null

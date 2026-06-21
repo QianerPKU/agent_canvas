@@ -49,7 +49,7 @@ describe("mapSdkMessage", () => {
     ]);
   });
 
-  it("auto compact boundary 不生成手动轮次，失败状态生成错误", () => {
+  it("auto compact boundary 生成 compact 事件，失败状态生成错误", () => {
     expect(
       mapSdkMessage({
         type: "system",
@@ -58,7 +58,15 @@ describe("mapSdkMessage", () => {
         uuid: "compact-2",
         session_id: "s1",
       }),
-    ).toEqual([]);
+    ).toEqual([
+      {
+        kind: "compact",
+        trigger: "auto",
+        preTokens: undefined,
+        postTokens: undefined,
+        durationMs: undefined,
+      },
+    ]);
     expect(
       mapSdkMessage({
         type: "system",

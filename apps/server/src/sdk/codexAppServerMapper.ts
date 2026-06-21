@@ -183,6 +183,16 @@ function mapItemCompleted(
       ];
     case "webSearch":
       return [toolResult(id, { query: item.query, action: item.action }, false, sessionId)];
+    case "contextCompaction":
+      return [
+        {
+          type: "system",
+          subtype: "compact_boundary",
+          compact_metadata: { trigger: "auto" },
+          uuid: id,
+          session_id: sessionId,
+        },
+      ];
     case "plan":
       return [assistantMessage(stringValue(item.text), id, sessionId)];
     case "reasoning": {

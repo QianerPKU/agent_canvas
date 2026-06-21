@@ -50,4 +50,34 @@ describe("buildConversationHistory", () => {
       "tool_use",
     ]);
   });
+
+  it("自动 compact 不作为轮次边界，手动 compact 仍然作为独立轮结束", () => {
+    const turns = buildConversationHistory(
+      [
+        envelope(1, { kind: "user_input", text: "长任务" }),
+        envelope(2, { kind: "compact", trigger: "auto" }),
+        envelope(3, { kind: "assistant_text", text: "继续执行", messageUuid: "a1" }),
+        envelope(4, { kind: "result", subtype: "success", isError: false }),
+        envelope(5, { kind: "status", status: "waiting_input" }),
+        envelope(6, { kind: "user_input", text: "/compact" }),
+        envelope(7, { kind: "compact", trigger: "manual" }),
+        envelope(8, { kind: "status", status: "waiting_input" }),
+        envelope(9, { kind: "user_input", text: "下一问" }),
+      ],
+      1,
+    );
+
+    expect(turns).toHaveLength(2);
+    expect(turns[0]!.items.map((item) => item.event.kind)).toEqual([
+      "user_input",
+      "compact",
+      "assistant_text",
+      "result",
+    ]);
+    expect(turns[1]!.items.map((item) => item.event)).toEqual([
+      { kind: "status", status: "waiting_input" },
+      { kind: "user_input", text: "/compact" },
+      { kind: "compact", trigger: "manual" },
+    ]);
+  });
 });

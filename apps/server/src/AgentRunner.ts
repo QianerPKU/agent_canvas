@@ -245,7 +245,11 @@ export class AgentRunner {
         this.promptInjectionPending = true;
         this.emit(event);
         this.lastAssistantUuid = undefined;
-        this.setStatus("waiting_input");
+        if (event.trigger === "manual") {
+          this.setStatus("waiting_input");
+        } else if (this.status === "starting") {
+          this.setStatus("running");
+        }
         break;
       case "result": {
         if (event.costUsd !== undefined) this.totalCostUsd = event.costUsd;

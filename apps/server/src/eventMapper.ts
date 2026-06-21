@@ -50,14 +50,15 @@ function mapSystem(msg: SdkMessage): AgentEvent[] {
     compact_error?: string;
   };
   if (m.subtype === "compact_boundary") {
-    if (m.compact_metadata?.trigger !== "manual") return [];
+    const metadata = m.compact_metadata;
+    if (!metadata || (metadata.trigger !== "manual" && metadata.trigger !== "auto")) return [];
     return [
       {
         kind: "compact",
-        trigger: "manual",
-        preTokens: m.compact_metadata.pre_tokens,
-        postTokens: m.compact_metadata.post_tokens,
-        durationMs: m.compact_metadata.duration_ms,
+        trigger: metadata.trigger,
+        preTokens: metadata.pre_tokens,
+        postTokens: metadata.post_tokens,
+        durationMs: metadata.duration_ms,
       },
     ];
   }

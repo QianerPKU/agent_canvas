@@ -83,6 +83,29 @@ describe("agentStore 轮次模型", () => {
     expect(get(map).turns[1]).toMatchObject({ status: "idle" });
   });
 
+  it("auto compact 记录在当前运行轮，不延伸新轮", () => {
+    seq = 0;
+    let map: AgentMap = { a1: newAgentView("a1") };
+    map = recordInput(map, "a1", "run long task");
+    map = applyEnvelope(
+      map,
+      env("a1", {
+        kind: "compact",
+        trigger: "auto",
+        preTokens: 2000,
+        postTokens: 800,
+      }),
+    );
+
+    const v = get(map);
+    expect(v.turns).toHaveLength(1);
+    expect(v.turns[0]).toMatchObject({ status: "running" });
+    expect(v.turns[0]!.lines).toContainEqual({
+      kind: "system",
+      text: "自动 compact 完成 · 2000 → 800 tokens",
+    });
+  });
+
   it("同一 assistant 消息的流式片段合并为一行", () => {
     seq = 0;
     let map: AgentMap = { a1: newAgentView("a1") };

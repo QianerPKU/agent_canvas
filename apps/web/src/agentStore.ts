@@ -163,6 +163,12 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
         event.preTokens != null && event.postTokens != null
           ? ` · ${event.preTokens} → ${event.postTokens} tokens`
           : "";
+      if (event.trigger === "auto") {
+        return pushLineToLast(view, {
+          kind: "system",
+          text: `自动 compact 完成${tokenText}`,
+        });
+      }
       const finalized = withLastTurn(view, (turn) => ({
         ...turn,
         status: "done",

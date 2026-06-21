@@ -5,7 +5,7 @@
 
 ## 核心模型：节点 = 一轮对话
 
-- 一个 agent = 一条**轮次链**。普通轮次 = 一次用户输入 + 一次完整答复，以 `result` 收尾；手动 compact 也单独记为一轮。
+- 一个 agent = 一条**轮次链**。普通轮次 = 一次用户输入 + 一次完整答复，以 `result` 收尾；手动 compact 也单独记为一轮，自动 compact 只作为当前运行轮中的系统记录。
 - 一轮完成后**自动延伸出一个 idle 轮**（"待输入"节点）；在它里面输入下一轮指令即续接。
 - 首轮 idle 节点可选择 provider：`Claude` 或 `Codex`。Codex 可选择 `gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`，默认 `gpt-5.5`。
 - 每个**完成**轮上有 **⑂ fork 按钮** → 从该轮的对话状态分叉出一个独立新 agent（连一条 fork 线），形成对话树。Codex fork 可在分叉时选择模型，子节点继承 provider 与所选模型；fork 不绑定 git。
@@ -34,7 +34,7 @@
 - **命令走 REST，事件走 WS**，单向清晰。`submit` 自动判断首轮 start / 续轮 send。
 - 新建 / fork 后后端不发事件，前端**乐观插入**节点（fork 带 `forkOrigin` 以画连线）。
 - Codex 的 `agentMessage` 流式 delta 按消息 UUID 合并到同一输出段落，避免每个小片段被渲染成独立短行。
-- 每个 agent 的最新节点显示 `Compact` 和 `Terminate`。Compact 仅在等待输入时启用，完成后当前 idle 节点定格为 `/compact` 完成轮并延伸新 idle 节点；Terminate 关闭底层 CLI 并进入 `terminated`。
+- 每个 agent 的最新节点显示 `Compact` 和 `Terminate`。Compact 仅在等待输入时启用，完成后当前 idle 节点定格为 `/compact` 完成轮并延伸新 idle 节点；自动 compact 完成事件在当前运行轮中显示为系统记录，不延伸新 idle 轮；Terminate 关闭底层 CLI 并进入 `terminated`。
 - 点击任意非最小化节点主体会打开独立历史窗口，内容累计到该轮为止；历史来自后端 `/history`，包括 provider 实际发出的 thinking/reasoning 与完整工具参数/结果。
 - 节点四边和四角可拖拽缩放。标题栏最小化按钮会保存当前宽高并把节点缩成 `68×48` 的小节点；小节点本身仍是拖动句柄，单击恢复。节点 id 与 Handle 始终不变，因此轮次线和 fork 线保持连接。
 - WebSocket 首次连接延迟到下一轮事件循环，兼容 React StrictMode 的开发期双重 effect 检查，避免 Vite 代理记录无害的 `ECONNABORTED`。

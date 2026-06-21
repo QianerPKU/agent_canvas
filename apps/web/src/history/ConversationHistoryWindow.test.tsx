@@ -49,6 +49,17 @@ describe("ConversationHistoryWindow", () => {
               content: { output: "完整工具结果" },
             },
           },
+          {
+            agentId: "agent_1",
+            seq: 5,
+            at: 5,
+            event: {
+              kind: "compact",
+              trigger: "auto",
+              preTokens: 2000,
+              postTokens: 800,
+            },
+          },
         ],
       }),
       text: async () => "",
@@ -58,7 +69,7 @@ describe("ConversationHistoryWindow", () => {
 
     render(
       <ConversationHistoryWindow
-        target={{ agentId: "agent_1", turnIndex: 0, lastSeq: 4 }}
+        target={{ agentId: "agent_1", turnIndex: 0, lastSeq: 5 }}
         onClose={onClose}
       />,
     );
@@ -66,6 +77,8 @@ describe("ConversationHistoryWindow", () => {
     expect(await screen.findByText("先读取配置")).toBeTruthy();
     expect(screen.getByText("工具调用 · Read")).toBeTruthy();
     expect(screen.getByText(/完整工具结果/)).toBeTruthy();
+    expect(screen.getByText("自动 compact")).toBeTruthy();
+    expect(screen.getByText("2000 → 800 tokens")).toBeTruthy();
 
     fireEvent.click(screen.getByTitle("关闭历史窗口"));
     expect(onClose).toHaveBeenCalledOnce();
