@@ -23,6 +23,7 @@ export interface PullRequestAgentHost {
   list(): AgentSnapshot[];
   get(id: string): DeliverableRunner | undefined;
   historyOf(id: string): AgentEventEnvelope[];
+  currentTurnIndex?(id: string): number;
 }
 
 export interface PullRequestFlowManagerOptions {
@@ -143,6 +144,7 @@ export class PullRequestFlowManager {
     const flow: PullRequestFlowSnapshot = {
       id: `pr_flow_${++this.counter}`,
       proposerAgentId: input.proposerAgentId,
+      sourceTurnIndex: this.host.currentTurnIndex?.(input.proposerAgentId),
       sourceBranch,
       targetBranch: input.targetBranch.trim(),
       title: input.title?.trim() || undefined,

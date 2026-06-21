@@ -22,6 +22,9 @@ describe("agentCanvasPolicyPrompt", () => {
     expect(prompt).toContain('"agentCanvasPrEvent": "pr_created"');
     expect(prompt).toContain('"fileChanges": [{ "status": "M", "path": "src/example.ts" }]');
     expect(prompt).toContain('"agentCanvasPrEvent": "merged"');
+    expect(prompt).toContain("commit report 工具");
+    expect(prompt).toContain("POST http://127.0.0.1:4317/api/agents/agent_42/commits");
+    expect(prompt).toContain('commit = "HEAD"');
   });
 
   it("uses AGENT_CANVAS_API when configured", () => {

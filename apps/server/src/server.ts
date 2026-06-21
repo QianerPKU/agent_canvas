@@ -19,12 +19,14 @@ import type {
   OpenCanvasProjectInput,
   PullRequestCreatedInput,
   CreatePullRequestFlowInput,
+  ReportAgentCommitInput,
   ServerFrame,
   UpdateAgentSettingsInput,
   UpdateCanvasFileInput,
   UpdateCanvasPromptInput,
 } from "@agent-canvas/shared";
 import { AgentManager } from "./AgentManager.js";
+import { CommitManager } from "./commits/CommitManager.js";
 import { pickDirectory as defaultPickDirectory, type PickDirectory } from "./files/DirectoryPicker.js";
 import { FileManager } from "./files/FileManager.js";
 import { openFileInVscode } from "./files/VscodeFileOpener.js";
@@ -40,6 +42,7 @@ export interface CreateServerResult {
   promptManager: PromptManager;
   workspaceManager: WorkspaceManager;
   pullRequestFlowManager: PullRequestFlowManager;
+  commitManager: CommitManager;
 }
 
 export interface CreateServerOptions {
@@ -49,6 +52,7 @@ export interface CreateServerOptions {
   promptManager?: PromptManager;
   workspaceManager?: WorkspaceManager;
   pullRequestFlowManager?: PullRequestFlowManager;
+  commitManager?: CommitManager;
 }
 
 /**
@@ -84,6 +88,7 @@ export function createServer(
       resolveChangedFiles: async ({ sourceBranch, targetBranch }) =>
         (await workspaceManager.diffPullRequestFiles(sourceBranch, targetBranch))?.files ?? [],
     });
+  const commitManager = options.commitManager ?? new CommitManager();
   manager.setPromptAccessResolver((agentId) => promptManager.accessFor(agentId));
   const httpServer = http.createServer((req, res) => {
     handleHttp(
@@ -94,6 +99,7 @@ export function createServer(
       promptManager,
       workspaceManager,
       pullRequestFlowManager,
+      commitManager,
       defaultCwd,
       options.openFile ?? openFileInVscode,
       options.pickDirectory ?? defaultPickDirectory,
@@ -105,7 +111,12 @@ export function createServer(
   const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
   wss.on("connection", (ws: WebSocket) => {
     // 连接即下发当前快照
-    send(ws, { type: "hello", agents: manager.list(), prFlows: pullRequestFlowManager.list() });
+    send(ws, {
+      type: "hello",
+      agents: manager.list(),
+      prFlows: pullRequestFlowManager.list(),
+      commits: commitManager.list(),
+    });
   });
 
   // 把 manager 的事件广播到所有 WS 客户端
@@ -126,6 +137,14 @@ export function createServer(
     }
   });
 
+  commitManager.onCommit((commit) => {
+    const frame: ServerFrame = { type: "commit", commit };
+    const data = JSON.stringify(frame);
+    for (const client of wss.clients) {
+      if (client.readyState === client.OPEN) client.send(data);
+    }
+  });
+
   return {
     httpServer,
     wss,
@@ -134,6 +153,7 @@ export function createServer(
     promptManager,
     workspaceManager,
     pullRequestFlowManager,
+    commitManager,
   };
 }
 
@@ -145,6 +165,7 @@ async function handleHttp(
   promptManager: PromptManager,
   workspaceManager: WorkspaceManager,
   pullRequestFlowManager: PullRequestFlowManager,
+  commitManager: CommitManager,
   defaultCwd: string,
   openFile: (filePath: string) => Promise<void>,
   pickDirectory: PickDirectory,
@@ -286,6 +307,10 @@ async function handleHttp(
 
   if (method === "GET" && path === "/api/pr-flows") {
     return sendJson(res, 200, { flows: pullRequestFlowManager.list() });
+  }
+
+  if (method === "GET" && path === "/api/commits") {
+    return sendJson(res, 200, { commits: commitManager.list() });
   }
 
   if (method === "POST" && path === "/api/pr-flows") {
@@ -558,6 +583,26 @@ async function handleHttp(
       return sendJson(res, 202, { ok: true });
     } catch (error) {
       return sendJson(res, 409, { error: errMsg(error) });
+    }
+  }
+
+  const commitMatch = path.match(/^\/api\/agents\/([^/]+)\/commits$/);
+  if (commitMatch) {
+    const id = decodeURIComponent(commitMatch[1]!);
+    if (method !== "POST") return sendJson(res, 405, { error: "method not allowed" });
+    if (!manager.get(id)) return sendJson(res, 404, { error: `未知 agent: ${id}` });
+    const body = await readJson<ReportAgentCommitInput>(req);
+    try {
+      return sendJson(res, 201, {
+        commit: await commitManager.recordFromAgent(
+          id,
+          manager.configOf(id),
+          manager.currentTurnIndex(id),
+          body ?? {},
+        ),
+      });
+    } catch (error) {
+      return sendJson(res, 400, { error: errMsg(error) });
     }
   }
 

@@ -2,6 +2,7 @@
 import type {
   AgentApprovalResponse,
   AgentCanvasSettings,
+  AgentCommitSnapshot,
   AgentEventEnvelope,
   AgentQuestionResponse,
   AgentSettings,
@@ -84,6 +85,8 @@ export const api = {
     }).then((r) => r.branch),
   listPullRequestFlows: () =>
     call<{ flows: PullRequestFlowSnapshot[] }>("/pr-flows").then((r) => r.flows),
+  listCommits: () =>
+    call<{ commits: AgentCommitSnapshot[] }>("/commits").then((r) => r.commits),
   createPullRequestFlow: (input: CreatePullRequestFlowInput) =>
     call<{ flow: PullRequestFlowSnapshot }>("/pr-flows", {
       method: "POST",

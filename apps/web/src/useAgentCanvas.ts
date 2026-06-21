@@ -7,6 +7,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   AgentApprovalResponse,
+  AgentCommitSnapshot,
   AgentQuestionResponse,
   AgentSettings,
   CanvasFileConnection,
@@ -81,6 +82,7 @@ export interface UseAgentCanvas {
   prompts: CanvasPromptNode[];
   promptConnections: CanvasPromptConnection[];
   prFlows: PullRequestFlowSnapshot[];
+  commits: AgentCommitSnapshot[];
   connected: boolean;
   actions: AgentActions;
   fileActions: FileActions;
@@ -129,6 +131,7 @@ export function useAgentCanvas(): UseAgentCanvas {
   const [prompts, setPrompts] = useState<CanvasPromptNode[]>([]);
   const [promptConnections, setPromptConnections] = useState<CanvasPromptConnection[]>([]);
   const [prFlows, setPrFlows] = useState<PullRequestFlowSnapshot[]>([]);
+  const [commits, setCommits] = useState<AgentCommitSnapshot[]>([]);
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   // 始终指向最新 agents，供 submit 判断 start/send（避免闭包过期）
@@ -159,10 +162,13 @@ export function useAgentCanvas(): UseAgentCanvas {
         if (frame.type === "hello") {
           setAgents(applyHello(frame.agents));
           setPrFlows(frame.prFlows ?? []);
+          setCommits(frame.commits ?? []);
         } else if (frame.type === "event") {
           setAgents((prev) => applyEnvelope(prev, frame.envelope));
         } else if (frame.type === "pr_flow") {
           setPrFlows((prev) => upsertFlow(prev, frame.flow));
+        } else if (frame.type === "commit") {
+          setCommits((prev) => upsertCommit(prev, frame.commit));
         }
       };
     };
@@ -185,14 +191,23 @@ export function useAgentCanvas(): UseAgentCanvas {
       api.listPrompts(),
       api.listPromptConnections(),
       api.listPullRequestFlows(),
+      api.listCommits(),
     ]).then(
-      ([nextFiles, nextConnections, nextPrompts, nextPromptConnections, nextPrFlows]) => {
+      ([
+        nextFiles,
+        nextConnections,
+        nextPrompts,
+        nextPromptConnections,
+        nextPrFlows,
+        nextCommits,
+      ]) => {
         if (closed) return;
         setFiles(nextFiles);
         setFileConnections(nextConnections);
         setPrompts(nextPrompts);
         setPromptConnections(nextPromptConnections);
         setPrFlows(nextPrFlows);
+        setCommits(nextCommits);
       },
       () => undefined,
     );
@@ -392,6 +407,7 @@ export function useAgentCanvas(): UseAgentCanvas {
     prompts,
     promptConnections,
     prFlows,
+    commits,
     connected,
     actions,
     fileActions,
@@ -407,4 +423,13 @@ function upsertFlow(
   return flows.some((candidate) => candidate.id === flow.id)
     ? flows.map((candidate) => (candidate.id === flow.id ? flow : candidate))
     : [flow, ...flows];
+}
+
+function upsertCommit(
+  commits: AgentCommitSnapshot[],
+  commit: AgentCommitSnapshot,
+): AgentCommitSnapshot[] {
+  return commits.some((candidate) => candidate.id === commit.id)
+    ? commits.map((candidate) => (candidate.id === commit.id ? commit : candidate))
+    : [commit, ...commits];
 }

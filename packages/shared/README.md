@@ -25,6 +25,10 @@
 | `ClientCommand` | 客户端→服务端命令：`start / stop / compact / terminate / send / steer / resume` |
 | `AgentSnapshot` | agent 当前快照（REST 列表、重连补齐） |
 
+### Commit 模型 (`src/commits.ts`)
+
+`AgentCommitSnapshot` 记录 agent 上报的一次 git commit：agent id、`sourceTurnIndex`、完整/短 hash、branch、作者、message、变更文件和每文件 diff。`ReportAgentCommitInput` 是 agent 调用 commit report 接口时的输入，默认记录当前工作区 `HEAD`。
+
 ## 设计约定
 
 - **事件单向、命令单向**：后端→前端只发 `AgentEvent`（包在 `AgentEventEnvelope` 里）；前端→后端只发 `ClientCommand`。
@@ -62,9 +66,9 @@ npm test --workspace packages/shared        # vitest
 
 流程状态只表达程序控制的审查/授权边界：源 branch preflight、提 PR 授权、目标 branch merge 审查、合并授权、失败、超时或取消。它不限制 agent 自行 commit，也不描述具体 `git`/`gh` 命令。
 
-`PullRequestFlowSnapshot.fileChanges` 使用 `PullRequestChangedFile` 记录这次 PR 的具体文件变化（`git diff --name-status` 的 `status + path`）。后端发给审查 agent 的 source/target review 提示必须包含该列表；`files` 保留为路径范围的简化列表。
+`PullRequestFlowSnapshot.fileChanges` 使用 `PullRequestChangedFile` 记录这次 PR 的具体文件变化（`git diff --name-status` 的 `status + path`）。后端发给审查 agent 的 source/target review 提示必须包含该列表；`files` 保留为路径范围的简化列表。`sourceTurnIndex` 固定 PR 节点连回的对话轮次，避免 agent 继续运行后连线漂移到最新轮。
 
-`ServerFrame` 的 `hello` 帧可携带 `prFlows` 快照，后续 `pr_flow` 帧推送单个流程更新。
+`ServerFrame` 的 `hello` 帧可携带 `prFlows` 和 `commits` 快照，后续 `pr_flow` 帧推送单个流程更新，`commit` 帧推送单个 commit 上报。
 
 ## 提示词节点模型
 

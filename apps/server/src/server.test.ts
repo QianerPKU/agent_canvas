@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { AgentManager } from "./AgentManager.js";
+import { CommitManager } from "./commits/CommitManager.js";
 import { createServer } from "./server.js";
 import { FileManager } from "./files/FileManager.js";
 import { PromptManager } from "./prompts/PromptManager.js";
@@ -107,6 +108,37 @@ describe("HTTP server", () => {
       pickDirectory,
       promptManager,
       workspaceManager,
+      commitManager: new CommitManager({
+        runGit: async (args) => {
+          if (args[0] === "rev-parse") return "abcdef1234567890";
+          if (args[0] === "branch") return "feature/server-test";
+          if (args[0] === "show" && args.includes("--name-status")) return "M\tsrc/a.ts";
+          if (args[0] === "show" && args.includes("--patch")) {
+            return [
+              "diff --git a/src/a.ts b/src/a.ts",
+              "index 1111111..2222222 100644",
+              "--- a/src/a.ts",
+              "+++ b/src/a.ts",
+              "@@ -1 +1 @@",
+              "-old",
+              "+new",
+            ].join("\n");
+          }
+          if (args[0] === "show" && args.includes("-s")) {
+            return [
+              "abcdef1234567890",
+              "abcdef1",
+              "Agent",
+              "agent@example.com",
+              "2026-06-22T00:00:00Z",
+              "2026-06-22T00:00:01Z",
+              "feat: server commit",
+              "",
+            ].join("\x1f");
+          }
+          return "";
+        },
+      }),
     }));
     await new Promise<void>((r) => server.listen(0, r));
     port = (server.address() as AddressInfo).port;
@@ -262,6 +294,34 @@ describe("HTTP server", () => {
     const c = await request(port, "POST", "/api/agents");
     const r = await request(port, "POST", `/api/agents/${c.json.id}/start`, { prompt: "hi" });
     expect(r.status).toBe(202);
+  });
+
+  it("agent 上报 commit 后返回 commit 节点快照", async () => {
+    const created = await request(port, "POST", "/api/agents", {
+      branch: "feature/server-test",
+    });
+    expect(created.status).toBe(201);
+
+    const reported = await request(port, "POST", `/api/agents/${created.json.id}/commits`, {
+      commit: "HEAD",
+      summary: "server route summary",
+    });
+
+    expect(reported.status).toBe(201);
+    expect(reported.json.commit).toMatchObject({
+      agentId: created.json.id,
+      sourceTurnIndex: 0,
+      commitSha: "abcdef1234567890",
+      shortSha: "abcdef1",
+      branch: "feature/server-test",
+      summary: "server route summary",
+      files: [{ status: "M", path: "src/a.ts", additions: 1, deletions: 1 }],
+    });
+
+    const listed = await request(port, "GET", "/api/commits");
+    expect(listed.json.commits.some((commit: { id: string }) => commit.id === reported.json.commit.id)).toBe(
+      true,
+    );
   });
 
   it("history 记录用户输入", async () => {

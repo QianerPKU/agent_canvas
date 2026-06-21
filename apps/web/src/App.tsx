@@ -22,6 +22,7 @@ import {
 import { api } from "./api.js";
 import type {
   AgentCanvasSettings,
+  AgentCommitSnapshot,
   BranchOption,
   BranchWorkspace,
   CanvasProjectSummary,
@@ -30,6 +31,7 @@ import type {
   CanvasPromptConnection,
   CanvasPromptNode,
   WorkspaceProject,
+  PullRequestFlowSnapshot,
 } from "@agent-canvas/shared";
 import "@xyflow/react/dist/style.css";
 import { useAgentCanvas, type AgentActions, type FileActions } from "./useAgentCanvas.js";
@@ -46,9 +48,22 @@ import { AgentSettingsDialog } from "./agents/AgentSettingsDialog.js";
 import { CreatePromptDialog } from "./prompts/CreatePromptDialog.js";
 import { PromptNode, type PromptNodeType } from "./prompts/PromptNode.js";
 import { PullRequestDialog } from "./pullRequests/PullRequestDialog.js";
+import {
+  PullRequestNode,
+  type PullRequestNodeType,
+} from "./pullRequests/PullRequestNode.js";
+import { PullRequestDetailsWindow } from "./pullRequests/PullRequestDetailsWindow.js";
+import { CommitNode, type CommitNodeType } from "./commits/CommitNode.js";
+import { CommitDetailsWindow } from "./commits/CommitDetailsWindow.js";
 import type { PromptActions } from "./useAgentCanvas.js";
 
-const nodeTypes = { turn: TurnNode, file: FileNode, prompt: PromptNode };
+const nodeTypes = {
+  turn: TurnNode,
+  file: FileNode,
+  prompt: PromptNode,
+  commit: CommitNode,
+  pullRequest: PullRequestNode,
+};
 
 const COL_W = 430;
 const ROW_H = 360;
@@ -59,10 +74,19 @@ const FILE_NODE_WIDTH = 280;
 const FILE_NODE_HEIGHT = 240;
 const PROMPT_NODE_WIDTH = 300;
 const PROMPT_NODE_HEIGHT = 260;
+const COMMIT_NODE_WIDTH = 270;
+const COMMIT_NODE_HEIGHT = 170;
+const PR_NODE_WIDTH = 290;
+const PR_NODE_HEIGHT = 180;
 const X0 = 40;
 const Y0 = 40;
 
-type CanvasNode = TurnNodeType | FileNodeType | PromptNodeType;
+type CanvasNode =
+  | TurnNodeType
+  | FileNodeType
+  | PromptNodeType
+  | CommitNodeType
+  | PullRequestNodeType;
 type AgentSettingsTarget =
   | { mode: "create" }
   | { mode: "edit"; agentId: string };
@@ -77,6 +101,14 @@ function fileNodeId(fileId: string): string {
 
 function promptNodeId(promptId: string): string {
   return `prompt:${promptId}`;
+}
+
+function commitNodeId(commitId: string): string {
+  return `commit:${commitId}`;
+}
+
+function pullRequestNodeId(flowId: string): string {
+  return `pr:${flowId}`;
 }
 
 function anchorIndex(agents: AgentMap, parentId: string, anchorUuid: string): number {
@@ -214,10 +246,76 @@ export function computePromptEdges(
   return edges;
 }
 
+export function computeCommitEdges(
+  agents: AgentMap,
+  commits: AgentCommitSnapshot[],
+): Edge[] {
+  const edges: Edge[] = [];
+  for (const commit of commits) {
+    const source = fixedTurnNodeId(agents, commit.agentId, commit.sourceTurnIndex);
+    if (!source) continue;
+    edges.push({
+      id: `commit-edge:${commit.id}`,
+      source,
+      target: commitNodeId(commit.id),
+      animated: false,
+      style: { stroke: "#0f766e" },
+      label: "commit",
+      deletable: false,
+    });
+  }
+  return edges;
+}
+
+export function computePullRequestEdges(
+  agents: AgentMap,
+  flows: PullRequestFlowSnapshot[],
+): Edge[] {
+  const edges: Edge[] = [];
+  for (const flow of flows) {
+    const source = fixedTurnNodeId(agents, flow.proposerAgentId, flow.sourceTurnIndex);
+    if (!source) continue;
+    edges.push({
+      id: `pr-edge:${flow.id}`,
+      source,
+      target: pullRequestNodeId(flow.id),
+      animated: !isClosedPrStatus(flow.status),
+      style: { stroke: "#7c3aed" },
+      label: "PR",
+      deletable: false,
+    });
+  }
+  return edges;
+}
+
+function fixedTurnNodeId(
+  agents: AgentMap,
+  agentId: string,
+  turnIndex: number | undefined,
+): string | undefined {
+  const agent = agents[agentId];
+  if (!agent) return undefined;
+  const index = turnIndex ?? agent.turns.length - 1;
+  return agent.turns[index] ? nodeId(agentId, index) : undefined;
+}
+
+function isClosedPrStatus(status: PullRequestFlowSnapshot["status"]): boolean {
+  return [
+    "source_review_failed",
+    "target_review_failed",
+    "merged",
+    "timed_out",
+    "cancelled",
+    "blocked",
+  ].includes(status);
+}
+
 function buildNodes(
   agents: AgentMap,
   files: CanvasFileNode[],
   prompts: CanvasPromptNode[],
+  commits: AgentCommitSnapshot[],
+  prFlows: PullRequestFlowSnapshot[],
   actions: AgentActions,
   fileActions: FileActions,
   promptActions: PromptActions,
@@ -226,6 +324,8 @@ function buildNodes(
   onOpenAgentSettings: (agentId: string) => void,
   onPreviewFile: (fileId: string) => void,
   onOpenFileEditor: (fileId: string) => void,
+  onOpenCommitDetails: (commitId: string) => void,
+  onOpenPullRequestDetails: (flowId: string) => void,
 ): CanvasNode[] {
   const layout = computeLayout(agents);
   const byId = new Map(current.map((node) => [node.id, node]));
@@ -315,6 +415,56 @@ function buildNodes(
           },
     );
   });
+
+  const commitX = promptX + 360;
+  commits.forEach((commit, index) => {
+    const id = commitNodeId(commit.id);
+    const existing = byId.get(id);
+    const existingCommit = existing?.type === "commit" ? existing : undefined;
+    const data = {
+      commit,
+      onOpenDetails: onOpenCommitDetails,
+      windowState: existingCommit?.data.windowState,
+    };
+    result.push(
+      existingCommit
+        ? { ...existingCommit, data }
+        : {
+            id,
+            type: "commit",
+            position: { x: commitX, y: Y0 + index * 210 },
+            width: COMMIT_NODE_WIDTH,
+            height: COMMIT_NODE_HEIGHT,
+            dragHandle: ".drag-handle",
+            data,
+          },
+    );
+  });
+
+  const prX = commitX + 330;
+  prFlows.forEach((flow, index) => {
+    const id = pullRequestNodeId(flow.id);
+    const existing = byId.get(id);
+    const existingPr = existing?.type === "pullRequest" ? existing : undefined;
+    const data = {
+      flow,
+      onOpenDetails: onOpenPullRequestDetails,
+      windowState: existingPr?.data.windowState,
+    };
+    result.push(
+      existingPr
+        ? { ...existingPr, data }
+        : {
+            id,
+            type: "pullRequest",
+            position: { x: prX, y: Y0 + index * 220 },
+            width: PR_NODE_WIDTH,
+            height: PR_NODE_HEIGHT,
+            dragHandle: ".drag-handle",
+            data,
+          },
+    );
+  });
   return result;
 }
 
@@ -326,6 +476,7 @@ export default function App(): React.ReactElement {
     prompts,
     promptConnections,
     prFlows,
+    commits,
     connected,
     actions,
     fileActions,
@@ -341,6 +492,8 @@ export default function App(): React.ReactElement {
   const [creatingPrompt, setCreatingPrompt] = useState(false);
   const [showingPullRequests, setShowingPullRequests] = useState(false);
   const [showingSettings, setShowingSettings] = useState(false);
+  const [openCommitId, setOpenCommitId] = useState<string>();
+  const [openPullRequestId, setOpenPullRequestId] = useState<string>();
   const [appSettings, setAppSettings] = useState<AgentCanvasSettings>({
     fullPermissionMode: false,
   });
@@ -350,6 +503,8 @@ export default function App(): React.ReactElement {
   const [projectError, setProjectError] = useState<string>();
   const [branches, setBranches] = useState<BranchOption[]>([]);
   const openFile = files.find((file) => file.id === openFileId);
+  const openCommit = commits.find((commit) => commit.id === openCommitId);
+  const openPullRequest = prFlows.find((flow) => flow.id === openPullRequestId);
   const settingsAgent =
     agentSettingsTarget?.mode === "edit" ? agents[agentSettingsTarget.agentId] : undefined;
 
@@ -467,6 +622,8 @@ export default function App(): React.ReactElement {
         agents,
         files,
         prompts,
+        commits,
+        prFlows,
         actions,
         fileActions,
         promptActions,
@@ -475,12 +632,16 @@ export default function App(): React.ReactElement {
         openAgentSettings,
         setOpenFileId,
         openFileEditor,
+        setOpenCommitId,
+        setOpenPullRequestId,
       ),
     );
     setEdges([
       ...computeConversationEdges(agents),
       ...computeFileEdges(agents, fileConnections),
       ...computePromptEdges(agents, promptConnections),
+      ...computeCommitEdges(agents, commits),
+      ...computePullRequestEdges(agents, prFlows),
     ]);
   }, [
     agents,
@@ -488,6 +649,8 @@ export default function App(): React.ReactElement {
     fileConnections,
     prompts,
     promptConnections,
+    commits,
+    prFlows,
     actions,
     fileActions,
     promptActions,
@@ -712,6 +875,18 @@ export default function App(): React.ReactElement {
           file={openFile}
           onClose={() => setOpenFileId(undefined)}
           onOpenEditor={openFileEditor}
+        />
+      )}
+      {openCommit && (
+        <CommitDetailsWindow
+          commit={openCommit}
+          onClose={() => setOpenCommitId(undefined)}
+        />
+      )}
+      {openPullRequest && (
+        <PullRequestDetailsWindow
+          flow={openPullRequest}
+          onClose={() => setOpenPullRequestId(undefined)}
         />
       )}
       {fileOpenError && (

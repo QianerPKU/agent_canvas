@@ -66,6 +66,10 @@ class FakeHost implements PullRequestAgentHost {
     return this.histories.get(id) ?? [];
   }
 
+  currentTurnIndex(id: string): number {
+    return this.historyOf(id).filter((envelope) => envelope.event.kind === "result").length;
+  }
+
   assistant(agentId: string, text: string, at: number): void {
     this.histories.get(agentId)?.push({
       agentId,
@@ -109,6 +113,7 @@ describe("PullRequestFlowManager", () => {
     });
 
     expect(flow.status).toBe("source_review_collecting");
+    expect(flow.sourceTurnIndex).toBe(0);
     expect(flow.fileChanges).toEqual([{ status: "specified", path: "src/a.ts" }]);
     expect(proposer.sent[0]).toContain("sourceBranch: feature/a");
     expect(proposer.sent[0]).toContain("changedFiles (git diff --name-status):");

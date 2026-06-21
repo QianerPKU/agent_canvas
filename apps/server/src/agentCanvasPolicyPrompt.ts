@@ -68,5 +68,15 @@ Invoke-RestMethod -Method Post -Uri "${apiBase}/pr-flows" -ContentType "applicat
 - 当用户要求提交时，只提交正式仓库文件；不要提交共享资源或 agent 临时文件。
 - 如果某个文件应属于哪一类不清楚，先按正式仓库文件谨慎处理，并在答复中说明不确定点。
 
-5. **通过commit进行版本控制** 每次实现新feature或者修bug后，需要及时 git commit ，并且在commit message里面写清楚具体修改内容。`;
+5. **通过 commit 进行版本控制**
+- 每次实现新 feature 或者修 bug 后，需要及时运行 git commit，并且在 commit message 里面写清楚具体修改内容。
+- 每次 git commit 成功后，必须立刻调用 Agent Canvas 自定义的 commit report 工具，让后端知道当前 agent 已产生一次 commit。
+- commit report 工具的调用方式是 POST ${apiBase}/agents/${agentId}/commits。默认记录当前工作区 HEAD；如果需要记录非 HEAD 的提交，可以传 commit 字段。
+- PowerShell 示例：
+~~~powershell
+Invoke-RestMethod -Method Post -Uri "${apiBase}/agents/${agentId}/commits" -ContentType "application/json" -Body (@{
+  commit = "HEAD"
+  summary = "这次 commit 的一句话概括"
+} | ConvertTo-Json -Depth 4)
+~~~`;
 }

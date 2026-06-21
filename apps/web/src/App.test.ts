@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { AgentMap } from "./agentStore.js";
-import { computeFileEdges, computePromptEdges } from "./App.js";
+import {
+  computeCommitEdges,
+  computeFileEdges,
+  computePromptEdges,
+  computePullRequestEdges,
+} from "./App.js";
 
 describe("computeFileEdges", () => {
   it("把连接继承到 Agent 最新一轮，并保留读写方向", () => {
@@ -62,6 +67,62 @@ describe("computeFileEdges", () => {
       sourceHandle: "read",
       target: "agent_1#1",
       targetHandle: "resource-read",
+    });
+  });
+
+  it("commit 和 PR 连线固定到记录中的历史轮次", () => {
+    const agents: AgentMap = {
+      agent_1: {
+        id: "agent_1",
+        status: "waiting_input",
+        turns: [
+          { index: 0, status: "done", lines: [] },
+          { index: 1, status: "done", lines: [] },
+          { index: 2, status: "idle", lines: [] },
+        ],
+        lastSeq: 4,
+      },
+    };
+
+    expect(
+      computeCommitEdges(agents, [
+        {
+          id: "commit_1",
+          agentId: "agent_1",
+          sourceTurnIndex: 1,
+          commitSha: "abcdef123456",
+          shortSha: "abcdef1",
+          subject: "feat: add thing",
+          summary: "add thing",
+          files: [],
+          createdAt: 1,
+        },
+      ])[0],
+    ).toMatchObject({
+      source: "agent_1#1",
+      target: "commit:commit_1",
+    });
+
+    expect(
+      computePullRequestEdges(agents, [
+        {
+          id: "pr_flow_1",
+          proposerAgentId: "agent_1",
+          sourceTurnIndex: 0,
+          sourceBranch: "feature/a",
+          targetBranch: "main",
+          summary: "merge feature",
+          files: ["src/a.ts"],
+          fileChanges: [{ status: "M", path: "src/a.ts" }],
+          status: "target_review_collecting",
+          createdAt: 1,
+          updatedAt: 2,
+          reviewRequests: [],
+        },
+      ])[0],
+    ).toMatchObject({
+      source: "agent_1#0",
+      target: "pr:pr_flow_1",
     });
   });
 });

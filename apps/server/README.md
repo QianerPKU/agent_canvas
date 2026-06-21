@@ -16,6 +16,7 @@
 | `src/AgentManager.ts` | 多 agent 注册表：分配 id、维护单调 `seq`、包 `AgentEventEnvelope` 广播、内存事件历史 |
 | `src/workspaces/WorkspaceManager.ts` | AppData 项目根、GitHub/repo clone、branch worktree、共享资源映射和 Agent 临时目录 |
 | `src/pullRequests/PullRequestFlowManager.ts` | PR 审查与授权状态机：活跃 agent 审查、JSON 校验/重试、超时、授权信号 |
+| `src/commits/CommitManager.ts` | Agent commit 上报记录：从 git 读取 commit 元信息、变更文件和每文件 diff，并推送给前端 |
 | `src/server.ts` | HTTP(REST) + WebSocket 装配 |
 | `src/index.ts` | 入口：实例化 manager（注入 Claude/Codex query）并监听端口 |
 
@@ -43,6 +44,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 - **自动 compact**：provider 在业务轮中途触发的 `compact_boundary/contextCompaction` 会投影成 `compact trigger=auto`。它不结束当前业务轮，只记录为当前轮系统事件，并标记下一条业务输入重新注入可读提示词。
 - **terminate**：调用 QueryHandle 的终止能力并关闭输入流。Claude adapter 会 interrupt 后结束 Query generator；Codex adapter 关闭并 kill 对应 app-server 子进程，状态进入 `terminated`。
 - **完整历史**：`AgentRunner` 把每次 start/send/steer/compact 输入记录为 `user_input`；Claude thinking block 与 Codex reasoning delta/summary 统一映射为 `thinking`。`GET /api/agents/:id/history` 因而可回放用户输入、思考、答复、工具调用/结果与轮次结果。
+- **commit 上报**：Agent Canvas 不替 agent 执行 `git commit`，但内置工作区规则要求每次 commit 成功后调用 `POST /api/agents/:id/commits`。后端用该 agent 的 branch workspace 读取 commit hash、message、文件列表和 diff，并记录当时的 `sourceTurnIndex`，让前端 commit 节点始终连回触发它的那一轮对话。
 
 ## HTTP API
 
@@ -70,11 +72,13 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 | `POST /api/agents/:id/steer` | body=`{ text }`，尽快引导当前正在运行的一轮 |
 | `POST /api/agents/:id/questions/:requestId` | body=`AgentQuestionResponse`，回答或拒绝底层 CLI/SDK 发出的交互问题 |
 | `POST /api/agents/:id/approvals/:requestId` | body=`AgentApprovalResponse`，允许、拒绝或取消底层 CLI/SDK 发出的授权请求 |
+| `POST /api/agents/:id/commits` | body=`{ commit?, summary? }`，记录该 agent 已完成一次 commit；默认读取当前工作区 `HEAD` |
 | `POST /api/agents/:id/compact` | 手动 compact 当前上下文；仅 `waiting_input` 可用 |
 | `POST /api/agents/:id/resume` | body=`{ sessionId, text }`，续接会话 |
 | `POST /api/agents/:id/fork` | body=`{ anchorUuid, model? }`，从该 agent 某轮 fork 出新 agent，可为 Codex fork 指定模型，返回 `{ id, origin }` |
 | `POST /api/agents/:id/stop` | 中止 |
 | `POST /api/agents/:id/terminate` | 关闭底层 CLI / Query，进入 `terminated` |
+| `GET /api/commits` | 列出已上报 commit 节点快照 |
 
 ## PR 流程
 
@@ -82,8 +86,9 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 - 程序不限制 commit，也不执行具体 `git`/`gh` 命令。提 PR 的 agent 在收到 `create_pr` 授权后可自由处理冲突、更新源 branch 并创建 PR；目标审查通过后再收到 `merge_pr` 授权并自行合并。
 - Agent Canvas 内置工作区规则会注入 PR pipeline 使用协议；用户可以直接在某个 agent 的对话框里要求它提 PR，agent 应先 `POST /api/pr-flows` 发起流程，并在收到 `create_pr` / `merge_pr` 授权后再执行实际 `git`/`gh` 操作。
 - 发起 PR flow 时必须有具体变更文件列表。默认 server 会通过 `WorkspaceManager.diffPullRequestFiles()` 计算 `git diff --name-status <target>...<source>`，并把 `changedFiles` 写入发给审查 agent 的提示词；如果用户或 agent 指定了 `files`，则按该文件范围审查并补齐状态。
+- PR flow 创建时也会记录 `sourceTurnIndex`，因此前端 PR 节点会固定连回发起 PR pipeline 的那一轮对话；后续 agent 继续对话、旧节点成为历史轮也不会断线或漂移。
 - `GET /api/pr-flows` 列出流程；`POST /api/pr-flows` 发起源 branch preflight；`POST /api/pr-flows/:id/pr-created` 可兜底登记 PR 已创建并进入目标 branch 审查；`POST /api/pr-flows/:id/merged` 可兜底登记已合并；`POST /api/pr-flows/:id/cancel` 取消流程。
-- WebSocket `hello` 帧会带上 `prFlows` 快照，后续状态变化通过 `pr_flow` 帧推送。
+- WebSocket `hello` 帧会带上 `prFlows` 和 `commits` 快照，后续 PR 状态变化通过 `pr_flow` 帧推送，commit 上报通过 `commit` 帧推送。
 
 ## 多轮对话与 fork（对话历史分叉）
 
@@ -93,8 +98,10 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 ## WebSocket (`/ws`)
 
 服务端 → 前端帧（`ServerFrame`）：
-- `{ type: "hello", agents }`：连接即下发当前快照
+- `{ type: "hello", agents, prFlows, commits }`：连接即下发当前快照
 - `{ type: "event", envelope }`：实时事件（带 `agentId/seq/at`）
+- `{ type: "pr_flow", flow }`：PR flow 快照更新
+- `{ type: "commit", commit }`：Agent 上报 commit 后的 commit 快照
 
 ## 测试（CLAUDE.md 原则 #1）
 
@@ -105,6 +112,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 - `sdk/codexAppServerQuery.test.ts`：`/compact` → 原生 `thread/compact/start`、`steer` → 原生 `turn/steer`、`requestUserInput`/授权审批回写，以及 app-server 进程终止
 - `sdk/realQuery.test.ts`：Claude 每轮文件上下文刷新，以及 `AskUserQuestion`/工具授权 → 统一处理器
 - `AgentRunner.test.ts`：start/running/waiting_input/send/steer/stop/done/error 全状态流转 + 流式输入 + provider 交互问题/授权挂起与回答 + 完全权限模式
+- `commits/CommitManager.test.ts`：真实临时 git repo 中读取 commit 元信息、文件列表和每文件 diff
 - `util/AsyncMessageQueue.test.ts`：队列的 push/wait/close 语义
 
 ```bash
@@ -177,5 +185,5 @@ npm run smoke --workspace apps/server
 - `POST /api/agents` 支持 `provider/model/branchWorkspaceId/cwd/systemPrompt`。新工作流中 `branchWorkspaceId` 决定 `cwd`；`cwd` 只保留兼容和快照展示。fork 会复制父 Agent 的 provider、模型、branch/cwd 和私有系统提示词。
 - `PATCH /api/agents/:id/settings` 可更新 `systemPrompt`，也可在 `idle` / `waiting_input` 状态切换到已有或新建 branch。切换后下一次业务输入会注入 branch 切换说明和 `git diff --name-status <old> <new>` 文件列表；`waiting_input` 下会脱开旧空闲会话，下次输入按新 `cwd` resume。
 - `systemPrompt` 是当前 Agent 私有提示词，不传给 Claude/Codex 原生 system prompt，而是在 `AgentRunner` 中按提示词节点同样的可读提示词机制拼接到业务输入。新 Agent 首轮、手动 compact 后、自动 compact 后、以及运行中更新设置后的下一条业务输入会重新注入。
-- Agent Canvas 内置工作区规则不属于用户可编辑的 `systemPrompt`，即使用户没有设置私有系统提示词也会注入；它约束共享文件默认只读、临时文件只写 `.agent-tmp/<agent-id>/`、其余非共享非临时修改都视为需要 commit 的仓库文件，并内置 PR pipeline 协议，指导 agent 在用户要求提 PR 时调用 `/api/pr-flows`。
+- Agent Canvas 内置工作区规则不属于用户可编辑的 `systemPrompt`，即使用户没有设置私有系统提示词也会注入；它约束共享文件默认只读、临时文件只写 `.agent-tmp/<agent-id>/`、其余非共享非临时修改都视为需要 commit 的仓库文件，并内置 PR pipeline 和 commit report 协议，指导 agent 在用户要求提 PR 时调用 `/api/pr-flows`，在每次 `git commit` 成功后调用 `/api/agents/:id/commits`。
 - `POST /api/directories/pick` 通过本机目录选择器返回用户选中的目录；Windows 使用 PowerShell + `System.Windows.Forms.FolderBrowserDialog`，其他平台暂返回明确错误并允许前端继续手动输入路径。

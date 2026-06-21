@@ -82,6 +82,7 @@ export interface PullRequestAuthorization {
 export interface PullRequestFlowSnapshot {
   id: string;
   proposerAgentId: string;
+  sourceTurnIndex?: number;
   sourceBranch: string;
   targetBranch: string;
   title?: string;

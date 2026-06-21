@@ -20,6 +20,7 @@
 | `src/nodes/TurnNode.tsx` | 自定义节点（一轮）：状态徽标 + provider/model 选择 + 输出滚动区；支持边缘缩放、最小化/恢复，最新节点提供运行中排队/引导、CLI/SDK 提问回答面板、授权审批面板、Compact/Terminate |
 | `src/history/` | 点击节点后打开的累计历史窗口；按目标轮截断并展示用户输入、provider 思考、答复、完整工具调用/结果与状态 |
 | `src/pullRequests/` | PR 流程面板：发起审查、展示流程状态，并兜底登记 PR 已创建/已合并 |
+| `src/commits/` | commit 节点与详情窗口：展示 agent 上报的 commit hash、摘要、文件列表和每文件 diff |
 | `src/App.tsx` | 画布装配：对话树布局（每 agent 一列、轮次向下、fork 另起列对齐锚点轮）+ 轮链边 + fork 边 |
 
 ## 数据流
@@ -34,6 +35,8 @@
 
 - **命令走 REST，事件走 WS**，单向清晰。`submit` 自动判断首轮 start / 续轮 send；运行中 submit 默认排队到下一轮，`steer` 按钮引导当前 in-flight turn。
 - PR 流程也走同一套 REST + WS：`useAgentCanvas` 读取 `hello.prFlows` 并监听 `pr_flow` 帧；顶栏 PR 面板调用 `/api/pr-flows` 发起流程。具体 `git`/`gh`/冲突处理仍由提 PR 的 agent 自己执行。
+- commit 节点来自后端 commit report：agent 在 `git commit` 后调用 `/api/agents/:id/commits`，`useAgentCanvas` 读取 `hello.commits` 并监听 `commit` 帧。commit 线使用后端记录的 `sourceTurnIndex`，所以旧对话框完成后变成历史轮，commit 线仍连在原来的那一轮上。
+- PR 节点来自 `prFlows`，同样使用 flow 的 `sourceTurnIndex` 连接到发起 PR pipeline 的原始对话轮。节点显示当前状态，点击可看完整流程、审查结果和变更文件。
 - 新建 / fork 后后端不发事件，前端**乐观插入**节点（fork 带 `forkOrigin` 以画连线）。
 - Codex 的 `agentMessage` 流式 delta 按消息 UUID 合并到同一输出段落，避免每个小片段被渲染成独立短行。
 - 每个 agent 的最新运行节点显示输入框：`排队` 会把提示词排到当前轮 result 后执行，`引导` 会尽快追加到当前运行轮，`停止` 保留中止能力。
@@ -42,7 +45,9 @@
 - 顶栏“设置”打开程序设置；“完全权限模式”开启后，后端直接允许所有授权请求，并放行已挂起授权，防止对话卡在审批上。它不会自动回答普通问题。
 - 每个 agent 的最新节点显示 `Compact` 和 `Terminate`。Compact 仅在等待输入时启用，完成后当前 idle 节点定格为 `/compact` 完成轮并延伸新 idle 节点；自动 compact 完成事件在当前运行轮中显示为系统记录，不延伸新 idle 轮；Terminate 关闭底层 CLI 并进入 `terminated`。
 - 点击任意非最小化节点主体会打开独立历史窗口，内容累计到该轮为止；历史来自后端 `/history`，包括 provider 实际发出的 thinking/reasoning 与完整工具参数/结果。
-- 对话节点、文件节点和提示词节点四边/四角可拖拽缩放，也都支持最小化/恢复。最小化按钮会保存当前宽高并把节点缩成 `68×48` 的小节点；小节点本身仍是拖动句柄，单击恢复。节点 id 与 Handle 始终不变，因此轮次线、fork 线和资源线保持连接。
+- 对话节点、文件节点、提示词节点、commit 节点和 PR 节点四边/四角可拖拽缩放，也都支持最小化/恢复。最小化按钮会保存当前宽高并把节点缩成小节点；小节点本身仍是拖动句柄，单击恢复。节点 id 与 Handle 始终不变，因此轮次线、fork 线、资源线、commit 线和 PR 线保持连接。
+- commit 节点预览短 hash、摘要、branch 和文件数量；点击打开详情窗口，可查看完整 hash、message、作者、时间、文件列表，并逐个展开 diff。
+- PR 节点预览状态、摘要和 source→target branch；点击打开详情窗口，可查看流程状态、PR 链接/编号、失败原因、变更文件和每轮审查意见。
 - 文件和提示词节点标题栏用于拖动；重命名只通过铅笔按钮进入输入态，避免点击标题边缘时误触。
 - WebSocket 首次连接延迟到下一轮事件循环，兼容 React StrictMode 的开发期双重 effect 检查，避免 Vite 代理记录无害的 `ECONNABORTED`。
 - 节点只有头部可拖动（`.drag-handle`），控制区 `.nodrag`、日志区 `.nowheel`。
@@ -68,6 +73,7 @@ npm test --workspace apps/web
 - `useAgentCanvas.test.tsx`：StrictMode 下只建立一次 WebSocket
 - `history/*.test.ts(x)`：按轮截断、流式片段合并与完整历史窗口渲染
 - `nodes/TurnNode.test.tsx`：各状态徽标、模型选择、运行中排队/引导/停止、交互问题回答、授权审批红点、Compact/Terminate、历史点击、尺寸保存/恢复与 fork 控件交互
+- `commits/CommitNode.test.tsx`、`pullRequests/PullRequestNode.test.tsx`：commit/PR 节点的最小化、Handle 保留和详情入口
 
 ## 文件节点
 

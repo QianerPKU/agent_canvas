@@ -227,6 +227,20 @@ export class AgentManager {
     return this.history.get(id) ?? [];
   }
 
+  currentTurnIndex(id: string): number {
+    if (!this.runners.has(id)) throw new Error(`未知 agent: ${id}`);
+    let index = 0;
+    for (const envelope of this.historyOf(id)) {
+      if (
+        envelope.event.kind === "result" ||
+        (envelope.event.kind === "compact" && envelope.event.trigger === "manual")
+      ) {
+        index++;
+      }
+    }
+    return index;
+  }
+
   private broadcast(agentId: string, event: AgentEvent): void {
     const seq = (this.seqs.get(agentId) ?? 0) + 1;
     this.seqs.set(agentId, seq);

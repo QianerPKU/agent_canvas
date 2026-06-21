@@ -6,6 +6,8 @@
 
 每次审查请求都会包含具体变更文件。默认 server 通过 `WorkspaceManager.diffPullRequestFiles()` 计算 `git diff --name-status <target>...<source>` 并写入 `changedFiles`；如果发起流程时显式传入 `files`，则按这次 PR 的文件范围审查并补齐对应状态。无法确定任何变更文件时，后端会拒绝创建 PR flow。
 
+每个 flow 创建时会记录 proposer agent 当前的 `sourceTurnIndex`。前端 PR 节点用这个字段固定连回发起 PR pipeline 的对话轮，避免 agent 继续运行后连线漂移到最新轮。
+
 ## 流程
 
 1. 用户通过 `POST /api/pr-flows` 发起流程，指定提 PR 的 agent、目标 branch、概括和可选文件范围。

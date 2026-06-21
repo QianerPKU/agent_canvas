@@ -227,4 +227,29 @@ describe("AgentManager fork", () => {
     await expect(pending).resolves.toEqual({ action: "approve" });
     expect(mgr.appSettings().fullPermissionMode).toBe(true);
   });
+
+  it("currentTurnIndex follows completed result turns", async () => {
+    const { query, out } = makeWaitingQuery();
+    const mgr = new AgentManager({ query });
+    const runner = mgr.create();
+    mgr.startAgent(runner.id, { prompt: "第一轮" });
+    out.push({
+      type: "system",
+      subtype: "init",
+      session_id: "sess-turns",
+      model: "m",
+      cwd: "/repo",
+      tools: [],
+    });
+    await flush();
+    expect(mgr.currentTurnIndex(runner.id)).toBe(0);
+
+    out.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+    });
+    await flush();
+    expect(mgr.currentTurnIndex(runner.id)).toBe(1);
+  });
 });
