@@ -106,6 +106,46 @@ describe("agentStore 轮次模型", () => {
     });
   });
 
+  it("运行中 queued/steer 输入不覆盖当前轮，queued 在 result 后成为下一轮输入", () => {
+    seq = 0;
+    let map: AgentMap = { a1: newAgentView("a1") };
+    map = recordInput(map, "a1", "run long task");
+
+    map = applyEnvelope(
+      map,
+      env("a1", { kind: "user_input", text: "下一轮继续整理", mode: "queued" }),
+    );
+    map = applyEnvelope(
+      map,
+      env("a1", { kind: "user_input", text: "先看失败测试", mode: "steer" }),
+    );
+
+    expect(get(map).turns[0]).toMatchObject({
+      userInput: "run long task",
+      status: "running",
+    });
+    expect(get(map).turns[0]!.lines).toContainEqual({
+      kind: "system",
+      text: "已排队下一轮：下一轮继续整理",
+    });
+    expect(get(map).turns[0]!.lines).toContainEqual({
+      kind: "system",
+      text: "引导：先看失败测试",
+    });
+
+    map = applyEnvelope(
+      map,
+      env("a1", { kind: "result", subtype: "success", isError: false }),
+    );
+    map = applyEnvelope(map, env("a1", { kind: "user_input", text: "下一轮继续整理" }));
+
+    expect(get(map).turns).toHaveLength(2);
+    expect(get(map).turns[1]).toMatchObject({
+      userInput: "下一轮继续整理",
+      status: "running",
+    });
+  });
+
   it("同一 assistant 消息的流式片段合并为一行", () => {
     seq = 0;
     let map: AgentMap = { a1: newAgentView("a1") };

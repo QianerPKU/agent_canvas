@@ -1,7 +1,7 @@
 /**
  * 把 WebSocket 事件流 + REST 命令收敛成一个 React hook。
  *  - 订阅 /ws，用 agentStore 的纯函数折叠出 agents 视图表
- *  - 暴露 create/start/stop/send/resume 动作
+ *  - 暴露 create/start/stop/send/steer/resume 动作
  *  - 自动断线重连
  */
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -41,6 +41,8 @@ export interface AgentActions {
     provider?: AgentProvider,
     model?: string,
   ) => Promise<void>;
+  /** 尽快引导当前正在运行的一轮。 */
+  steer: (agentId: string, text: string) => Promise<void>;
   /** 中止 agent。 */
   stop: (agentId: string) => Promise<void>;
   /** 手动压缩上下文，并把 compact 记为独立一轮。 */
@@ -191,18 +193,22 @@ export function useAgentCanvas(): UseAgentCanvas {
         const view = agentsRef.current[agentId];
         const startProvider = provider ?? view?.provider;
         const startModel = model ?? (startProvider === "codex" ? view?.model : undefined);
-        setAgents((prev) => recordInput(prev, agentId, text, startProvider, startModel));
         // 首轮（idle）用 start（fork 出来的 agent 由后端合并 fork 配置）；续轮用 send
         if (!view || view.status === "idle") {
+          setAgents((prev) => recordInput(prev, agentId, text, startProvider, startModel));
           await api.start(agentId, {
             prompt: text,
             provider: startProvider,
             model: startModel,
           });
+        } else if (view.status === "waiting_input") {
+          setAgents((prev) => recordInput(prev, agentId, text, startProvider, startModel));
+          await api.send(agentId, text);
         } else {
           await api.send(agentId, text);
         }
       },
+      steer: (agentId, text) => api.steer(agentId, text).then(() => undefined),
       stop: (agentId) => api.stop(agentId).then(() => undefined),
       compact: async (agentId) => {
         setAgents((prev) => recordCompact(prev, agentId));

@@ -326,7 +326,21 @@ async function handleHttp(
     if (method === "POST" && action === "send") {
       const body = await readJson<{ text?: string }>(req);
       if (!body?.text) return sendJson(res, 400, { error: "缺少 text" });
-      runner.send(body.text);
+      try {
+        runner.send(body.text);
+      } catch (err) {
+        return sendJson(res, 409, { error: errMsg(err) });
+      }
+      return sendJson(res, 202, { ok: true });
+    }
+    if (method === "POST" && action === "steer") {
+      const body = await readJson<{ text?: string }>(req);
+      if (!body?.text) return sendJson(res, 400, { error: "缺少 text" });
+      try {
+        await runner.steer(body.text);
+      } catch (err) {
+        return sendJson(res, 409, { error: errMsg(err) });
+      }
       return sendJson(res, 202, { ok: true });
     }
     if (method === "POST" && action === "compact") {

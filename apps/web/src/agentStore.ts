@@ -183,6 +183,18 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
       };
     }
     case "user_input":
+      if (event.mode === "queued") {
+        return pushLineToLast(view, {
+          kind: "system",
+          text: `已排队下一轮：${event.text}`,
+        });
+      }
+      if (event.mode === "steer") {
+        return pushLineToLast(view, {
+          kind: "system",
+          text: `引导：${event.text}`,
+        });
+      }
       return withLastTurn(view, (turn) => ({
         ...turn,
         userInput: event.text,

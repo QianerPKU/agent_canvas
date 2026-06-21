@@ -8,7 +8,7 @@ import {
   type Node,
   type NodeProps,
 } from "@xyflow/react";
-import { MessageSquare, Minimize2 } from "lucide-react";
+import { MessageSquare, Minimize2, Send, Square, Zap } from "lucide-react";
 import {
   CODEX_MODELS,
   DEFAULT_CODEX_MODEL,
@@ -148,6 +148,7 @@ export function TurnNode({
     (turn.index === 0 ? agentStatus === "idle" : agentStatus === "waiting_input");
   const canFork = turn.status === "done" && !!turn.anchorUuid;
   const isRunning = turn.status === "running";
+  const canGuideRunningTurn = isLatest && isRunning && agentStatus === "running";
   const canCompact = isLatest && agentStatus === "waiting_input";
   const canTerminate =
     isLatest &&
@@ -388,8 +389,49 @@ export function TurnNode({
               {turn.index === 0 ? "▶ 启动" : "▶ 发送本轮"}
             </button>
           </>
+        ) : isRunning && canGuideRunningTurn ? (
+          <>
+            <textarea
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              placeholder="运行中追加提示词…"
+              rows={3}
+              style={textareaStyle}
+            />
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
+              <button
+                style={iconBtn("#2563eb")}
+                disabled={!text.trim()}
+                title="排队到当前轮完成后执行"
+                onClick={() => {
+                  void actions.submit(agentId, text.trim());
+                  setText("");
+                }}
+              >
+                <Send size={14} />
+                排队
+              </button>
+              <button
+                style={iconBtn("#7c3aed")}
+                disabled={!text.trim()}
+                title="尽快引导当前运行轮"
+                onClick={() => {
+                  void actions.steer(agentId, text.trim());
+                  setText("");
+                }}
+              >
+                <Zap size={14} />
+                引导
+              </button>
+              <button style={iconBtn("#dc2626")} onClick={() => void actions.stop(agentId)}>
+                <Square size={13} />
+                停止
+              </button>
+            </div>
+          </>
         ) : isRunning ? (
-          <button style={btn("#dc2626")} onClick={() => void actions.stop(agentId)}>
+          <button style={iconBtn("#dc2626")} onClick={() => void actions.stop(agentId)}>
+            <Square size={13} />
             停止
           </button>
         ) : canFork ? (
@@ -519,5 +561,16 @@ function btn(color: string): React.CSSProperties {
     padding: "6px 10px",
     cursor: "pointer",
     fontSize: 12,
+  };
+}
+
+function iconBtn(color: string): React.CSSProperties {
+  return {
+    ...btn(color),
+    minHeight: 30,
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 4,
   };
 }

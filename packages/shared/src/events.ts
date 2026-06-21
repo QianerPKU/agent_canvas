@@ -49,6 +49,7 @@ export interface UsageInfo {
 }
 
 export type CompactTrigger = "manual" | "auto";
+export type UserInputMode = "queued" | "steer";
 
 /**
  * 归一化后的 agent 事件（后端 → 前端，单向流）。
@@ -56,7 +57,7 @@ export type CompactTrigger = "manual" | "auto";
  */
 export type AgentEvent =
   | { kind: "status"; status: AgentStatus }
-  | { kind: "user_input"; text: string }
+  | { kind: "user_input"; text: string; mode?: UserInputMode }
   | {
       kind: "compact";
       trigger: CompactTrigger;
@@ -143,6 +144,7 @@ export type ClientCommand =
   | { type: "compact" }
   | { type: "terminate" }
   | { type: "send"; text: string } // 中途追加指令（流式输入干预）
+  | { type: "steer"; text: string } // 尽快引导当前 in-flight turn
   | { type: "resume"; sessionId: string; text: string };
 
 /** agent 当前快照（REST 列表 / 重连补齐用）。 */

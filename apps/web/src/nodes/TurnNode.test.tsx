@@ -18,6 +18,7 @@ function makeActions(): AgentActions {
   return {
     create: vi.fn().mockResolvedValue(undefined),
     submit: vi.fn().mockResolvedValue(undefined),
+    steer: vi.fn().mockResolvedValue(undefined),
     stop: vi.fn().mockResolvedValue(undefined),
     compact: vi.fn().mockResolvedValue(undefined),
     terminate: vi.fn().mockResolvedValue(undefined),
@@ -203,7 +204,7 @@ describe("TurnNode", () => {
     expect(actions.terminate).toHaveBeenCalledWith("agent_1");
   });
 
-  it("运行中：显示停止按钮", () => {
+  it("运行中：可排队、引导和停止", () => {
     const actions = makeActions();
     renderTurn(
       { index: 0, status: "running", lines: [{ kind: "assistant", text: "思考中" }] },
@@ -211,6 +212,22 @@ describe("TurnNode", () => {
       actions,
     );
     expect(screen.getByText("运行中")).toBeTruthy();
+
+    fireEvent.change(screen.getByPlaceholderText("运行中追加提示词…"), {
+      target: { value: "下一轮整理结果" },
+    });
+    fireEvent.click(screen.getByText("排队"));
+    expect(actions.submit).toHaveBeenCalledWith(
+      "agent_1",
+      "下一轮整理结果",
+    );
+
+    fireEvent.change(screen.getByPlaceholderText("运行中追加提示词…"), {
+      target: { value: "先看失败测试" },
+    });
+    fireEvent.click(screen.getByText("引导"));
+    expect(actions.steer).toHaveBeenCalledWith("agent_1", "先看失败测试");
+
     fireEvent.click(screen.getByText("停止"));
     expect(actions.stop).toHaveBeenCalledWith("agent_1");
   });

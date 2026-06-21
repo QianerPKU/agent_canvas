@@ -108,7 +108,20 @@ function HistoryEvent({ item }: { item: HistoryItem }): React.ReactElement {
 
   switch (event.kind) {
     case "user_input":
-      return <EventBlock tone="user" label="用户" time={time} content={event.text} />;
+      return (
+        <EventBlock
+          tone="user"
+          label={
+            event.mode === "queued"
+              ? "用户 · 已排队"
+              : event.mode === "steer"
+                ? "用户 · 引导"
+                : "用户"
+          }
+          time={time}
+          content={event.text}
+        />
+      );
     case "thinking":
       return <EventBlock tone="thinking" label="思考" time={time} content={event.text} />;
     case "assistant_text":

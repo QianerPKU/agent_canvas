@@ -20,7 +20,8 @@ function userInput(
   };
 }
 
-function makeFakeSpawn() {
+function makeFakeSpawn(options: { completeTurnStart?: boolean } = {}) {
+  const completeTurnStart = options.completeTurnStart ?? true;
   const requests: string[] = [];
   const messages: Array<{ id?: number; method?: string; params?: Record<string, unknown> }> = [];
   const stdin = new PassThrough();
@@ -68,13 +69,18 @@ function makeFakeSpawn() {
         break;
       case "turn/start":
         write({ id: message.id, result: { turn: { id: "turn-1" } } });
-        write({
-          method: "turn/completed",
-          params: {
-            threadId: "thread-1",
-            turn: { id: "turn-1", status: "completed" },
-          },
-        });
+        if (completeTurnStart) {
+          write({
+            method: "turn/completed",
+            params: {
+              threadId: "thread-1",
+              turn: { id: "turn-1", status: "completed" },
+            },
+          });
+        }
+        break;
+      case "turn/steer":
+        write({ id: message.id, result: { turn: { id: "turn-1" } } });
         break;
       case "thread/compact/start":
         write({ id: message.id, result: {} });
@@ -246,6 +252,39 @@ describe("Codex app-server query", () => {
       { type: "mention", name: "next.txt", path: "C:/shared/next.txt" },
     ]);
     expect(turnStarts[1]?.params?.sandboxPolicy).toBeUndefined();
+    await handle.terminate?.();
+  });
+
+  it("steer 在活跃 turn 上调用 Codex 原生 turn/steer", async () => {
+    const fake = makeFakeSpawn({ completeTurnStart: false });
+    const prompt = new AsyncMessageQueue<SdkUserInput>();
+    prompt.push(userInput("长任务"));
+
+    const handle = createCodexAppServerQuery({ spawnFn: fake.spawnFn })({
+      prompt,
+      options: { model: "gpt-5.5" },
+    });
+    const iterator = handle[Symbol.asyncIterator]();
+    await iterator.next();
+
+    const pendingTurn = iterator.next();
+    void pendingTurn.catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    await handle.steer?.(userInput("请优先检查失败测试"));
+
+    const steer = fake.messages.find((message) => message.method === "turn/steer");
+    expect(steer?.params).toEqual({
+      threadId: "thread-1",
+      input: [
+        {
+          type: "text",
+          text: "请优先检查失败测试",
+          text_elements: [],
+        },
+      ],
+    });
+
     await handle.terminate?.();
   });
 });

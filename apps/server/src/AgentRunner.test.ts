@@ -36,6 +36,7 @@ function resultMsg(extra: Partial<Record<string, unknown>> = {}): SdkMessage {
 function makeControllableQuery() {
   const out = new AsyncMessageQueue<SdkMessage>();
   const inputs: SdkUserInput[] = [];
+  const steeredInputs: SdkUserInput[] = [];
   let interrupted = false;
   let terminated = false;
   let lastOptions: QueryOptions | undefined;
@@ -53,6 +54,9 @@ function makeControllableQuery() {
       interrupt: async () => {
         interrupted = true;
       },
+      steer: async (input) => {
+        steeredInputs.push(input);
+      },
       terminate: async () => {
         terminated = true;
         out.close();
@@ -66,6 +70,7 @@ function makeControllableQuery() {
     emit: (m: SdkMessage) => out.push(m),
     finish: () => out.close(),
     inputs,
+    steeredInputs,
     wasInterrupted: () => interrupted,
     wasTerminated: () => terminated,
     getOptions: () => lastOptions,
@@ -128,6 +133,67 @@ describe("AgentRunner 生命周期", () => {
     ]);
 
     await runner.stop();
+  });
+
+  it("运行中 send 先排队，当前轮 result 后再作为下一轮用户输入", async () => {
+    const ctl = makeControllableQuery();
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("queued-agent", { query: ctl.query });
+    runner.on((event) => events.push(event));
+
+    runner.start({ prompt: "先做 x" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+
+    runner.send("下一轮做 y");
+    await flush();
+    expect(runner.getStatus()).toBe("running");
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual(["先做 x"]);
+    expect(events).toContainEqual({
+      kind: "user_input",
+      text: "下一轮做 y",
+      mode: "queued",
+    });
+
+    ctl.emit(resultMsg());
+    await flush();
+    expect(runner.getStatus()).toBe("running");
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual(["先做 x", "下一轮做 y"]);
+    expect(
+      events.filter(
+        (event): event is Extract<AgentEvent, { kind: "user_input" }> =>
+          event.kind === "user_input",
+      ),
+    ).toEqual([
+      { kind: "user_input", text: "先做 x" },
+      { kind: "user_input", text: "下一轮做 y", mode: "queued" },
+      { kind: "user_input", text: "下一轮做 y" },
+    ]);
+
+    ctl.emit(resultMsg());
+    await flush();
+    expect(runner.getStatus()).toBe("waiting_input");
+  });
+
+  it("steer 优先调用底层 handle 的引导能力，并记录 steer 事件", async () => {
+    const ctl = makeControllableQuery();
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("steer-agent", { query: ctl.query });
+    runner.on((event) => events.push(event));
+
+    runner.start({ prompt: "长任务" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+
+    await runner.steer("请优先看失败测试");
+    expect(ctl.steeredInputs.map((input) => input.message.content)).toEqual([
+      "请优先看失败测试",
+    ]);
+    expect(events).toContainEqual({
+      kind: "user_input",
+      text: "请优先看失败测试",
+      mode: "steer",
+    });
   });
 
   it("stop → stopped，调用 interrupt，且之后不可再 send", async () => {
@@ -407,6 +473,42 @@ describe("AgentRunner 生命周期", () => {
 
     runner.send("after auto compact");
     await flush();
+    expect(ctl.inputs.at(-1)?.promptAccess?.readablePrompts[0]?.content).toBe("先写测试");
+  });
+
+  it("运行中已排队输入遇到 auto compact 时，在正式入队下一轮时重新注入提示词", async () => {
+    const promptAccess = {
+      readablePrompts: [
+        { id: "prompt_1", name: "规范", content: "先写测试", kind: "shared" as const },
+      ],
+      writablePrompts: [],
+      writableDirectories: [],
+    };
+    const ctl = makeControllableQuery();
+    const runner = new AgentRunner("queued-auto-compact-agent", {
+      query: ctl.query,
+      resolvePromptAccess: () => promptAccess,
+    });
+
+    runner.start({ prompt: "first" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+
+    runner.send("queued after current turn");
+    await flush();
+    expect(ctl.inputs).toHaveLength(1);
+
+    ctl.emit({
+      type: "system",
+      subtype: "compact_boundary",
+      compact_metadata: { trigger: "auto" },
+      uuid: "compact-auto-queued",
+      session_id: "s1",
+    });
+    ctl.emit(resultMsg());
+    await flush();
+
+    expect(ctl.inputs).toHaveLength(2);
     expect(ctl.inputs.at(-1)?.promptAccess?.readablePrompts[0]?.content).toBe("先写测试");
   });
 

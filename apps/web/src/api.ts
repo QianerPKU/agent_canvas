@@ -40,6 +40,8 @@ export const api = {
     call(`/agents/${id}/start`, { method: "POST", body: JSON.stringify(config) }),
   send: (id: string, text: string) =>
     call(`/agents/${id}/send`, { method: "POST", body: JSON.stringify({ text }) }),
+  steer: (id: string, text: string) =>
+    call(`/agents/${id}/steer`, { method: "POST", body: JSON.stringify({ text }) }),
   compact: (id: string) => call(`/agents/${id}/compact`, { method: "POST" }),
   stop: (id: string) => call(`/agents/${id}/stop`, { method: "POST" }),
   terminate: (id: string) => call(`/agents/${id}/terminate`, { method: "POST" }),

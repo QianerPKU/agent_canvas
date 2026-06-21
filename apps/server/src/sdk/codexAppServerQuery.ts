@@ -101,6 +101,19 @@ function createHandle(
       }
       client?.close();
     },
+    steer: async (input) => {
+      if (!client || !threadId || !turnId) {
+        throw new Error("Codex turn is not active");
+      }
+      await client.request("turn/steer", {
+        threadId,
+        input: codexInputs({
+          text: inputText(input),
+          fileAccess: input.fileAccess,
+          promptAccess: input.promptAccess,
+        }),
+      });
+    },
     terminate: async () => {
       client?.close();
       await iterator.return(undefined).catch(() => undefined);

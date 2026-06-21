@@ -15,10 +15,11 @@
 | `AgentProvider` | 底层 agent 驱动：`claude / codex` |
 | `CODEX_MODELS` / `DEFAULT_CODEX_MODEL` | Codex UI 可选模型与默认模型 |
 | `CompactTrigger` | compact 来源：`manual` 表示用户触发并独立成轮，`auto` 表示 provider 自动压缩且保留在当前业务轮 |
+| `UserInputMode` | 运行中输入模式：`queued` 表示排到下一轮，`steer` 表示引导当前 in-flight turn；未设置表示普通轮次输入 |
 | `AgentEvent` | 归一化事件的可辨识联合（判别字段 `kind`）：`status / user_input / compact / system_init / thinking / assistant_text / tool_use / tool_result / result / error` |
 | `AgentEventEnvelope` | 传输信封：`{ agentId, seq, at, event }`，带单调序号便于回放/补齐 |
 | `AgentStartConfig` | 启动 agent 的配置（provider、prompt、cwd、model、权限模式、`zoneId` 占位等） |
-| `ClientCommand` | 客户端→服务端命令：`start / stop / compact / terminate / send / resume` |
+| `ClientCommand` | 客户端→服务端命令：`start / stop / compact / terminate / send / steer / resume` |
 | `AgentSnapshot` | agent 当前快照（REST 列表、重连补齐） |
 
 ## 设计约定

@@ -137,6 +137,17 @@ describe("HTTP server", () => {
     expect(r.status).toBe(409);
   });
 
+  it("steer 缺 text → 400，非运行状态 → 409", async () => {
+    const c = await request(port, "POST", "/api/agents");
+    const missingText = await request(port, "POST", `/api/agents/${c.json.id}/steer`, {});
+    expect(missingText.status).toBe(400);
+
+    const notRunning = await request(port, "POST", `/api/agents/${c.json.id}/steer`, {
+      text: "请立刻调整",
+    });
+    expect(notRunning.status).toBe(409);
+  });
+
   it("terminate → 202", async () => {
     const c = await request(port, "POST", "/api/agents");
     const r = await request(port, "POST", `/api/agents/${c.json.id}/terminate`);

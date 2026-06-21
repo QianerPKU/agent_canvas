@@ -61,6 +61,7 @@ export class AgentRunner {
   private lastAssistantUuid?: string; // 本轮最后一条 assistant 消息 uuid（fork 锚点）
   private compactPending = false;
   private promptInjectionPending = false;
+  private pendingQueuedInputs: string[] = [];
   private readonly createdAt: number;
 
   constructor(id: string, deps: AgentRunnerDeps) {
@@ -113,6 +114,7 @@ export class AgentRunner {
     this.lastAssistantUuid = undefined;
     this.compactPending = false;
     this.promptInjectionPending = !config.resume && !extra.resumeSessionId;
+    this.pendingQueuedInputs = [];
 
     this.abortController = new AbortController();
     this.inputQueue = new AsyncMessageQueue<SdkUserInput>();
@@ -149,6 +151,12 @@ export class AgentRunner {
     if (!this.inputQueue || this.inputQueue.isClosed || isTerminalStatus(this.status)) {
       throw new Error(`agent ${this.id} 当前不可接收输入（${this.status}）`);
     }
+    const isQueuedInput = this.status === "starting" || this.status === "running";
+    if (isQueuedInput) {
+      this.pendingQueuedInputs.push(text);
+      this.emit({ kind: "user_input", text, mode: "queued" });
+      return;
+    }
     this.inputQueue.push(
       toUserInput(
         text,
@@ -158,6 +166,29 @@ export class AgentRunner {
     );
     this.setStatus("running");
     this.emit({ kind: "user_input", text });
+  }
+
+  /** 尽快把输入追加到当前正在运行的一轮；Codex 使用 turn/steer，Claude 回退到流式输入通道。 */
+  async steer(text: string): Promise<void> {
+    if (
+      !this.inputQueue ||
+      this.inputQueue.isClosed ||
+      isTerminalStatus(this.status) ||
+      this.status !== "running"
+    ) {
+      throw new Error(`agent ${this.id} 当前不可引导（${this.status}）`);
+    }
+    const input = toUserInput(
+      text,
+      this.resolveFileAccess?.(this.id),
+      this.promptAccessWithoutReadablePrompts(),
+    );
+    if (this.handle?.steer) {
+      await this.handle.steer(input);
+    } else {
+      this.inputQueue.push(input);
+    }
+    this.emit({ kind: "user_input", text, mode: "steer" });
   }
 
   /** 手动压缩当前会话上下文；压缩本身作为独立一轮。 */
@@ -176,6 +207,7 @@ export class AgentRunner {
     if (isTerminalStatus(this.status) || this.status === "idle") return;
     this.inputQueue?.close();
     this.compactPending = false;
+    this.pendingQueuedInputs = [];
     this.abortController?.abort();
     try {
       await this.handle?.interrupt?.();
@@ -190,6 +222,7 @@ export class AgentRunner {
     if (this.status === "terminated") return;
     this.inputQueue?.close();
     this.compactPending = false;
+    this.pendingQueuedInputs = [];
     this.setStatus("terminated");
     this.abortController?.abort();
     try {
@@ -262,7 +295,26 @@ export class AgentRunner {
         this.lastAssistantUuid = undefined; // 下一轮重新累积
         this.emit(enriched);
         // 一轮结束：输入流仍开则等待下一条指令，否则完成
-        this.setStatus(this.inputQueue?.isClosed ? "done" : "waiting_input");
+        const inputQueue = this.inputQueue;
+        if (!inputQueue || inputQueue.isClosed) {
+          this.pendingQueuedInputs = [];
+          this.setStatus("done");
+        } else {
+          const queuedInput = this.pendingQueuedInputs.shift();
+          if (queuedInput) {
+            inputQueue.push(
+              toUserInput(
+                queuedInput,
+                this.resolveFileAccess?.(this.id),
+                this.promptAccessForNextInput(),
+              ),
+            );
+            this.emit({ kind: "user_input", text: queuedInput });
+            this.setStatus("running");
+          } else {
+            this.setStatus("waiting_input");
+          }
+        }
         break;
       }
       case "error":
@@ -307,6 +359,15 @@ export class AgentRunner {
           ...access,
           readablePrompts: [],
         };
+  }
+
+  private promptAccessWithoutReadablePrompts(): AgentPromptAccess | undefined {
+    const access = this.resolvePromptAccess?.(this.id);
+    if (!access) return undefined;
+    return {
+      ...access,
+      readablePrompts: [],
+    };
   }
 }
 
