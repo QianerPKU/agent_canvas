@@ -33,3 +33,9 @@
 - `readWrite` 共享资源会额外加入 `writableDirectories`，Codex 的 `workspaceWrite.writableRoots` 和 Claude 的额外目录授权会据此放行。
 - junction/symlink 本身不是跨平台硬只读边界；因此内置工作区规则提示词会要求 Agent 未经用户明确授权不得修改 `readOnly` 资源。
 - 这里的共享资源不同于文件节点的共享开关。文件节点始终位于画布隔离文件夹，`sharedRead/sharedWrite` 只是把该隔离文件引用授权给全部 Agent，不做 branch 间重映射。
+
+## 测试覆盖
+
+- `WorkspaceManager.test.ts` 包含一个 fake git 单测，用来快速验证路径、权限和 API 返回结构。
+- 同文件还包含一个真实 git 集成测试：在系统临时目录创建 source repo 与 bare remote，clone 后创建多个 branch worktree，再把一个 `readWrite` 共享资源映射到每个 worktree，验证每个 branch 都能通过挂载路径读写同一份源目录。
+- 真实 `git worktree` 的 `.git` 通常是指向实际 gitdir 的文件；测试和实现都应通过 `git rev-parse --git-path info/exclude` 找到本地 exclude 文件。

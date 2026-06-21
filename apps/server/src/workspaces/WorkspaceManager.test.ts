@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, readFile, rm, lstat } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { WorkspaceManager, type GitRunner } from "./WorkspaceManager.js";
@@ -108,4 +109,128 @@ describe("WorkspaceManager", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("maps one read-write shared resource into every real git branch worktree", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-real-git-"));
+    const source = path.join(root, "source-repo");
+    const remote = path.join(root, "remote.git");
+    const projectRoot = path.join(root, "project");
+
+    try {
+      await mkdir(source, { recursive: true });
+      await runGit(["init", "--initial-branch=main"], source);
+      await runGit(["config", "user.email", "agent-canvas@example.test"], source);
+      await runGit(["config", "user.name", "Agent Canvas Test"], source);
+      await writeFile(path.join(source, "README.md"), "# smoke\n", "utf-8");
+      await runGit(["add", "README.md"], source);
+      await runGit(["commit", "-m", "init"], source);
+      await runGit(["init", "--bare", "--initial-branch=main", remote], root);
+      await runGit(["remote", "add", "origin", remote], source);
+      await runGit(["push", "-u", "origin", "main"], source);
+
+      const manager = new WorkspaceManager({
+        defaultSourcePath: source,
+        projectRoot,
+      });
+
+      const project = await manager.connect({
+        remoteUrl: remote,
+        localPath: source,
+        defaultBranch: "main",
+      });
+      const main = project.branches[0];
+      if (!main) throw new Error("expected default branch workspace");
+      const featureA = await manager.createBranch({ branch: "feature/a" });
+      const resource = await manager.createSharedResource({
+        name: "dataset",
+        mountPath: "shared/dataset",
+        access: "readWrite",
+      });
+      const featureB = await manager.createBranch({ branch: "feature/b" });
+      const branches = [main, featureA, featureB];
+
+      for (const branch of branches) {
+        const mountPath = path.join(branch.worktreePath, "shared", "dataset");
+        const mountStat = await lstat(mountPath);
+        expect(mountStat.isDirectory() || mountStat.isSymbolicLink()).toBe(true);
+        expect(await realpath(mountPath)).toBe(await realpath(resource.sourcePath));
+      }
+
+      await writeFile(
+        path.join(main.worktreePath, "shared", "dataset", "from-main.txt"),
+        "main branch\n",
+        "utf-8",
+      );
+      await writeFile(
+        path.join(featureA.worktreePath, "shared", "dataset", "from-feature-a.txt"),
+        "feature a\n",
+        "utf-8",
+      );
+      await writeFile(
+        path.join(featureB.worktreePath, "shared", "dataset", "from-feature-b.txt"),
+        "feature b\n",
+        "utf-8",
+      );
+
+      for (const branch of branches) {
+        const mountPath = path.join(branch.worktreePath, "shared", "dataset");
+        await expect(readFile(path.join(mountPath, "from-main.txt"), "utf-8")).resolves.toBe(
+          "main branch\n",
+        );
+        await expect(
+          readFile(path.join(mountPath, "from-feature-a.txt"), "utf-8"),
+        ).resolves.toBe("feature a\n");
+        await expect(
+          readFile(path.join(mountPath, "from-feature-b.txt"), "utf-8"),
+        ).resolves.toBe("feature b\n");
+      }
+
+      const access = branches.map((branch) =>
+        manager.accessForAgent({ branchWorkspaceId: branch.id }),
+      );
+      expect(
+        access.every((item) => (item.readableDirectories ?? []).includes(resource.sourcePath)),
+      ).toBe(
+        true,
+      );
+      expect(
+        access.every((item) => (item.writableDirectories ?? []).includes(resource.sourcePath)),
+      ).toBe(
+        true,
+      );
+      expect(access.map((item) => item.sharedResources?.[0]?.mountPath)).toEqual(
+        branches.map((branch) => path.join(branch.worktreePath, "shared/dataset")),
+      );
+
+      for (const branch of branches) {
+        const status = await runGit(["status", "--short"], branch.worktreePath);
+        expect(status).toBe("");
+        const excludePath = await gitPath(branch.worktreePath, "info/exclude");
+        const exclude = await readFile(
+          excludePath,
+          "utf-8",
+        );
+        expect(exclude).toContain("shared/dataset/");
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
+
+async function runGit(args: string[], cwd: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile("git", args, { cwd, windowsHide: true }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error((stderr || error.message).trim()));
+        return;
+      }
+      resolve(stdout.trim());
+    });
+  });
+}
+
+async function gitPath(cwd: string, key: string): Promise<string> {
+  const value = await runGit(["rev-parse", "--git-path", key], cwd);
+  return path.isAbsolute(value) ? value : path.resolve(cwd, value);
+}
