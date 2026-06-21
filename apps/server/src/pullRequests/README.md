@@ -2,6 +2,8 @@
 
 `PullRequestFlowManager` 管理 Agent Canvas 内的 PR 审查与授权流程。它只控制流程状态、超时、审查 JSON 校验、重试和授权信号；具体 `git`/`gh` 命令、冲突处理、提交和合并操作都交给提 PR 的 agent 自行执行。
 
+流程可以由前端 PR 面板发起，也可以由提 PR 的 agent 自己发起。`agentCanvasPolicyPrompt` 会把 `POST /api/pr-flows` 的使用协议注入给每个 agent，因此用户在 agent 对话框里直接要求“提 PR”时，agent 应先调用该接口进入 Agent Canvas 审查流程。
+
 ## 流程
 
 1. 用户通过 `POST /api/pr-flows` 发起流程，指定提 PR 的 agent、目标 branch、概括和可选文件范围。

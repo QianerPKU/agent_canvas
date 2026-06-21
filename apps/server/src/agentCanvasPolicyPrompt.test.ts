@@ -1,0 +1,31 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { agentCanvasPolicyPrompt } from "./agentCanvasPolicyPrompt.js";
+
+describe("agentCanvasPolicyPrompt", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("injects the PR pipeline protocol for the current agent", () => {
+    vi.stubEnv("AGENT_CANVAS_API", "");
+    vi.stubEnv("PORT", "4317");
+
+    const prompt = agentCanvasPolicyPrompt("agent_42");
+
+    expect(prompt).toContain("PR pipeline 规则");
+    expect(prompt).toContain("POST http://127.0.0.1:4317/api/pr-flows");
+    expect(prompt).toContain('proposerAgentId = "agent_42"');
+    expect(prompt).toContain("create_pr 授权");
+    expect(prompt).toContain("merge_pr 授权");
+    expect(prompt).toContain('"agentCanvasPrEvent": "pr_created"');
+    expect(prompt).toContain('"agentCanvasPrEvent": "merged"');
+  });
+
+  it("uses AGENT_CANVAS_API when configured", () => {
+    vi.stubEnv("AGENT_CANVAS_API", "http://127.0.0.1:9999/api");
+
+    expect(agentCanvasPolicyPrompt("agent_1")).toContain(
+      "POST http://127.0.0.1:9999/api/pr-flows",
+    );
+  });
+});

@@ -73,6 +73,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 
 - `PullRequestFlowManager` 只控制流程状态：找出源/目标 branch 上的活跃 agent、发送审查请求、校验固定 JSON、重试、10 分钟超时、聚合意见和发放授权信号。
 - 程序不限制 commit，也不执行具体 `git`/`gh` 命令。提 PR 的 agent 在收到 `create_pr` 授权后可自由处理冲突、更新源 branch 并创建 PR；目标审查通过后再收到 `merge_pr` 授权并自行合并。
+- Agent Canvas 内置工作区规则会注入 PR pipeline 使用协议；用户可以直接在某个 agent 的对话框里要求它提 PR，agent 应先 `POST /api/pr-flows` 发起流程，并在收到 `create_pr` / `merge_pr` 授权后再执行实际 `git`/`gh` 操作。
 - `GET /api/pr-flows` 列出流程；`POST /api/pr-flows` 发起源 branch preflight；`POST /api/pr-flows/:id/pr-created` 可兜底登记 PR 已创建并进入目标 branch 审查；`POST /api/pr-flows/:id/merged` 可兜底登记已合并；`POST /api/pr-flows/:id/cancel` 取消流程。
 - WebSocket `hello` 帧会带上 `prFlows` 快照，后续状态变化通过 `pr_flow` 帧推送。
 
@@ -167,5 +168,5 @@ npm run smoke --workspace apps/server
 - `POST /api/agents` 支持 `provider/model/branchWorkspaceId/cwd/systemPrompt`。新工作流中 `branchWorkspaceId` 决定 `cwd`；`cwd` 只保留兼容和快照展示。fork 会复制父 Agent 的 provider、模型、branch/cwd 和私有系统提示词。
 - `PATCH /api/agents/:id/settings` 可更新 `systemPrompt`，也可在 `idle` / `waiting_input` 状态切换到已有或新建 branch。切换后下一次业务输入会注入 branch 切换说明和 `git diff --name-status <old> <new>` 文件列表；`waiting_input` 下会脱开旧空闲会话，下次输入按新 `cwd` resume。
 - `systemPrompt` 是当前 Agent 私有提示词，不传给 Claude/Codex 原生 system prompt，而是在 `AgentRunner` 中按提示词节点同样的可读提示词机制拼接到业务输入。新 Agent 首轮、手动 compact 后、自动 compact 后、以及运行中更新设置后的下一条业务输入会重新注入。
-- Agent Canvas 内置工作区规则不属于用户可编辑的 `systemPrompt`，即使用户没有设置私有系统提示词也会注入；它约束共享文件默认只读、临时文件只写 `.agent-tmp/<agent-id>/`、其余非共享非临时修改都视为需要 commit 的仓库文件。
+- Agent Canvas 内置工作区规则不属于用户可编辑的 `systemPrompt`，即使用户没有设置私有系统提示词也会注入；它约束共享文件默认只读、临时文件只写 `.agent-tmp/<agent-id>/`、其余非共享非临时修改都视为需要 commit 的仓库文件，并内置 PR pipeline 协议，指导 agent 在用户要求提 PR 时调用 `/api/pr-flows`。
 - `POST /api/directories/pick` 通过本机目录选择器返回用户选中的目录；Windows 使用 PowerShell + `System.Windows.Forms.FolderBrowserDialog`，其他平台暂返回明确错误并允许前端继续手动输入路径。
