@@ -261,6 +261,70 @@ describe("AgentRunner 生命周期", () => {
     });
   });
 
+  it("provider 发起授权请求时广播到前端，并等待 answerApproval", async () => {
+    const ctl = makeControllableQuery();
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("approval-agent", { query: ctl.query });
+    runner.on((event) => events.push(event));
+
+    runner.start({ prompt: "需要执行命令" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+
+    const pending = ctl.getOptions()?.requestApproval?.({
+      requestId: "approval-1",
+      kind: "command",
+      title: "Codex 请求执行命令",
+      command: "npm test",
+      cwd: "/repo",
+    });
+    await flush();
+
+    expect(events).toContainEqual({
+      kind: "user_approval",
+      request: {
+        requestId: "approval-1",
+        kind: "command",
+        title: "Codex 请求执行命令",
+        command: "npm test",
+        cwd: "/repo",
+      },
+    });
+
+    runner.answerApproval("approval-1", { action: "approve", remember: true });
+    await expect(pending).resolves.toEqual({ action: "approve", remember: true });
+    expect(events).toContainEqual({
+      kind: "user_approval_result",
+      requestId: "approval-1",
+      action: "approve",
+      summary: "已允许并记住",
+    });
+  });
+
+  it("完全权限模式下授权请求直接允许且不广播等待事件", async () => {
+    const ctl = makeControllableQuery();
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("full-permission-agent", {
+      query: ctl.query,
+      fullPermissionMode: () => true,
+    });
+    runner.on((event) => events.push(event));
+
+    runner.start({ prompt: "需要执行命令" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+
+    await expect(
+      ctl.getOptions()?.requestApproval?.({
+        requestId: "approval-auto",
+        kind: "command",
+        title: "Codex 请求执行命令",
+        command: "npm test",
+      }),
+    ).resolves.toEqual({ action: "approve" });
+    expect(events.some((event) => event.kind === "user_approval")).toBe(false);
+  });
+
   it("stop → stopped，调用 interrupt，且之后不可再 send", async () => {
     const ctl = makeControllableQuery();
     const runner = new AgentRunner("a2", { query: ctl.query });

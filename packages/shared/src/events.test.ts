@@ -50,6 +50,19 @@ describe("AgentEvent 联合类型", () => {
     };
     expect(ev.request.requestId).toBe("q1");
   });
+
+  it("包含授权请求事件", () => {
+    const ev: AgentEvent = {
+      kind: "user_approval",
+      request: {
+        requestId: "approval1",
+        kind: "command",
+        title: "执行命令",
+        command: "npm test",
+      },
+    };
+    expect(ev.request.command).toBe("npm test");
+  });
 });
 
 describe("Codex models", () => {

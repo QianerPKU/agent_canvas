@@ -202,6 +202,50 @@ describe("agentStore 轮次模型", () => {
     });
   });
 
+  it("授权请求作为当前轮输出行，处理后更新状态", () => {
+    seq = 0;
+    let map: AgentMap = { a1: newAgentView("a1") };
+    map = recordInput(map, "a1", "运行测试");
+    map = applyEnvelope(
+      map,
+      env("a1", {
+        kind: "user_approval",
+        request: {
+          requestId: "approval-1",
+          kind: "command",
+          title: "Codex 请求执行命令",
+          command: "npm test",
+        },
+      }),
+    );
+
+    expect(get(map).turns[0]!.lines.at(-1)).toMatchObject({
+      kind: "approval",
+      status: "pending",
+      request: {
+        requestId: "approval-1",
+        kind: "command",
+        title: "Codex 请求执行命令",
+        command: "npm test",
+      },
+    });
+
+    map = applyEnvelope(
+      map,
+      env("a1", {
+        kind: "user_approval_result",
+        requestId: "approval-1",
+        action: "approve",
+        summary: "已允许",
+      }),
+    );
+    expect(get(map).turns[0]!.lines.at(-1)).toMatchObject({
+      kind: "approval",
+      status: "approved",
+      summary: "已允许",
+    });
+  });
+
   it("同一 assistant 消息的流式片段合并为一行", () => {
     seq = 0;
     let map: AgentMap = { a1: newAgentView("a1") };

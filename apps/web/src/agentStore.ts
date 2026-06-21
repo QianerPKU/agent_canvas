@@ -9,6 +9,8 @@
  * 与 React 解耦、无副作用，是前端单测的主要对象。
  */
 import type {
+  AgentApprovalAction,
+  AgentApprovalRequest,
   AgentEvent,
   AgentEventEnvelope,
   AgentQuestionAction,
@@ -29,6 +31,12 @@ export type OutputLine =
       kind: "question";
       request: AgentQuestionRequest;
       status: "pending" | "accepted" | "declined" | "cancelled";
+      summary?: string;
+    }
+  | {
+      kind: "approval";
+      request: AgentApprovalRequest;
+      status: "pending" | "approved" | "denied" | "cancelled";
       summary?: string;
     }
   | { kind: "system"; text: string }
@@ -253,6 +261,14 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
       });
     case "user_question_result":
       return updateQuestionLine(view, event.requestId, event.action, event.summary);
+    case "user_approval":
+      return pushLineToLast(view, {
+        kind: "approval",
+        request: event.request,
+        status: "pending",
+      });
+    case "user_approval_result":
+      return updateApprovalLine(view, event.requestId, event.action, event.summary);
     case "system_init":
       return pushLineToLast(
         { ...view, sessionId: event.sessionId, model: event.model },
@@ -371,6 +387,27 @@ function updateQuestionLine(
       ...turn,
       lines: turn.lines.map((line) =>
         line.kind === "question" && line.request.requestId === requestId
+          ? { ...line, status, summary }
+          : line,
+      ),
+    })),
+  };
+}
+
+function updateApprovalLine(
+  view: AgentView,
+  requestId: string,
+  action: AgentApprovalAction,
+  summary: string | undefined,
+): AgentView {
+  const status =
+    action === "approve" ? "approved" : action === "deny" ? "denied" : "cancelled";
+  return {
+    ...view,
+    turns: view.turns.map((turn) => ({
+      ...turn,
+      lines: turn.lines.map((line) =>
+        line.kind === "approval" && line.request.requestId === requestId
           ? { ...line, status, summary }
           : line,
       ),

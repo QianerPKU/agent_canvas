@@ -144,6 +144,25 @@ function HistoryEvent({ item }: { item: HistoryItem }): React.ReactElement {
           content={event.summary ?? event.action}
         />
       );
+    case "user_approval":
+      return (
+        <EventBlock
+          tone="system"
+          label={event.request.title}
+          time={time}
+          content={approvalText(event.request)}
+          code
+        />
+      );
+    case "user_approval_result":
+      return (
+        <EventBlock
+          tone="system"
+          label="授权结果"
+          time={time}
+          content={event.summary ?? event.action}
+        />
+      );
     case "tool_use":
       return (
         <EventBlock
@@ -256,4 +275,22 @@ function questionText(request: Extract<AgentEvent, { kind: "user_question" }>["r
     }),
   ].filter((line): line is string => !!line);
   return lines.length > 0 ? lines.join("\n") : request.requestId;
+}
+
+function approvalText(request: Extract<AgentEvent, { kind: "user_approval" }>["request"]): string {
+  const lines = [
+    request.message,
+    request.command ? `command:\n${request.command}` : undefined,
+    request.cwd ? `cwd: ${request.cwd}` : undefined,
+    request.toolName ? `tool: ${request.toolName}` : undefined,
+    request.blockedPath ? `path: ${request.blockedPath}` : undefined,
+    request.fileChanges?.length
+      ? `files:\n${request.fileChanges
+          .map((file) => `${file.status ? `${file.status} ` : ""}${file.path}`)
+          .join("\n")}`
+      : undefined,
+    request.permissions !== undefined ? `permissions:\n${pretty(request.permissions)}` : undefined,
+    request.input !== undefined ? `input:\n${pretty(request.input)}` : undefined,
+  ].filter((line): line is string => !!line);
+  return lines.length > 0 ? lines.join("\n\n") : request.requestId;
 }

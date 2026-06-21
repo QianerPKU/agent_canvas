@@ -2,6 +2,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import path from "node:path";
 import readline from "node:readline";
 import type {
+  AgentApprovalRequest,
+  AgentApprovalResponse,
   AgentFileAccess,
   AgentPromptAccess,
   AgentQuestionItem,
@@ -62,7 +64,7 @@ function createHandle(
   let turnId: string | undefined;
 
   const run = async function* (): AsyncGenerator<SdkMessage> {
-    client = new CodexAppServerClient(deps, options?.requestUserInput);
+    client = new CodexAppServerClient(deps, options?.requestUserInput, options?.requestApproval);
     await client.start();
 
     const state = createCodexAppServerMapState();
@@ -403,6 +405,90 @@ function codexMcpElicitationResponse(response: AgentQuestionResponse): Record<st
   };
 }
 
+function codexCommandApprovalRequest(id: JsonRpcId, params: unknown): AgentApprovalRequest {
+  const record = asRecord(params);
+  const command = stringValue(record?.command);
+  const reason = stringValue(record?.reason);
+  return {
+    requestId: `codex-approval:${String(id)}`,
+    kind: "command",
+    title: "Codex 请求执行命令",
+    message: reason || undefined,
+    command: command || undefined,
+    cwd: stringValue(record?.cwd) || undefined,
+    raw: params,
+  };
+}
+
+function codexCommandApprovalResponse(
+  response: AgentApprovalResponse,
+): Record<string, unknown> {
+  switch (response.action) {
+    case "approve":
+      return { decision: response.remember ? "acceptForSession" : "accept" };
+    case "deny":
+      return { decision: "decline" };
+    case "cancel":
+      return { decision: "cancel" };
+  }
+}
+
+function codexFileChangeApprovalRequest(id: JsonRpcId, params: unknown): AgentApprovalRequest {
+  const record = asRecord(params);
+  const grantRoot = stringValue(record?.grantRoot);
+  const reason = stringValue(record?.reason);
+  return {
+    requestId: `codex-approval:${String(id)}`,
+    kind: "file_change",
+    title: "Codex 请求修改文件",
+    message: reason || undefined,
+    fileChanges: grantRoot
+      ? [{ path: grantRoot, status: "grantRoot", summary: "允许写入此目录" }]
+      : [],
+    raw: params,
+  };
+}
+
+function codexFileChangeApprovalResponse(
+  response: AgentApprovalResponse,
+): Record<string, unknown> {
+  switch (response.action) {
+    case "approve":
+      return { decision: response.remember ? "acceptForSession" : "accept" };
+    case "deny":
+      return { decision: "decline" };
+    case "cancel":
+      return { decision: "cancel" };
+  }
+}
+
+function codexPermissionsApprovalRequest(id: JsonRpcId, params: unknown): AgentApprovalRequest {
+  const record = asRecord(params);
+  return {
+    requestId: `codex-approval:${String(id)}`,
+    kind: "permissions",
+    title: "Codex 请求扩大权限",
+    message: stringValue(record?.reason) || undefined,
+    cwd: stringValue(record?.cwd) || undefined,
+    permissions: record?.permissions,
+    raw: params,
+  };
+}
+
+function codexPermissionsApprovalResponse(
+  response: AgentApprovalResponse,
+  params: unknown,
+): Record<string, unknown> {
+  if (response.action !== "approve") {
+    return { permissions: {}, scope: "turn" };
+  }
+  const permissions = asRecord(params)?.permissions;
+  return {
+    permissions: permissions ?? {},
+    scope: response.remember ? "session" : "turn",
+  };
+}
+
 function questionsFromJsonSchema(schema: unknown): AgentQuestionItem[] {
   const root = asRecord(schema);
   const properties = asRecord(root?.properties);
@@ -435,6 +521,7 @@ class CodexAppServerClient {
   private readonly command: string;
   private readonly spawnFn: typeof spawn;
   private readonly requestUserInput?: QueryOptions["requestUserInput"];
+  private readonly requestApproval?: QueryOptions["requestApproval"];
   private readonly pending = new Map<JsonRpcId, PendingRequest>();
   private readonly notifications = new AsyncMessageQueue<JsonRpcMessage>();
   private proc?: ChildProcessWithoutNullStreams;
@@ -446,10 +533,12 @@ class CodexAppServerClient {
   constructor(
     deps: CodexAppServerQueryDeps,
     requestUserInput: QueryOptions["requestUserInput"] | undefined,
+    requestApproval: QueryOptions["requestApproval"] | undefined,
   ) {
     this.command = deps.command ?? "codex";
     this.spawnFn = deps.spawnFn ?? spawn;
     this.requestUserInput = requestUserInput;
+    this.requestApproval = requestApproval;
   }
 
   async start(): Promise<void> {
@@ -618,11 +707,13 @@ class CodexAppServerClient {
     if (id === undefined) return;
     switch (message.method) {
       case "item/commandExecution/requestApproval":
+        await this.respondToCommandApprovalRequest(id, message.params);
+        break;
       case "item/fileChange/requestApproval":
-        this.write({ id, result: { decision: "decline" } });
+        await this.respondToFileChangeApprovalRequest(id, message.params);
         break;
       case "item/permissions/requestApproval":
-        this.write({ id, result: { permissions: {}, scope: "turn" } });
+        await this.respondToPermissionsApprovalRequest(id, message.params);
         break;
       case "item/tool/requestUserInput":
         await this.respondToUserInputRequest(id, message.params);
@@ -647,9 +738,54 @@ class CodexAppServerClient {
     }
   }
 
+  private async respondToCommandApprovalRequest(id: JsonRpcId, params: unknown): Promise<void> {
+    if (!this.requestApproval) {
+      this.writeApprovalHandlerMissing(id);
+      return;
+    }
+    try {
+      const request = codexCommandApprovalRequest(id, params);
+      const response = await this.requestApproval(request);
+      this.write({ id, result: codexCommandApprovalResponse(response) });
+    } catch (error) {
+      this.writeRequestError(id, error);
+    }
+  }
+
+  private async respondToFileChangeApprovalRequest(id: JsonRpcId, params: unknown): Promise<void> {
+    if (!this.requestApproval) {
+      this.writeApprovalHandlerMissing(id);
+      return;
+    }
+    try {
+      const request = codexFileChangeApprovalRequest(id, params);
+      const response = await this.requestApproval(request);
+      this.write({ id, result: codexFileChangeApprovalResponse(response) });
+    } catch (error) {
+      this.writeRequestError(id, error);
+    }
+  }
+
+  private async respondToPermissionsApprovalRequest(id: JsonRpcId, params: unknown): Promise<void> {
+    if (!this.requestApproval) {
+      this.writeApprovalHandlerMissing(id);
+      return;
+    }
+    try {
+      const request = codexPermissionsApprovalRequest(id, params);
+      const response = await this.requestApproval(request);
+      this.write({ id, result: codexPermissionsApprovalResponse(response, params) });
+    } catch (error) {
+      this.writeRequestError(id, error);
+    }
+  }
+
   private async respondToUserInputRequest(id: JsonRpcId, params: unknown): Promise<void> {
     if (!this.requestUserInput) {
-      this.write({ id, result: { answers: {} } });
+      this.write({
+        id,
+        error: { code: -32000, message: "Agent Canvas user input handler is not available." },
+      });
       return;
     }
     try {
@@ -657,19 +793,16 @@ class CodexAppServerClient {
       const response = await this.requestUserInput(request);
       this.write({ id, result: codexUserInputResponse(response) });
     } catch (error) {
-      this.write({
-        id,
-        error: {
-          code: -32000,
-          message: error instanceof Error ? error.message : String(error),
-        },
-      });
+      this.writeRequestError(id, error);
     }
   }
 
   private async respondToMcpElicitationRequest(id: JsonRpcId, params: unknown): Promise<void> {
     if (!this.requestUserInput) {
-      this.write({ id, result: { action: "decline", content: null, _meta: null } });
+      this.write({
+        id,
+        error: { code: -32000, message: "Agent Canvas user input handler is not available." },
+      });
       return;
     }
     try {
@@ -677,14 +810,25 @@ class CodexAppServerClient {
       const response = await this.requestUserInput(request);
       this.write({ id, result: codexMcpElicitationResponse(response) });
     } catch (error) {
-      this.write({
-        id,
-        error: {
-          code: -32000,
-          message: error instanceof Error ? error.message : String(error),
-        },
-      });
+      this.writeRequestError(id, error);
     }
+  }
+
+  private writeApprovalHandlerMissing(id: JsonRpcId): void {
+    this.write({
+      id,
+      error: { code: -32000, message: "Agent Canvas approval handler is not available." },
+    });
+  }
+
+  private writeRequestError(id: JsonRpcId, error: unknown): void {
+    this.write({
+      id,
+      error: {
+        code: -32000,
+        message: error instanceof Error ? error.message : String(error),
+      },
+    });
   }
 
   private onExit(code: number | null, signal: NodeJS.Signals | null): void {

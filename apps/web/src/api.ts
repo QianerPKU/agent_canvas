@@ -1,5 +1,7 @@
 /** 后端 REST 命令客户端。事件走 WebSocket，命令走这里。 */
 import type {
+  AgentApprovalResponse,
+  AgentCanvasSettings,
   AgentEventEnvelope,
   AgentQuestionResponse,
   AgentSettings,
@@ -47,6 +49,12 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   list: () => call<{ agents: AgentSnapshot[] }>("/agents").then((r) => r.agents),
   config: () => call<{ defaultCwd: string; projectRoot: string }>("/config"),
+  settings: () => call<AgentCanvasSettings>("/settings"),
+  updateSettings: (input: Partial<AgentCanvasSettings>) =>
+    call<AgentCanvasSettings>("/settings", {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
   listCanvasProjects: () =>
     call<{ projects: CanvasProjectSummary[] }>("/canvas-projects").then((r) => r.projects),
   createCanvasProject: (input: CreateCanvasProjectInput) =>
@@ -119,6 +127,11 @@ export const api = {
     call(`/agents/${id}/steer`, { method: "POST", body: JSON.stringify({ text }) }),
   answerQuestion: (id: string, requestId: string, response: AgentQuestionResponse) =>
     call(`/agents/${id}/questions/${encodeURIComponent(requestId)}`, {
+      method: "POST",
+      body: JSON.stringify(response),
+    }),
+  answerApproval: (id: string, requestId: string, response: AgentApprovalResponse) =>
+    call(`/agents/${id}/approvals/${encodeURIComponent(requestId)}`, {
       method: "POST",
       body: JSON.stringify(response),
     }),

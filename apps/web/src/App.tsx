@@ -16,10 +16,12 @@ import {
   Link,
   MessageSquarePlus,
   Plus,
+  Settings,
   X,
 } from "lucide-react";
 import { api } from "./api.js";
 import type {
+  AgentCanvasSettings,
   BranchOption,
   BranchWorkspace,
   CanvasProjectSummary,
@@ -338,6 +340,10 @@ export default function App(): React.ReactElement {
   const [creatingFile, setCreatingFile] = useState(false);
   const [creatingPrompt, setCreatingPrompt] = useState(false);
   const [showingPullRequests, setShowingPullRequests] = useState(false);
+  const [showingSettings, setShowingSettings] = useState(false);
+  const [appSettings, setAppSettings] = useState<AgentCanvasSettings>({
+    fullPermissionMode: false,
+  });
   const [agentSettingsTarget, setAgentSettingsTarget] = useState<AgentSettingsTarget>();
   const [projects, setProjects] = useState<CanvasProjectSummary[]>([]);
   const [workspace, setWorkspace] = useState<WorkspaceProject>();
@@ -360,6 +366,24 @@ export default function App(): React.ReactElement {
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api.settings().then(
+      (settings) => {
+        if (!cancelled) setAppSettings(settings);
+      },
+      () => undefined,
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const updateAppSettings = useCallback(async (settings: Partial<AgentCanvasSettings>) => {
+    const updated = await api.updateSettings(settings);
+    setAppSettings(updated);
   }, []);
 
   const refreshBranchOptions = useCallback(async () => {
@@ -570,6 +594,13 @@ export default function App(): React.ReactElement {
         </button>
         <button
           className="header-button header-button--secondary"
+          onClick={() => setShowingSettings(true)}
+        >
+          <Settings size={15} />
+          设置
+        </button>
+        <button
+          className="header-button header-button--secondary"
           onClick={() => setCreatingPrompt(true)}
         >
           <MessageSquarePlus size={15} />
@@ -658,6 +689,13 @@ export default function App(): React.ReactElement {
           flows={prFlows}
           actions={prActions}
           onClose={() => setShowingPullRequests(false)}
+        />
+      )}
+      {showingSettings && (
+        <AppSettingsDialog
+          settings={appSettings}
+          onUpdate={updateAppSettings}
+          onClose={() => setShowingSettings(false)}
         />
       )}
       {historyTarget && (
@@ -834,6 +872,53 @@ function RepoConnectGate({
         </section>
         {error && <div className="file-dialog__error">{error}</div>}
       </main>
+    </div>
+  );
+}
+
+function AppSettingsDialog({
+  settings,
+  onUpdate,
+  onClose,
+}: {
+  settings: AgentCanvasSettings;
+  onUpdate: (settings: Partial<AgentCanvasSettings>) => Promise<void>;
+  onClose: () => void;
+}): React.ReactElement {
+  const [busy, setBusy] = useState(false);
+  const toggleFullPermission = async (fullPermissionMode: boolean) => {
+    setBusy(true);
+    try {
+      await onUpdate({ fullPermissionMode });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="file-dialog-backdrop" onMouseDown={onClose}>
+      <section
+        className="file-dialog file-dialog--narrow"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header className="file-dialog__header">
+          <h2>设置</h2>
+          <button className="icon-button" title="关闭设置" onClick={onClose}>
+            <X size={16} />
+          </button>
+        </header>
+        <label className="settings-toggle">
+          <input
+            type="checkbox"
+            checked={settings.fullPermissionMode}
+            disabled={busy}
+            onChange={(event) => void toggleFullPermission(event.target.checked)}
+          />
+          <span>
+            <strong>完全权限模式</strong>
+            <small>开启后所有授权请求由后端直接允许，不再等待前端审批。</small>
+          </span>
+        </label>
+      </section>
     </div>
   );
 }

@@ -77,6 +77,17 @@ export type CompactTrigger = "manual" | "auto";
 export type UserInputMode = "queued" | "steer";
 export type AgentQuestionKind = "ask_user_question" | "mcp_elicitation";
 export type AgentQuestionAction = "accept" | "decline" | "cancel";
+export type AgentApprovalKind =
+  | "command"
+  | "file_change"
+  | "permissions"
+  | "tool";
+export type AgentApprovalAction = "approve" | "deny" | "cancel";
+
+export interface AgentCanvasSettings {
+  /** 开启后后端直接允许所有 provider 授权请求，不再等待前端审批。 */
+  fullPermissionMode: boolean;
+}
 
 export interface AgentQuestionOption {
   label: string;
@@ -112,6 +123,28 @@ export interface AgentQuestionResponse {
   content?: unknown;
 }
 
+export interface AgentApprovalRequest {
+  requestId: string;
+  kind: AgentApprovalKind;
+  title: string;
+  message?: string;
+  command?: string;
+  cwd?: string;
+  toolName?: string;
+  input?: unknown;
+  fileChanges?: Array<{ path: string; status?: string; summary?: string }>;
+  permissions?: unknown;
+  suggestions?: unknown;
+  blockedPath?: string;
+  raw?: unknown;
+}
+
+export interface AgentApprovalResponse {
+  action: AgentApprovalAction;
+  remember?: boolean;
+  message?: string;
+}
+
 /**
  * 归一化后的 agent 事件（后端 → 前端，单向流）。
  * `kind` 作为可辨识联合的判别字段。
@@ -124,6 +157,13 @@ export type AgentEvent =
       kind: "user_question_result";
       requestId: string;
       action: AgentQuestionAction;
+      summary?: string;
+    }
+  | { kind: "user_approval"; request: AgentApprovalRequest }
+  | {
+      kind: "user_approval_result";
+      requestId: string;
+      action: AgentApprovalAction;
       summary?: string;
     }
   | {

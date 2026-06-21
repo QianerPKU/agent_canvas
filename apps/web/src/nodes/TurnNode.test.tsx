@@ -21,6 +21,7 @@ function makeActions(): AgentActions {
     submit: vi.fn().mockResolvedValue(undefined),
     steer: vi.fn().mockResolvedValue(undefined),
     answerQuestion: vi.fn().mockResolvedValue(undefined),
+    answerApproval: vi.fn().mockResolvedValue(undefined),
     stop: vi.fn().mockResolvedValue(undefined),
     compact: vi.fn().mockResolvedValue(undefined),
     terminate: vi.fn().mockResolvedValue(undefined),
@@ -272,6 +273,38 @@ describe("TurnNode", () => {
     expect(actions.answerQuestion).toHaveBeenCalledWith("agent_1", "claude:tool-1", {
       action: "accept",
       answers: { question_1: "React" },
+    });
+  });
+
+  it("待授权时显示红点并可允许授权", () => {
+    const actions = makeActions();
+    const { container } = renderTurn(
+      {
+        index: 0,
+        status: "running",
+        lines: [
+          {
+            kind: "approval",
+            status: "pending",
+            request: {
+              requestId: "codex-approval:9",
+              kind: "command",
+              title: "Codex 请求执行命令",
+              command: "npm test",
+              cwd: "C:/repo",
+            },
+          },
+        ],
+      },
+      "running",
+      actions,
+    );
+
+    expect(container.querySelector(".turn-node__interaction-dot")).toBeTruthy();
+    fireEvent.click(screen.getByText("允许"));
+    expect(actions.answerApproval).toHaveBeenCalledWith("agent_1", "codex-approval:9", {
+      action: "approve",
+      remember: false,
     });
   });
 

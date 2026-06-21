@@ -1,6 +1,8 @@
 import http from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import type {
+  AgentApprovalResponse,
+  AgentCanvasSettings,
   AgentFileAccess,
   AgentQuestionResponse,
   AgentPromptReference,
@@ -164,6 +166,15 @@ async function handleHttp(
 
   if (method === "GET" && path === "/api/config") {
     return sendJson(res, 200, { defaultCwd, projectRoot: workspaceManager.root() });
+  }
+
+  if (method === "GET" && path === "/api/settings") {
+    return sendJson(res, 200, manager.appSettings());
+  }
+
+  if (method === "PATCH" && path === "/api/settings") {
+    const body = await readJson<Partial<AgentCanvasSettings>>(req);
+    return sendJson(res, 200, manager.updateAppSettings(body ?? {}));
   }
 
   if (method === "GET" && path === "/api/canvas-projects") {
@@ -530,6 +541,20 @@ async function handleHttp(
     const body = await readJson<AgentQuestionResponse>(req);
     try {
       manager.answerQuestion(id, requestId, body ?? {});
+      return sendJson(res, 202, { ok: true });
+    } catch (error) {
+      return sendJson(res, 409, { error: errMsg(error) });
+    }
+  }
+
+  const approvalMatch = path.match(/^\/api\/agents\/([^/]+)\/approvals\/([^/]+)$/);
+  if (approvalMatch) {
+    const id = decodeURIComponent(approvalMatch[1]!);
+    const requestId = decodeURIComponent(approvalMatch[2]!);
+    if (method !== "POST") return sendJson(res, 405, { error: "method not allowed" });
+    const body = await readJson<AgentApprovalResponse>(req);
+    try {
+      manager.answerApproval(id, requestId, body ?? { action: "cancel" });
       return sendJson(res, 202, { ok: true });
     } catch (error) {
       return sendJson(res, 409, { error: errMsg(error) });

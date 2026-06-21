@@ -1,6 +1,7 @@
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import type { CanUseTool, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 import type {
+  AgentApprovalResponse,
   AgentFileAccess,
   AgentFileReference,
   AgentQuestionItem,
@@ -15,7 +16,8 @@ import type { QueryFn, QueryOptions, QueryPrompt, SdkUserInput } from "./types.j
  * 仅在服务运行时引入；单测改用注入的假实现，故不会触达真实模型/鉴权。
  */
 export const realQuery: QueryFn = (args) => {
-  const { fileAccess, promptAccess, requestUserInput, ...options } = args.options ?? {};
+  const { fileAccess, promptAccess, requestUserInput, requestApproval, ...options } =
+    args.options ?? {};
   const additionalDirectories = accessibleDirectories(fileAccess, promptAccess);
   const existingCanUseTool =
     typeof options.canUseTool === "function" ? (options.canUseTool as CanUseTool) : undefined;
@@ -32,7 +34,7 @@ export const realQuery: QueryFn = (args) => {
       ...options,
       allowedTools: includeAskUserQuestion(options.allowedTools, !!requestUserInput),
       canUseTool: requestUserInput
-        ? createCanUseTool(requestUserInput, existingCanUseTool)
+        ? createCanUseTool(requestUserInput, requestApproval, existingCanUseTool)
         : existingCanUseTool,
       additionalDirectories:
         additionalDirectories && additionalDirectories.length > 0
@@ -45,16 +47,26 @@ export const realQuery: QueryFn = (args) => {
 
 function createCanUseTool(
   requestUserInput: NonNullable<QueryOptions["requestUserInput"]>,
+  requestApproval: QueryOptions["requestApproval"] | undefined,
   fallback: CanUseTool | undefined,
 ): CanUseTool {
   return async (toolName, input, options): Promise<PermissionResult> => {
     if (toolName !== "AskUserQuestion") {
       if (fallback) return fallback(toolName, input, options);
-      return {
-        behavior: "deny",
-        message: "Agent Canvas 当前只接入 AskUserQuestion 交互提问。",
-        toolUseID: options.toolUseID,
-      };
+      if (!requestApproval) {
+        throw new Error("Agent Canvas approval handler is not available.");
+      }
+      const response = await requestApproval({
+        requestId: `claude-approval:${options.toolUseID}`,
+        kind: "tool",
+        title: options.title ?? options.displayName ?? `Claude 请求使用 ${toolName}`,
+        message: options.description ?? options.decisionReason,
+        toolName,
+        input,
+        blockedPath: options.blockedPath,
+        suggestions: options.suggestions,
+      });
+      return claudeApprovalResult(response, options.toolUseID, options.suggestions);
     }
 
     const questions = claudeQuestions(input);
@@ -82,6 +94,27 @@ function createCanUseTool(
         answers: claudeAnswerMap(questions, response),
       },
     };
+  };
+}
+
+function claudeApprovalResult(
+  response: AgentApprovalResponse,
+  toolUseID: string,
+  suggestions: unknown,
+): PermissionResult {
+  if (response.action === "approve") {
+    return {
+      behavior: "allow",
+      toolUseID,
+      updatedPermissions:
+        response.remember && Array.isArray(suggestions) ? suggestions : undefined,
+    };
+  }
+  return {
+    behavior: "deny",
+    message: response.message ?? (response.action === "cancel" ? "用户取消授权。" : "用户拒绝授权。"),
+    interrupt: response.action === "cancel",
+    toolUseID,
   };
 }
 

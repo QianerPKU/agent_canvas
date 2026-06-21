@@ -1,4 +1,7 @@
 import type {
+  AgentApprovalAction,
+  AgentApprovalRequest,
+  AgentApprovalResponse,
   AgentFileAccess,
   AgentEvent,
   AgentQuestionAction,
@@ -36,6 +39,7 @@ export interface AgentRunnerDeps {
   now?: () => number;
   resolveFileAccess?: (agentId: string) => AgentFileAccess;
   resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
+  fullPermissionMode?: () => boolean;
 }
 
 export interface StartExtra {
@@ -45,6 +49,11 @@ export interface StartExtra {
 
 interface PendingQuestion {
   resolve: (response: AgentQuestionResponse) => void;
+  cleanup?: () => void;
+}
+
+interface PendingApproval {
+  resolve: (response: AgentApprovalResponse) => void;
   cleanup?: () => void;
 }
 
@@ -61,6 +70,7 @@ export class AgentRunner {
   private readonly now: () => number;
   private readonly resolveFileAccess?: (agentId: string) => AgentFileAccess;
   private readonly resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
+  private readonly fullPermissionMode: () => boolean;
   private readonly listeners = new Set<AgentEventListener>();
 
   private status: AgentStatus = "idle";
@@ -79,7 +89,9 @@ export class AgentRunner {
   private pendingInjectedPrompts: AgentPromptReference[] = [];
   private pendingQueuedInputs: string[] = [];
   private readonly pendingQuestions = new Map<string, PendingQuestion>();
+  private readonly pendingApprovals = new Map<string, PendingApproval>();
   private questionCounter = 0;
+  private approvalCounter = 0;
   private suppressAbortStatus = false;
   private suppressNaturalEndStatus = false;
   private readonly createdAt: number;
@@ -93,6 +105,7 @@ export class AgentRunner {
     this.now = deps.now ?? Date.now;
     this.resolveFileAccess = deps.resolveFileAccess;
     this.resolvePromptAccess = deps.resolvePromptAccess;
+    this.fullPermissionMode = deps.fullPermissionMode ?? (() => false);
     this.createdAt = this.now();
   }
 
@@ -168,6 +181,7 @@ export class AgentRunner {
     this.policyPromptInjectionPending = true;
     this.pendingQueuedInputs = [];
     this.cancelPendingQuestions("cancel");
+    this.cancelPendingApprovals("cancel");
 
     this.abortController = new AbortController();
     this.inputQueue = new AsyncMessageQueue<SdkUserInput>();
@@ -192,6 +206,7 @@ export class AgentRunner {
       fileAccess,
       promptAccess,
       requestUserInput: (request) => this.requestUserInput(request),
+      requestApproval: (request) => this.requestApproval(request),
     };
 
     this.handle = this.queries[provider]({ prompt: this.inputQueue, options });
@@ -272,6 +287,7 @@ export class AgentRunner {
     this.policyPromptInjectionPending = false;
     this.pendingQueuedInputs = [];
     this.cancelPendingQuestions("cancel");
+    this.cancelPendingApprovals("cancel");
     this.abortController?.abort();
     try {
       await this.handle?.interrupt?.();
@@ -289,6 +305,7 @@ export class AgentRunner {
     this.policyPromptInjectionPending = false;
     this.pendingQueuedInputs = [];
     this.cancelPendingQuestions("cancel");
+    this.cancelPendingApprovals("cancel");
     this.setStatus("terminated");
     this.abortController?.abort();
     try {
@@ -317,6 +334,34 @@ export class AgentRunner {
     });
   }
 
+  answerApproval(requestId: string, response: AgentApprovalResponse): void {
+    const pending = this.pendingApprovals.get(requestId);
+    if (!pending) throw new Error(`未知或已处理的授权请求: ${requestId}`);
+    this.pendingApprovals.delete(requestId);
+    pending.cleanup?.();
+    pending.resolve(response);
+    this.emit({
+      kind: "user_approval_result",
+      requestId,
+      action: response.action,
+      summary: summarizeApprovalResponse(response),
+    });
+  }
+
+  approvePendingApprovals(summary = "完全权限模式已允许"): void {
+    for (const [requestId, pending] of this.pendingApprovals) {
+      pending.cleanup?.();
+      pending.resolve({ action: "approve" });
+      this.emit({
+        kind: "user_approval_result",
+        requestId,
+        action: "approve",
+        summary,
+      });
+    }
+    this.pendingApprovals.clear();
+  }
+
   // ---- 内部 ----
 
   private async consume(handle: QueryHandle): Promise<void> {
@@ -332,6 +377,7 @@ export class AgentRunner {
         return;
       }
       this.cancelPendingQuestions("cancel");
+      this.cancelPendingApprovals("cancel");
       if (!isTerminalStatus(this.status)) {
         this.setStatus("done");
       }
@@ -346,6 +392,7 @@ export class AgentRunner {
         return;
       }
       this.cancelPendingQuestions("cancel");
+      this.cancelPendingApprovals("cancel");
       this.emit({ kind: "error", message: errorMessage(err) });
       this.setStatus("error");
     }
@@ -382,6 +429,42 @@ export class AgentRunner {
       this.emit({ kind: "user_question_result", requestId, action });
     }
     this.pendingQuestions.clear();
+  }
+
+  private requestApproval(request: AgentApprovalRequest): Promise<AgentApprovalResponse> {
+    const requestId = request.requestId || `${this.id}:approval-${++this.approvalCounter}`;
+    const normalized: AgentApprovalRequest = { ...request, requestId };
+    if (this.fullPermissionMode()) {
+      return Promise.resolve({ action: "approve" });
+    }
+    if (this.abortController?.signal.aborted || isTerminalStatus(this.status)) {
+      return Promise.resolve({ action: "cancel" });
+    }
+    this.emit({ kind: "user_approval", request: normalized });
+    return new Promise((resolve) => {
+      const onAbort = () => {
+        const pending = this.pendingApprovals.get(requestId);
+        if (!pending) return;
+        this.pendingApprovals.delete(requestId);
+        pending.cleanup?.();
+        resolve({ action: "cancel" });
+        this.emit({ kind: "user_approval_result", requestId, action: "cancel" });
+      };
+      this.abortController?.signal.addEventListener("abort", onAbort, { once: true });
+      this.pendingApprovals.set(requestId, {
+        resolve,
+        cleanup: () => this.abortController?.signal.removeEventListener("abort", onAbort),
+      });
+    });
+  }
+
+  private cancelPendingApprovals(action: AgentApprovalAction): void {
+    for (const [requestId, pending] of this.pendingApprovals) {
+      pending.cleanup?.();
+      pending.resolve({ action });
+      this.emit({ kind: "user_approval_result", requestId, action });
+    }
+    this.pendingApprovals.clear();
   }
 
   private applyEvent(event: AgentEvent): void {
@@ -536,6 +619,7 @@ export class AgentRunner {
     this.compactPending = false;
     this.pendingQueuedInputs = [];
     this.cancelPendingQuestions("cancel");
+    this.cancelPendingApprovals("cancel");
     this.suppressAbortStatus = true;
     this.suppressNaturalEndStatus = true;
     this.abortController?.abort();
@@ -603,4 +687,15 @@ function summarizeQuestionResponse(response: AgentQuestionResponse): string | un
   if (response.response?.trim()) return "已回答";
   if (response.content !== undefined) return "已提交内容";
   return undefined;
+}
+
+function summarizeApprovalResponse(response: AgentApprovalResponse): string {
+  switch (response.action) {
+    case "approve":
+      return response.remember ? "已允许并记住" : "已允许";
+    case "deny":
+      return "已拒绝";
+    case "cancel":
+      return "已取消";
+  }
 }

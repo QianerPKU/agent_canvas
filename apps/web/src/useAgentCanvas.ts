@@ -6,6 +6,7 @@
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import type {
+  AgentApprovalResponse,
   AgentQuestionResponse,
   AgentSettings,
   CanvasFileConnection,
@@ -56,6 +57,12 @@ export interface AgentActions {
     agentId: string,
     requestId: string,
     response: AgentQuestionResponse,
+  ) => Promise<void>;
+  /** 回答底层 agent 发出的授权审批。 */
+  answerApproval: (
+    agentId: string,
+    requestId: string,
+    response: AgentApprovalResponse,
   ) => Promise<void>;
   /** 中止 agent。 */
   stop: (agentId: string) => Promise<void>;
@@ -274,6 +281,8 @@ export function useAgentCanvas(): UseAgentCanvas {
       steer: (agentId, text) => api.steer(agentId, text).then(() => undefined),
       answerQuestion: (agentId, requestId, response) =>
         api.answerQuestion(agentId, requestId, response).then(() => undefined),
+      answerApproval: (agentId, requestId, response) =>
+        api.answerApproval(agentId, requestId, response).then(() => undefined),
       stop: (agentId) => api.stop(agentId).then(() => undefined),
       compact: async (agentId) => {
         setAgents((prev) => recordCompact(prev, agentId));

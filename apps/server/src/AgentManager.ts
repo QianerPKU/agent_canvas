@@ -1,4 +1,6 @@
 import type {
+  AgentApprovalResponse,
+  AgentCanvasSettings,
   AgentFileAccess,
   AgentEvent,
   AgentEventEnvelope,
@@ -39,6 +41,7 @@ export class AgentManager {
   private readonly forkOrigins = new Map<string, ForkOrigin>();
   private readonly forkConfigs = new Map<string, Partial<AgentStartConfig>>();
   private readonly draftConfigs = new Map<string, Partial<AgentStartConfig>>();
+  private readonly appSettingsState: AgentCanvasSettings = { fullPermissionMode: false };
   private readonly query: QueryFn;
   private readonly codexQuery?: QueryFn;
   private readonly defaultCwd: string;
@@ -67,6 +70,7 @@ export class AgentManager {
       query: this.query,
       codexQuery: this.codexQuery,
       now: this.now,
+      fullPermissionMode: () => this.appSettingsState.fullPermissionMode,
       resolveFileAccess: (agentId) =>
         this.resolveFileAccess?.(agentId) ?? {
           readableFiles: [],
@@ -190,6 +194,29 @@ export class AgentManager {
     const runner = this.runners.get(id);
     if (!runner) throw new Error(`未知 agent: ${id}`);
     runner.answerQuestion(requestId, response);
+  }
+
+  answerApproval(id: string, requestId: string, response: AgentApprovalResponse): void {
+    const runner = this.runners.get(id);
+    if (!runner) throw new Error(`未知 agent: ${id}`);
+    runner.answerApproval(requestId, response);
+  }
+
+  appSettings(): AgentCanvasSettings {
+    return { ...this.appSettingsState };
+  }
+
+  updateAppSettings(input: Partial<AgentCanvasSettings>): AgentCanvasSettings {
+    const wasFullPermission = this.appSettingsState.fullPermissionMode;
+    if (input.fullPermissionMode !== undefined) {
+      this.appSettingsState.fullPermissionMode = input.fullPermissionMode;
+    }
+    if (!wasFullPermission && this.appSettingsState.fullPermissionMode) {
+      for (const runner of this.runners.values()) {
+        runner.approvePendingApprovals();
+      }
+    }
+    return this.appSettings();
   }
 
   list(): AgentSnapshot[] {

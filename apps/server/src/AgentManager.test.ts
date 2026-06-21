@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { AgentManager } from "./AgentManager.js";
 import type { QueryFn, QueryOptions } from "./sdk/types.js";
+import { AsyncMessageQueue } from "./util/AsyncMessageQueue.js";
+import type { SdkMessage } from "./sdk/types.js";
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
@@ -23,6 +25,18 @@ function makeQuery(sessionId = "sess-1") {
     };
   };
   return { query, calls };
+}
+
+function makeWaitingQuery() {
+  const out = new AsyncMessageQueue<SdkMessage>();
+  let lastOptions: QueryOptions | undefined;
+  const query: QueryFn = ({ options }) => {
+    lastOptions = options;
+    return {
+      [Symbol.asyncIterator]: () => out[Symbol.asyncIterator](),
+    };
+  };
+  return { query, out, getOptions: () => lastOptions };
 }
 
 describe("AgentManager fork", () => {
@@ -181,5 +195,36 @@ describe("AgentManager fork", () => {
       cwd: "/parent-work",
       systemPrompt: "parent private prompt",
     });
+  });
+
+  it("开启完全权限模式会放行已挂起的授权请求", async () => {
+    const ctl = makeWaitingQuery();
+    const mgr = new AgentManager({ query: ctl.query });
+    const runner = mgr.create();
+    mgr.startAgent(runner.id, { prompt: "需要权限" });
+    ctl.out.push({
+      type: "system",
+      subtype: "init",
+      session_id: "sess-approval",
+      model: "m",
+      cwd: "/repo",
+      tools: [],
+    });
+    await flush();
+
+    const pending = ctl.getOptions()?.requestApproval?.({
+      requestId: "approval-manager",
+      kind: "command",
+      title: "执行命令",
+      command: "npm test",
+    });
+    await flush();
+
+    expect(mgr.historyOf(runner.id).some((entry) => entry.event.kind === "user_approval")).toBe(
+      true,
+    );
+    mgr.updateAppSettings({ fullPermissionMode: true });
+    await expect(pending).resolves.toEqual({ action: "approve" });
+    expect(mgr.appSettings().fullPermissionMode).toBe(true);
   });
 });

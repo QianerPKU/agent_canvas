@@ -121,6 +121,10 @@ export type SdkRequestUserInput = (
   request: import("@agent-canvas/shared").AgentQuestionRequest,
 ) => Promise<import("@agent-canvas/shared").AgentQuestionResponse>;
 
+export type SdkRequestApproval = (
+  request: import("@agent-canvas/shared").AgentApprovalRequest,
+) => Promise<import("@agent-canvas/shared").AgentApprovalResponse>;
+
 /** 流式输入模式下推给 SDK 的用户消息（对齐 SDKUserMessage 必填字段）。 */
 export interface SdkUserInput {
   type: "user";
@@ -147,6 +151,7 @@ export interface QueryOptions {
   fileAccess?: import("@agent-canvas/shared").AgentFileAccess;
   promptAccess?: import("@agent-canvas/shared").AgentPromptAccess;
   requestUserInput?: SdkRequestUserInput;
+  requestApproval?: SdkRequestApproval;
   [k: string]: unknown;
 }
 

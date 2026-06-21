@@ -134,6 +134,18 @@ describe("HTTP server", () => {
     expect(pickDirectory).toHaveBeenCalledWith(root);
   });
 
+  it("exposes and updates app settings", async () => {
+    const initial = await request(port, "GET", "/api/settings");
+    expect(initial).toEqual({ status: 200, json: { fullPermissionMode: false } });
+
+    const updated = await request(port, "PATCH", "/api/settings", {
+      fullPermissionMode: true,
+    });
+    expect(updated).toEqual({ status: 200, json: { fullPermissionMode: true } });
+
+    await request(port, "PATCH", "/api/settings", { fullPermissionMode: false });
+  });
+
   it("exposes GitHub workspace branches and creates agents on a selected branch", async () => {
     const branches = await request(port, "GET", "/api/workspace/branches");
     expect(branches.status).toBe(200);

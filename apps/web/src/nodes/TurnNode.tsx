@@ -15,6 +15,7 @@ import {
   Minimize2,
   Send,
   Settings,
+  ShieldAlert,
   Square,
   X,
   Zap,
@@ -23,6 +24,7 @@ import {
   CODEX_MODELS,
   DEFAULT_CODEX_MODEL,
   isCodexModel,
+  type AgentApprovalResponse,
   type AgentQuestionItem,
   type AgentQuestionResponse,
   type AgentProvider,
@@ -107,6 +109,8 @@ function lineStyle(kind: OutputLine["kind"], isError?: boolean): React.CSSProper
       return { color: "#374151", fontFamily: "monospace" };
     case "question":
       return { color: "#111827" };
+    case "approval":
+      return { color: "#111827" };
     case "system":
       return { color: "#6b7280", fontStyle: "italic" };
     case "result":
@@ -128,6 +132,8 @@ function renderLine(line: OutputLine): string {
       return `↩ ${short(line.content)}`;
     case "question":
       return line.request.title ?? "需要回答";
+    case "approval":
+      return line.request.title;
     case "system":
       return line.text;
     case "result":
@@ -174,9 +180,13 @@ export function TurnNode({
     isLatest &&
     agentStatus !== "done" &&
     agentStatus !== "stopped" &&
-    agentStatus !== "terminated" &&
-    agentStatus !== "error";
+      agentStatus !== "terminated" &&
+      agentStatus !== "error";
   const minimized = data.windowState?.minimized === true;
+  const hasPendingInteraction = turn.lines.some(
+    (line) =>
+      (line.kind === "question" || line.kind === "approval") && line.status === "pending",
+  );
 
   useEffect(() => {
     const el = logRef.current;
@@ -202,6 +212,7 @@ export function TurnNode({
   if (minimized) {
     return (
       <div className="turn-node turn-node--minimized">
+        {hasPendingInteraction && <span className="turn-node__interaction-dot" />}
         <button
           className="turn-node__restore drag-handle"
           title={`恢复 ${agentId} 第 ${turn.index + 1} 轮`}
@@ -236,6 +247,7 @@ export function TurnNode({
         handleStyle={{ width: 8, height: 8, borderRadius: 2 }}
       />
       <NodeHandles resourceAccess={hasResourceHandles} />
+      {hasPendingInteraction && <span className="turn-node__interaction-dot" />}
       <div
         className="turn-node__surface"
         style={{
@@ -331,6 +343,13 @@ export function TurnNode({
             turn.lines.map((line, i) =>
               line.kind === "question" ? (
                 <QuestionLine
+                  key={i}
+                  agentId={agentId}
+                  line={line}
+                  actions={actions}
+                />
+              ) : line.kind === "approval" ? (
+                <ApprovalLine
                   key={i}
                   agentId={agentId}
                   line={line}
@@ -584,6 +603,91 @@ function QuestionLine({
   );
 }
 
+function ApprovalLine({
+  agentId,
+  line,
+  actions,
+}: {
+  agentId: string;
+  line: Extract<OutputLine, { kind: "approval" }>;
+  actions: AgentActions;
+}): React.ReactElement {
+  const { request } = line;
+  const [remember, setRemember] = useState(false);
+  const disabled = line.status !== "pending";
+  const answer = (response: AgentApprovalResponse) => {
+    void actions.answerApproval(agentId, request.requestId, response);
+  };
+  return (
+    <div className="nodrag" style={approvalPanelStyle}>
+      <div style={questionHeaderStyle}>
+        <ShieldAlert size={14} />
+        <span style={{ fontWeight: 700 }}>{request.title}</span>
+        <span style={approvalStatusStyle(line.status)}>{approvalStatusLabel(line.status)}</span>
+      </div>
+      {request.message && <div style={questionMessageStyle}>{request.message}</div>}
+      {request.command && <pre style={approvalCodeStyle}>{request.command}</pre>}
+      {request.cwd && <div style={questionMessageStyle}>cwd: {request.cwd}</div>}
+      {request.toolName && <div style={questionMessageStyle}>tool: {request.toolName}</div>}
+      {request.blockedPath && <div style={questionMessageStyle}>path: {request.blockedPath}</div>}
+      {request.fileChanges && request.fileChanges.length > 0 && (
+        <div style={approvalListStyle}>
+          {request.fileChanges.map((change, index) => (
+            <div key={`${change.path}-${index}`}>
+              {change.status ? `${change.status} ` : ""}
+              {change.path}
+              {change.summary ? ` · ${change.summary}` : ""}
+            </div>
+          ))}
+        </div>
+      )}
+      {request.permissions !== undefined && (
+        <pre style={approvalCodeStyle}>{prettyShort(request.permissions)}</pre>
+      )}
+      {request.input !== undefined && <pre style={approvalCodeStyle}>{prettyShort(request.input)}</pre>}
+      {line.summary && <div style={questionMessageStyle}>{line.summary}</div>}
+      {!disabled && (
+        <>
+          <label style={approvalRememberStyle}>
+            <input
+              type="checkbox"
+              checked={remember}
+              onChange={(event) => setRemember(event.target.checked)}
+            />
+            本会话记住
+          </label>
+          <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+            <button
+              style={iconBtn("#2563eb")}
+              onClick={() => answer({ action: "approve", remember })}
+              title="允许本次授权请求"
+            >
+              <Check size={13} />
+              允许
+            </button>
+            <button
+              style={iconBtn("#64748b")}
+              onClick={() => answer({ action: "deny" })}
+              title="拒绝本次授权请求"
+            >
+              <X size={13} />
+              拒绝
+            </button>
+            <button
+              style={iconBtn("#dc2626")}
+              onClick={() => answer({ action: "cancel" })}
+              title="取消并尽量中断当前请求"
+            >
+              <Square size={13} />
+              取消
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function QuestionItem({
   question,
   value,
@@ -755,6 +859,44 @@ function questionStatusStyle(
   };
 }
 
+function approvalStatusLabel(status: Extract<OutputLine, { kind: "approval" }>["status"]): string {
+  switch (status) {
+    case "pending":
+      return "待授权";
+    case "approved":
+      return "已允许";
+    case "denied":
+      return "已拒绝";
+    case "cancelled":
+      return "已取消";
+  }
+}
+
+function approvalStatusStyle(
+  status: Extract<OutputLine, { kind: "approval" }>["status"],
+): React.CSSProperties {
+  const color =
+    status === "pending"
+      ? "#dc2626"
+      : status === "approved"
+        ? "#16a34a"
+        : "#64748b";
+  return {
+    marginLeft: "auto",
+    color,
+    border: `1px solid ${color}`,
+    borderRadius: 6,
+    padding: "1px 6px",
+    fontSize: 10,
+    whiteSpace: "nowrap",
+  };
+}
+
+function prettyShort(value: unknown): string {
+  const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  return text && text.length > 1400 ? `${text.slice(0, 1400)}...` : text || "";
+}
+
 const questionPanelStyle: React.CSSProperties = {
   border: "1px solid #bfdbfe",
   borderRadius: 8,
@@ -764,6 +906,41 @@ const questionPanelStyle: React.CSSProperties = {
   display: "flex",
   flexDirection: "column",
   gap: 6,
+};
+
+const approvalPanelStyle: React.CSSProperties = {
+  ...questionPanelStyle,
+  border: "1px solid #fecaca",
+  background: "#fffafa",
+};
+
+const approvalCodeStyle: React.CSSProperties = {
+  margin: 0,
+  padding: 6,
+  border: "1px solid #e2e8f0",
+  borderRadius: 6,
+  background: "#fff",
+  color: "#111827",
+  fontSize: 11,
+  lineHeight: 1.45,
+  overflowX: "auto",
+  whiteSpace: "pre-wrap",
+};
+
+const approvalListStyle: React.CSSProperties = {
+  display: "grid",
+  gap: 3,
+  color: "#334155",
+  fontFamily: "monospace",
+  fontSize: 11,
+};
+
+const approvalRememberStyle: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 5,
+  color: "#475569",
+  fontSize: 11,
 };
 
 const questionHeaderStyle: React.CSSProperties = {

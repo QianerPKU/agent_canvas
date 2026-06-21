@@ -199,4 +199,64 @@ describe("realQuery file access", () => {
       },
     });
   });
+
+  it("把 Claude 非 AskUserQuestion 工具授权转发到前端审批处理器", async () => {
+    const requestUserInput = vi.fn().mockResolvedValue({ answers: {} });
+    const requestApproval = vi.fn().mockResolvedValue({ action: "approve", remember: true });
+
+    realQuery({
+      prompt: "x",
+      options: {
+        requestUserInput,
+        requestApproval,
+      },
+    });
+    const sdkArgs = sdk.query.mock.calls.at(-1)?.[0] as {
+      options: {
+        canUseTool?: (
+          toolName: string,
+          input: Record<string, unknown>,
+          options: {
+            signal: AbortSignal;
+            toolUseID: string;
+            title?: string;
+            displayName?: string;
+            description?: string;
+            decisionReason?: string;
+            blockedPath?: string;
+            suggestions?: unknown[];
+          },
+        ) => Promise<unknown>;
+      };
+    };
+
+    const suggestions = [{ type: "setMode", mode: "acceptEdits" }];
+    const result = await sdkArgs.options.canUseTool?.(
+      "Bash",
+      { command: "npm test" },
+      {
+        signal: new AbortController().signal,
+        toolUseID: "tool-bash",
+        title: "Claude 想运行命令",
+        description: "运行测试",
+        suggestions,
+      },
+    );
+
+    expect(requestApproval).toHaveBeenCalledWith({
+      requestId: "claude-approval:tool-bash",
+      kind: "tool",
+      title: "Claude 想运行命令",
+      message: "运行测试",
+      toolName: "Bash",
+      input: { command: "npm test" },
+      blockedPath: undefined,
+      suggestions,
+    });
+    expect(result).toEqual({
+      behavior: "allow",
+      toolUseID: "tool-bash",
+      updatedPermissions: suggestions,
+    });
+  });
 });

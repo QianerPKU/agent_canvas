@@ -384,4 +384,62 @@ describe("Codex app-server query", () => {
 
     await handle.terminate?.();
   });
+
+  it("将 Codex 命令授权请求转发给前端处理器并回写 accept", async () => {
+    const fake = makeFakeSpawn({ completeTurnStart: false });
+    const prompt = new AsyncMessageQueue<SdkUserInput>();
+    prompt.push(userInput("运行命令"));
+    const requestApproval = vi.fn().mockResolvedValue({ action: "approve" });
+
+    const handle = createCodexAppServerQuery({ spawnFn: fake.spawnFn })({
+      prompt,
+      options: { requestApproval },
+    });
+    const iterator = handle[Symbol.asyncIterator]();
+    await iterator.next();
+    const pendingTurn = iterator.next();
+    void pendingTurn.catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    fake.proc.stdout.write(
+      `${JSON.stringify({
+        id: 101,
+        method: "item/commandExecution/requestApproval",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          itemId: "cmd-1",
+          startedAtMs: 1,
+          command: "npm test",
+          cwd: "C:/repo",
+          reason: "需要运行测试",
+        },
+      })}\n`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(requestApproval).toHaveBeenCalledWith({
+      requestId: "codex-approval:101",
+      kind: "command",
+      title: "Codex 请求执行命令",
+      message: "需要运行测试",
+      command: "npm test",
+      cwd: "C:/repo",
+      raw: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "cmd-1",
+        startedAtMs: 1,
+        command: "npm test",
+        cwd: "C:/repo",
+        reason: "需要运行测试",
+      },
+    });
+    expect(fake.responses).toContainEqual({
+      id: 101,
+      result: { decision: "accept" },
+    });
+
+    await handle.terminate?.();
+  });
 });
