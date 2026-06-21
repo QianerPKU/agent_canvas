@@ -5,6 +5,7 @@ import {
   computeFileEdges,
   computePromptEdges,
   computePullRequestEdges,
+  computeSyncFlowEdges,
 } from "./App.js";
 
 describe("computeFileEdges", () => {
@@ -123,6 +124,30 @@ describe("computeFileEdges", () => {
     ).toMatchObject({
       source: "agent_1#0",
       target: "pr:pr_flow_1",
+    });
+
+    expect(
+      computeSyncFlowEdges(agents, [
+        {
+          id: "sync_flow_1",
+          kind: "cherry_pick",
+          proposerAgentId: "agent_1",
+          sourceTurnIndex: 1,
+          sourceBranch: "main",
+          targetBranch: "feature/a",
+          commitSha: "abcdef123456",
+          summary: "pick fix",
+          reason: "need fix",
+          files: ["src/a.ts"],
+          fileChanges: [{ status: "M", path: "src/a.ts" }],
+          status: "review_collecting",
+          createdAt: 1,
+          updatedAt: 2,
+        },
+      ])[0],
+    ).toMatchObject({
+      source: "agent_1#1",
+      target: "sync:sync_flow_1",
     });
   });
 });

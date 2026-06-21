@@ -3,5 +3,6 @@ export * from "./commits.js";
 export * from "./files.js";
 export * from "./prompts.js";
 export * from "./pullRequests.js";
+export * from "./syncFlows.js";
 export * from "./wire.js";
 export * from "./workspaces.js";

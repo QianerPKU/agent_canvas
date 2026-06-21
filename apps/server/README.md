@@ -16,6 +16,7 @@
 | `src/AgentManager.ts` | 多 agent 注册表：分配 id、维护单调 `seq`、包 `AgentEventEnvelope` 广播、内存事件历史 |
 | `src/workspaces/WorkspaceManager.ts` | AppData 项目根、GitHub/repo clone、branch worktree、共享资源映射和 Agent 临时目录 |
 | `src/pullRequests/PullRequestFlowManager.ts` | PR 审查与授权状态机：活跃 agent 审查、JSON 校验/重试、超时、授权信号 |
+| `src/sync/SyncFlowManager.ts` | cherry-pick / branch pull 的一步审查与授权状态机 |
 | `src/commits/CommitManager.ts` | Agent commit 上报记录：从 git 读取 commit 元信息、变更文件和每文件 diff，并推送给前端 |
 | `src/server.ts` | HTTP(REST) + WebSocket 装配 |
 | `src/index.ts` | 入口：实例化 manager（注入 Claude/Codex query）并监听端口 |
@@ -79,6 +80,10 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 | `POST /api/agents/:id/stop` | 中止 |
 | `POST /api/agents/:id/terminate` | 关闭底层 CLI / Query，进入 `terminated` |
 | `GET /api/commits` | 列出已上报 commit 节点快照 |
+| `GET /api/sync-flows` | 列出 cherry-pick / branch pull 同步流程 |
+| `POST /api/sync-flows` | body=`CreateSyncFlowInput`，发起同步前的一步审查 |
+| `POST /api/sync-flows/:id/applied` | 兜底登记同步已经由 proposer agent 执行完成 |
+| `POST /api/sync-flows/:id/cancel` | 取消尚未关闭的同步流程 |
 
 ## PR 流程
 
@@ -88,7 +93,16 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 - 发起 PR flow 时必须有具体变更文件列表。默认 server 会通过 `WorkspaceManager.diffPullRequestFiles()` 计算 `git diff --name-status <target>...<source>`，并把 `changedFiles` 写入发给审查 agent 的提示词；如果用户或 agent 指定了 `files`，则按该文件范围审查并补齐状态。
 - PR flow 创建时也会记录 `sourceTurnIndex`，因此前端 PR 节点会固定连回发起 PR pipeline 的那一轮对话；后续 agent 继续对话、旧节点成为历史轮也不会断线或漂移。
 - `GET /api/pr-flows` 列出流程；`POST /api/pr-flows` 发起源 branch preflight；`POST /api/pr-flows/:id/pr-created` 可兜底登记 PR 已创建并进入目标 branch 审查；`POST /api/pr-flows/:id/merged` 可兜底登记已合并；`POST /api/pr-flows/:id/cancel` 取消流程。
-- WebSocket `hello` 帧会带上 `prFlows` 和 `commits` 快照，后续 PR 状态变化通过 `pr_flow` 帧推送，commit 上报通过 `commit` 帧推送。
+- WebSocket `hello` 帧会带上 `prFlows`、`syncFlows` 和 `commits` 快照，后续 PR 状态变化通过 `pr_flow` 帧推送，同步流程变化通过 `sync_flow` 帧推送，commit 上报通过 `commit` 帧推送。
+
+## Sync 流程
+
+- `SyncFlowManager` 用于两类“把别处代码带入当前 branch”的操作：`cherry_pick` 表示拉取某个 commit，`branch_pull` 表示拉取/合并/变基某个 branch。
+- 流程只有一步审查：目标 branch 上所有活跃 agent 收到审查请求，运行中的 agent 通过 steer 插入，等待输入的 agent 通过 send 发送。审查目标是判断这次同步是否会影响 reviewer 自己当前正在进行的工作、实验或验证。
+- 全部审查通过后，proposer agent 收到 apply authorization；程序只发授权信号，不执行 git 命令。后续 fetch、cherry-pick、merge/rebase/pull、冲突处理、测试和 commit 都由 proposer agent 自己完成。
+- proposer agent 完成后可输出 `agentCanvasSyncEvent="applied"` JSON 自动关闭流程；前端 Sync 面板也提供 `Mark applied` 兜底按钮。
+- 同步流程创建时必须有具体文件范围。`cherry_pick` 默认通过 `git show --name-status` 解析 commit 文件；`branch_pull` 默认复用 `git diff --name-status <target>...<source>`。调用方显式传入 `files` 时，按该范围审查。
+- 内置 `agentCanvasPolicyPrompt` 已注入 sync pipeline 使用协议，因此用户可以直接在 agent 对话框里要求“cherry-pick 某个 commit”或“pull main”，agent 应先调用 `/api/sync-flows`，收到授权后再实际执行 git 操作。
 
 ## 多轮对话与 fork（对话历史分叉）
 
@@ -98,9 +112,10 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 ## WebSocket (`/ws`)
 
 服务端 → 前端帧（`ServerFrame`）：
-- `{ type: "hello", agents, prFlows, commits }`：连接即下发当前快照
+- `{ type: "hello", agents, prFlows, syncFlows, commits }`：连接即下发当前快照
 - `{ type: "event", envelope }`：实时事件（带 `agentId/seq/at`）
 - `{ type: "pr_flow", flow }`：PR flow 快照更新
+- `{ type: "sync_flow", flow }`：cherry-pick / branch pull flow 快照更新
 - `{ type: "commit", commit }`：Agent 上报 commit 后的 commit 快照
 
 ## 测试（CLAUDE.md 原则 #1）
@@ -185,5 +200,5 @@ npm run smoke --workspace apps/server
 - `POST /api/agents` 支持 `provider/model/branchWorkspaceId/cwd/systemPrompt`。新工作流中 `branchWorkspaceId` 决定 `cwd`；`cwd` 只保留兼容和快照展示。fork 会复制父 Agent 的 provider、模型、branch/cwd 和私有系统提示词。
 - `PATCH /api/agents/:id/settings` 可更新 `systemPrompt`，也可在 `idle` / `waiting_input` 状态切换到已有或新建 branch。切换后下一次业务输入会注入 branch 切换说明和 `git diff --name-status <old> <new>` 文件列表；`waiting_input` 下会脱开旧空闲会话，下次输入按新 `cwd` resume。
 - `systemPrompt` 是当前 Agent 私有提示词，不传给 Claude/Codex 原生 system prompt，而是在 `AgentRunner` 中按提示词节点同样的可读提示词机制拼接到业务输入。新 Agent 首轮、手动 compact 后、自动 compact 后、以及运行中更新设置后的下一条业务输入会重新注入。
-- Agent Canvas 内置工作区规则不属于用户可编辑的 `systemPrompt`，即使用户没有设置私有系统提示词也会注入；它约束共享文件默认只读、临时文件只写 `.agent-tmp/<agent-id>/`、其余非共享非临时修改都视为需要 commit 的仓库文件，并内置 PR pipeline 和 commit report 协议，指导 agent 在用户要求提 PR 时调用 `/api/pr-flows`，在每次 `git commit` 成功后调用 `/api/agents/:id/commits`。
+- Agent Canvas 内置工作区规则不属于用户可编辑的 `systemPrompt`，即使用户没有设置私有系统提示词也会注入；它约束共享文件默认只读、临时文件只写 `.agent-tmp/<agent-id>/`、其余非共享非临时修改都视为需要 commit 的仓库文件，并内置 PR pipeline、sync pipeline 和 commit report 协议，指导 agent 在用户要求提 PR 时调用 `/api/pr-flows`，在用户要求 cherry-pick/pull branch 时调用 `/api/sync-flows`，在每次 `git commit` 成功后调用 `/api/agents/:id/commits`。
 - `POST /api/directories/pick` 通过本机目录选择器返回用户选中的目录；Windows 使用 PowerShell + `System.Windows.Forms.FolderBrowserDialog`，其他平台暂返回明确错误并允许前端继续手动输入路径。

@@ -63,6 +63,51 @@ Invoke-RestMethod -Method Post -Uri "${apiBase}/pr-flows" -ContentType "applicat
 }
 ~~~
 
+4.1. Sync pipeline rules for cherry-pick and branch pull
+- Current agent id is ${agentId}.
+- When the user asks you to cherry-pick/import/apply a specific commit from another branch, or asks you to pull/merge/rebase/sync another branch into the current branch, you must use the Agent Canvas sync pipeline first.
+- Do not run git cherry-pick, git pull, git merge, or git rebase for this request before Agent Canvas sends an apply authorization.
+- The Agent Canvas sync API is POST ${apiBase}/sync-flows.
+- For a single commit cherry-pick, call the API with kind="cherry_pick", proposerAgentId="${agentId}", commitSha, summary, reason, and files. sourceBranch is optional but recommended when known. targetBranch defaults to your current branch when omitted.
+- For pulling a branch, call the API with kind="branch_pull", proposerAgentId="${agentId}", sourceBranch, summary, reason, files, and optionally strategy="merge" | "rebase" | "pull". targetBranch defaults to your current branch when omitted.
+- Before creating the sync flow, inspect git status/diff/show so files lists the concrete affected paths. If you cannot determine the files, explain the blocker instead of guessing.
+- After all current-branch active agents approve, Agent Canvas will send you an apply authorization. Only then may you freely fetch, cherry-pick, merge/rebase/pull, resolve conflicts, run tests, and commit the result as needed.
+- After the sync is complete, output exactly one JSON object to report the result:
+~~~json
+{
+  "agentCanvasSyncEvent": "applied",
+  "flowId": "sync_flow_x",
+  "summary": "what was applied",
+  "commitSha": "resulting commit sha if applicable",
+  "files": ["src/example.ts"],
+  "fileChanges": [{ "status": "M", "path": "src/example.ts" }]
+}
+~~~
+- PowerShell cherry-pick example:
+~~~powershell
+Invoke-RestMethod -Method Post -Uri "${apiBase}/sync-flows" -ContentType "application/json" -Body (@{
+  kind = "cherry_pick"
+  proposerAgentId = "${agentId}"
+  sourceBranch = "feature/source"
+  commitSha = "abcdef1234567890"
+  summary = "Apply the focused fix from feature/source"
+  reason = "Current branch needs this commit without merging the whole source branch"
+  files = @("src/example.ts")
+} | ConvertTo-Json -Depth 6)
+~~~
+- PowerShell branch pull example:
+~~~powershell
+Invoke-RestMethod -Method Post -Uri "${apiBase}/sync-flows" -ContentType "application/json" -Body (@{
+  kind = "branch_pull"
+  proposerAgentId = "${agentId}"
+  sourceBranch = "main"
+  strategy = "merge"
+  summary = "Catch up with main"
+  reason = "Current branch is behind main and needs shared fixes"
+  files = @("src/example.ts")
+} | ConvertTo-Json -Depth 6)
+~~~
+
 提交规则：
 - 不在 ${scratchDirectory}/ 内、也不是共享资源的所有新增或修改文件，都应被视为需要 commit 的正式改动。
 - 当用户要求提交时，只提交正式仓库文件；不要提交共享资源或 agent 临时文件。

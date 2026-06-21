@@ -4,11 +4,13 @@ import type { AddressInfo } from "node:net";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import type { AgentEventEnvelope, AgentSnapshot } from "@agent-canvas/shared";
 import { AgentManager } from "./AgentManager.js";
 import { CommitManager } from "./commits/CommitManager.js";
 import { createServer } from "./server.js";
 import { FileManager } from "./files/FileManager.js";
 import { PromptManager } from "./prompts/PromptManager.js";
+import { SyncFlowManager, type SyncFlowAgentHost } from "./sync/SyncFlowManager.js";
 import type { QueryFn } from "./sdk/types.js";
 import { WorkspaceManager, type GitRunner } from "./workspaces/WorkspaceManager.js";
 
@@ -22,6 +24,81 @@ const emptyQuery: QueryFn = () => ({
 interface Resp {
   status: number;
   json: any;
+}
+
+class FakeSyncRunner {
+  readonly sent: string[] = [];
+
+  constructor(private status: string) {}
+
+  getStatus(): string {
+    return this.status;
+  }
+
+  setStatus(status: string): void {
+    this.status = status;
+  }
+
+  send(text: string): void {
+    this.sent.push(text);
+    this.status = "running";
+  }
+
+  async steer(text: string): Promise<void> {
+    this.sent.push(text);
+  }
+}
+
+class FakeSyncHost implements SyncFlowAgentHost {
+  readonly runner = new FakeSyncRunner("waiting_input");
+  readonly history: AgentEventEnvelope[] = [];
+  seq = 0;
+
+  list(): AgentSnapshot[] {
+    return [
+      {
+        id: "agent_sync",
+        provider: "codex",
+        status: this.runner.getStatus() as AgentSnapshot["status"],
+        config: { prompt: "", provider: "codex", branch: "feature/server-test" },
+        createdAt: 0,
+        lastEventSeq: this.seq,
+      },
+    ];
+  }
+
+  get(id: string): FakeSyncRunner | undefined {
+    return id === "agent_sync" ? this.runner : undefined;
+  }
+
+  historyOf(id: string): AgentEventEnvelope[] {
+    return id === "agent_sync" ? this.history : [];
+  }
+
+  currentTurnIndex(): number {
+    return 0;
+  }
+
+  assistant(text: string, at: number): void {
+    this.history.push({
+      agentId: "agent_sync",
+      seq: ++this.seq,
+      at,
+      event: { kind: "assistant_text", text },
+    });
+  }
+
+  result(at: number): AgentEventEnvelope {
+    const envelope: AgentEventEnvelope = {
+      agentId: "agent_sync",
+      seq: ++this.seq,
+      at,
+      event: { kind: "result", subtype: "success", isError: false },
+    };
+    this.history.push(envelope);
+    this.runner.setStatus("waiting_input");
+    return envelope;
+  }
 }
 
 function request(
@@ -62,6 +139,8 @@ describe("HTTP server", () => {
   let port = 0;
   let root = "";
   let projectRoot = "";
+  let syncHost: FakeSyncHost;
+  let syncFlowManager: SyncFlowManager;
   const openFile = vi.fn<(filePath: string) => Promise<void>>().mockResolvedValue(undefined);
   const pickDirectory = vi
     .fn<(initialDirectory?: string) => Promise<string | undefined>>()
@@ -102,12 +181,15 @@ describe("HTTP server", () => {
       workspaceRoot: root,
       promptRoot: path.join(root, "prompts"),
     });
+    syncHost = new FakeSyncHost();
+    syncFlowManager = new SyncFlowManager({ host: syncHost });
     ({ httpServer: server } = createServer(manager, fileManager, {
       defaultCwd: root,
       openFile,
       pickDirectory,
       promptManager,
       workspaceManager,
+      syncFlowManager,
       commitManager: new CommitManager({
         runGit: async (args) => {
           if (args[0] === "rev-parse") return "abcdef1234567890";
@@ -322,6 +404,65 @@ describe("HTTP server", () => {
     expect(listed.json.commits.some((commit: { id: string }) => commit.id === reported.json.commit.id)).toBe(
       true,
     );
+  });
+
+  it("sync flow REST supports create, review authorization and applied fallback", async () => {
+    const created = await request(port, "POST", "/api/sync-flows", {
+      kind: "cherry_pick",
+      proposerAgentId: "agent_sync",
+      sourceBranch: "main",
+      commitSha: "abcdef123456",
+      summary: "Apply shared fix",
+      reason: "Feature branch needs this commit",
+      files: ["src/sync.ts"],
+    });
+
+    expect(created.status).toBe(201);
+    expect(created.json.flow).toMatchObject({
+      kind: "cherry_pick",
+      proposerAgentId: "agent_sync",
+      status: "review_collecting",
+      files: ["src/sync.ts"],
+    });
+
+    const reviewedAt = Date.now() + 1;
+    syncHost.assistant(
+      JSON.stringify({
+        agentCanvasSyncReview: true,
+        flowId: created.json.flow.id,
+        decision: "approve",
+        summary: "safe to apply",
+        risks: [],
+        filesReviewed: ["src/sync.ts"],
+        requiredChanges: [],
+      }),
+      reviewedAt,
+    );
+    await syncFlowManager.handleAgentEvent(syncHost.result(reviewedAt));
+
+    const authorized = await request(port, "GET", `/api/sync-flows/${created.json.flow.id}`);
+    expect(authorized.json.flow.status).toBe("apply_authorized");
+
+    const applied = await request(
+      port,
+      "POST",
+      `/api/sync-flows/${created.json.flow.id}/applied`,
+      {
+        summary: "Applied shared fix",
+        files: ["src/sync.ts"],
+      },
+    );
+
+    expect(applied.status).toBe(200);
+    expect(applied.json.flow).toMatchObject({
+      status: "applied",
+      applied: { summary: "Applied shared fix", files: ["src/sync.ts"] },
+    });
+
+    const listedSyncFlows = await request(port, "GET", "/api/sync-flows");
+    expect(
+      listedSyncFlows.json.flows.some((flow: { id: string }) => flow.id === created.json.flow.id),
+    ).toBe(true);
   });
 
   it("history 记录用户输入", async () => {

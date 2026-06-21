@@ -12,6 +12,7 @@ import {
 import {
   FilePlus2,
   FolderOpen,
+  GitBranch,
   GitPullRequest,
   Link,
   MessageSquarePlus,
@@ -32,6 +33,7 @@ import type {
   CanvasPromptNode,
   WorkspaceProject,
   PullRequestFlowSnapshot,
+  SyncFlowSnapshot,
 } from "@agent-canvas/shared";
 import "@xyflow/react/dist/style.css";
 import { useAgentCanvas, type AgentActions, type FileActions } from "./useAgentCanvas.js";
@@ -55,6 +57,9 @@ import {
 import { PullRequestDetailsWindow } from "./pullRequests/PullRequestDetailsWindow.js";
 import { CommitNode, type CommitNodeType } from "./commits/CommitNode.js";
 import { CommitDetailsWindow } from "./commits/CommitDetailsWindow.js";
+import { SyncFlowDialog } from "./sync/SyncFlowDialog.js";
+import { SyncFlowNode, type SyncFlowNodeType } from "./sync/SyncFlowNode.js";
+import { SyncFlowDetailsWindow } from "./sync/SyncFlowDetailsWindow.js";
 import type { PromptActions } from "./useAgentCanvas.js";
 
 const nodeTypes = {
@@ -63,6 +68,7 @@ const nodeTypes = {
   prompt: PromptNode,
   commit: CommitNode,
   pullRequest: PullRequestNode,
+  syncFlow: SyncFlowNode,
 };
 
 const COL_W = 430;
@@ -78,6 +84,8 @@ const COMMIT_NODE_WIDTH = 270;
 const COMMIT_NODE_HEIGHT = 170;
 const PR_NODE_WIDTH = 290;
 const PR_NODE_HEIGHT = 180;
+const SYNC_NODE_WIDTH = 290;
+const SYNC_NODE_HEIGHT = 180;
 const X0 = 40;
 const Y0 = 40;
 
@@ -86,7 +94,8 @@ type CanvasNode =
   | FileNodeType
   | PromptNodeType
   | CommitNodeType
-  | PullRequestNodeType;
+  | PullRequestNodeType
+  | SyncFlowNodeType;
 type AgentSettingsTarget =
   | { mode: "create" }
   | { mode: "edit"; agentId: string };
@@ -109,6 +118,10 @@ function commitNodeId(commitId: string): string {
 
 function pullRequestNodeId(flowId: string): string {
   return `pr:${flowId}`;
+}
+
+function syncFlowNodeId(flowId: string): string {
+  return `sync:${flowId}`;
 }
 
 function anchorIndex(agents: AgentMap, parentId: string, anchorUuid: string): number {
@@ -288,6 +301,27 @@ export function computePullRequestEdges(
   return edges;
 }
 
+export function computeSyncFlowEdges(
+  agents: AgentMap,
+  flows: SyncFlowSnapshot[],
+): Edge[] {
+  const edges: Edge[] = [];
+  for (const flow of flows) {
+    const source = fixedTurnNodeId(agents, flow.proposerAgentId, flow.sourceTurnIndex);
+    if (!source) continue;
+    edges.push({
+      id: `sync-edge:${flow.id}`,
+      source,
+      target: syncFlowNodeId(flow.id),
+      animated: !isClosedSyncStatus(flow.status),
+      style: { stroke: "#0891b2" },
+      label: flow.kind === "cherry_pick" ? "pick" : "pull",
+      deletable: false,
+    });
+  }
+  return edges;
+}
+
 function fixedTurnNodeId(
   agents: AgentMap,
   agentId: string,
@@ -310,12 +344,17 @@ function isClosedPrStatus(status: PullRequestFlowSnapshot["status"]): boolean {
   ].includes(status);
 }
 
+function isClosedSyncStatus(status: SyncFlowSnapshot["status"]): boolean {
+  return ["review_failed", "applied", "timed_out", "cancelled", "blocked"].includes(status);
+}
+
 function buildNodes(
   agents: AgentMap,
   files: CanvasFileNode[],
   prompts: CanvasPromptNode[],
   commits: AgentCommitSnapshot[],
   prFlows: PullRequestFlowSnapshot[],
+  syncFlows: SyncFlowSnapshot[],
   actions: AgentActions,
   fileActions: FileActions,
   promptActions: PromptActions,
@@ -326,6 +365,7 @@ function buildNodes(
   onOpenFileEditor: (fileId: string) => void,
   onOpenCommitDetails: (commitId: string) => void,
   onOpenPullRequestDetails: (flowId: string) => void,
+  onOpenSyncFlowDetails: (flowId: string) => void,
 ): CanvasNode[] {
   const layout = computeLayout(agents);
   const byId = new Map(current.map((node) => [node.id, node]));
@@ -465,6 +505,31 @@ function buildNodes(
           },
     );
   });
+
+  const syncX = prX + 350;
+  syncFlows.forEach((flow, index) => {
+    const id = syncFlowNodeId(flow.id);
+    const existing = byId.get(id);
+    const existingSync = existing?.type === "syncFlow" ? existing : undefined;
+    const data = {
+      flow,
+      onOpenDetails: onOpenSyncFlowDetails,
+      windowState: existingSync?.data.windowState,
+    };
+    result.push(
+      existingSync
+        ? { ...existingSync, data }
+        : {
+            id,
+            type: "syncFlow",
+            position: { x: syncX, y: Y0 + index * 220 },
+            width: SYNC_NODE_WIDTH,
+            height: SYNC_NODE_HEIGHT,
+            dragHandle: ".drag-handle",
+            data,
+          },
+    );
+  });
   return result;
 }
 
@@ -476,12 +541,14 @@ export default function App(): React.ReactElement {
     prompts,
     promptConnections,
     prFlows,
+    syncFlows,
     commits,
     connected,
     actions,
     fileActions,
     promptActions,
     prActions,
+    syncActions,
   } = useAgentCanvas();
   const [nodes, setNodes, onNodesChange] = useNodesState<CanvasNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
@@ -491,9 +558,11 @@ export default function App(): React.ReactElement {
   const [creatingFile, setCreatingFile] = useState(false);
   const [creatingPrompt, setCreatingPrompt] = useState(false);
   const [showingPullRequests, setShowingPullRequests] = useState(false);
+  const [showingSyncFlows, setShowingSyncFlows] = useState(false);
   const [showingSettings, setShowingSettings] = useState(false);
   const [openCommitId, setOpenCommitId] = useState<string>();
   const [openPullRequestId, setOpenPullRequestId] = useState<string>();
+  const [openSyncFlowId, setOpenSyncFlowId] = useState<string>();
   const [appSettings, setAppSettings] = useState<AgentCanvasSettings>({
     fullPermissionMode: false,
   });
@@ -505,6 +574,7 @@ export default function App(): React.ReactElement {
   const openFile = files.find((file) => file.id === openFileId);
   const openCommit = commits.find((commit) => commit.id === openCommitId);
   const openPullRequest = prFlows.find((flow) => flow.id === openPullRequestId);
+  const openSyncFlow = syncFlows.find((flow) => flow.id === openSyncFlowId);
   const settingsAgent =
     agentSettingsTarget?.mode === "edit" ? agents[agentSettingsTarget.agentId] : undefined;
 
@@ -624,6 +694,7 @@ export default function App(): React.ReactElement {
         prompts,
         commits,
         prFlows,
+        syncFlows,
         actions,
         fileActions,
         promptActions,
@@ -634,6 +705,7 @@ export default function App(): React.ReactElement {
         openFileEditor,
         setOpenCommitId,
         setOpenPullRequestId,
+        setOpenSyncFlowId,
       ),
     );
     setEdges([
@@ -642,6 +714,7 @@ export default function App(): React.ReactElement {
       ...computePromptEdges(agents, promptConnections),
       ...computeCommitEdges(agents, commits),
       ...computePullRequestEdges(agents, prFlows),
+      ...computeSyncFlowEdges(agents, syncFlows),
     ]);
   }, [
     agents,
@@ -651,6 +724,7 @@ export default function App(): React.ReactElement {
     promptConnections,
     commits,
     prFlows,
+    syncFlows,
     actions,
     fileActions,
     promptActions,
@@ -757,6 +831,13 @@ export default function App(): React.ReactElement {
         </button>
         <button
           className="header-button header-button--secondary"
+          onClick={() => setShowingSyncFlows(true)}
+        >
+          <GitBranch size={15} />
+          Sync
+        </button>
+        <button
+          className="header-button header-button--secondary"
           onClick={() => setShowingSettings(true)}
         >
           <Settings size={15} />
@@ -854,6 +935,15 @@ export default function App(): React.ReactElement {
           onClose={() => setShowingPullRequests(false)}
         />
       )}
+      {showingSyncFlows && (
+        <SyncFlowDialog
+          agents={agents}
+          branches={branches}
+          flows={syncFlows}
+          actions={syncActions}
+          onClose={() => setShowingSyncFlows(false)}
+        />
+      )}
       {showingSettings && (
         <AppSettingsDialog
           settings={appSettings}
@@ -887,6 +977,12 @@ export default function App(): React.ReactElement {
         <PullRequestDetailsWindow
           flow={openPullRequest}
           onClose={() => setOpenPullRequestId(undefined)}
+        />
+      )}
+      {openSyncFlow && (
+        <SyncFlowDetailsWindow
+          flow={openSyncFlow}
+          onClose={() => setOpenSyncFlowId(undefined)}
         />
       )}
       {fileOpenError && (

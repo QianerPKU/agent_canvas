@@ -21,11 +21,14 @@ import type {
   CreateCanvasProjectInput,
   CreateCanvasPromptInput,
   CreatePullRequestFlowInput,
+  CreateSyncFlowInput,
   FileConnectionAccess,
   ForkOrigin,
   PullRequestCreatedInput,
   PullRequestFlowSnapshot,
   PromptConnectionAccess,
+  SyncFlowAppliedInput,
+  SyncFlowSnapshot,
   UpdateAgentSettingsInput,
   UpdateCanvasFileInput,
   UpdateCanvasPromptInput,
@@ -85,6 +88,8 @@ export const api = {
     }).then((r) => r.branch),
   listPullRequestFlows: () =>
     call<{ flows: PullRequestFlowSnapshot[] }>("/pr-flows").then((r) => r.flows),
+  listSyncFlows: () =>
+    call<{ flows: SyncFlowSnapshot[] }>("/sync-flows").then((r) => r.flows),
   listCommits: () =>
     call<{ commits: AgentCommitSnapshot[] }>("/commits").then((r) => r.commits),
   createPullRequestFlow: (input: CreatePullRequestFlowInput) =>
@@ -103,6 +108,20 @@ export const api = {
     }).then((r) => r.flow),
   cancelPullRequestFlow: (id: string) =>
     call<{ flow: PullRequestFlowSnapshot }>(`/pr-flows/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+    }).then((r) => r.flow),
+  createSyncFlow: (input: CreateSyncFlowInput) =>
+    call<{ flow: SyncFlowSnapshot }>("/sync-flows", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }).then((r) => r.flow),
+  recordSyncFlowApplied: (id: string, input: SyncFlowAppliedInput) =>
+    call<{ flow: SyncFlowSnapshot }>(`/sync-flows/${encodeURIComponent(id)}/applied`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }).then((r) => r.flow),
+  cancelSyncFlow: (id: string) =>
+    call<{ flow: SyncFlowSnapshot }>(`/sync-flows/${encodeURIComponent(id)}/cancel`, {
       method: "POST",
     }).then((r) => r.flow),
   history: (id: string) =>

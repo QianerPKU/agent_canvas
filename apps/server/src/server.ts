@@ -16,11 +16,13 @@ import type {
   CreateCanvasFileInput,
   CreateCanvasPromptInput,
   CreateSharedResourceInput,
+  CreateSyncFlowInput,
   OpenCanvasProjectInput,
   PullRequestCreatedInput,
   CreatePullRequestFlowInput,
   ReportAgentCommitInput,
   ServerFrame,
+  SyncFlowAppliedInput,
   UpdateAgentSettingsInput,
   UpdateCanvasFileInput,
   UpdateCanvasPromptInput,
@@ -32,6 +34,7 @@ import { FileManager } from "./files/FileManager.js";
 import { openFileInVscode } from "./files/VscodeFileOpener.js";
 import { PromptManager } from "./prompts/PromptManager.js";
 import { PullRequestFlowManager } from "./pullRequests/PullRequestFlowManager.js";
+import { SyncFlowManager } from "./sync/SyncFlowManager.js";
 import { WorkspaceManager } from "./workspaces/WorkspaceManager.js";
 
 export interface CreateServerResult {
@@ -42,6 +45,7 @@ export interface CreateServerResult {
   promptManager: PromptManager;
   workspaceManager: WorkspaceManager;
   pullRequestFlowManager: PullRequestFlowManager;
+  syncFlowManager: SyncFlowManager;
   commitManager: CommitManager;
 }
 
@@ -52,6 +56,7 @@ export interface CreateServerOptions {
   promptManager?: PromptManager;
   workspaceManager?: WorkspaceManager;
   pullRequestFlowManager?: PullRequestFlowManager;
+  syncFlowManager?: SyncFlowManager;
   commitManager?: CommitManager;
 }
 
@@ -88,6 +93,17 @@ export function createServer(
       resolveChangedFiles: async ({ sourceBranch, targetBranch }) =>
         (await workspaceManager.diffPullRequestFiles(sourceBranch, targetBranch))?.files ?? [],
     });
+  const syncFlowManager =
+    options.syncFlowManager ??
+    new SyncFlowManager({
+      host: manager,
+      resolveChangedFiles: async ({ kind, sourceBranch, targetBranch, commitSha }) => {
+        if (kind === "cherry_pick") {
+          return await workspaceManager.changedFilesForCommit(commitSha, sourceBranch);
+        }
+        return (await workspaceManager.diffPullRequestFiles(sourceBranch, targetBranch))?.files;
+      },
+    });
   const commitManager = options.commitManager ?? new CommitManager();
   manager.setPromptAccessResolver((agentId) => promptManager.accessFor(agentId));
   const httpServer = http.createServer((req, res) => {
@@ -99,6 +115,7 @@ export function createServer(
       promptManager,
       workspaceManager,
       pullRequestFlowManager,
+      syncFlowManager,
       commitManager,
       defaultCwd,
       options.openFile ?? openFileInVscode,
@@ -115,6 +132,7 @@ export function createServer(
       type: "hello",
       agents: manager.list(),
       prFlows: pullRequestFlowManager.list(),
+      syncFlows: syncFlowManager.list(),
       commits: commitManager.list(),
     });
   });
@@ -122,6 +140,7 @@ export function createServer(
   // 把 manager 的事件广播到所有 WS 客户端
   manager.onEvent((envelope) => {
     void pullRequestFlowManager.handleAgentEvent(envelope);
+    void syncFlowManager.handleAgentEvent(envelope);
     const frame: ServerFrame = { type: "event", envelope };
     const data = JSON.stringify(frame);
     for (const client of wss.clients) {
@@ -131,6 +150,14 @@ export function createServer(
 
   pullRequestFlowManager.onFlow((flow) => {
     const frame: ServerFrame = { type: "pr_flow", flow };
+    const data = JSON.stringify(frame);
+    for (const client of wss.clients) {
+      if (client.readyState === client.OPEN) client.send(data);
+    }
+  });
+
+  syncFlowManager.onFlow((flow) => {
+    const frame: ServerFrame = { type: "sync_flow", flow };
     const data = JSON.stringify(frame);
     for (const client of wss.clients) {
       if (client.readyState === client.OPEN) client.send(data);
@@ -153,6 +180,7 @@ export function createServer(
     promptManager,
     workspaceManager,
     pullRequestFlowManager,
+    syncFlowManager,
     commitManager,
   };
 }
@@ -165,6 +193,7 @@ async function handleHttp(
   promptManager: PromptManager,
   workspaceManager: WorkspaceManager,
   pullRequestFlowManager: PullRequestFlowManager,
+  syncFlowManager: SyncFlowManager,
   commitManager: CommitManager,
   defaultCwd: string,
   openFile: (filePath: string) => Promise<void>,
@@ -309,6 +338,10 @@ async function handleHttp(
     return sendJson(res, 200, { flows: pullRequestFlowManager.list() });
   }
 
+  if (method === "GET" && path === "/api/sync-flows") {
+    return sendJson(res, 200, { flows: syncFlowManager.list() });
+  }
+
   if (method === "GET" && path === "/api/commits") {
     return sendJson(res, 200, { commits: commitManager.list() });
   }
@@ -318,6 +351,17 @@ async function handleHttp(
     try {
       return sendJson(res, 201, {
         flow: await pullRequestFlowManager.create(body ?? ({} as CreatePullRequestFlowInput)),
+      });
+    } catch (error) {
+      return sendJson(res, 400, { error: errMsg(error) });
+    }
+  }
+
+  if (method === "POST" && path === "/api/sync-flows") {
+    const body = await readJson<CreateSyncFlowInput>(req);
+    try {
+      return sendJson(res, 201, {
+        flow: await syncFlowManager.create(body ?? ({} as CreateSyncFlowInput)),
       });
     } catch (error) {
       return sendJson(res, 400, { error: errMsg(error) });
@@ -354,6 +398,35 @@ async function handleHttp(
     if (method === "POST" && action === "cancel") {
       try {
         return sendJson(res, 200, { flow: pullRequestFlowManager.cancel(id) });
+      } catch (error) {
+        return sendJson(res, 404, { error: errMsg(error) });
+      }
+    }
+  }
+
+  const syncFlowMatch = path.match(/^\/api\/sync-flows\/([^/]+)(?:\/([^/]+))?$/);
+  if (syncFlowMatch) {
+    const id = decodeURIComponent(syncFlowMatch[1]!);
+    const action = syncFlowMatch[2];
+    if (method === "GET" && !action) {
+      const flow = syncFlowManager.get(id);
+      return flow
+        ? sendJson(res, 200, { flow })
+        : sendJson(res, 404, { error: `unknown sync flow: ${id}` });
+    }
+    if (method === "POST" && action === "applied") {
+      const body = await readJson<SyncFlowAppliedInput>(req);
+      try {
+        return sendJson(res, 200, {
+          flow: syncFlowManager.recordApplied(id, body ?? {}),
+        });
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
+    }
+    if (method === "POST" && action === "cancel") {
+      try {
+        return sendJson(res, 200, { flow: syncFlowManager.cancel(id) });
       } catch (error) {
         return sendJson(res, 404, { error: errMsg(error) });
       }

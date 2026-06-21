@@ -25,6 +25,11 @@ describe("agentCanvasPolicyPrompt", () => {
     expect(prompt).toContain("commit report 工具");
     expect(prompt).toContain("POST http://127.0.0.1:4317/api/agents/agent_42/commits");
     expect(prompt).toContain('commit = "HEAD"');
+    expect(prompt).toContain("Sync pipeline rules for cherry-pick and branch pull");
+    expect(prompt).toContain("POST http://127.0.0.1:4317/api/sync-flows");
+    expect(prompt).toContain('kind = "cherry_pick"');
+    expect(prompt).toContain('kind = "branch_pull"');
+    expect(prompt).toContain('"agentCanvasSyncEvent": "applied"');
   });
 
   it("uses AGENT_CANVAS_API when configured", () => {
@@ -32,6 +37,9 @@ describe("agentCanvasPolicyPrompt", () => {
 
     expect(agentCanvasPolicyPrompt("agent_1")).toContain(
       "POST http://127.0.0.1:9999/api/pr-flows",
+    );
+    expect(agentCanvasPolicyPrompt("agent_1")).toContain(
+      "POST http://127.0.0.1:9999/api/sync-flows",
     );
   });
 });

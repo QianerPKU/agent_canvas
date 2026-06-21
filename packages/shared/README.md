@@ -68,7 +68,19 @@ npm test --workspace packages/shared        # vitest
 
 `PullRequestFlowSnapshot.fileChanges` 使用 `PullRequestChangedFile` 记录这次 PR 的具体文件变化（`git diff --name-status` 的 `status + path`）。后端发给审查 agent 的 source/target review 提示必须包含该列表；`files` 保留为路径范围的简化列表。`sourceTurnIndex` 固定 PR 节点连回的对话轮次，避免 agent 继续运行后连线漂移到最新轮。
 
-`ServerFrame` 的 `hello` 帧可携带 `prFlows` 和 `commits` 快照，后续 `pr_flow` 帧推送单个流程更新，`commit` 帧推送单个 commit 上报。
+`ServerFrame` 的 `hello` 帧可携带 `prFlows`、`syncFlows` 和 `commits` 快照，后续 `pr_flow` 帧推送单个 PR 流程更新，`sync_flow` 帧推送单个同步流程更新，`commit` 帧推送单个 commit 上报。
+
+## Sync Flow Model
+
+`src/syncFlows.ts` defines the one-step review model for importing code into the current branch.
+It intentionally separates two operations:
+
+- `cherry_pick`: review a single commit before the proposer agent runs `git cherry-pick`.
+- `branch_pull`: review another branch before the proposer agent runs a merge/rebase/pull.
+
+`CreateSyncFlowInput` always includes `proposerAgentId`, `summary`, `reason`, and a concrete file
+scope either provided by the caller or resolved by the server. `SyncFlowSnapshot.sourceTurnIndex`
+pins the canvas node edge to the exact agent turn that started the flow.
 
 ## 提示词节点模型
 

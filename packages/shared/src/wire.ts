@@ -4,6 +4,7 @@
 import type { AgentEventEnvelope, AgentSnapshot } from "./events.js";
 import type { AgentCommitSnapshot } from "./commits.js";
 import type { PullRequestFlowSnapshot } from "./pullRequests.js";
+import type { SyncFlowSnapshot } from "./syncFlows.js";
 
 export type ServerFrame =
   | {
@@ -11,7 +12,9 @@ export type ServerFrame =
       agents: AgentSnapshot[];
       prFlows?: PullRequestFlowSnapshot[];
       commits?: AgentCommitSnapshot[];
-    } // 连接建立时下发当前全部 agent / PR / commit 快照
+      syncFlows?: SyncFlowSnapshot[];
+    } // 连接建立时下发当前全部 agent / PR / sync / commit 快照
   | { type: "event"; envelope: AgentEventEnvelope } // 实时事件
   | { type: "commit"; commit: AgentCommitSnapshot } // Agent 上报的 commit 记录
-  | { type: "pr_flow"; flow: PullRequestFlowSnapshot }; // PR 流程状态
+  | { type: "pr_flow"; flow: PullRequestFlowSnapshot } // PR 流程状态
+  | { type: "sync_flow"; flow: SyncFlowSnapshot }; // cherry-pick / branch pull 流程状态

@@ -289,6 +289,42 @@ export class WorkspaceManager {
     );
   }
 
+  async changedFilesForCommit(
+    commitRef: string | undefined,
+    sourceBranch: string | undefined,
+  ): Promise<Array<{ status: string; path: string }> | undefined> {
+    const commit = commitRef?.trim();
+    if (!commit) return undefined;
+    await this.ensureProjectOpen();
+    await this.loadStateIfNeeded();
+    const repo = this.state.repo;
+    if (!repo) return undefined;
+    const branch = sourceBranch?.trim();
+    if (branch) {
+      try {
+        await this.runGit(
+          ["fetch", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`],
+          { cwd: repo.localRepoPath },
+        );
+      } catch {
+        // The commit may already exist locally, or sourceBranch may be local-only.
+      }
+    }
+    try {
+      const output = await this.runGit(
+        ["show", "--format=", "--name-status", "--find-renames", commit],
+        { cwd: repo.localRepoPath },
+      );
+      return output
+        .split(/\r?\n/u)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map(parseDiffNameStatus);
+    } catch {
+      return [];
+    }
+  }
+
   private async diffBranchRefs(
     fromBranch: string | undefined,
     toBranch: string | undefined,

@@ -17,11 +17,14 @@ import type {
   CreateCanvasFileInput,
   CreateCanvasPromptInput,
   CreatePullRequestFlowInput,
+  CreateSyncFlowInput,
   FileConnectionAccess,
   PullRequestCreatedInput,
   PullRequestFlowSnapshot,
   PromptConnectionAccess,
   ServerFrame,
+  SyncFlowAppliedInput,
+  SyncFlowSnapshot,
   UpdateCanvasFileInput,
   UpdateCanvasPromptInput,
 } from "@agent-canvas/shared";
@@ -82,12 +85,14 @@ export interface UseAgentCanvas {
   prompts: CanvasPromptNode[];
   promptConnections: CanvasPromptConnection[];
   prFlows: PullRequestFlowSnapshot[];
+  syncFlows: SyncFlowSnapshot[];
   commits: AgentCommitSnapshot[];
   connected: boolean;
   actions: AgentActions;
   fileActions: FileActions;
   promptActions: PromptActions;
   prActions: PullRequestActions;
+  syncActions: SyncFlowActions;
 }
 
 export interface FileActions {
@@ -119,6 +124,12 @@ export interface PullRequestActions {
   cancel: (id: string) => Promise<void>;
 }
 
+export interface SyncFlowActions {
+  create: (input: CreateSyncFlowInput) => Promise<void>;
+  recordApplied: (id: string, input: SyncFlowAppliedInput) => Promise<void>;
+  cancel: (id: string) => Promise<void>;
+}
+
 function wsUrl(): string {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   return `${proto}://${location.host}/ws`;
@@ -131,6 +142,7 @@ export function useAgentCanvas(): UseAgentCanvas {
   const [prompts, setPrompts] = useState<CanvasPromptNode[]>([]);
   const [promptConnections, setPromptConnections] = useState<CanvasPromptConnection[]>([]);
   const [prFlows, setPrFlows] = useState<PullRequestFlowSnapshot[]>([]);
+  const [syncFlows, setSyncFlows] = useState<SyncFlowSnapshot[]>([]);
   const [commits, setCommits] = useState<AgentCommitSnapshot[]>([]);
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
@@ -162,11 +174,14 @@ export function useAgentCanvas(): UseAgentCanvas {
         if (frame.type === "hello") {
           setAgents(applyHello(frame.agents));
           setPrFlows(frame.prFlows ?? []);
+          setSyncFlows(frame.syncFlows ?? []);
           setCommits(frame.commits ?? []);
         } else if (frame.type === "event") {
           setAgents((prev) => applyEnvelope(prev, frame.envelope));
         } else if (frame.type === "pr_flow") {
           setPrFlows((prev) => upsertFlow(prev, frame.flow));
+        } else if (frame.type === "sync_flow") {
+          setSyncFlows((prev) => upsertSyncFlow(prev, frame.flow));
         } else if (frame.type === "commit") {
           setCommits((prev) => upsertCommit(prev, frame.commit));
         }
@@ -191,6 +206,7 @@ export function useAgentCanvas(): UseAgentCanvas {
       api.listPrompts(),
       api.listPromptConnections(),
       api.listPullRequestFlows(),
+      api.listSyncFlows(),
       api.listCommits(),
     ]).then(
       ([
@@ -199,6 +215,7 @@ export function useAgentCanvas(): UseAgentCanvas {
         nextPrompts,
         nextPromptConnections,
         nextPrFlows,
+        nextSyncFlows,
         nextCommits,
       ]) => {
         if (closed) return;
@@ -207,6 +224,7 @@ export function useAgentCanvas(): UseAgentCanvas {
         setPrompts(nextPrompts);
         setPromptConnections(nextPromptConnections);
         setPrFlows(nextPrFlows);
+        setSyncFlows(nextSyncFlows);
         setCommits(nextCommits);
       },
       () => undefined,
@@ -400,6 +418,24 @@ export function useAgentCanvas(): UseAgentCanvas {
     [],
   );
 
+  const syncActions = useMemo<SyncFlowActions>(
+    () => ({
+      create: async (input) => {
+        const flow = await api.createSyncFlow(input);
+        setSyncFlows((current) => upsertSyncFlow(current, flow));
+      },
+      recordApplied: async (id, input) => {
+        const flow = await api.recordSyncFlowApplied(id, input);
+        setSyncFlows((current) => upsertSyncFlow(current, flow));
+      },
+      cancel: async (id) => {
+        const flow = await api.cancelSyncFlow(id);
+        setSyncFlows((current) => upsertSyncFlow(current, flow));
+      },
+    }),
+    [],
+  );
+
   return {
     agents,
     files,
@@ -407,12 +443,14 @@ export function useAgentCanvas(): UseAgentCanvas {
     prompts,
     promptConnections,
     prFlows,
+    syncFlows,
     commits,
     connected,
     actions,
     fileActions,
     promptActions,
     prActions,
+    syncActions,
   };
 }
 
@@ -432,4 +470,13 @@ function upsertCommit(
   return commits.some((candidate) => candidate.id === commit.id)
     ? commits.map((candidate) => (candidate.id === commit.id ? commit : candidate))
     : [commit, ...commits];
+}
+
+function upsertSyncFlow(
+  flows: SyncFlowSnapshot[],
+  flow: SyncFlowSnapshot,
+): SyncFlowSnapshot[] {
+  return flows.some((candidate) => candidate.id === flow.id)
+    ? flows.map((candidate) => (candidate.id === flow.id ? flow : candidate))
+    : [flow, ...flows];
 }
