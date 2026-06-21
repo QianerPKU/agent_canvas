@@ -11,6 +11,8 @@
 import type {
   AgentEvent,
   AgentEventEnvelope,
+  AgentQuestionAction,
+  AgentQuestionRequest,
   AgentProvider,
   AgentSettings,
   AgentSnapshot,
@@ -23,6 +25,12 @@ export type OutputLine =
   | { kind: "thinking"; text: string; messageUuid?: string }
   | { kind: "tool_use"; name: string; input: unknown }
   | { kind: "tool_result"; isError: boolean; content: unknown }
+  | {
+      kind: "question";
+      request: AgentQuestionRequest;
+      status: "pending" | "accepted" | "declined" | "cancelled";
+      summary?: string;
+    }
   | { kind: "system"; text: string }
   | { kind: "result"; text: string }
   | { kind: "error"; text: string };
@@ -237,6 +245,14 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
         userInput: event.text,
         status: turn.status === "idle" ? "running" : turn.status,
       }));
+    case "user_question":
+      return pushLineToLast(view, {
+        kind: "question",
+        request: event.request,
+        status: "pending",
+      });
+    case "user_question_result":
+      return updateQuestionLine(view, event.requestId, event.action, event.summary);
     case "system_init":
       return pushLineToLast(
         { ...view, sessionId: event.sessionId, model: event.model },
@@ -339,6 +355,27 @@ function markLastTurn(view: AgentView, status: TurnStatus): AgentView {
 
 function markLastTurnIfIdle(view: AgentView, status: TurnStatus): AgentView {
   return withLastTurn(view, (t) => (t.status === "idle" ? { ...t, status } : t));
+}
+
+function updateQuestionLine(
+  view: AgentView,
+  requestId: string,
+  action: AgentQuestionAction,
+  summary: string | undefined,
+): AgentView {
+  const status =
+    action === "accept" ? "accepted" : action === "decline" ? "declined" : "cancelled";
+  return {
+    ...view,
+    turns: view.turns.map((turn) => ({
+      ...turn,
+      lines: turn.lines.map((line) =>
+        line.kind === "question" && line.request.requestId === requestId
+          ? { ...line, status, summary }
+          : line,
+      ),
+    })),
+  };
 }
 
 function pushLine(lines: OutputLine[], line: OutputLine): OutputLine[] {

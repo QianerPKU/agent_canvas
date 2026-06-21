@@ -8,11 +8,23 @@ import {
   type Node,
   type NodeProps,
 } from "@xyflow/react";
-import { MessageSquare, Minimize2, Send, Settings, Square, Zap } from "lucide-react";
+import {
+  Check,
+  HelpCircle,
+  MessageSquare,
+  Minimize2,
+  Send,
+  Settings,
+  Square,
+  X,
+  Zap,
+} from "lucide-react";
 import {
   CODEX_MODELS,
   DEFAULT_CODEX_MODEL,
   isCodexModel,
+  type AgentQuestionItem,
+  type AgentQuestionResponse,
   type AgentProvider,
   type AgentStatus,
   type CodexModel,
@@ -93,6 +105,8 @@ function lineStyle(kind: OutputLine["kind"], isError?: boolean): React.CSSProper
       return { color: "#7c3aed", fontFamily: "monospace" };
     case "tool_result":
       return { color: "#374151", fontFamily: "monospace" };
+    case "question":
+      return { color: "#111827" };
     case "system":
       return { color: "#6b7280", fontStyle: "italic" };
     case "result":
@@ -112,6 +126,8 @@ function renderLine(line: OutputLine): string {
       return `🔧 ${line.name}(${short(line.input)})`;
     case "tool_result":
       return `↩ ${short(line.content)}`;
+    case "question":
+      return line.request.title ?? "需要回答";
     case "system":
       return line.text;
     case "result":
@@ -312,14 +328,26 @@ export function TurnNode({
           {turn.lines.length === 0 ? (
             <span style={{ color: "#9ca3af" }}>（运行中…）</span>
           ) : (
-            turn.lines.map((line, i) => (
-              <div
-                key={i}
-                style={lineStyle(line.kind, line.kind === "tool_result" ? line.isError : undefined)}
-              >
-                {renderLine(line)}
-              </div>
-            ))
+            turn.lines.map((line, i) =>
+              line.kind === "question" ? (
+                <QuestionLine
+                  key={i}
+                  agentId={agentId}
+                  line={line}
+                  actions={actions}
+                />
+              ) : (
+                <div
+                  key={i}
+                  style={lineStyle(
+                    line.kind,
+                    line.kind === "tool_result" ? line.isError : undefined,
+                  )}
+                >
+                  {renderLine(line)}
+                </div>
+              ),
+            )
           )}
           {turn.costUsd != null && (
             <div style={{ color: "#9ca3af", marginTop: 4 }}>花费 ${turn.costUsd.toFixed(4)}</div>
@@ -450,6 +478,181 @@ export function TurnNode({
   );
 }
 
+function QuestionLine({
+  agentId,
+  line,
+  actions,
+}: {
+  agentId: string;
+  line: Extract<OutputLine, { kind: "question" }>;
+  actions: AgentActions;
+}): React.ReactElement {
+  const { request } = line;
+  const [answers, setAnswers] = useState<Record<string, string | string[]>>({});
+  const [contentText, setContentText] = useState("");
+  const [error, setError] = useState("");
+  const disabled = line.status !== "pending";
+  const canSubmit =
+    !disabled &&
+    (request.kind === "mcp_elicitation" ||
+      request.questions.every((question) => hasAnswer(answers[question.id])));
+
+  const setAnswer = (id: string, value: string | string[]) => {
+    setError("");
+    setAnswers((current) => ({ ...current, [id]: value }));
+  };
+
+  const submit = () => {
+    const response: AgentQuestionResponse = { action: "accept", answers };
+    if (request.kind === "mcp_elicitation") {
+      const trimmed = contentText.trim();
+      if (trimmed) {
+        try {
+          response.content = JSON.parse(trimmed) as unknown;
+        } catch {
+          setError("JSON 格式错误");
+          return;
+        }
+      } else if (Object.keys(answers).length > 0) {
+        response.content = answers;
+      } else {
+        response.content = null;
+      }
+    }
+    void actions.answerQuestion(agentId, request.requestId, response);
+  };
+
+  const decline = () => {
+    void actions.answerQuestion(agentId, request.requestId, { action: "decline" });
+  };
+
+  return (
+    <div className="nodrag" style={questionPanelStyle}>
+      <div style={questionHeaderStyle}>
+        <HelpCircle size={14} />
+        <span style={{ fontWeight: 700 }}>{request.title ?? "需要回答"}</span>
+        <span style={questionStatusStyle(line.status)}>{questionStatusLabel(line.status)}</span>
+      </div>
+      {request.message && <div style={questionMessageStyle}>{request.message}</div>}
+      {request.url && (
+        <a style={questionLinkStyle} href={request.url} target="_blank" rel="noreferrer">
+          {request.url}
+        </a>
+      )}
+      {request.questions.map((question) => (
+        <QuestionItem
+          key={question.id}
+          question={question}
+          value={answers[question.id]}
+          disabled={disabled}
+          onChange={(value) => setAnswer(question.id, value)}
+        />
+      ))}
+      {request.kind === "mcp_elicitation" && (
+        <textarea
+          value={contentText}
+          disabled={disabled}
+          onChange={(event) => {
+            setError("");
+            setContentText(event.target.value);
+          }}
+          placeholder="JSON 内容"
+          rows={3}
+          style={questionTextareaStyle}
+        />
+      )}
+      {error && <div style={questionErrorStyle}>{error}</div>}
+      {line.summary && <div style={questionMessageStyle}>{line.summary}</div>}
+      {!disabled && (
+        <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+          <button
+            style={iconBtn("#2563eb")}
+            disabled={!canSubmit}
+            onClick={submit}
+            title="提交回答"
+          >
+            <Check size={13} />
+            回答
+          </button>
+          <button style={iconBtn("#64748b")} onClick={decline} title="拒绝回答">
+            <X size={13} />
+            拒绝
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function QuestionItem({
+  question,
+  value,
+  disabled,
+  onChange,
+}: {
+  question: AgentQuestionItem;
+  value: string | string[] | undefined;
+  disabled: boolean;
+  onChange: (value: string | string[]) => void;
+}): React.ReactElement {
+  const options = question.options ?? [];
+  const selected = new Set(Array.isArray(value) ? value : value ? [value] : []);
+  const optionLabels = new Set(options.map((option) => option.label));
+  const customValue =
+    typeof value === "string" && !optionLabels.has(value) ? value : "";
+
+  return (
+    <div style={questionItemStyle}>
+      <div style={questionPromptStyle}>
+        {question.header && <span style={questionChipStyle}>{question.header}</span>}
+        <span>{question.question}</span>
+      </div>
+      {options.length > 0 && (
+        <div style={questionOptionsStyle}>
+          {options.map((option) => {
+            const isSelected = selected.has(option.label);
+            return (
+              <button
+                key={option.label}
+                disabled={disabled}
+                style={questionOptionStyle(isSelected)}
+                onClick={() => {
+                  if (question.multiSelect) {
+                    const next = new Set(selected);
+                    if (isSelected) next.delete(option.label);
+                    else next.add(option.label);
+                    onChange([...next]);
+                  } else {
+                    onChange(option.label);
+                  }
+                }}
+                title={option.description}
+              >
+                <span style={{ fontWeight: 600 }}>{option.label}</span>
+                {option.description && (
+                  <span style={{ color: "#64748b", fontSize: 10 }}>
+                    {option.description}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {(question.isOther || options.length === 0) && !question.multiSelect && (
+        <input
+          type={question.isSecret ? "password" : "text"}
+          disabled={disabled}
+          value={customValue}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={options.length > 0 ? "其他回答" : "回答"}
+          style={questionInputStyle}
+        />
+      )}
+    </div>
+  );
+}
+
 function NodeHandles({ resourceAccess }: { resourceAccess: boolean }): React.ReactElement {
   return (
     <>
@@ -513,6 +716,140 @@ function CodexModelSelect({
 function codexModel(model: string | undefined): CodexModel {
   return isCodexModel(model) ? model : DEFAULT_CODEX_MODEL;
 }
+
+function hasAnswer(value: string | string[] | undefined): boolean {
+  if (Array.isArray(value)) return value.some((item) => item.trim().length > 0);
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function questionStatusLabel(status: Extract<OutputLine, { kind: "question" }>["status"]): string {
+  switch (status) {
+    case "pending":
+      return "待回答";
+    case "accepted":
+      return "已回答";
+    case "declined":
+      return "已拒绝";
+    case "cancelled":
+      return "已取消";
+  }
+}
+
+function questionStatusStyle(
+  status: Extract<OutputLine, { kind: "question" }>["status"],
+): React.CSSProperties {
+  const color =
+    status === "pending"
+      ? "#2563eb"
+      : status === "accepted"
+        ? "#16a34a"
+        : "#64748b";
+  return {
+    marginLeft: "auto",
+    color,
+    border: `1px solid ${color}`,
+    borderRadius: 6,
+    padding: "1px 6px",
+    fontSize: 10,
+    whiteSpace: "nowrap",
+  };
+}
+
+const questionPanelStyle: React.CSSProperties = {
+  border: "1px solid #bfdbfe",
+  borderRadius: 8,
+  padding: 8,
+  margin: "4px 0 6px",
+  background: "#f8fbff",
+  display: "flex",
+  flexDirection: "column",
+  gap: 6,
+};
+
+const questionHeaderStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 6,
+  color: "#1e3a8a",
+};
+
+const questionMessageStyle: React.CSSProperties = {
+  color: "#475569",
+  fontSize: 11,
+};
+
+const questionLinkStyle: React.CSSProperties = {
+  color: "#2563eb",
+  overflowWrap: "anywhere",
+};
+
+const questionItemStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: 5,
+};
+
+const questionPromptStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 6,
+  color: "#111827",
+};
+
+const questionChipStyle: React.CSSProperties = {
+  color: "#1e40af",
+  background: "#dbeafe",
+  borderRadius: 6,
+  padding: "1px 5px",
+  fontSize: 10,
+  maxWidth: 90,
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+};
+
+const questionOptionsStyle: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "repeat(auto-fit, minmax(92px, 1fr))",
+  gap: 5,
+};
+
+function questionOptionStyle(selected: boolean): React.CSSProperties {
+  return {
+    border: selected ? "1px solid #2563eb" : "1px solid #cbd5e1",
+    background: selected ? "#eff6ff" : "#fff",
+    color: "#111827",
+    borderRadius: 6,
+    padding: "5px 6px",
+    minHeight: 30,
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "flex-start",
+    gap: 2,
+    cursor: "pointer",
+    overflow: "hidden",
+  };
+}
+
+const questionInputStyle: React.CSSProperties = {
+  width: "100%",
+  boxSizing: "border-box",
+  fontSize: 12,
+  padding: 6,
+  border: "1px solid #cbd5e1",
+  borderRadius: 6,
+  fontFamily: "inherit",
+};
+
+const questionTextareaStyle: React.CSSProperties = {
+  ...questionInputStyle,
+  resize: "vertical",
+};
+
+const questionErrorStyle: React.CSSProperties = {
+  color: "#dc2626",
+  fontSize: 11,
+};
 
 const textareaStyle: React.CSSProperties = {
   width: "100%",

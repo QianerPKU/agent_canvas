@@ -38,6 +38,18 @@ describe("AgentEvent 联合类型", () => {
       throw new Error("收窄失败");
     }
   });
+
+  it("包含交互问题事件", () => {
+    const ev: AgentEvent = {
+      kind: "user_question",
+      request: {
+        requestId: "q1",
+        kind: "ask_user_question",
+        questions: [{ id: "choice", question: "选哪个？" }],
+      },
+    };
+    expect(ev.request.requestId).toBe("q1");
+  });
 });
 
 describe("Codex models", () => {

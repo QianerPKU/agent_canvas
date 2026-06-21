@@ -1,7 +1,14 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import path from "node:path";
 import readline from "node:readline";
-import type { AgentFileAccess, AgentPromptAccess } from "@agent-canvas/shared";
+import type {
+  AgentFileAccess,
+  AgentPromptAccess,
+  AgentQuestionItem,
+  AgentQuestionOption,
+  AgentQuestionRequest,
+  AgentQuestionResponse,
+} from "@agent-canvas/shared";
 import { AsyncMessageQueue } from "../util/AsyncMessageQueue.js";
 import {
   createCodexAppServerMapState,
@@ -55,7 +62,7 @@ function createHandle(
   let turnId: string | undefined;
 
   const run = async function* (): AsyncGenerator<SdkMessage> {
-    client = new CodexAppServerClient(deps);
+    client = new CodexAppServerClient(deps, options?.requestUserInput);
     await client.start();
 
     const state = createCodexAppServerMapState();
@@ -323,9 +330,111 @@ function inputText(input: SdkUserInput): string {
     .join("\n");
 }
 
+function codexUserInputRequest(id: JsonRpcId, params: unknown): AgentQuestionRequest {
+  const record = asRecord(params);
+  return {
+    requestId: `codex:${String(id)}`,
+    kind: "ask_user_question",
+    title: "Codex 需要确认",
+    questions: arrayValue(record?.questions).map((question, index) =>
+      codexQuestionItem(question, index),
+    ),
+    autoResolutionMs: numberOrNull(record?.autoResolutionMs),
+  };
+}
+
+function codexQuestionItem(question: unknown, index: number): AgentQuestionItem {
+  const record = asRecord(question);
+  const id = stringValue(record?.id) || `question_${index + 1}`;
+  return {
+    id,
+    header: stringValue(record?.header) || undefined,
+    question: stringValue(record?.question) || id,
+    options: arrayValue(record?.options).map(codexQuestionOption),
+    multiSelect: false,
+    isOther: booleanValue(record?.isOther),
+    isSecret: booleanValue(record?.isSecret),
+  };
+}
+
+function codexQuestionOption(option: unknown): AgentQuestionOption {
+  const record = asRecord(option);
+  return {
+    label: stringValue(record?.label),
+    description: stringValue(record?.description) || undefined,
+  };
+}
+
+function codexUserInputResponse(response: AgentQuestionResponse): Record<string, unknown> {
+  if (response.action === "decline" || response.action === "cancel") return { answers: {} };
+  const answers: Record<string, { answers: string[] }> = {};
+  for (const [id, value] of Object.entries(response.answers ?? {})) {
+    answers[id] = {
+      answers: Array.isArray(value) ? value.map(String) : [String(value)],
+    };
+  }
+  return { answers };
+}
+
+function codexMcpElicitationRequest(id: JsonRpcId, params: unknown): AgentQuestionRequest {
+  const record = asRecord(params);
+  const mode = stringValue(record?.mode);
+  const serverName = stringValue(record?.serverName);
+  const message = stringValue(record?.message);
+  const requestedSchema = record?.requestedSchema;
+  return {
+    requestId: `codex:${String(id)}`,
+    kind: "mcp_elicitation",
+    title: serverName ? `MCP: ${serverName}` : "MCP 需要输入",
+    message,
+    questions: questionsFromJsonSchema(requestedSchema),
+    requestedSchema,
+    url: mode === "url" ? stringValue(record?.url) || undefined : undefined,
+  };
+}
+
+function codexMcpElicitationResponse(response: AgentQuestionResponse): Record<string, unknown> {
+  const action = response.action ?? "accept";
+  if (action !== "accept") return { action, content: null, _meta: null };
+  return {
+    action: "accept",
+    content: response.content ?? response.answers ?? (response.response ? { response: response.response } : null),
+    _meta: null,
+  };
+}
+
+function questionsFromJsonSchema(schema: unknown): AgentQuestionItem[] {
+  const root = asRecord(schema);
+  const properties = asRecord(root?.properties);
+  if (!properties) return [];
+  return Object.entries(properties).map(([id, property]) => {
+    const record = asRecord(property);
+    return {
+      id,
+      header: stringValue(record?.title) || id,
+      question: stringValue(record?.description) || stringValue(record?.title) || id,
+      options: enumOptions(record),
+      multiSelect: stringValue(record?.type) === "array",
+      isOther: false,
+      isSecret: stringValue(record?.format) === "password",
+    };
+  });
+}
+
+function enumOptions(record: Record<string, unknown> | undefined): AgentQuestionOption[] {
+  if (!record) return [];
+  const values = arrayValue(record.enum);
+  if (values.length === 0) return [];
+  return values.map((value) => {
+    const label = String(value);
+    return { label, description: label };
+  });
+}
+
 class CodexAppServerClient {
   private readonly command: string;
   private readonly spawnFn: typeof spawn;
+  private readonly requestUserInput?: QueryOptions["requestUserInput"];
   private readonly pending = new Map<JsonRpcId, PendingRequest>();
   private readonly notifications = new AsyncMessageQueue<JsonRpcMessage>();
   private proc?: ChildProcessWithoutNullStreams;
@@ -334,9 +443,13 @@ class CodexAppServerClient {
   private closed = false;
   private stderrTail = "";
 
-  constructor(deps: CodexAppServerQueryDeps) {
+  constructor(
+    deps: CodexAppServerQueryDeps,
+    requestUserInput: QueryOptions["requestUserInput"] | undefined,
+  ) {
     this.command = deps.command ?? "codex";
     this.spawnFn = deps.spawnFn ?? spawn;
+    this.requestUserInput = requestUserInput;
   }
 
   async start(): Promise<void> {
@@ -479,7 +592,7 @@ class CodexAppServerClient {
     }
 
     if (message.method && message.id !== undefined) {
-      this.respondToServerRequest(message);
+      void this.respondToServerRequest(message);
       return;
     }
 
@@ -500,7 +613,7 @@ class CodexAppServerClient {
     }
   }
 
-  private respondToServerRequest(message: JsonRpcMessage): void {
+  private async respondToServerRequest(message: JsonRpcMessage): Promise<void> {
     const id = message.id;
     if (id === undefined) return;
     switch (message.method) {
@@ -512,10 +625,10 @@ class CodexAppServerClient {
         this.write({ id, result: { permissions: {}, scope: "turn" } });
         break;
       case "item/tool/requestUserInput":
-        this.write({ id, result: { answers: {} } });
+        await this.respondToUserInputRequest(id, message.params);
         break;
       case "mcpServer/elicitation/request":
-        this.write({ id, result: { action: "decline", content: null, _meta: null } });
+        await this.respondToMcpElicitationRequest(id, message.params);
         break;
       case "item/tool/call":
         this.write({
@@ -531,6 +644,46 @@ class CodexAppServerClient {
           id,
           error: { code: -32000, message: `Unsupported app-server request: ${message.method}` },
         });
+    }
+  }
+
+  private async respondToUserInputRequest(id: JsonRpcId, params: unknown): Promise<void> {
+    if (!this.requestUserInput) {
+      this.write({ id, result: { answers: {} } });
+      return;
+    }
+    try {
+      const request = codexUserInputRequest(id, params);
+      const response = await this.requestUserInput(request);
+      this.write({ id, result: codexUserInputResponse(response) });
+    } catch (error) {
+      this.write({
+        id,
+        error: {
+          code: -32000,
+          message: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
+  }
+
+  private async respondToMcpElicitationRequest(id: JsonRpcId, params: unknown): Promise<void> {
+    if (!this.requestUserInput) {
+      this.write({ id, result: { action: "decline", content: null, _meta: null } });
+      return;
+    }
+    try {
+      const request = codexMcpElicitationRequest(id, params);
+      const response = await this.requestUserInput(request);
+      this.write({ id, result: codexMcpElicitationResponse(response) });
+    } catch (error) {
+      this.write({
+        id,
+        error: {
+          code: -32000,
+          message: error instanceof Error ? error.message : String(error),
+        },
+      });
     }
   }
 
@@ -590,6 +743,18 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
 }
 
+function arrayValue(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
 function stringValue(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+function booleanValue(value: unknown): boolean {
+  return typeof value === "boolean" ? value : false;
+}
+
+function numberOrNull(value: unknown): number | null {
+  return typeof value === "number" ? value : null;
 }

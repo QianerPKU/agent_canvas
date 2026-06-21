@@ -202,6 +202,65 @@ describe("AgentRunner 生命周期", () => {
     });
   });
 
+  it("provider 发起交互问题时广播到前端，并等待 answerQuestion", async () => {
+    const ctl = makeControllableQuery();
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("question-agent", { query: ctl.query });
+    runner.on((event) => events.push(event));
+
+    runner.start({ prompt: "需要澄清" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+
+    const pending = ctl.getOptions()?.requestUserInput?.({
+      requestId: "q-1",
+      kind: "ask_user_question",
+      title: "Claude 需要确认",
+      questions: [
+        {
+          id: "choice",
+          question: "选哪个？",
+          options: [
+            { label: "A", description: "方案 A" },
+            { label: "B", description: "方案 B" },
+          ],
+        },
+      ],
+    });
+    await flush();
+
+    expect(events).toContainEqual({
+      kind: "user_question",
+      request: {
+        requestId: "q-1",
+        kind: "ask_user_question",
+        title: "Claude 需要确认",
+        questions: [
+          {
+            id: "choice",
+            question: "选哪个？",
+            options: [
+              { label: "A", description: "方案 A" },
+              { label: "B", description: "方案 B" },
+            ],
+          },
+        ],
+      },
+    });
+
+    runner.answerQuestion("q-1", { answers: { choice: "A" } });
+    await expect(pending).resolves.toEqual({
+      action: "accept",
+      answers: { choice: "A" },
+    });
+    expect(events).toContainEqual({
+      kind: "user_question_result",
+      requestId: "q-1",
+      action: "accept",
+      summary: "已回答 1 个问题",
+    });
+  });
+
   it("stop → stopped，调用 interrupt，且之后不可再 send", async () => {
     const ctl = makeControllableQuery();
     const runner = new AgentRunner("a2", { query: ctl.query });

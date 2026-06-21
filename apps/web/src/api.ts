@@ -1,6 +1,7 @@
 /** 后端 REST 命令客户端。事件走 WebSocket，命令走这里。 */
 import type {
   AgentEventEnvelope,
+  AgentQuestionResponse,
   AgentSettings,
   AgentSnapshot,
   AgentStartConfig,
@@ -116,6 +117,11 @@ export const api = {
     call(`/agents/${id}/send`, { method: "POST", body: JSON.stringify({ text }) }),
   steer: (id: string, text: string) =>
     call(`/agents/${id}/steer`, { method: "POST", body: JSON.stringify({ text }) }),
+  answerQuestion: (id: string, requestId: string, response: AgentQuestionResponse) =>
+    call(`/agents/${id}/questions/${encodeURIComponent(requestId)}`, {
+      method: "POST",
+      body: JSON.stringify(response),
+    }),
   compact: (id: string) => call(`/agents/${id}/compact`, { method: "POST" }),
   stop: (id: string) => call(`/agents/${id}/stop`, { method: "POST" }),
   terminate: (id: string) => call(`/agents/${id}/terminate`, { method: "POST" }),

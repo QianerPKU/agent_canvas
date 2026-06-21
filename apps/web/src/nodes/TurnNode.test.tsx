@@ -20,6 +20,7 @@ function makeActions(): AgentActions {
     updateSettings: vi.fn().mockResolvedValue(undefined),
     submit: vi.fn().mockResolvedValue(undefined),
     steer: vi.fn().mockResolvedValue(undefined),
+    answerQuestion: vi.fn().mockResolvedValue(undefined),
     stop: vi.fn().mockResolvedValue(undefined),
     compact: vi.fn().mockResolvedValue(undefined),
     terminate: vi.fn().mockResolvedValue(undefined),
@@ -231,6 +232,47 @@ describe("TurnNode", () => {
 
     fireEvent.click(screen.getByText("停止"));
     expect(actions.stop).toHaveBeenCalledWith("agent_1");
+  });
+
+  it("运行中问题面板可提交回答", () => {
+    const actions = makeActions();
+    renderTurn(
+      {
+        index: 0,
+        status: "running",
+        lines: [
+          {
+            kind: "question",
+            status: "pending",
+            request: {
+              requestId: "claude:tool-1",
+              kind: "ask_user_question",
+              title: "Claude 需要确认",
+              questions: [
+                {
+                  id: "question_1",
+                  header: "框架",
+                  question: "选择哪个框架？",
+                  options: [
+                    { label: "React", description: "使用 React" },
+                    { label: "Vue", description: "使用 Vue" },
+                  ],
+                },
+              ],
+            },
+          },
+        ],
+      },
+      "running",
+      actions,
+    );
+
+    fireEvent.click(screen.getByText("React"));
+    fireEvent.click(screen.getByText("回答"));
+    expect(actions.answerQuestion).toHaveBeenCalledWith("agent_1", "claude:tool-1", {
+      action: "accept",
+      answers: { question_1: "React" },
+    });
   });
 
   it("完成轮（有 anchorUuid）：fork 按钮 + 展示用户输入", () => {

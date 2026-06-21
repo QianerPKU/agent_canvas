@@ -75,6 +75,42 @@ export interface UsageInfo {
 
 export type CompactTrigger = "manual" | "auto";
 export type UserInputMode = "queued" | "steer";
+export type AgentQuestionKind = "ask_user_question" | "mcp_elicitation";
+export type AgentQuestionAction = "accept" | "decline" | "cancel";
+
+export interface AgentQuestionOption {
+  label: string;
+  description?: string;
+  preview?: string;
+}
+
+export interface AgentQuestionItem {
+  id: string;
+  header?: string;
+  question: string;
+  options?: AgentQuestionOption[];
+  multiSelect?: boolean;
+  isOther?: boolean;
+  isSecret?: boolean;
+}
+
+export interface AgentQuestionRequest {
+  requestId: string;
+  kind: AgentQuestionKind;
+  title?: string;
+  message?: string;
+  questions: AgentQuestionItem[];
+  autoResolutionMs?: number | null;
+  requestedSchema?: unknown;
+  url?: string;
+}
+
+export interface AgentQuestionResponse {
+  action?: AgentQuestionAction;
+  answers?: Record<string, string | string[]>;
+  response?: string;
+  content?: unknown;
+}
 
 /**
  * 归一化后的 agent 事件（后端 → 前端，单向流）。
@@ -83,6 +119,13 @@ export type UserInputMode = "queued" | "steer";
 export type AgentEvent =
   | { kind: "status"; status: AgentStatus }
   | { kind: "user_input"; text: string; mode?: UserInputMode }
+  | { kind: "user_question"; request: AgentQuestionRequest }
+  | {
+      kind: "user_question_result";
+      requestId: string;
+      action: AgentQuestionAction;
+      summary?: string;
+    }
   | {
       kind: "compact";
       trigger: CompactTrigger;

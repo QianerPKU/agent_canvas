@@ -126,6 +126,24 @@ function HistoryEvent({ item }: { item: HistoryItem }): React.ReactElement {
       return <EventBlock tone="thinking" label="思考" time={time} content={event.text} />;
     case "assistant_text":
       return <EventBlock tone="assistant" label="答复" time={time} content={event.text} />;
+    case "user_question":
+      return (
+        <EventBlock
+          tone="system"
+          label={event.request.title ?? "交互问题"}
+          time={time}
+          content={questionText(event.request)}
+        />
+      );
+    case "user_question_result":
+      return (
+        <EventBlock
+          tone="system"
+          label="交互问题结果"
+          time={time}
+          content={event.summary ?? event.action}
+        />
+      );
     case "tool_use":
       return (
         <EventBlock
@@ -227,4 +245,15 @@ function resultText(event: Extract<AgentEvent, { kind: "result" }>): string {
     );
   }
   return details.join(" · ");
+}
+
+function questionText(request: Extract<AgentEvent, { kind: "user_question" }>["request"]): string {
+  const lines = [
+    request.message,
+    ...request.questions.map((question) => {
+      const options = question.options?.map((option) => option.label).join(" / ");
+      return options ? `${question.question}\n选项：${options}` : question.question;
+    }),
+  ].filter((line): line is string => !!line);
+  return lines.length > 0 ? lines.join("\n") : request.requestId;
 }

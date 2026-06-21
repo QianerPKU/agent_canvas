@@ -1,18 +1,24 @@
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
+import type { CanUseTool, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 import type {
   AgentFileAccess,
   AgentFileReference,
+  AgentQuestionItem,
+  AgentQuestionOption,
+  AgentQuestionResponse,
   AgentPromptAccess,
 } from "@agent-canvas/shared";
-import type { QueryFn, QueryPrompt, SdkUserInput } from "./types.js";
+import type { QueryFn, QueryOptions, QueryPrompt, SdkUserInput } from "./types.js";
 
 /**
  * 把真实 SDK 的 `query` 适配成本地 `QueryFn`。
  * 仅在服务运行时引入；单测改用注入的假实现，故不会触达真实模型/鉴权。
  */
 export const realQuery: QueryFn = (args) => {
-  const { fileAccess, promptAccess, ...options } = args.options ?? {};
+  const { fileAccess, promptAccess, requestUserInput, ...options } = args.options ?? {};
   const additionalDirectories = accessibleDirectories(fileAccess, promptAccess);
+  const existingCanUseTool =
+    typeof options.canUseTool === "function" ? (options.canUseTool as CanUseTool) : undefined;
   let handle: ReturnType<typeof sdkQuery> | undefined;
   const prompt = withContext(args.prompt, async (directories) => {
     if (!handle) return;
@@ -24,6 +30,10 @@ export const realQuery: QueryFn = (args) => {
     prompt,
     options: {
       ...options,
+      allowedTools: includeAskUserQuestion(options.allowedTools, !!requestUserInput),
+      canUseTool: requestUserInput
+        ? createCanUseTool(requestUserInput, existingCanUseTool)
+        : existingCanUseTool,
       additionalDirectories:
         additionalDirectories && additionalDirectories.length > 0
           ? additionalDirectories
@@ -32,6 +42,97 @@ export const realQuery: QueryFn = (args) => {
   } as unknown as Parameters<typeof sdkQuery>[0]);
   return adaptQuery(handle);
 };
+
+function createCanUseTool(
+  requestUserInput: NonNullable<QueryOptions["requestUserInput"]>,
+  fallback: CanUseTool | undefined,
+): CanUseTool {
+  return async (toolName, input, options): Promise<PermissionResult> => {
+    if (toolName !== "AskUserQuestion") {
+      if (fallback) return fallback(toolName, input, options);
+      return {
+        behavior: "deny",
+        message: "Agent Canvas 当前只接入 AskUserQuestion 交互提问。",
+        toolUseID: options.toolUseID,
+      };
+    }
+
+    const questions = claudeQuestions(input);
+    const response = await requestUserInput({
+      requestId: `claude:${options.toolUseID}`,
+      kind: "ask_user_question",
+      title: options.title ?? options.displayName ?? "Claude 需要确认",
+      message: options.description,
+      questions,
+    });
+
+    if (response.action === "decline" || response.action === "cancel") {
+      return {
+        behavior: "deny",
+        message: "用户未提供回答。",
+        toolUseID: options.toolUseID,
+      };
+    }
+
+    return {
+      behavior: "allow",
+      toolUseID: options.toolUseID,
+      updatedInput: {
+        ...input,
+        answers: claudeAnswerMap(questions, response),
+      },
+    };
+  };
+}
+
+function claudeQuestions(input: Record<string, unknown>): AgentQuestionItem[] {
+  const questions = Array.isArray(input.questions) ? input.questions : [];
+  return questions.map((question, index) => {
+    const record = asRecord(question);
+    const text = stringValue(record?.question) || `question_${index + 1}`;
+    return {
+      id: `question_${index + 1}`,
+      header: stringValue(record?.header) || undefined,
+      question: text,
+      options: arrayValue(record?.options).map(questionOption),
+      multiSelect: booleanValue(record?.multiSelect),
+      isOther: true,
+      isSecret: false,
+    };
+  });
+}
+
+function questionOption(option: unknown): AgentQuestionOption {
+  const record = asRecord(option);
+  return {
+    label: stringValue(record?.label),
+    description: stringValue(record?.description) || undefined,
+    preview: stringValue(record?.preview) || undefined,
+  };
+}
+
+function claudeAnswerMap(
+  questions: AgentQuestionItem[],
+  response: AgentQuestionResponse,
+): Record<string, string | string[]> {
+  const source = response.answers ?? {};
+  const answers: Record<string, string | string[]> = {};
+  for (const question of questions) {
+    const value = source[question.id] ?? source[question.question];
+    if (value !== undefined) answers[question.question] = value;
+  }
+  return answers;
+}
+
+function includeAskUserQuestion(
+  allowedTools: string[] | undefined,
+  enabled: boolean,
+): string[] | undefined {
+  if (!enabled || !allowedTools) return allowedTools;
+  return allowedTools.includes("AskUserQuestion")
+    ? allowedTools
+    : [...allowedTools, "AskUserQuestion"];
+}
 
 async function* withContext(
   prompt: QueryPrompt,
@@ -132,6 +233,22 @@ function accessibleDirectories(
       ...(promptAccess?.writableDirectories ?? []),
     ]),
   ];
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
+}
+
+function arrayValue(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function booleanValue(value: unknown): boolean {
+  return typeof value === "boolean" ? value : false;
 }
 
 function adaptQuery(handle: ReturnType<typeof sdkQuery>): ReturnType<QueryFn> {

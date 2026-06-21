@@ -1,6 +1,9 @@
 import type {
   AgentFileAccess,
   AgentEvent,
+  AgentQuestionAction,
+  AgentQuestionRequest,
+  AgentQuestionResponse,
   AgentPromptAccess,
   AgentPromptReference,
   AgentProvider,
@@ -40,6 +43,11 @@ export interface StartExtra {
   resumeSessionId?: string;
 }
 
+interface PendingQuestion {
+  resolve: (response: AgentQuestionResponse) => void;
+  cleanup?: () => void;
+}
+
 /**
  * 单个 agent 的生命周期管理：封装 Agent SDK 的一次 query，
  * 驱动流式输入（用于中途干预），把 SDK 消息归一为统一事件向外广播，
@@ -70,6 +78,8 @@ export class AgentRunner {
   private policyPromptInjectionPending = false;
   private pendingInjectedPrompts: AgentPromptReference[] = [];
   private pendingQueuedInputs: string[] = [];
+  private readonly pendingQuestions = new Map<string, PendingQuestion>();
+  private questionCounter = 0;
   private suppressAbortStatus = false;
   private suppressNaturalEndStatus = false;
   private readonly createdAt: number;
@@ -157,6 +167,7 @@ export class AgentRunner {
     this.promptInjectionPending = !config.resume && !extra.resumeSessionId;
     this.policyPromptInjectionPending = true;
     this.pendingQueuedInputs = [];
+    this.cancelPendingQuestions("cancel");
 
     this.abortController = new AbortController();
     this.inputQueue = new AsyncMessageQueue<SdkUserInput>();
@@ -180,6 +191,7 @@ export class AgentRunner {
       abortController: this.abortController,
       fileAccess,
       promptAccess,
+      requestUserInput: (request) => this.requestUserInput(request),
     };
 
     this.handle = this.queries[provider]({ prompt: this.inputQueue, options });
@@ -259,6 +271,7 @@ export class AgentRunner {
     this.compactPending = false;
     this.policyPromptInjectionPending = false;
     this.pendingQueuedInputs = [];
+    this.cancelPendingQuestions("cancel");
     this.abortController?.abort();
     try {
       await this.handle?.interrupt?.();
@@ -275,6 +288,7 @@ export class AgentRunner {
     this.compactPending = false;
     this.policyPromptInjectionPending = false;
     this.pendingQueuedInputs = [];
+    this.cancelPendingQuestions("cancel");
     this.setStatus("terminated");
     this.abortController?.abort();
     try {
@@ -286,6 +300,21 @@ export class AgentRunner {
     } catch {
       // 终止尽力而为；状态仍保持 terminated
     }
+  }
+
+  answerQuestion(requestId: string, response: AgentQuestionResponse): void {
+    const pending = this.pendingQuestions.get(requestId);
+    if (!pending) throw new Error(`未知或已处理的问题: ${requestId}`);
+    this.pendingQuestions.delete(requestId);
+    pending.cleanup?.();
+    const normalized = normalizeQuestionResponse(response);
+    pending.resolve(normalized);
+    this.emit({
+      kind: "user_question_result",
+      requestId,
+      action: normalized.action ?? "accept",
+      summary: summarizeQuestionResponse(normalized),
+    });
   }
 
   // ---- 内部 ----
@@ -302,6 +331,7 @@ export class AgentRunner {
         this.suppressNaturalEndStatus = false;
         return;
       }
+      this.cancelPendingQuestions("cancel");
       if (!isTerminalStatus(this.status)) {
         this.setStatus("done");
       }
@@ -315,9 +345,43 @@ export class AgentRunner {
         if (!isTerminalStatus(this.status)) this.setStatus("stopped");
         return;
       }
+      this.cancelPendingQuestions("cancel");
       this.emit({ kind: "error", message: errorMessage(err) });
       this.setStatus("error");
     }
+  }
+
+  private requestUserInput(request: AgentQuestionRequest): Promise<AgentQuestionResponse> {
+    const requestId = request.requestId || `${this.id}:question-${++this.questionCounter}`;
+    const normalized: AgentQuestionRequest = { ...request, requestId };
+    if (this.abortController?.signal.aborted || isTerminalStatus(this.status)) {
+      return Promise.resolve({ action: "cancel" });
+    }
+    this.emit({ kind: "user_question", request: normalized });
+    return new Promise((resolve) => {
+      const onAbort = () => {
+        const pending = this.pendingQuestions.get(requestId);
+        if (!pending) return;
+        this.pendingQuestions.delete(requestId);
+        pending.cleanup?.();
+        resolve({ action: "cancel" });
+        this.emit({ kind: "user_question_result", requestId, action: "cancel" });
+      };
+      this.abortController?.signal.addEventListener("abort", onAbort, { once: true });
+      this.pendingQuestions.set(requestId, {
+        resolve,
+        cleanup: () => this.abortController?.signal.removeEventListener("abort", onAbort),
+      });
+    });
+  }
+
+  private cancelPendingQuestions(action: AgentQuestionAction): void {
+    for (const [requestId, pending] of this.pendingQuestions) {
+      pending.cleanup?.();
+      pending.resolve({ action });
+      this.emit({ kind: "user_question_result", requestId, action });
+    }
+    this.pendingQuestions.clear();
   }
 
   private applyEvent(event: AgentEvent): void {
@@ -471,6 +535,7 @@ export class AgentRunner {
     this.inputQueue = undefined;
     this.compactPending = false;
     this.pendingQueuedInputs = [];
+    this.cancelPendingQuestions("cancel");
     this.suppressAbortStatus = true;
     this.suppressNaturalEndStatus = true;
     this.abortController?.abort();
@@ -522,4 +587,20 @@ function toUserInput(
 function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   return String(err);
+}
+
+function normalizeQuestionResponse(response: AgentQuestionResponse): AgentQuestionResponse {
+  return {
+    ...response,
+    action: response.action ?? "accept",
+  };
+}
+
+function summarizeQuestionResponse(response: AgentQuestionResponse): string | undefined {
+  if (response.action && response.action !== "accept") return undefined;
+  const answerCount = Object.keys(response.answers ?? {}).length;
+  if (answerCount > 0) return `已回答 ${answerCount} 个问题`;
+  if (response.response?.trim()) return "已回答";
+  if (response.content !== undefined) return "已提交内容";
+  return undefined;
 }

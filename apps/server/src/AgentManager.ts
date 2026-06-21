@@ -3,6 +3,7 @@ import type {
   AgentEvent,
   AgentEventEnvelope,
   AgentPromptReference,
+  AgentQuestionResponse,
   AgentSettings,
   AgentSnapshot,
   AgentStartConfig,
@@ -183,6 +184,12 @@ export class AgentManager {
     const merged = mergeDefined(draftCfg, forkCfg, config);
     if (!merged?.prompt) throw new Error("缺少 prompt");
     runner.start(merged as AgentStartConfig);
+  }
+
+  answerQuestion(id: string, requestId: string, response: AgentQuestionResponse): void {
+    const runner = this.runners.get(id);
+    if (!runner) throw new Error(`未知 agent: ${id}`);
+    runner.answerQuestion(requestId, response);
   }
 
   list(): AgentSnapshot[] {

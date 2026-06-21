@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AsyncMessageQueue } from "../util/AsyncMessageQueue.js";
 import type { SdkUserInput } from "./types.js";
 
@@ -21,6 +21,11 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({ query: sdk.query }));
 import { realQuery } from "./realQuery.js";
 
 describe("realQuery file access", () => {
+  beforeEach(() => {
+    sdk.query.mockClear();
+    sdk.applyFlagSettings.mockClear();
+  });
+
   it("给 Claude 每轮输入追加当时的 @ 文件引用，并动态更新额外写目录", async () => {
     const prompt = new AsyncMessageQueue<SdkUserInput>();
     prompt.push({
@@ -100,6 +105,98 @@ describe("realQuery file access", () => {
     });
     expect(sdk.applyFlagSettings).toHaveBeenNthCalledWith(2, {
       permissions: { additionalDirectories: [] },
+    });
+  });
+
+  it("把 Claude AskUserQuestion 转发到前端问题处理器", async () => {
+    const requestUserInput = vi.fn().mockResolvedValue({
+      answers: { question_1: "React" },
+    });
+
+    realQuery({
+      prompt: "x",
+      options: {
+        allowedTools: ["Read"],
+        requestUserInput,
+      },
+    });
+    const sdkArgs = sdk.query.mock.calls.at(-1)?.[0] as {
+      options: {
+        allowedTools?: string[];
+        canUseTool?: (
+          toolName: string,
+          input: Record<string, unknown>,
+          options: {
+            signal: AbortSignal;
+            toolUseID: string;
+            title?: string;
+            displayName?: string;
+            description?: string;
+          },
+        ) => Promise<unknown>;
+      };
+    };
+
+    expect(sdkArgs.options.allowedTools).toEqual(["Read", "AskUserQuestion"]);
+    const result = await sdkArgs.options.canUseTool?.(
+      "AskUserQuestion",
+      {
+        questions: [
+          {
+            question: "选择哪个框架？",
+            header: "框架",
+            options: [
+              { label: "React", description: "使用 React" },
+              { label: "Vue", description: "使用 Vue" },
+            ],
+            multiSelect: false,
+          },
+        ],
+      },
+      {
+        signal: new AbortController().signal,
+        toolUseID: "tool-1",
+        title: "Claude 需要确认",
+      },
+    );
+
+    expect(requestUserInput).toHaveBeenCalledWith({
+      requestId: "claude:tool-1",
+      kind: "ask_user_question",
+      title: "Claude 需要确认",
+      message: undefined,
+      questions: [
+        {
+          id: "question_1",
+          header: "框架",
+          question: "选择哪个框架？",
+          options: [
+            { label: "React", description: "使用 React", preview: undefined },
+            { label: "Vue", description: "使用 Vue", preview: undefined },
+          ],
+          multiSelect: false,
+          isOther: true,
+          isSecret: false,
+        },
+      ],
+    });
+    expect(result).toEqual({
+      behavior: "allow",
+      toolUseID: "tool-1",
+      updatedInput: {
+        questions: [
+          {
+            question: "选择哪个框架？",
+            header: "框架",
+            options: [
+              { label: "React", description: "使用 React" },
+              { label: "Vue", description: "使用 Vue" },
+            ],
+            multiSelect: false,
+          },
+        ],
+        answers: { "选择哪个框架？": "React" },
+      },
     });
   });
 });

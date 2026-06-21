@@ -146,6 +146,62 @@ describe("agentStore 轮次模型", () => {
     });
   });
 
+  it("交互问题作为当前轮输出行，回答后更新状态", () => {
+    seq = 0;
+    let map: AgentMap = { a1: newAgentView("a1") };
+    map = recordInput(map, "a1", "需要先问我");
+    map = applyEnvelope(
+      map,
+      env("a1", {
+        kind: "user_question",
+        request: {
+          requestId: "codex:7",
+          kind: "ask_user_question",
+          title: "Codex 需要确认",
+          questions: [
+            {
+              id: "choice",
+              question: "怎么处理？",
+              options: [{ label: "继续", description: "继续执行" }],
+            },
+          ],
+        },
+      }),
+    );
+
+    expect(get(map).turns[0]!.lines).toContainEqual({
+      kind: "question",
+      status: "pending",
+      request: {
+        requestId: "codex:7",
+        kind: "ask_user_question",
+        title: "Codex 需要确认",
+        questions: [
+          {
+            id: "choice",
+            question: "怎么处理？",
+            options: [{ label: "继续", description: "继续执行" }],
+          },
+        ],
+      },
+    });
+
+    map = applyEnvelope(
+      map,
+      env("a1", {
+        kind: "user_question_result",
+        requestId: "codex:7",
+        action: "accept",
+        summary: "已回答 1 个问题",
+      }),
+    );
+    expect(get(map).turns[0]!.lines.at(-1)).toMatchObject({
+      kind: "question",
+      status: "accepted",
+      summary: "已回答 1 个问题",
+    });
+  });
+
   it("同一 assistant 消息的流式片段合并为一行", () => {
     seq = 0;
     let map: AgentMap = { a1: newAgentView("a1") };

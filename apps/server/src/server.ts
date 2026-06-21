@@ -2,6 +2,7 @@ import http from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import type {
   AgentFileAccess,
+  AgentQuestionResponse,
   AgentPromptReference,
   AgentSettings,
   AgentStartConfig,
@@ -519,6 +520,20 @@ async function handleHttp(
     res.writeHead(204);
     res.end();
     return;
+  }
+
+  const questionMatch = path.match(/^\/api\/agents\/([^/]+)\/questions\/([^/]+)$/);
+  if (questionMatch) {
+    const id = decodeURIComponent(questionMatch[1]!);
+    const requestId = decodeURIComponent(questionMatch[2]!);
+    if (method !== "POST") return sendJson(res, 405, { error: "method not allowed" });
+    const body = await readJson<AgentQuestionResponse>(req);
+    try {
+      manager.answerQuestion(id, requestId, body ?? {});
+      return sendJson(res, 202, { ok: true });
+    } catch (error) {
+      return sendJson(res, 409, { error: errMsg(error) });
+    }
   }
 
   // /api/agents/:id(/action)

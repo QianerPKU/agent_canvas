@@ -24,6 +24,7 @@ function makeFakeSpawn(options: { completeTurnStart?: boolean } = {}) {
   const completeTurnStart = options.completeTurnStart ?? true;
   const requests: string[] = [];
   const messages: Array<{ id?: number; method?: string; params?: Record<string, unknown> }> = [];
+  const responses: Array<{ id?: number; result?: unknown; error?: unknown }> = [];
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   const stderr = new PassThrough();
@@ -51,8 +52,13 @@ function makeFakeSpawn(options: { completeTurnStart?: boolean } = {}) {
       id?: number;
       method?: string;
       params?: Record<string, unknown>;
+      result?: unknown;
+      error?: unknown;
     };
-    if (!message.method) return;
+    if (!message.method) {
+      responses.push(message);
+      return;
+    }
     messages.push(message);
     requests.push(message.method);
     if (message.id === undefined) return;
@@ -114,6 +120,7 @@ function makeFakeSpawn(options: { completeTurnStart?: boolean } = {}) {
     spawnFn: vi.fn(() => proc) as never,
     requests,
     messages,
+    responses,
     proc,
   };
 }
@@ -302,6 +309,77 @@ describe("Codex app-server query", () => {
           text_elements: [],
         },
       ],
+    });
+
+    await handle.terminate?.();
+  });
+
+  it("将 Codex requestUserInput 转发给前端处理器并回写 answers", async () => {
+    const fake = makeFakeSpawn({ completeTurnStart: false });
+    const prompt = new AsyncMessageQueue<SdkUserInput>();
+    prompt.push(userInput("需要询问用户"));
+    const requestUserInput = vi.fn().mockResolvedValue({
+      answers: { flavor: "vanilla" },
+    });
+
+    const handle = createCodexAppServerQuery({ spawnFn: fake.spawnFn })({
+      prompt,
+      options: { requestUserInput },
+    });
+    const iterator = handle[Symbol.asyncIterator]();
+    await iterator.next();
+    const pendingTurn = iterator.next();
+    void pendingTurn.catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    fake.proc.stdout.write(
+      `${JSON.stringify({
+        id: 99,
+        method: "item/tool/requestUserInput",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          itemId: "item-question",
+          questions: [
+            {
+              id: "flavor",
+              header: "口味",
+              question: "选择口味？",
+              options: [{ label: "vanilla", description: "香草" }],
+              isOther: false,
+              isSecret: false,
+            },
+          ],
+          autoResolutionMs: 60000,
+        },
+      })}\n`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(requestUserInput).toHaveBeenCalledWith({
+      requestId: "codex:99",
+      kind: "ask_user_question",
+      title: "Codex 需要确认",
+      questions: [
+        {
+          id: "flavor",
+          header: "口味",
+          question: "选择口味？",
+          options: [{ label: "vanilla", description: "香草" }],
+          multiSelect: false,
+          isOther: false,
+          isSecret: false,
+        },
+      ],
+      autoResolutionMs: 60000,
+    });
+    expect(fake.responses).toContainEqual({
+      id: 99,
+      result: {
+        answers: {
+          flavor: { answers: ["vanilla"] },
+        },
+      },
     });
 
     await handle.terminate?.();

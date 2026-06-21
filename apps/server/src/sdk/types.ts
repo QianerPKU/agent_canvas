@@ -117,6 +117,10 @@ export type SdkMessage =
 
 // ---- query 的输入与函数签名（供依赖注入）----
 
+export type SdkRequestUserInput = (
+  request: import("@agent-canvas/shared").AgentQuestionRequest,
+) => Promise<import("@agent-canvas/shared").AgentQuestionResponse>;
+
 /** 流式输入模式下推给 SDK 的用户消息（对齐 SDKUserMessage 必填字段）。 */
 export interface SdkUserInput {
   type: "user";
@@ -142,6 +146,7 @@ export interface QueryOptions {
   abortController?: AbortController;
   fileAccess?: import("@agent-canvas/shared").AgentFileAccess;
   promptAccess?: import("@agent-canvas/shared").AgentPromptAccess;
+  requestUserInput?: SdkRequestUserInput;
   [k: string]: unknown;
 }
 

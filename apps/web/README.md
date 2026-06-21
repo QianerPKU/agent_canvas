@@ -15,9 +15,9 @@
 | 文件 | 职责 |
 | --- | --- |
 | `src/agentStore.ts` | **纯函数**：把事件流折叠成对话树（`AgentView.turns: Turn[]`）。result 收尾本轮并延伸新 idle 轮；记录每轮 `anchorUuid`（fork 锚点）、provider 与 model；合并同一消息的流式文本片段。无 React 依赖，单测主对象。 |
-| `src/api.ts` | REST 命令客户端（create/start/send/steer/stop/compact/terminate/fork/resume） |
-| `src/useAgentCanvas.ts` | React hook：订阅 `/ws`、折叠出 `agents` 表、暴露动作（create/submit/steer/stop/compact/terminate/fork）、断线自动重连 |
-| `src/nodes/TurnNode.tsx` | 自定义节点（一轮）：状态徽标 + provider/model 选择 + 输出滚动区；支持边缘缩放、最小化/恢复，最新节点提供运行中排队/引导、Compact/Terminate |
+| `src/api.ts` | REST 命令客户端（create/start/send/steer/answerQuestion/stop/compact/terminate/fork/resume） |
+| `src/useAgentCanvas.ts` | React hook：订阅 `/ws`、折叠出 `agents` 表、暴露动作（create/submit/steer/answerQuestion/stop/compact/terminate/fork）、断线自动重连 |
+| `src/nodes/TurnNode.tsx` | 自定义节点（一轮）：状态徽标 + provider/model 选择 + 输出滚动区；支持边缘缩放、最小化/恢复，最新节点提供运行中排队/引导、CLI/SDK 提问回答面板、Compact/Terminate |
 | `src/history/` | 点击节点后打开的累计历史窗口；按目标轮截断并展示用户输入、provider 思考、答复、完整工具调用/结果与状态 |
 | `src/pullRequests/` | PR 流程面板：发起审查、展示流程状态，并兜底登记 PR 已创建/已合并 |
 | `src/App.tsx` | 画布装配：对话树布局（每 agent 一列、轮次向下、fork 另起列对齐锚点轮）+ 轮链边 + fork 边 |
@@ -37,6 +37,7 @@
 - 新建 / fork 后后端不发事件，前端**乐观插入**节点（fork 带 `forkOrigin` 以画连线）。
 - Codex 的 `agentMessage` 流式 delta 按消息 UUID 合并到同一输出段落，避免每个小片段被渲染成独立短行。
 - 每个 agent 的最新运行节点显示输入框：`排队` 会把提示词排到当前轮 result 后执行，`引导` 会尽快追加到当前运行轮，`停止` 保留中止能力。
+- Codex app-server 或 Claude SDK 在运行中主动提问时，当前运行轮会出现问题面板；选项题可直接点选，多选题可多选，MCP elicitation 可提交 JSON content 或拒绝。回答后面板保留在日志中并标记状态，不新开轮次。
 - 每个 agent 的最新节点显示 `Compact` 和 `Terminate`。Compact 仅在等待输入时启用，完成后当前 idle 节点定格为 `/compact` 完成轮并延伸新 idle 节点；自动 compact 完成事件在当前运行轮中显示为系统记录，不延伸新 idle 轮；Terminate 关闭底层 CLI 并进入 `terminated`。
 - 点击任意非最小化节点主体会打开独立历史窗口，内容累计到该轮为止；历史来自后端 `/history`，包括 provider 实际发出的 thinking/reasoning 与完整工具参数/结果。
 - 对话节点、文件节点和提示词节点四边/四角可拖拽缩放，也都支持最小化/恢复。最小化按钮会保存当前宽高并把节点缩成 `68×48` 的小节点；小节点本身仍是拖动句柄，单击恢复。节点 id 与 Handle 始终不变，因此轮次线、fork 线和资源线保持连接。
@@ -61,10 +62,10 @@ npm run dev --workspace apps/web        # 终端 2：前端 :5317
 npm test --workspace apps/web
 ```
 
-- `agentStore.test.ts`：事件折叠、不可变更新、旧 seq 去重、行数封顶（node 环境）
+- `agentStore.test.ts`：事件折叠、交互问题行状态、不可变更新、旧 seq 去重、行数封顶（node 环境）
 - `useAgentCanvas.test.tsx`：StrictMode 下只建立一次 WebSocket
 - `history/*.test.ts(x)`：按轮截断、流式片段合并与完整历史窗口渲染
-- `nodes/TurnNode.test.tsx`：各状态徽标、模型选择、运行中排队/引导/停止、Compact/Terminate、历史点击、尺寸保存/恢复与 fork 控件交互
+- `nodes/TurnNode.test.tsx`：各状态徽标、模型选择、运行中排队/引导/停止、交互问题回答、Compact/Terminate、历史点击、尺寸保存/恢复与 fork 控件交互
 
 ## 文件节点
 

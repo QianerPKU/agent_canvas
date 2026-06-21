@@ -6,6 +6,7 @@
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import type {
+  AgentQuestionResponse,
   AgentSettings,
   CanvasFileConnection,
   CanvasFileNode,
@@ -50,6 +51,12 @@ export interface AgentActions {
   submit: (agentId: string, text: string) => Promise<void>;
   /** 尽快引导当前正在运行的一轮。 */
   steer: (agentId: string, text: string) => Promise<void>;
+  /** 回答底层 agent 发出的交互问题。 */
+  answerQuestion: (
+    agentId: string,
+    requestId: string,
+    response: AgentQuestionResponse,
+  ) => Promise<void>;
   /** 中止 agent。 */
   stop: (agentId: string) => Promise<void>;
   /** 手动压缩上下文，并把 compact 记为独立一轮。 */
@@ -265,6 +272,8 @@ export function useAgentCanvas(): UseAgentCanvas {
         }
       },
       steer: (agentId, text) => api.steer(agentId, text).then(() => undefined),
+      answerQuestion: (agentId, requestId, response) =>
+        api.answerQuestion(agentId, requestId, response).then(() => undefined),
       stop: (agentId) => api.stop(agentId).then(() => undefined),
       compact: async (agentId) => {
         setAgents((prev) => recordCompact(prev, agentId));
