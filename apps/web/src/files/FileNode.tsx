@@ -1,6 +1,14 @@
 import { useEffect, useState } from "react";
-import { Handle, NodeResizer, Position, type Node, type NodeProps } from "@xyflow/react";
-import { Check, ExternalLink, Eye, File, FileText, Image, Pencil, X } from "lucide-react";
+import {
+  Handle,
+  NodeResizer,
+  Position,
+  useReactFlow,
+  useUpdateNodeInternals,
+  type Node,
+  type NodeProps,
+} from "@xyflow/react";
+import { Check, ExternalLink, Eye, File, FileText, Image, Minimize2, Pencil, X } from "lucide-react";
 import type { CanvasFileNode } from "@agent-canvas/shared";
 import { api } from "../api.js";
 import type { FileActions } from "../useAgentCanvas.js";
@@ -10,13 +18,46 @@ export interface FileNodeData {
   actions: FileActions;
   onPreview: (fileId: string) => void;
   onOpenEditor: (fileId: string) => void;
+  windowState?: {
+    minimized: boolean;
+    restoreWidth?: number;
+    restoreHeight?: number;
+  };
   [key: string]: unknown;
 }
 
 export type FileNodeType = Node<FileNodeData, "file">;
 
-export function FileNode({ data }: NodeProps<FileNodeType>): React.ReactElement {
+export function toggleFileNodeWindow(node: FileNodeType): Partial<FileNodeType> {
+  const state = node.data.windowState;
+  if (state?.minimized) {
+    return {
+      width: state.restoreWidth ?? 280,
+      height: state.restoreHeight ?? 240,
+      data: {
+        ...node.data,
+        windowState: { ...state, minimized: false },
+      },
+    };
+  }
+  return {
+    width: 68,
+    height: 48,
+    data: {
+      ...node.data,
+      windowState: {
+        minimized: true,
+        restoreWidth: node.width ?? node.measured?.width ?? 280,
+        restoreHeight: node.height ?? node.measured?.height ?? 240,
+      },
+    },
+  };
+}
+
+export function FileNode({ id, data }: NodeProps<FileNodeType>): React.ReactElement {
   const { file, actions, onPreview, onOpenEditor } = data;
+  const reactFlow = useReactFlow<FileNodeType>();
+  const updateNodeInternals = useUpdateNodeInternals();
   const [preview, setPreview] = useState("");
   const [previewError, setPreviewError] = useState("");
   const [imageVersion, setImageVersion] = useState(() => Date.now());
@@ -24,6 +65,7 @@ export function FileNode({ data }: NodeProps<FileNodeType>): React.ReactElement 
   const [renaming, setRenaming] = useState(false);
   const [name, setName] = useState(file.name);
   const [extension, setExtension] = useState(file.extension);
+  const minimized = data.windowState?.minimized === true;
 
   useEffect(() => {
     setName(file.name);
@@ -70,6 +112,28 @@ export function FileNode({ data }: NodeProps<FileNodeType>): React.ReactElement 
     setRenaming(false);
   };
 
+  const toggleMinimized = (event: React.MouseEvent) => {
+    event.stopPropagation();
+    reactFlow.updateNode(id, toggleFileNodeWindow);
+    requestAnimationFrame(() => updateNodeInternals(id));
+  };
+
+  if (minimized) {
+    return (
+      <div className="file-node file-node--minimized">
+        <button
+          className="resource-node__restore drag-handle"
+          title={`恢复文件节点 ${file.filename}`}
+          onClick={toggleMinimized}
+        >
+          <FileKindIcon file={file} />
+          <span>文件</span>
+        </button>
+        <FileNodeHandles file={file} />
+      </div>
+    );
+  }
+
   return (
     <div className="file-node">
       <NodeResizer
@@ -82,26 +146,7 @@ export function FileNode({ data }: NodeProps<FileNodeType>): React.ReactElement 
         lineStyle={{ opacity: 0.55 }}
         handleStyle={{ width: 8, height: 8, borderRadius: 2 }}
       />
-      {file.kind === "normal" && (
-        <>
-          <Handle
-            id="write"
-            type="target"
-            position={Position.Left}
-            className="file-node__handle file-node__handle--write"
-            title="Agent 输出连接到这里：允许写入"
-          />
-          <span className="file-node__handle-label file-node__handle-label--write">写</span>
-          <Handle
-            id="read"
-            type="source"
-            position={Position.Right}
-            className="file-node__handle file-node__handle--read"
-            title="连接到 Agent 输入：允许读取"
-          />
-          <span className="file-node__handle-label file-node__handle-label--read">读</span>
-        </>
-      )}
+      <FileNodeHandles file={file} />
 
       <div className="file-node__header drag-handle">
         <FileKindIcon file={file} />
@@ -129,6 +174,13 @@ export function FileNode({ data }: NodeProps<FileNodeType>): React.ReactElement 
         ) : (
           <>
             <strong title={file.path}>{file.filename}</strong>
+            <button
+              className="icon-button nodrag"
+              title="最小化文件节点"
+              onClick={toggleMinimized}
+            >
+              <Minimize2 size={13} />
+            </button>
             <button
               className="icon-button nodrag"
               title="用 VS Code 打开"
@@ -222,6 +274,30 @@ export function FileNode({ data }: NodeProps<FileNodeType>): React.ReactElement 
         )}
       </div>
     </div>
+  );
+}
+
+function FileNodeHandles({ file }: { file: CanvasFileNode }): React.ReactElement | null {
+  if (file.kind !== "normal") return null;
+  return (
+    <>
+      <Handle
+        id="write"
+        type="target"
+        position={Position.Left}
+        className="file-node__handle file-node__handle--write"
+        title="Agent 输出连接到这里：允许写入"
+      />
+      <span className="file-node__handle-label file-node__handle-label--write">写</span>
+      <Handle
+        id="read"
+        type="source"
+        position={Position.Right}
+        className="file-node__handle file-node__handle--read"
+        title="连接到 Agent 输入：允许读取"
+      />
+      <span className="file-node__handle-label file-node__handle-label--read">读</span>
+    </>
   );
 }
 

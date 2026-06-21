@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { ReactFlowProvider, type NodeProps } from "@xyflow/react";
 import type { CanvasPromptNode } from "@agent-canvas/shared";
-import { PromptNode, type PromptNodeType } from "./PromptNode.js";
+import { PromptNode, togglePromptNodeWindow, type PromptNodeType } from "./PromptNode.js";
 import type { PromptActions } from "../useAgentCanvas.js";
 
 afterEach(cleanup);
@@ -45,6 +45,45 @@ function renderPrompt(promptData: CanvasPromptNode, promptActions: PromptActions
 }
 
 describe("PromptNode", () => {
+  it("最小化保存尺寸，并在最小化后保留读写 Handle", () => {
+    const promptData = prompt();
+    const promptActions = actions();
+    const node: PromptNodeType = {
+      id: "prompt:prompt_1",
+      type: "prompt",
+      position: { x: 0, y: 0 },
+      width: 340,
+      height: 280,
+      data: {
+        prompt: promptData,
+        actions: promptActions,
+      },
+    };
+
+    const minimized = { ...node, ...togglePromptNodeWindow(node) } as PromptNodeType;
+    expect(minimized).toMatchObject({
+      width: 68,
+      height: 48,
+      data: {
+        windowState: {
+          minimized: true,
+          restoreWidth: 340,
+          restoreHeight: 280,
+        },
+      },
+    });
+
+    const { container } = render(
+      <ReactFlowProvider>
+        <PromptNode {...({ id: minimized.id, data: minimized.data } as unknown as NodeProps<PromptNodeType>)} />
+      </ReactFlowProvider>,
+    );
+    expect(container.querySelectorAll(".react-flow__handle")).toHaveLength(2);
+    const restoreButton = screen.getByTitle("恢复提示词节点 工程规范");
+    expect(restoreButton.classList.contains("drag-handle")).toBe(true);
+    expect(restoreButton.classList.contains("nodrag")).toBe(false);
+  });
+
   it("普通节点显示读写 Handle，并可编辑保存文本", async () => {
     const promptActions = actions();
     const { container } = renderPrompt(prompt(), promptActions);

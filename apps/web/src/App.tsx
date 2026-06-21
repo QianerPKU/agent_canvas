@@ -253,6 +253,7 @@ function buildNodes(
       actions: fileActions,
       onPreview: onPreviewFile,
       onOpenEditor: onOpenFileEditor,
+      windowState: existingFile?.data.windowState,
     };
     result.push(
       existingFile
@@ -274,7 +275,11 @@ function buildNodes(
     const id = promptNodeId(prompt.id);
     const existing = byId.get(id);
     const existingPrompt = existing?.type === "prompt" ? existing : undefined;
-    const data = { prompt, actions: promptActions };
+    const data = {
+      prompt,
+      actions: promptActions,
+      windowState: existingPrompt?.data.windowState,
+    };
     result.push(
       existingPrompt
         ? { ...existingPrompt, data }

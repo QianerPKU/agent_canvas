@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { ReactFlowProvider, type NodeProps } from "@xyflow/react";
 import type { CanvasFileNode } from "@agent-canvas/shared";
-import { FileNode, type FileNodeType } from "./FileNode.js";
+import { FileNode, toggleFileNodeWindow, type FileNodeType } from "./FileNode.js";
 import type { FileActions } from "../useAgentCanvas.js";
 
 afterEach(cleanup);
@@ -55,6 +55,47 @@ function renderFile(
 }
 
 describe("FileNode", () => {
+  it("最小化保存尺寸，并在最小化后保留读写 Handle", () => {
+    const fileData = file();
+    const fileActions = actions();
+    const node: FileNodeType = {
+      id: "file:file_1",
+      type: "file",
+      position: { x: 0, y: 0 },
+      width: 320,
+      height: 260,
+      data: {
+        file: fileData,
+        actions: fileActions,
+        onPreview: vi.fn(),
+        onOpenEditor: vi.fn(),
+      },
+    };
+
+    const minimized = { ...node, ...toggleFileNodeWindow(node) } as FileNodeType;
+    expect(minimized).toMatchObject({
+      width: 68,
+      height: 48,
+      data: {
+        windowState: {
+          minimized: true,
+          restoreWidth: 320,
+          restoreHeight: 260,
+        },
+      },
+    });
+
+    const { container } = render(
+      <ReactFlowProvider>
+        <FileNode {...({ id: minimized.id, data: minimized.data } as unknown as NodeProps<FileNodeType>)} />
+      </ReactFlowProvider>,
+    );
+    expect(container.querySelectorAll(".react-flow__handle")).toHaveLength(2);
+    const restoreButton = screen.getByTitle("恢复文件节点 archive.bin");
+    expect(restoreButton.classList.contains("drag-handle")).toBe(true);
+    expect(restoreButton.classList.contains("nodrag")).toBe(false);
+  });
+
   it("普通节点显示读写 Handle，并支持重命名和后缀选择", async () => {
     const fileActions = actions();
     const { container } = renderFile(file(), fileActions);
