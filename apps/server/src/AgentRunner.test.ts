@@ -9,6 +9,7 @@ import type {
   SdkMessage,
   SdkUserInput,
 } from "./sdk/types.js";
+import { agentCanvasPolicyPrompt } from "./agentCanvasPolicyPrompt.js";
 
 /** 让微任务与队列 resolver 跑完。 */
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -81,6 +82,10 @@ function collectStatuses(events: AgentEvent[]): AgentStatus[] {
   return events
     .filter((e): e is Extract<AgentEvent, { kind: "status" }> => e.kind === "status")
     .map((e) => e.status);
+}
+
+function readablePromptContents(input: SdkUserInput | undefined): string[] {
+  return input?.promptAccess?.readablePrompts.map((prompt) => prompt.content) ?? [];
 }
 
 describe("AgentRunner 生命周期", () => {
@@ -278,6 +283,41 @@ describe("AgentRunner 生命周期", () => {
     expect(() => runner.send("y")).toThrow();
   });
 
+  it("built-in workspace policy is injected without user configured prompts and after compact", async () => {
+    const ctl = makeControllableQuery();
+    const runner = new AgentRunner("policy-agent", { query: ctl.query });
+
+    runner.start({ prompt: "x" });
+    await flush();
+    expect(readablePromptContents(ctl.inputs[0])).toEqual([
+      agentCanvasPolicyPrompt("policy-agent"),
+    ]);
+
+    ctl.emit(SYSTEM_INIT);
+    ctl.emit(resultMsg());
+    await flush();
+    runner.send("y");
+    await flush();
+    expect(readablePromptContents(ctl.inputs[1])).toEqual([]);
+
+    ctl.emit(resultMsg());
+    await flush();
+    runner.compact();
+    ctl.emit({
+      type: "system",
+      subtype: "compact_boundary",
+      compact_metadata: { trigger: "manual" },
+      uuid: "compact-policy",
+      session_id: "s1",
+    });
+    await flush();
+    runner.send("after compact");
+    await flush();
+    expect(readablePromptContents(ctl.inputs.at(-1))).toEqual([
+      agentCanvasPolicyPrompt("policy-agent"),
+    ]);
+  });
+
   it("输入关闭后消息流自然结束 → done", async () => {
     const ctl = makeControllableQuery();
     const runner = new AgentRunner("a3", { query: ctl.query });
@@ -306,7 +346,8 @@ describe("AgentRunner 生命周期", () => {
 
     runner.start({ prompt: "first", systemPrompt: "private rules" });
     await flush();
-    expect(ctl.inputs[0]?.promptAccess?.readablePrompts.map((prompt) => prompt.content)).toEqual([
+    expect(readablePromptContents(ctl.inputs[0])).toEqual([
+      agentCanvasPolicyPrompt("private-prompt-agent"),
       "private rules",
       "先写测试",
     ]);
@@ -316,14 +357,15 @@ describe("AgentRunner 生命周期", () => {
     await flush();
     runner.send("second");
     await flush();
-    expect(ctl.inputs[1]?.promptAccess?.readablePrompts).toEqual([]);
+    expect(readablePromptContents(ctl.inputs[1])).toEqual([]);
 
     ctl.emit(resultMsg());
     await flush();
     runner.updateSettings({ systemPrompt: "new private rules" });
     runner.send("after settings");
     await flush();
-    expect(ctl.inputs.at(-1)?.promptAccess?.readablePrompts.map((prompt) => prompt.content)).toEqual([
+    expect(readablePromptContents(ctl.inputs.at(-1))).toEqual([
+      agentCanvasPolicyPrompt("private-prompt-agent"),
       "new private rules",
       "先写测试",
     ]);
@@ -486,7 +528,7 @@ describe("AgentRunner 生命周期", () => {
 
     runner.send("second");
     await flush();
-    expect(ctl.inputs[1]?.promptAccess?.readablePrompts).toEqual([]);
+    expect(readablePromptContents(ctl.inputs[1])).toEqual([]);
     expect(runner.getStatus()).toBe("running");
 
     ctl.emit({
@@ -512,7 +554,10 @@ describe("AgentRunner 生命周期", () => {
 
     runner.send("after auto compact");
     await flush();
-    expect(ctl.inputs.at(-1)?.promptAccess?.readablePrompts[0]?.content).toBe("先写测试");
+    expect(readablePromptContents(ctl.inputs.at(-1))).toEqual([
+      agentCanvasPolicyPrompt("auto-compact-agent"),
+      "先写测试",
+    ]);
   });
 
   it("运行中已排队输入遇到 auto compact 时，在正式入队下一轮时重新注入提示词", async () => {
@@ -548,10 +593,13 @@ describe("AgentRunner 生命周期", () => {
     await flush();
 
     expect(ctl.inputs).toHaveLength(2);
-    expect(ctl.inputs.at(-1)?.promptAccess?.readablePrompts[0]?.content).toBe("先写测试");
+    expect(readablePromptContents(ctl.inputs.at(-1))).toEqual([
+      agentCanvasPolicyPrompt("queued-auto-compact-agent"),
+      "先写测试",
+    ]);
   });
 
-  it("提示词只在新 Agent 首轮和 compact 后下一轮注入，fork 首轮不注入", async () => {
+  it("提示词只在新 Agent 首轮和 compact 后下一轮注入，fork 首轮仅保留内置规则", async () => {
     const promptAccess = {
       readablePrompts: [
         { id: "prompt_1", name: "规范", content: "先写测试", kind: "shared" as const },
@@ -569,7 +617,10 @@ describe("AgentRunner 生命周期", () => {
 
     runner.start({ prompt: "first" });
     await flush();
-    expect(ctl.inputs[0]?.promptAccess?.readablePrompts[0]?.content).toBe("先写测试");
+    expect(readablePromptContents(ctl.inputs[0])).toEqual([
+      agentCanvasPolicyPrompt("prompt-agent"),
+      "先写测试",
+    ]);
 
     ctl.emit(SYSTEM_INIT);
     ctl.emit(resultMsg());
@@ -594,7 +645,10 @@ describe("AgentRunner 生命周期", () => {
     await flush();
     runner.send("after compact");
     await flush();
-    expect(ctl.inputs.at(-1)?.promptAccess?.readablePrompts[0]?.content).toBe("先写测试");
+    expect(readablePromptContents(ctl.inputs.at(-1))).toEqual([
+      agentCanvasPolicyPrompt("prompt-agent"),
+      "先写测试",
+    ]);
 
     const forkCtl = makeControllableQuery();
     const fork = new AgentRunner("fork-agent", {
@@ -607,9 +661,11 @@ describe("AgentRunner 生命周期", () => {
       forkSession: true,
     });
     await flush();
-    expect(forkCtl.inputs[0]?.promptAccess).toMatchObject({
-      readablePrompts: [],
-      writablePrompts: promptAccess.writablePrompts,
-    });
+    expect(readablePromptContents(forkCtl.inputs[0])).toEqual([
+      agentCanvasPolicyPrompt("fork-agent"),
+    ]);
+    expect(forkCtl.inputs[0]?.promptAccess?.writablePrompts).toEqual(
+      promptAccess.writablePrompts,
+    );
   });
 });

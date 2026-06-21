@@ -16,6 +16,11 @@ import type {
   QueryOptions,
   SdkUserInput,
 } from "./sdk/types.js";
+import {
+  AGENT_CANVAS_POLICY_PROMPT_ID,
+  AGENT_CANVAS_POLICY_PROMPT_NAME,
+  agentCanvasPolicyPrompt,
+} from "./agentCanvasPolicyPrompt.js";
 
 export type AgentEventListener = (event: AgentEvent) => void;
 
@@ -61,6 +66,7 @@ export class AgentRunner {
   private lastAssistantUuid?: string; // 本轮最后一条 assistant 消息 uuid（fork 锚点）
   private compactPending = false;
   private promptInjectionPending = false;
+  private policyPromptInjectionPending = false;
   private pendingQueuedInputs: string[] = [];
   private readonly createdAt: number;
 
@@ -124,6 +130,7 @@ export class AgentRunner {
     this.lastAssistantUuid = undefined;
     this.compactPending = false;
     this.promptInjectionPending = !config.resume && !extra.resumeSessionId;
+    this.policyPromptInjectionPending = true;
     this.pendingQueuedInputs = [];
 
     this.abortController = new AbortController();
@@ -216,6 +223,7 @@ export class AgentRunner {
     if (isTerminalStatus(this.status) || this.status === "idle") return;
     this.inputQueue?.close();
     this.compactPending = false;
+    this.policyPromptInjectionPending = false;
     this.pendingQueuedInputs = [];
     this.abortController?.abort();
     try {
@@ -231,6 +239,7 @@ export class AgentRunner {
     if (this.status === "terminated") return;
     this.inputQueue?.close();
     this.compactPending = false;
+    this.policyPromptInjectionPending = false;
     this.pendingQueuedInputs = [];
     this.setStatus("terminated");
     this.abortController?.abort();
@@ -285,6 +294,7 @@ export class AgentRunner {
       case "compact":
         this.compactPending = false;
         this.promptInjectionPending = true;
+        this.policyPromptInjectionPending = true;
         this.emit(event);
         this.lastAssistantUuid = undefined;
         if (event.trigger === "manual") {
@@ -365,27 +375,37 @@ export class AgentRunner {
         writableDirectories: [],
       };
     const includeReadable = this.promptInjectionPending;
+    const includePolicy = this.policyPromptInjectionPending || includeReadable;
     this.promptInjectionPending = false;
+    this.policyPromptInjectionPending = false;
     const next = includeReadable
       ? access
       : {
           ...access,
           readablePrompts: [],
         };
-    if (!includeReadable) return next;
+    if (!includeReadable && !includePolicy) return next;
+    const readablePrompts = [...next.readablePrompts];
     const systemPrompt = this.config?.systemPrompt?.trim();
-    if (!systemPrompt) return next;
+    if (includeReadable && systemPrompt) {
+      readablePrompts.unshift({
+        id: `${this.id}:system-prompt`,
+        name: "Agent 私有系统提示词",
+        content: systemPrompt,
+        kind: "normal",
+      });
+    }
+    if (includePolicy) {
+      readablePrompts.unshift({
+        id: AGENT_CANVAS_POLICY_PROMPT_ID,
+        name: AGENT_CANVAS_POLICY_PROMPT_NAME,
+        content: agentCanvasPolicyPrompt(this.id),
+        kind: "shared",
+      });
+    }
     return {
       ...next,
-      readablePrompts: [
-        {
-          id: `${this.id}:system-prompt`,
-          name: "Agent 私有系统提示词",
-          content: systemPrompt,
-          kind: "normal",
-        },
-        ...next.readablePrompts,
-      ],
+      readablePrompts,
     };
   }
 

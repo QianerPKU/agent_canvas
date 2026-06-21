@@ -116,7 +116,8 @@ npm run smoke --workspace apps/server
 - `GET/POST /api/prompts` 列出/创建；`PATCH /api/prompts/:id` 编辑名称、文本或共享开关。
 - `GET/POST /api/prompt-connections` 与 `DELETE /api/prompt-connections/:id` 管理普通节点连线；fork 自动复制父 Agent 的提示词连线。
 - 可读提示词直接拼在用户输入之前，不传文件引用。顺序固定为共享优先、普通其次，同类按 UTF-8 字节序排列。
-- 注入时机仅为新建 Agent 的首轮，以及手动或自动 compact 完成后的下一条业务输入；fork/resume 首轮继承已有上下文，不重复注入。
+- 用户/节点可读提示词的注入时机为新建 Agent 的首轮，以及手动或自动 compact 完成后的下一条业务输入；fork/resume 首轮继承已有上下文，不重复注入用户/节点提示词。
+- `AgentRunner` 会在所有 Agent start（含 fork/resume）和 compact 后下一条业务输入中额外注入一段硬编码的 Agent Canvas 工作区规则，位于所有可读提示词之前。规则说明三类文件：需要 commit 的仓库文件、默认只读的共享映射资源，以及 `.agent-tmp/<agent-id>/` 下不可提交的当前 Agent 临时文件。
 - 写权限与文件节点一致，会授权 provider 修改提示词节点的内部文本文件；前端周期读取最新文本。
 
 官方参考：
@@ -138,4 +139,5 @@ npm run smoke --workspace apps/server
 - `POST /api/agents` 支持 `provider/model/cwd/systemPrompt`。新 Agent 创建后还未启动时，这些设置保存在快照配置里；fork 会复制父 Agent 的 provider、模型、工作目录和私有系统提示词。
 - `PATCH /api/agents/:id/settings` 只允许更新 `systemPrompt`。已创建 Agent 的 provider、模型和工作目录不在该接口中变更。
 - `systemPrompt` 是当前 Agent 私有提示词，不传给 Claude/Codex 原生 system prompt，而是在 `AgentRunner` 中按提示词节点同样的可读提示词机制拼接到业务输入。新 Agent 首轮、手动 compact 后、自动 compact 后、以及运行中更新设置后的下一条业务输入会重新注入。
+- Agent Canvas 内置工作区规则不属于用户可编辑的 `systemPrompt`，即使用户没有设置私有系统提示词也会注入；它约束共享文件默认只读、临时文件只写 `.agent-tmp/<agent-id>/`、其余非共享非临时修改都视为需要 commit 的仓库文件。
 - `POST /api/directories/pick` 通过本机目录选择器返回用户选中的目录；Windows 使用 PowerShell + `System.Windows.Forms.FolderBrowserDialog`，其他平台暂返回明确错误并允许前端继续手动输入路径。
