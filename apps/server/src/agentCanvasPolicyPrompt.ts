@@ -66,5 +66,7 @@ Invoke-RestMethod -Method Post -Uri "${apiBase}/pr-flows" -ContentType "applicat
 提交规则：
 - 不在 ${scratchDirectory}/ 内、也不是共享资源的所有新增或修改文件，都应被视为需要 commit 的正式改动。
 - 当用户要求提交时，只提交正式仓库文件；不要提交共享资源或 agent 临时文件。
-- 如果某个文件应属于哪一类不清楚，先按正式仓库文件谨慎处理，并在答复中说明不确定点。`;
+- 如果某个文件应属于哪一类不清楚，先按正式仓库文件谨慎处理，并在答复中说明不确定点。
+
+5. **通过commit进行版本控制** 每次实现新feature或者修bug后，需要及时 git commit ，并且在commit message里面写清楚具体修改内容。`;
 }
