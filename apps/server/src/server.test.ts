@@ -60,6 +60,9 @@ describe("HTTP server", () => {
   let port = 0;
   let root = "";
   const openFile = vi.fn<(filePath: string) => Promise<void>>().mockResolvedValue(undefined);
+  const pickDirectory = vi
+    .fn<(initialDirectory?: string) => Promise<string | undefined>>()
+    .mockResolvedValue("C:\\picked");
 
   beforeAll(async () => {
     const manager = new AgentManager({ query: emptyQuery });
@@ -74,7 +77,9 @@ describe("HTTP server", () => {
       promptRoot: path.join(root, "prompts"),
     });
     ({ httpServer: server } = createServer(manager, fileManager, {
+      defaultCwd: root,
       openFile,
+      pickDirectory,
       promptManager,
     }));
     await new Promise<void>((r) => server.listen(0, r));
@@ -92,6 +97,17 @@ describe("HTTP server", () => {
     expect(json.ok).toBe(true);
   });
 
+  it("exposes default cwd and directory picker", async () => {
+    const config = await request(port, "GET", "/api/config");
+    expect(config).toEqual({ status: 200, json: { defaultCwd: root } });
+
+    const picked = await request(port, "POST", "/api/directories/pick", {
+      initialDirectory: root,
+    });
+    expect(picked).toEqual({ status: 200, json: { path: "C:\\picked" } });
+    expect(pickDirectory).toHaveBeenCalledWith(root);
+  });
+
   it("POST /api/agents 新建，GET /api/agents 能列出", async () => {
     const created = await request(port, "POST", "/api/agents");
     expect(created.status).toBe(201);
@@ -100,6 +116,34 @@ describe("HTTP server", () => {
     const listed = await request(port, "GET", "/api/agents");
     expect(listed.status).toBe(200);
     expect(listed.json.agents.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("creates agents with settings and updates private system prompt", async () => {
+    const created = await request(port, "POST", "/api/agents", {
+      provider: "codex",
+      model: "gpt-5.4-mini",
+      cwd: path.join(root, "agent-work"),
+      systemPrompt: "private rules",
+    });
+    expect(created.status).toBe(201);
+
+    const listed = await request(port, "GET", "/api/agents");
+    const snapshot = listed.json.agents.find(
+      (agent: { id: string }) => agent.id === created.json.id,
+    );
+    expect(snapshot.config).toMatchObject({
+      provider: "codex",
+      model: "gpt-5.4-mini",
+      cwd: path.join(root, "agent-work"),
+      systemPrompt: "private rules",
+    });
+
+    const updated = await request(port, "PATCH", `/api/agents/${created.json.id}/settings`, {
+      systemPrompt: "updated private rules",
+    });
+    expect(updated.status).toBe(200);
+    expect(updated.json.config.systemPrompt).toBe("updated private rules");
+    expect(updated.json.config.cwd).toBe(path.join(root, "agent-work"));
   });
 
   it("对未知 agent start → 404", async () => {
@@ -169,6 +213,20 @@ describe("HTTP server", () => {
   it("未知路由 → 404", async () => {
     const r = await request(port, "GET", "/nope");
     expect(r.status).toBe(404);
+  });
+
+  it("creates file nodes in an explicit work directory without selecting an agent", async () => {
+    const directory = path.join(root, "picked-workdir");
+    const created = await request(port, "POST", "/api/files", {
+      name: "brief",
+      extension: "md",
+      storage: "agent",
+      directory,
+      kind: "normal",
+    });
+    expect(created.status).toBe(201);
+    expect(created.json.file.path).toBe(path.join(directory, "brief.md"));
+    expect(created.json.file.agentId).toBeUndefined();
   });
 
   it("文件节点 REST 支持创建、重命名、预览与普通读连线", async () => {

@@ -131,3 +131,11 @@ npm run smoke --workspace apps/server
 - https://code.claude.com/docs/en/agent-sdk/user-input
 - https://docs.anthropic.com/en/docs/claude-code/common-workflows
 - https://docs.anthropic.com/en/docs/claude-code/cli-reference
+
+## Agent 设置与工作目录
+
+- 进程入口用 `AGENT_CANVAS_WORKSPACE_ROOT ?? INIT_CWD ?? process.cwd()` 解析画布默认工作目录，避免从 npm workspace 启动时误把 `apps/server` 当作项目根目录。`GET /api/config` 会把这个 `defaultCwd` 交给前端。
+- `POST /api/agents` 支持 `provider/model/cwd/systemPrompt`。新 Agent 创建后还未启动时，这些设置保存在快照配置里；fork 会复制父 Agent 的 provider、模型、工作目录和私有系统提示词。
+- `PATCH /api/agents/:id/settings` 只允许更新 `systemPrompt`。已创建 Agent 的 provider、模型和工作目录不在该接口中变更。
+- `systemPrompt` 是当前 Agent 私有提示词，不传给 Claude/Codex 原生 system prompt，而是在 `AgentRunner` 中按提示词节点同样的可读提示词机制拼接到业务输入。新 Agent 首轮、手动 compact 后、自动 compact 后、以及运行中更新设置后的下一条业务输入会重新注入。
+- `POST /api/directories/pick` 通过本机目录选择器返回用户选中的目录；Windows 使用 PowerShell + `System.Windows.Forms.FolderBrowserDialog`，其他平台暂返回明确错误并允许前端继续手动输入路径。

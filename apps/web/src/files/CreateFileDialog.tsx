@@ -1,29 +1,34 @@
 import { useEffect, useState } from "react";
-import { FilePlus2, X } from "lucide-react";
+import { FilePlus2, FolderOpen, X } from "lucide-react";
 import type {
   CanvasFileKind,
   CanvasFileStorage,
   CreateCanvasFileInput,
 } from "@agent-canvas/shared";
-import type { AgentMap } from "../agentStore.js";
 
 export function CreateFileDialog({
-  agents,
+  defaultDirectory,
+  onBrowseDirectory,
   onCreate,
   onClose,
 }: {
-  agents: AgentMap;
+  defaultDirectory: string;
+  onBrowseDirectory: (initialDirectory?: string) => Promise<string | undefined>;
   onCreate: (input: CreateCanvasFileInput) => Promise<void>;
   onClose: () => void;
 }): React.ReactElement {
-  const agentIds = Object.keys(agents);
   const [name, setName] = useState("");
   const [extension, setExtension] = useState("txt");
   const [kind, setKind] = useState<CanvasFileKind>("normal");
-  const [storage, setStorage] = useState<CanvasFileStorage>("isolated");
-  const [agentId, setAgentId] = useState(agentIds[0] ?? "");
+  const [storage, setStorage] = useState<CanvasFileStorage>("agent");
+  const [directory, setDirectory] = useState(defaultDirectory);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [browsing, setBrowsing] = useState(false);
+
+  useEffect(() => {
+    if (!directory && defaultDirectory) setDirectory(defaultDirectory);
+  }, [defaultDirectory, directory]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -43,13 +48,26 @@ export function CreateFileDialog({
         extension,
         kind,
         storage,
-        agentId: storage === "agent" ? agentId : undefined,
+        directory: storage === "agent" ? directory.trim() : undefined,
       });
       onClose();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const browseDirectory = async () => {
+    setBrowsing(true);
+    setError("");
+    try {
+      const selected = await onBrowseDirectory(directory || defaultDirectory);
+      if (selected) setDirectory(selected);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBrowsing(false);
     }
   };
 
@@ -100,8 +118,8 @@ export function CreateFileDialog({
           <Segmented
             value={storage}
             options={[
+              ["agent", "工作目录"],
               ["isolated", "隔离目录"],
-              ["agent", "Agent 工作目录"],
             ]}
             onChange={(value) => setStorage(value as CanvasFileStorage)}
           />
@@ -109,23 +127,23 @@ export function CreateFileDialog({
 
         {storage === "agent" && (
           <label className="file-dialog__field">
-            <span>选择 Agent</span>
-            <select
-              aria-label="文件所属 agent"
-              value={agentId}
-              disabled={agentIds.length === 0}
-              onChange={(event) => setAgentId(event.target.value)}
-            >
-              {agentIds.length === 0 ? (
-                <option value="">请先新建 Agent</option>
-              ) : (
-                agentIds.map((id) => (
-                  <option key={id} value={id}>
-                    {id}
-                  </option>
-                ))
-              )}
-            </select>
+            <span>工作目录</span>
+            <div className="file-dialog__path">
+              <input
+                aria-label="文件工作目录"
+                value={directory}
+                onChange={(event) => setDirectory(event.target.value)}
+              />
+              <button
+                type="button"
+                className="icon-button"
+                title="浏览目录"
+                disabled={browsing}
+                onClick={() => void browseDirectory()}
+              >
+                <FolderOpen size={15} />
+              </button>
+            </div>
           </label>
         )}
 
@@ -137,7 +155,7 @@ export function CreateFileDialog({
           <button
             type="submit"
             className="file-dialog__primary"
-            disabled={!name.trim() || submitting || (storage === "agent" && !agentId)}
+            disabled={!name.trim() || submitting || (storage === "agent" && !directory.trim())}
           >
             创建
           </button>

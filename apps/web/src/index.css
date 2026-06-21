@@ -489,6 +489,10 @@ button:disabled {
   box-shadow: 0 22px 60px rgba(15, 23, 42, 0.28);
 }
 
+.agent-dialog {
+  width: min(520px, calc(100vw - 32px));
+}
+
 .file-dialog > header {
   min-height: 48px;
   display: flex;
@@ -526,7 +530,8 @@ button:disabled {
 .file-dialog__field > input,
 .file-dialog__field > select,
 .file-dialog__filename input,
-.file-dialog__filename select {
+.file-dialog__filename select,
+.file-dialog__path input {
   height: 34px;
   min-width: 0;
   padding: 5px 8px;
@@ -537,10 +542,34 @@ button:disabled {
   font-size: 12px;
 }
 
+.file-dialog__field textarea {
+  min-height: 120px;
+  resize: vertical;
+  padding: 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 5px;
+  background: #fff;
+  font: 12px/1.55 Consolas, "Courier New", monospace;
+  letter-spacing: 0;
+}
+
 .file-dialog__filename {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 100px;
   gap: 6px;
+}
+
+.file-dialog__path {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  gap: 6px;
+}
+
+.file-dialog__path .icon-button {
+  width: 34px;
+  height: 34px;
+  border: 1px solid #cbd5e1;
+  background: #fff;
 }
 
 .segmented-control {

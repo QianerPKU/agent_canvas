@@ -2,10 +2,12 @@ import type {
   AgentFileAccess,
   AgentEvent,
   AgentEventEnvelope,
+  AgentSettings,
   AgentSnapshot,
   AgentStartConfig,
   AgentPromptAccess,
   ForkOrigin,
+  UpdateAgentSettingsInput,
 } from "@agent-canvas/shared";
 import { AgentRunner } from "./AgentRunner.js";
 import type { QueryFn } from "./sdk/types.js";
@@ -15,6 +17,7 @@ export type EnvelopeListener = (envelope: AgentEventEnvelope) => void;
 export interface AgentManagerDeps {
   query: QueryFn;
   codexQuery?: QueryFn;
+  defaultCwd?: string;
   now?: () => number;
   resolveFileAccess?: (agentId: string) => AgentFileAccess;
   resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
@@ -33,8 +36,10 @@ export class AgentManager {
   // fork 产生的 agent：来源（展示用）与启动时要合并的 fork 配置
   private readonly forkOrigins = new Map<string, ForkOrigin>();
   private readonly forkConfigs = new Map<string, Partial<AgentStartConfig>>();
+  private readonly draftConfigs = new Map<string, Partial<AgentStartConfig>>();
   private readonly query: QueryFn;
   private readonly codexQuery?: QueryFn;
+  private readonly defaultCwd: string;
   private readonly now: () => number;
   private resolveFileAccess?: (agentId: string) => AgentFileAccess;
   private resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
@@ -43,6 +48,7 @@ export class AgentManager {
   constructor(deps: AgentManagerDeps) {
     this.query = deps.query;
     this.codexQuery = deps.codexQuery;
+    this.defaultCwd = deps.defaultCwd ?? process.cwd();
     this.now = deps.now ?? Date.now;
     this.resolveFileAccess = deps.resolveFileAccess;
     this.resolvePromptAccess = deps.resolvePromptAccess;
@@ -53,7 +59,7 @@ export class AgentManager {
     return () => this.listeners.delete(listener);
   }
 
-  create(): AgentRunner {
+  create(settings: AgentSettings = {}): AgentRunner {
     const id = `agent_${++this.counter}`;
     const runner = new AgentRunner(id, {
       query: this.query,
@@ -75,6 +81,7 @@ export class AgentManager {
     this.runners.set(id, runner);
     this.seqs.set(id, 0);
     this.history.set(id, []);
+    this.draftConfigs.set(id, normalizeSettings(settings, this.defaultCwd));
     runner.on((event) => this.broadcast(id, event));
     return runner;
   }
@@ -89,6 +96,33 @@ export class AgentManager {
 
   setPromptAccessResolver(resolvePromptAccess: (agentId: string) => AgentPromptAccess): void {
     this.resolvePromptAccess = resolvePromptAccess;
+  }
+
+  configOf(id: string): AgentStartConfig | undefined {
+    const runnerConfig = this.runners.get(id)?.snapshot().config;
+    const draftConfig = this.draftConfigs.get(id);
+    const forkConfig = this.forkConfigs.get(id);
+    const merged = mergeDefined(draftConfig, forkConfig, runnerConfig);
+    return merged ? ({ ...merged, prompt: runnerConfig?.prompt ?? "" } as AgentStartConfig) : undefined;
+  }
+
+  snapshot(id: string): AgentSnapshot | undefined {
+    return this.runners.has(id) ? this.snapshotOf(id) : undefined;
+  }
+
+  updateSettings(id: string, input: UpdateAgentSettingsInput): AgentSnapshot {
+    const runner = this.runners.get(id);
+    if (!runner) throw new Error(`未知 agent: ${id}`);
+    const draft = this.draftConfigs.get(id) ?? {};
+    const next =
+      input.systemPrompt === undefined
+        ? draft
+        : { ...draft, systemPrompt: input.systemPrompt };
+    this.draftConfigs.set(id, next);
+    if (input.systemPrompt !== undefined) {
+      runner.updateSettings({ systemPrompt: input.systemPrompt });
+    }
+    return this.snapshotOf(id);
   }
 
   /**
@@ -107,6 +141,8 @@ export class AgentManager {
     const parentSession = parentSnapshot.sessionId;
     if (!parentSession) return undefined;
     const parentProvider = parentSnapshot.config?.provider;
+    const parentCwd = parentSnapshot.config?.cwd;
+    const parentSystemPrompt = parentSnapshot.config?.systemPrompt;
 
     const runner = this.create();
     const origin: ForkOrigin = { parentAgentId: parentId, anchorUuid };
@@ -114,6 +150,8 @@ export class AgentManager {
     this.forkConfigs.set(runner.id, {
       provider: parentProvider,
       model: model ?? parentSnapshot.config?.model,
+      cwd: parentCwd,
+      systemPrompt: parentSystemPrompt,
       resume: parentSession,
       resumeSessionAt: anchorUuid,
       forkSession: true,
@@ -126,27 +164,14 @@ export class AgentManager {
     const runner = this.runners.get(id);
     if (!runner) throw new Error(`未知 agent: ${id}`);
     const forkCfg = this.forkConfigs.get(id);
-    runner.start(forkCfg ? { ...forkCfg, ...config, provider: forkCfg.provider } : config);
+    const draftCfg = this.draftConfigs.get(id);
+    const merged = mergeDefined(draftCfg, forkCfg, config);
+    if (!merged?.prompt) throw new Error("缺少 prompt");
+    runner.start(merged as AgentStartConfig);
   }
 
   list(): AgentSnapshot[] {
-    return [...this.runners.entries()].map(([id, runner]) => {
-      const s = runner.snapshot();
-      const config: AgentStartConfig =
-        s.config ?? { ...this.forkConfigs.get(id), prompt: "" };
-      return {
-        id,
-        provider: config.provider,
-        status: s.status,
-        sessionId: s.sessionId,
-        config,
-        createdAt: s.createdAt,
-        lastEventSeq: this.seqs.get(id) ?? 0,
-        totalCostUsd: s.totalCostUsd,
-        usage: s.usage,
-        forkOrigin: this.forkOrigins.get(id),
-      };
-    });
+    return [...this.runners.keys()].map((id) => this.snapshotOf(id));
   }
 
   historyOf(id: string): AgentEventEnvelope[] {
@@ -171,4 +196,55 @@ export class AgentManager {
       }
     }
   }
+
+  private snapshotOf(id: string): AgentSnapshot {
+    const runner = this.runners.get(id);
+    if (!runner) throw new Error(`未知 agent: ${id}`);
+    const s = runner.snapshot();
+    const config: AgentStartConfig = {
+      ...this.draftConfigs.get(id),
+      ...this.forkConfigs.get(id),
+      ...s.config,
+      prompt: s.config?.prompt ?? "",
+    };
+    return {
+      id,
+      provider: config.provider,
+      status: s.status,
+      sessionId: s.sessionId,
+      config,
+      createdAt: s.createdAt,
+      lastEventSeq: this.seqs.get(id) ?? 0,
+      totalCostUsd: s.totalCostUsd,
+      usage: s.usage,
+      forkOrigin: this.forkOrigins.get(id),
+    };
+  }
+}
+
+function normalizeSettings(
+  settings: AgentSettings,
+  defaultCwd: string,
+): Partial<AgentStartConfig> {
+  return {
+    provider: settings.provider ?? "claude",
+    model: settings.model,
+    cwd: settings.cwd?.trim() || defaultCwd,
+    systemPrompt: settings.systemPrompt ?? "",
+  };
+}
+
+function mergeDefined(
+  ...configs: Array<Partial<AgentStartConfig> | undefined>
+): Partial<AgentStartConfig> | undefined {
+  const merged: Partial<AgentStartConfig> = {};
+  for (const config of configs) {
+    if (!config) continue;
+    for (const [key, value] of Object.entries(config) as Array<
+      [keyof AgentStartConfig, AgentStartConfig[keyof AgentStartConfig]]
+    >) {
+      if (value !== undefined) merged[key] = value as never;
+    }
+  }
+  return Object.keys(merged).length > 0 ? merged : undefined;
 }

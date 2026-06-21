@@ -2,7 +2,8 @@
 
 `FileManager` 管理画布文件节点、真实文件和 Agent 读写连线。
 
-- `agent` 存储把文件建在所选 Agent 的工作目录。
+- `agent` 存储把文件建在显式 `directory` 中；未传目录但传了 `agentId` 时回退到该 Agent 的工作目录，再回退到画布默认工作目录。
+- 前端新建文件默认传画布工作目录，因此不需要先选择某个 Agent。
 - `isolated` 存储把每个节点放在用户本地数据目录的 `agent_canvas/files/<workspace-key>/<file-id>/`，位置在 Agent 工作目录之外，并且每个节点独占目录。
 - 共享文件通过 `sharedRead/sharedWrite` 对全部 Agent 生效。
 - 普通文件通过 `CanvasFileConnection` 按 Agent 授予 `read/write`。

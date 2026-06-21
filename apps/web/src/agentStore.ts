@@ -12,6 +12,7 @@ import type {
   AgentEvent,
   AgentEventEnvelope,
   AgentProvider,
+  AgentSettings,
   AgentSnapshot,
   AgentStatus,
   ForkOrigin,
@@ -50,6 +51,8 @@ export interface AgentView {
   provider?: AgentProvider;
   sessionId?: string;
   model?: string;
+  cwd?: string;
+  systemPrompt?: string;
   status: AgentStatus;
   turns: Turn[];
   forkOrigin?: ForkOrigin;
@@ -82,6 +85,8 @@ export function applyHello(agents: AgentSnapshot[]): AgentMap {
       status: a.status,
       sessionId: a.sessionId,
       model: a.config.model,
+      cwd: a.config.cwd,
+      systemPrompt: a.config.systemPrompt,
       forkOrigin: a.forkOrigin,
       createdAt: a.createdAt,
       lastSeq: a.lastEventSeq,
@@ -104,8 +109,28 @@ export function insertForked(
     [id]: newAgentView(id, {
       provider: parent?.provider,
       model: model ?? parent?.model,
+      cwd: parent?.cwd,
+      systemPrompt: parent?.systemPrompt,
       forkOrigin: origin,
     }),
+  };
+}
+
+export function recordAgentSettings(
+  map: AgentMap,
+  agentId: string,
+  settings: AgentSettings,
+): AgentMap {
+  const prev = map[agentId] ?? newAgentView(agentId);
+  return {
+    ...map,
+    [agentId]: {
+      ...prev,
+      provider: settings.provider ?? prev.provider,
+      model: settings.model ?? prev.model,
+      cwd: settings.cwd ?? prev.cwd,
+      systemPrompt: settings.systemPrompt ?? prev.systemPrompt,
+    },
   };
 }
 
@@ -122,9 +147,9 @@ export function recordInput(
   return {
     ...map,
     [agentId]: {
-      ...next,
-      provider: provider ?? prev.provider,
-      model: model ?? prev.model,
+        ...next,
+        provider: provider ?? prev.provider,
+        model: model ?? prev.model,
     },
   };
 }

@@ -39,6 +39,12 @@ npm test --workspace packages/shared        # vitest
 
 `src/files.ts` 定义 `CanvasFileNode`、`CanvasFileConnection`、创建/更新输入，以及服务端解析后的 `AgentFileAccess`。普通节点通过 `read/write` 连线授权，共享节点通过全局读写开关授权。
 
+`CreateCanvasFileInput.directory` 允许 `storage="agent"` 时显式指定工作目录；前端新建文件默认使用画布工作目录，不再必须选择某个 Agent。
+
+## Agent 设置模型
+
+`src/events.ts` 定义 `AgentSettings`、`CreateAgentInput` 和 `UpdateAgentSettingsInput`。创建 Agent 可带 provider、模型、工作目录和私有系统提示词；更新已创建 Agent 时只允许调整私有系统提示词。`AgentStartConfig.systemPrompt` 只表示画布私有提示词，会按提示词节点方式拼接到业务输入中。
+
 ## 提示词节点模型
 
 `src/prompts.ts` 定义纯文本 `CanvasPromptNode`、普通节点连线、共享读写开关，以及服务端解析后的 `AgentPromptAccess`。读权限把文本直接拼接进 Agent 上下文，写权限授权 Agent 修改节点的内部文本载体；可读提示词已由服务端按稳定顺序排列。

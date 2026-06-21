@@ -8,7 +8,7 @@ import {
   type Node,
   type NodeProps,
 } from "@xyflow/react";
-import { MessageSquare, Minimize2, Send, Square, Zap } from "lucide-react";
+import { MessageSquare, Minimize2, Send, Settings, Square, Zap } from "lucide-react";
 import {
   CODEX_MODELS,
   DEFAULT_CODEX_MODEL,
@@ -34,6 +34,7 @@ export interface TurnNodeData {
     restoreHeight?: number;
   };
   onOpenHistory: (agentId: string, turnIndex: number) => void;
+  onOpenSettings?: (agentId: string) => void;
   actions: AgentActions;
   [key: string]: unknown;
 }
@@ -130,14 +131,12 @@ export function TurnNode({
     agentStatus,
     provider: agentProvider,
     model: agentModel,
-    providerLocked,
     isLatest,
     actions,
   } = data;
   const reactFlow = useReactFlow<TurnNodeType>();
   const updateNodeInternals = useUpdateNodeInternals();
   const [text, setText] = useState("");
-  const [provider, setProvider] = useState<AgentProvider>(agentProvider ?? "claude");
   const [model, setModel] = useState<CodexModel>(codexModel(agentModel));
   const logRef = useRef<HTMLDivElement>(null);
 
@@ -167,10 +166,6 @@ export function TurnNode({
     const el = logRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [turn.lines.length]);
-
-  useEffect(() => {
-    setProvider(agentProvider ?? "claude");
-  }, [agentProvider]);
 
   useEffect(() => {
     setModel(codexModel(agentModel));
@@ -255,11 +250,24 @@ export function TurnNode({
       >
         <span style={{ fontWeight: 600 }}>第 {turn.index + 1} 轮</span>
         <span style={{ color: "#9ca3af", fontSize: 10 }}>{agentId}</span>
+        {isLatest && data.onOpenSettings && (
+          <button
+            className="icon-button nodrag"
+            title="Agent 设置"
+            onClick={(event) => {
+              event.stopPropagation();
+              data.onOpenSettings?.(agentId);
+            }}
+            style={{ marginLeft: "auto" }}
+          >
+            <Settings size={14} />
+          </button>
+        )}
         <button
           className="icon-button nodrag"
           title="最小化节点"
           onClick={toggleMinimized}
-          style={{ marginLeft: "auto" }}
+          style={isLatest && data.onOpenSettings ? undefined : { marginLeft: "auto" }}
         >
           <Minimize2 size={14} />
         </button>
@@ -347,25 +355,6 @@ export function TurnNode({
         )}
         {isActiveInput ? (
           <>
-            {turn.index === 0 && (
-              <select
-                aria-label="agent provider"
-                value={provider}
-                disabled={providerLocked}
-                onChange={(e) => setProvider(e.target.value as AgentProvider)}
-                style={selectStyle}
-              >
-                <option value="claude">Claude</option>
-                <option value="codex">Codex</option>
-              </select>
-            )}
-            {turn.index === 0 && provider === "codex" && (
-              <CodexModelSelect
-                ariaLabel="codex model"
-                value={model}
-                onChange={setModel}
-              />
-            )}
             <textarea
               value={text}
               onChange={(e) => setText(e.target.value)}
@@ -377,12 +366,7 @@ export function TurnNode({
               style={btn("#2563eb")}
               disabled={!text.trim()}
               onClick={() => {
-                void actions.submit(
-                  agentId,
-                  text.trim(),
-                  turn.index === 0 ? provider : undefined,
-                  turn.index === 0 && provider === "codex" ? model : undefined,
-                );
+                void actions.submit(agentId, text.trim());
                 setText("");
               }}
             >

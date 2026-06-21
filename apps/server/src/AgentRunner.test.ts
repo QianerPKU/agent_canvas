@@ -290,6 +290,45 @@ describe("AgentRunner 生命周期", () => {
     expect(runner.getStatus()).toBe("done");
   });
 
+  it("private system prompt is injected like readable prompt nodes", async () => {
+    const promptAccess = {
+      readablePrompts: [
+        { id: "prompt_1", name: "规范", content: "先写测试", kind: "shared" as const },
+      ],
+      writablePrompts: [],
+      writableDirectories: [],
+    };
+    const ctl = makeControllableQuery();
+    const runner = new AgentRunner("private-prompt-agent", {
+      query: ctl.query,
+      resolvePromptAccess: () => promptAccess,
+    });
+
+    runner.start({ prompt: "first", systemPrompt: "private rules" });
+    await flush();
+    expect(ctl.inputs[0]?.promptAccess?.readablePrompts.map((prompt) => prompt.content)).toEqual([
+      "private rules",
+      "先写测试",
+    ]);
+
+    ctl.emit(SYSTEM_INIT);
+    ctl.emit(resultMsg());
+    await flush();
+    runner.send("second");
+    await flush();
+    expect(ctl.inputs[1]?.promptAccess?.readablePrompts).toEqual([]);
+
+    ctl.emit(resultMsg());
+    await flush();
+    runner.updateSettings({ systemPrompt: "new private rules" });
+    runner.send("after settings");
+    await flush();
+    expect(ctl.inputs.at(-1)?.promptAccess?.readablePrompts.map((prompt) => prompt.content)).toEqual([
+      "new private rules",
+      "先写测试",
+    ]);
+  });
+
   it("消息流抛错 → error 事件 + error 状态", async () => {
     const query: QueryFn = () => ({
       // eslint-disable-next-line require-yield

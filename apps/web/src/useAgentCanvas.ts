@@ -6,7 +6,7 @@
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import type {
-  AgentProvider,
+  AgentSettings,
   CanvasFileConnection,
   CanvasFileNode,
   CanvasPromptConnection,
@@ -26,6 +26,7 @@ import {
   emptyMap,
   insertForked,
   newAgentView,
+  recordAgentSettings,
   recordCompact,
   recordInput,
   type AgentMap,
@@ -33,14 +34,11 @@ import {
 
 export interface AgentActions {
   /** 新建一个 agent（出现一个 idle 起始节点）。 */
-  create: () => Promise<void>;
+  create: (settings: AgentSettings) => Promise<void>;
+  /** 更新已创建 agent 的可变设置。 */
+  updateSettings: (agentId: string, settings: Pick<AgentSettings, "systemPrompt">) => Promise<void>;
   /** 在末尾 idle 轮提交输入：首轮→start，续轮→send（自动判断）。 */
-  submit: (
-    agentId: string,
-    text: string,
-    provider?: AgentProvider,
-    model?: string,
-  ) => Promise<void>;
+  submit: (agentId: string, text: string) => Promise<void>;
   /** 尽快引导当前正在运行的一轮。 */
   steer: (agentId: string, text: string) => Promise<void>;
   /** 中止 agent。 */
@@ -184,15 +182,38 @@ export function useAgentCanvas(): UseAgentCanvas {
 
   const actions = useMemo<AgentActions>(
     () => ({
-      create: async () => {
-        const id = await api.create();
+      create: async (settings) => {
+        const id = await api.create(settings);
         // 后端 create 不发事件，乐观插入一个 idle 节点
-        setAgents((prev) => (prev[id] ? prev : { ...prev, [id]: newAgentView(id) }));
+        setAgents((prev) =>
+          prev[id]
+            ? prev
+            : {
+                ...prev,
+                [id]: newAgentView(id, {
+                  provider: settings.provider,
+                  model: settings.model,
+                  cwd: settings.cwd,
+                  systemPrompt: settings.systemPrompt,
+                }),
+              },
+        );
       },
-      submit: async (agentId, text, provider, model) => {
+      updateSettings: async (agentId, settings) => {
+        const snapshot = await api.updateAgentSettings(agentId, settings);
+        setAgents((prev) =>
+          recordAgentSettings(prev, agentId, {
+            provider: snapshot.config.provider,
+            model: snapshot.config.model,
+            cwd: snapshot.config.cwd,
+            systemPrompt: snapshot.config.systemPrompt,
+          }),
+        );
+      },
+      submit: async (agentId, text) => {
         const view = agentsRef.current[agentId];
-        const startProvider = provider ?? view?.provider;
-        const startModel = model ?? (startProvider === "codex" ? view?.model : undefined);
+        const startProvider = view?.provider;
+        const startModel = startProvider === "codex" ? view?.model : undefined;
         // 首轮（idle）用 start（fork 出来的 agent 由后端合并 fork 配置）；续轮用 send
         if (!view || view.status === "idle") {
           setAgents((prev) => recordInput(prev, agentId, text, startProvider, startModel));
@@ -200,6 +221,8 @@ export function useAgentCanvas(): UseAgentCanvas {
             prompt: text,
             provider: startProvider,
             model: startModel,
+            cwd: view?.cwd,
+            systemPrompt: view?.systemPrompt,
           });
         } else if (view.status === "waiting_input") {
           setAgents((prev) => recordInput(prev, agentId, text, startProvider, startModel));

@@ -227,6 +227,7 @@ export class FileManager {
 
   private storageDirectory(id: string, input: CreateCanvasFileInput): string {
     if (input.storage === "isolated") return path.join(this.isolatedRoot, id);
+    if (input.directory?.trim()) return path.resolve(input.directory);
     if (!input.agentId) throw new Error("存放到 agent 工作目录时必须选择 agent");
     const cwd = this.resolveAgentCwd(input.agentId) ?? this.workspaceRoot;
     return path.resolve(cwd);

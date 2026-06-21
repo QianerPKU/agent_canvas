@@ -45,6 +45,20 @@ describe("FileManager", () => {
     expect(await readFile(renamed.path, "utf-8")).toBe("hello file node");
   });
 
+  it("可在显式工作目录中创建文件而不绑定 agent", async () => {
+    const directory = path.join(root, "manual-workdir");
+    const file = await manager.create({
+      name: "brief",
+      extension: "md",
+      storage: "agent",
+      directory,
+      kind: "normal",
+    });
+
+    expect(file.path).toBe(path.join(directory, "brief.md"));
+    expect(file.agentId).toBeUndefined();
+  });
+
   it("共享读写开关对全部 Agent 生效", async () => {
     const file = await manager.create({
       name: "shared",

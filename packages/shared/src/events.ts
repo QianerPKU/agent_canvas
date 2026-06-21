@@ -40,6 +40,21 @@ export function isCodexModel(model: string | undefined): model is CodexModel {
   return CODEX_MODELS.some((candidate) => candidate === model);
 }
 
+export interface AgentSettings {
+  provider?: AgentProvider;
+  model?: string;
+  cwd?: string;
+  /** 当前 agent 私有的系统提示词；按提示词节点一样拼接进业务输入。 */
+  systemPrompt?: string;
+}
+
+export interface CreateAgentInput extends AgentSettings {}
+
+export interface UpdateAgentSettingsInput {
+  /** 已创建 agent 只允许调整私有系统提示词。 */
+  systemPrompt?: string;
+}
+
 /** token 使用量（来自 SDK result.usage）。 */
 export interface UsageInfo {
   inputTokens?: number;
@@ -114,6 +129,7 @@ export interface AgentStartConfig {
   /** 工作目录（M2 起由"区域=分支"的 worktree 决定）。 */
   cwd?: string;
   model?: string;
+  /** 当前 agent 私有的系统提示词；由 AgentRunner 按提示词节点方式拼接。 */
   systemPrompt?: string;
   allowedTools?: string[];
   permissionMode?: PermissionMode;

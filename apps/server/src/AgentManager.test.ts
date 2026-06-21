@@ -125,4 +125,61 @@ describe("AgentManager fork", () => {
     await flush();
     expect(codex.calls.at(-1)?.model).toBe("gpt-5.5");
   });
+
+  it("create stores provider, cwd and private system prompt settings", () => {
+    const { query } = makeQuery();
+    const mgr = new AgentManager({ query, defaultCwd: "/repo" });
+    const agent = mgr.create({
+      provider: "codex",
+      model: "gpt-5.4-mini",
+      cwd: "/work",
+      systemPrompt: "private",
+    });
+
+    expect(mgr.snapshot(agent.id)?.config).toMatchObject({
+      provider: "codex",
+      model: "gpt-5.4-mini",
+      cwd: "/work",
+      systemPrompt: "private",
+      prompt: "",
+    });
+  });
+
+  it("updateSettings only changes the private system prompt", () => {
+    const { query } = makeQuery();
+    const mgr = new AgentManager({ query, defaultCwd: "/repo" });
+    const agent = mgr.create({
+      provider: "codex",
+      model: "gpt-5.4",
+      cwd: "/work",
+      systemPrompt: "old",
+    });
+
+    const updated = mgr.updateSettings(agent.id, { systemPrompt: "new" });
+    expect(updated.config).toMatchObject({
+      provider: "codex",
+      model: "gpt-5.4",
+      cwd: "/work",
+      systemPrompt: "new",
+    });
+  });
+
+  it("fork inherits cwd and private system prompt", async () => {
+    const { query } = makeQuery("sess-parent");
+    const mgr = new AgentManager({ query });
+
+    const parent = mgr.create({
+      cwd: "/parent-work",
+      systemPrompt: "parent private prompt",
+    });
+    mgr.startAgent(parent.id, { prompt: "p" });
+    await flush();
+
+    const forked = mgr.fork(parent.id, "u-anchor");
+    expect(forked).toBeDefined();
+    expect(mgr.snapshot(forked!.id)?.config).toMatchObject({
+      cwd: "/parent-work",
+      systemPrompt: "parent private prompt",
+    });
+  });
 });

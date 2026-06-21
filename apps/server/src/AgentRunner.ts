@@ -98,6 +98,16 @@ export class AgentRunner {
     };
   }
 
+  updateSettings(settings: Pick<AgentStartConfig, "systemPrompt">): void {
+    this.config = {
+      ...(this.config ?? { prompt: "" }),
+      systemPrompt: settings.systemPrompt ?? "",
+    };
+    if (this.status !== "idle") {
+      this.promptInjectionPending = true;
+    }
+  }
+
   // ---- 生命周期 ----
 
   /** 启动（或以 resumeSessionId 续接）一次会话。 */
@@ -129,7 +139,6 @@ export class AgentRunner {
     const options: QueryOptions = {
       cwd: config.cwd,
       model: config.model,
-      systemPrompt: config.systemPrompt,
       allowedTools: config.allowedTools,
       permissionMode: config.permissionMode,
       maxTurns: config.maxTurns,
@@ -349,16 +358,35 @@ export class AgentRunner {
   }
 
   private promptAccessForNextInput(): AgentPromptAccess | undefined {
-    const access = this.resolvePromptAccess?.(this.id);
-    if (!access) return undefined;
+    const access =
+      this.resolvePromptAccess?.(this.id) ?? {
+        readablePrompts: [],
+        writablePrompts: [],
+        writableDirectories: [],
+      };
     const includeReadable = this.promptInjectionPending;
     this.promptInjectionPending = false;
-    return includeReadable
+    const next = includeReadable
       ? access
       : {
           ...access,
           readablePrompts: [],
         };
+    if (!includeReadable) return next;
+    const systemPrompt = this.config?.systemPrompt?.trim();
+    if (!systemPrompt) return next;
+    return {
+      ...next,
+      readablePrompts: [
+        {
+          id: `${this.id}:system-prompt`,
+          name: "Agent 私有系统提示词",
+          content: systemPrompt,
+          kind: "normal",
+        },
+        ...next.readablePrompts,
+      ],
+    };
   }
 
   private promptAccessWithoutReadablePrompts(): AgentPromptAccess | undefined {

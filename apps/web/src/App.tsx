@@ -28,6 +28,7 @@ import {
 import { CreateFileDialog } from "./files/CreateFileDialog.js";
 import { FileNode, type FileNodeType } from "./files/FileNode.js";
 import { FileContentWindow } from "./files/FileContentWindow.js";
+import { AgentSettingsDialog } from "./agents/AgentSettingsDialog.js";
 import { CreatePromptDialog } from "./prompts/CreatePromptDialog.js";
 import { PromptNode, type PromptNodeType } from "./prompts/PromptNode.js";
 import type { PromptActions } from "./useAgentCanvas.js";
@@ -47,6 +48,9 @@ const X0 = 40;
 const Y0 = 40;
 
 type CanvasNode = TurnNodeType | FileNodeType | PromptNodeType;
+type AgentSettingsTarget =
+  | { mode: "create" }
+  | { mode: "edit"; agentId: string };
 
 function nodeId(agentId: string, turnIndex: number): string {
   return `${agentId}#${turnIndex}`;
@@ -204,6 +208,7 @@ function buildNodes(
   promptActions: PromptActions,
   current: CanvasNode[],
   onOpenHistory: (agentId: string, turnIndex: number) => void,
+  onOpenAgentSettings: (agentId: string) => void,
   onPreviewFile: (fileId: string) => void,
   onOpenFileEditor: (fileId: string) => void,
 ): CanvasNode[] {
@@ -225,6 +230,7 @@ function buildNodes(
         isLatest: index === view.turns.length - 1,
         windowState: existingTurn?.data.windowState,
         onOpenHistory,
+        onOpenSettings: index === view.turns.length - 1 ? onOpenAgentSettings : undefined,
         actions,
       };
       if (existingTurn) {
@@ -316,7 +322,24 @@ export default function App(): React.ReactElement {
   const [fileOpenError, setFileOpenError] = useState<string>();
   const [creatingFile, setCreatingFile] = useState(false);
   const [creatingPrompt, setCreatingPrompt] = useState(false);
+  const [agentSettingsTarget, setAgentSettingsTarget] = useState<AgentSettingsTarget>();
+  const [defaultCwd, setDefaultCwd] = useState("");
   const openFile = files.find((file) => file.id === openFileId);
+  const settingsAgent =
+    agentSettingsTarget?.mode === "edit" ? agents[agentSettingsTarget.agentId] : undefined;
+
+  useEffect(() => {
+    let cancelled = false;
+    void api.config().then(
+      (config) => {
+        if (!cancelled) setDefaultCwd(config.defaultCwd);
+      },
+      () => undefined,
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const openFileEditor = useCallback((fileId: string) => {
     setFileOpenError(undefined);
@@ -336,6 +359,15 @@ export default function App(): React.ReactElement {
     [agents],
   );
 
+  const openAgentSettings = useCallback((agentId: string) => {
+    setAgentSettingsTarget({ mode: "edit", agentId });
+  }, []);
+
+  const pickDirectory = useCallback(async (initialDirectory?: string) => {
+    const result = await api.pickDirectory(initialDirectory);
+    return result.path ?? undefined;
+  }, []);
+
   useEffect(() => {
     setNodes((current) =>
       buildNodes(
@@ -347,6 +379,7 @@ export default function App(): React.ReactElement {
         promptActions,
         current,
         openHistory,
+        openAgentSettings,
         setOpenFileId,
         openFileEditor,
       ),
@@ -366,6 +399,7 @@ export default function App(): React.ReactElement {
     fileActions,
     promptActions,
     openHistory,
+    openAgentSettings,
     openFileEditor,
     setNodes,
     setEdges,
@@ -445,7 +479,7 @@ export default function App(): React.ReactElement {
           <FilePlus2 size={15} />
           新建文件
         </button>
-        <button className="header-button" onClick={() => void actions.create()}>
+        <button className="header-button" onClick={() => setAgentSettingsTarget({ mode: "create" })}>
           新建 Agent
         </button>
       </header>
@@ -478,11 +512,33 @@ export default function App(): React.ReactElement {
 
       {creatingFile && (
         <CreateFileDialog
-          agents={agents}
+          defaultDirectory={defaultCwd}
+          onBrowseDirectory={pickDirectory}
           onCreate={async (input) => {
             await fileActions.create(input);
           }}
           onClose={() => setCreatingFile(false)}
+        />
+      )}
+      {agentSettingsTarget?.mode === "create" && (
+        <AgentSettingsDialog
+          mode="create"
+          defaultCwd={defaultCwd}
+          onPickDirectory={pickDirectory}
+          onCreate={async (settings) => {
+            await actions.create(settings);
+          }}
+          onClose={() => setAgentSettingsTarget(undefined)}
+        />
+      )}
+      {agentSettingsTarget?.mode === "edit" && settingsAgent && (
+        <AgentSettingsDialog
+          mode="edit"
+          agent={settingsAgent}
+          defaultCwd={defaultCwd}
+          onPickDirectory={pickDirectory}
+          onUpdate={actions.updateSettings}
+          onClose={() => setAgentSettingsTarget(undefined)}
         />
       )}
       {creatingPrompt && (

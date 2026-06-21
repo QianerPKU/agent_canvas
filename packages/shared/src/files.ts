@@ -24,6 +24,8 @@ export interface CreateCanvasFileInput {
   name: string;
   extension?: string;
   storage: CanvasFileStorage;
+  /** storage=agent 时可显式指定工作目录；未指定时回退到所选 agent/default cwd。 */
+  directory?: string;
   agentId?: string;
   kind: CanvasFileKind;
 }

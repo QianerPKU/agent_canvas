@@ -1,6 +1,7 @@
 /** 后端 REST 命令客户端。事件走 WebSocket，命令走这里。 */
 import type {
   AgentEventEnvelope,
+  AgentSettings,
   AgentSnapshot,
   AgentStartConfig,
   CanvasFileConnection,
@@ -12,6 +13,7 @@ import type {
   FileConnectionAccess,
   ForkOrigin,
   PromptConnectionAccess,
+  UpdateAgentSettingsInput,
   UpdateCanvasFileInput,
   UpdateCanvasPromptInput,
 } from "@agent-canvas/shared";
@@ -33,9 +35,24 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   list: () => call<{ agents: AgentSnapshot[] }>("/agents").then((r) => r.agents),
+  config: () => call<{ defaultCwd: string }>("/config"),
   history: (id: string) =>
     call<{ events: AgentEventEnvelope[] }>(`/agents/${id}/history`).then((r) => r.events),
-  create: () => call<{ id: string }>("/agents", { method: "POST" }).then((r) => r.id),
+  create: (settings: AgentSettings) =>
+    call<{ id: string }>("/agents", {
+      method: "POST",
+      body: JSON.stringify(settings),
+    }).then((r) => r.id),
+  updateAgentSettings: (id: string, input: UpdateAgentSettingsInput) =>
+    call<AgentSnapshot>(`/agents/${id}/settings`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
+  pickDirectory: (initialDirectory?: string) =>
+    call<{ path: string | null }>("/directories/pick", {
+      method: "POST",
+      body: JSON.stringify({ initialDirectory }),
+    }),
   start: (id: string, config: AgentStartConfig) =>
     call(`/agents/${id}/start`, { method: "POST", body: JSON.stringify(config) }),
   send: (id: string, text: string) =>

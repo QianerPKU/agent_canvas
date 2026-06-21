@@ -17,6 +17,7 @@ afterEach(cleanup);
 function makeActions(): AgentActions {
   return {
     create: vi.fn().mockResolvedValue(undefined),
+    updateSettings: vi.fn().mockResolvedValue(undefined),
     submit: vi.fn().mockResolvedValue(undefined),
     steer: vi.fn().mockResolvedValue(undefined),
     stop: vi.fn().mockResolvedValue(undefined),
@@ -158,29 +159,29 @@ describe("TurnNode", () => {
       target: { value: "写个 a+b" },
     });
     fireEvent.click(screen.getByText("▶ 启动"));
-    expect(actions.submit).toHaveBeenCalledWith("agent_1", "写个 a+b", "claude", undefined);
+    expect(actions.submit).toHaveBeenCalledWith("agent_1", "写个 a+b");
   });
 
-  it("首轮可选择 Codex provider 与模型", () => {
+  it("最新节点可打开 Agent 设置", () => {
     const actions = makeActions();
-    renderTurn({ index: 0, status: "idle", lines: [] }, "idle", actions);
-
-    fireEvent.change(screen.getByLabelText("agent provider"), {
-      target: { value: "codex" },
-    });
-    fireEvent.change(screen.getByPlaceholderText("输入任务/提示词…"), {
-      target: { value: "用 codex 跑" },
-    });
-    fireEvent.change(screen.getByLabelText("codex model"), {
-      target: { value: "gpt-5.4-mini" },
-    });
-    fireEvent.click(screen.getByText("▶ 启动"));
-    expect(actions.submit).toHaveBeenCalledWith(
-      "agent_1",
-      "用 codex 跑",
-      "codex",
-      "gpt-5.4-mini",
+    const onOpenSettings = vi.fn();
+    const data: TurnNodeData = {
+      agentId: "agent_1",
+      turn: { index: 0, status: "idle", lines: [] },
+      agentStatus: "idle",
+      isLatest: true,
+      onOpenHistory: vi.fn(),
+      onOpenSettings,
+      actions,
+    };
+    render(
+      <ReactFlowProvider>
+        <TurnNode {...({ data, id: "agent_1#0" } as unknown as NodeProps<TurnNodeType>)} />
+      </ReactFlowProvider>,
     );
+
+    fireEvent.click(screen.getByTitle("Agent 设置"));
+    expect(onOpenSettings).toHaveBeenCalledWith("agent_1");
   });
 
   it("续轮 idle（agent waiting_input）：发送本轮按钮", () => {
@@ -191,7 +192,7 @@ describe("TurnNode", () => {
       target: { value: "继续" },
     });
     fireEvent.click(screen.getByText("▶ 发送本轮"));
-    expect(actions.submit).toHaveBeenCalledWith("agent_1", "继续", undefined, undefined);
+    expect(actions.submit).toHaveBeenCalledWith("agent_1", "继续");
   });
 
   it("等待输入时可 compact，并始终可 terminate CLI", () => {

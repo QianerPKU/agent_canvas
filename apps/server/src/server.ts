@@ -1,14 +1,18 @@
 import http from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import type {
+  AgentSettings,
   AgentStartConfig,
+  CreateAgentInput,
   CreateCanvasFileInput,
   CreateCanvasPromptInput,
   ServerFrame,
+  UpdateAgentSettingsInput,
   UpdateCanvasFileInput,
   UpdateCanvasPromptInput,
 } from "@agent-canvas/shared";
 import { AgentManager } from "./AgentManager.js";
+import { pickDirectory as defaultPickDirectory, type PickDirectory } from "./files/DirectoryPicker.js";
 import { FileManager } from "./files/FileManager.js";
 import { openFileInVscode } from "./files/VscodeFileOpener.js";
 import { PromptManager } from "./prompts/PromptManager.js";
@@ -22,7 +26,9 @@ export interface CreateServerResult {
 }
 
 export interface CreateServerOptions {
+  defaultCwd?: string;
   openFile?: (filePath: string) => Promise<void>;
+  pickDirectory?: PickDirectory;
   promptManager?: PromptManager;
 }
 
@@ -32,16 +38,19 @@ export interface CreateServerOptions {
  */
 export function createServer(
   manager: AgentManager,
-  fileManager = new FileManager({
-    resolveAgentCwd: (agentId) => manager.get(agentId)?.snapshot().config?.cwd,
-  }),
+  fileManager?: FileManager,
   options: CreateServerOptions = {},
 ): CreateServerResult {
+  const defaultCwd = options.defaultCwd ?? process.cwd();
+  fileManager ??= new FileManager({
+    workspaceRoot: defaultCwd,
+    resolveAgentCwd: (agentId) => manager.configOf(agentId)?.cwd,
+  });
   manager.setFileAccessResolver((agentId) => fileManager.accessFor(agentId));
   const promptManager =
     options.promptManager ??
     new PromptManager({
-      workspaceRoot: process.cwd(),
+      workspaceRoot: defaultCwd,
     });
   manager.setPromptAccessResolver((agentId) => promptManager.accessFor(agentId));
   const httpServer = http.createServer((req, res) => {
@@ -51,7 +60,9 @@ export function createServer(
       manager,
       fileManager,
       promptManager,
+      defaultCwd,
       options.openFile ?? openFileInVscode,
+      options.pickDirectory ?? defaultPickDirectory,
     ).catch((err) => {
       sendJson(res, 500, { error: errMsg(err) });
     });
@@ -81,7 +92,9 @@ async function handleHttp(
   manager: AgentManager,
   fileManager: FileManager,
   promptManager: PromptManager,
+  defaultCwd: string,
   openFile: (filePath: string) => Promise<void>,
+  pickDirectory: PickDirectory,
 ): Promise<void> {
   setCors(res);
   if (req.method === "OPTIONS") {
@@ -98,12 +111,28 @@ async function handleHttp(
     return sendJson(res, 200, { ok: true });
   }
 
+  if (method === "GET" && path === "/api/config") {
+    return sendJson(res, 200, { defaultCwd });
+  }
+
+  if (method === "POST" && path === "/api/directories/pick") {
+    const body = await readJson<{ initialDirectory?: string }>(req);
+    try {
+      return sendJson(res, 200, {
+        path: (await pickDirectory(body?.initialDirectory)) ?? null,
+      });
+    } catch (error) {
+      return sendJson(res, 501, { error: errMsg(error) });
+    }
+  }
+
   if (method === "GET" && path === "/api/agents") {
     return sendJson(res, 200, { agents: manager.list() });
   }
 
   if (method === "POST" && path === "/api/agents") {
-    const runner = manager.create();
+    const body = await readJson<CreateAgentInput>(req);
+    const runner = manager.create(normalizeAgentSettings(body, defaultCwd));
     return sendJson(res, 201, { id: runner.id });
   }
 
@@ -120,7 +149,7 @@ async function handleHttp(
     ) {
       return sendJson(res, 400, { error: "缺少文件名、存储位置或节点类型" });
     }
-    if (body.storage === "agent" && (!body.agentId || !manager.get(body.agentId))) {
+    if (body.storage === "agent" && body.agentId && !manager.get(body.agentId)) {
       return sendJson(res, 400, { error: "请选择有效的 agent 工作目录" });
     }
     try {
@@ -303,7 +332,15 @@ async function handleHttp(
     if (!runner) return sendJson(res, 404, { error: `未知 agent: ${id}` });
 
     if (method === "GET" && !action) {
-      return sendJson(res, 200, runner.snapshot());
+      return sendJson(res, 200, manager.snapshot(id));
+    }
+    if (method === "PATCH" && action === "settings") {
+      const body = await readJson<UpdateAgentSettingsInput>(req);
+      try {
+        return sendJson(res, 200, manager.updateSettings(id, body ?? {}));
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
     }
     if (method === "GET" && action === "history") {
       return sendJson(res, 200, { events: manager.historyOf(id) });
@@ -405,4 +442,17 @@ function send(ws: WebSocket, frame: ServerFrame): void {
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function normalizeAgentSettings(
+  input: CreateAgentInput | undefined,
+  defaultCwd: string,
+): AgentSettings {
+  const provider = input?.provider === "codex" ? "codex" : "claude";
+  return {
+    provider,
+    model: provider === "codex" ? input?.model : undefined,
+    cwd: input?.cwd?.trim() || defaultCwd,
+    systemPrompt: input?.systemPrompt ?? "",
+  };
 }
