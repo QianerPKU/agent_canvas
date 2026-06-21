@@ -194,6 +194,7 @@ export class PullRequestFlowManager {
 
   async handleAgentEvent(envelope: AgentEventEnvelope): Promise<void> {
     if (envelope.event.kind !== "result") return;
+    await Promise.resolve();
     await this.captureReviewResult(envelope.agentId);
     await this.captureAgentPrEvent(envelope.agentId);
   }

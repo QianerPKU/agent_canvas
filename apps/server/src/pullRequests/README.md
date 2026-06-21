@@ -54,3 +54,11 @@ PR 创建输出：
 ## 测试
 
 `PullRequestFlowManager.test.ts` 使用 fake agent host 覆盖源审查通过、PR 创建、目标审查通过、合并授权、非法 JSON 重试失败和超时。
+
+`PullRequestFlowManager.integration.test.ts` 会创建真实临时 git repo 和 bare remote，经 `WorkspaceManager` clone 出 `main`、`feature/pr-flow`、`feature/other` 三个 branch workspace，再启动多个 fake agent。测试覆盖：
+
+- 源 branch 多个活跃 agent 同时审查，`running` agent 走 steer，`waiting_input` agent 走 send。
+- 目标 branch 多个活跃 agent 在 PR 创建后审查。
+- 非相关 branch 的活跃 agent 不收到审查请求。
+- 目标审查中的非法 JSON 会触发重试，重试通过后才发合并授权。
+- 提 PR agent 输出 `pr_created` / `merged` JSON 后流程自动推进和闭合。
