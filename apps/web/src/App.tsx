@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Background,
   Controls,
@@ -8,6 +8,7 @@ import {
   useNodesState,
   type Connection,
   type Edge,
+  type ReactFlowInstance,
 } from "@xyflow/react";
 import {
   FilePlus2,
@@ -106,6 +107,7 @@ type AgentSettingsTarget =
   | { mode: "edit"; agentId: string };
 type NodePosition = { x: number; y: number };
 type NodeRect = NodePosition & { width: number; height: number };
+type NodePlacementOverrides = Record<string, NodePosition>;
 
 function nodeId(agentId: string, turnIndex: number): string {
   return `${agentId}#${turnIndex}`;
@@ -177,6 +179,17 @@ function nodeWindowState(node: CanvasNode): CanvasNodeLayout["windowState"] {
     default:
       return undefined;
   }
+}
+
+export function centeredNodePosition(
+  center: NodePosition,
+  width: number,
+  height: number,
+): NodePosition {
+  return {
+    x: center.x - width / 2,
+    y: center.y - height / 2,
+  };
 }
 
 export function canvasLayoutFromNodes(
@@ -554,6 +567,7 @@ export function buildNodes(
   onOpenPullRequestDetails: (flowId: string) => void,
   onOpenSyncFlowDetails: (flowId: string) => void,
   savedLayout: CanvasNodeLayout[] = [],
+  placementOverrides: NodePlacementOverrides = {},
 ): CanvasNode[] {
   const layout = computeLayout(agents);
   const byId = new Map(current.map((node) => [node.id, node]));
@@ -570,6 +584,7 @@ export function buildNodes(
   for (const view of Object.values(agents)) {
     view.turns.forEach((turn, index) => {
       const id = nodeId(view.id, index);
+      const placement = placementOverrides[id];
       const existing = byId.get(id);
       const existingTurn = existing?.type === "turn" ? existing : undefined;
       const stored = storedLayoutFor(savedById, id, "turn");
@@ -597,15 +612,33 @@ export function buildNodes(
       if (existingTurn) {
         pushNode({
           ...existingTurn,
+          position: placement
+            ? findFreePosition(
+                placement,
+                nodeWidth(existingTurn),
+                nodeHeight(existingTurn),
+                occupied,
+              )
+            : existingTurn.position,
           width: windowState?.minimized ? 68 : existingTurn.width,
           height: windowState?.minimized ? 48 : existingTurn.height,
           data,
         });
       } else {
+        const fallbackPosition = turnPosition(id, view.id, index, layout, placed, occupied);
+        const positionedAt =
+          index === 0 && placement
+            ? findFreePosition(
+                placement,
+                stored?.width ?? turnWidth(windowState),
+                stored?.height ?? turnHeight(windowState),
+                occupied,
+              )
+            : fallbackPosition;
         pushNode({
           id,
           type: "turn",
-          position: stored?.position ?? turnPosition(id, view.id, index, layout, placed, occupied),
+          position: stored?.position ?? positionedAt,
           width: stored?.width ?? turnWidth(windowState),
           height: stored?.height ?? turnHeight(windowState),
           dragHandle: ".drag-handle",
@@ -618,6 +651,7 @@ export function buildNodes(
   const fileX = X0 + Math.max(Object.keys(agents).length, 1) * COL_W;
   files.forEach((file, index) => {
     const id = fileNodeId(file.id);
+    const placement = placementOverrides[id];
     const existing = byId.get(id);
     const existingFile = existing?.type === "file" ? existing : undefined;
     const stored = storedLayoutFor(savedById, id, "file");
@@ -631,14 +665,25 @@ export function buildNodes(
     };
     pushNode(
       existingFile
-        ? { ...existingFile, data }
+        ? {
+            ...existingFile,
+            position: placement
+              ? findFreePosition(
+                  placement,
+                  nodeWidth(existingFile),
+                  nodeHeight(existingFile),
+                  occupied,
+                )
+              : existingFile.position,
+            data,
+          }
         : {
             id,
             type: "file",
             position:
               stored?.position ??
               findFreePosition(
-                { x: fileX, y: Y0 + index * FILE_ROW_H },
+                placement ?? { x: fileX, y: Y0 + index * FILE_ROW_H },
                 FILE_NODE_WIDTH,
                 FILE_NODE_HEIGHT,
                 occupied,
@@ -654,6 +699,7 @@ export function buildNodes(
   const promptX = fileX + 340;
   prompts.forEach((prompt, index) => {
     const id = promptNodeId(prompt.id);
+    const placement = placementOverrides[id];
     const existing = byId.get(id);
     const existingPrompt = existing?.type === "prompt" ? existing : undefined;
     const stored = storedLayoutFor(savedById, id, "prompt");
@@ -665,14 +711,25 @@ export function buildNodes(
     };
     pushNode(
       existingPrompt
-        ? { ...existingPrompt, data }
+        ? {
+            ...existingPrompt,
+            position: placement
+              ? findFreePosition(
+                  placement,
+                  nodeWidth(existingPrompt),
+                  nodeHeight(existingPrompt),
+                  occupied,
+                )
+              : existingPrompt.position,
+            data,
+          }
         : {
             id,
             type: "prompt",
             position:
               stored?.position ??
               findFreePosition(
-                { x: promptX, y: Y0 + index * FILE_ROW_H },
+                placement ?? { x: promptX, y: Y0 + index * FILE_ROW_H },
                 PROMPT_NODE_WIDTH,
                 PROMPT_NODE_HEIGHT,
                 occupied,
@@ -813,6 +870,8 @@ export default function App(): React.ReactElement {
     prActions,
     syncActions,
   } = useAgentCanvas();
+  const flowRef = useRef<ReactFlowInstance<CanvasNode, Edge> | null>(null);
+  const canvasWrapRef = useRef<HTMLDivElement | null>(null);
   const [nodes, setNodes, onNodesChange] = useNodesState<CanvasNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [savedLayout, setSavedLayout] = useState<CanvasLayoutSnapshot>({
@@ -839,12 +898,28 @@ export default function App(): React.ReactElement {
   const [workspace, setWorkspace] = useState<WorkspaceProject>();
   const [projectError, setProjectError] = useState<string>();
   const [branches, setBranches] = useState<BranchOption[]>([]);
+  const [pendingPlacements, setPendingPlacements] = useState<NodePlacementOverrides>({});
   const openFile = files.find((file) => file.id === openFileId);
   const openCommit = commits.find((commit) => commit.id === openCommitId);
   const openPullRequest = prFlows.find((flow) => flow.id === openPullRequestId);
   const openSyncFlow = syncFlows.find((flow) => flow.id === openSyncFlowId);
   const settingsAgent =
     agentSettingsTarget?.mode === "edit" ? agents[agentSettingsTarget.agentId] : undefined;
+
+  const rememberNodePlacement = useCallback((id: string, width: number, height: number) => {
+    const flow = flowRef.current;
+    const bounds = canvasWrapRef.current?.getBoundingClientRect();
+    if (!flow || !bounds) return;
+    const center = flow.screenToFlowPosition({
+      x: bounds.left + bounds.width / 2,
+      y: bounds.top + bounds.height / 2,
+    });
+    const position = centeredNodePosition(center, width, height);
+    setPendingPlacements((current) => ({
+      ...current,
+      [id]: position,
+    }));
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -894,6 +969,7 @@ export default function App(): React.ReactElement {
         const nextLayout = await api.canvasLayout();
         setNodes([]);
         setEdges([]);
+        setPendingPlacements({});
         setSavedLayout(nextLayout);
         await refresh();
         setWorkspace(nextWorkspace);
@@ -916,6 +992,7 @@ export default function App(): React.ReactElement {
         const nextLayout = await api.canvasLayout();
         setNodes([]);
         setEdges([]);
+        setPendingPlacements({});
         setSavedLayout(nextLayout);
         await refresh();
         setWorkspace(nextWorkspace);
@@ -992,6 +1069,7 @@ export default function App(): React.ReactElement {
         setOpenPullRequestId,
         setOpenSyncFlowId,
         savedLayout.nodes,
+        pendingPlacements,
       ),
     );
     setEdges([
@@ -1018,9 +1096,25 @@ export default function App(): React.ReactElement {
     openAgentSettings,
     openFileEditor,
     savedLayout.nodes,
+    pendingPlacements,
     setNodes,
     setEdges,
   ]);
+
+  useEffect(() => {
+    if (Object.keys(pendingPlacements).length === 0) return;
+    setPendingPlacements((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const node of nodes) {
+        if (next[node.id]) {
+          delete next[node.id];
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [nodes, pendingPlacements]);
 
   useEffect(() => {
     if (!workspace?.canvasProject?.id || workspace.canvasProject.id !== layoutProjectId) return;
@@ -1156,11 +1250,14 @@ export default function App(): React.ReactElement {
         </button>
       </header>
 
-      <div className="canvas-wrap">
+      <div className="canvas-wrap" ref={canvasWrapRef}>
         <ReactFlow
           nodes={nodes}
           edges={edges}
           nodeTypes={nodeTypes}
+          onInit={(instance) => {
+            flowRef.current = instance;
+          }}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={(connection) => void connect(connection)}
@@ -1185,7 +1282,8 @@ export default function App(): React.ReactElement {
       {creatingFile && (
         <CreateFileDialog
           onCreate={async (input) => {
-            await fileActions.create(input);
+            const file = await fileActions.create(input);
+            rememberNodePlacement(fileNodeId(file.id), FILE_NODE_WIDTH, FILE_NODE_HEIGHT);
           }}
           onClose={() => setCreatingFile(false)}
         />
@@ -1196,7 +1294,8 @@ export default function App(): React.ReactElement {
           branches={branches}
           onCreateBranch={createBranch}
           onCreate={async (settings) => {
-            await actions.create(settings);
+            const id = await actions.create(settings);
+            rememberNodePlacement(nodeId(id, 0), DEFAULT_NODE_WIDTH, DEFAULT_NODE_HEIGHT);
             await refreshBranchOptions();
           }}
           onClose={() => setAgentSettingsTarget(undefined)}
@@ -1218,7 +1317,8 @@ export default function App(): React.ReactElement {
       {creatingPrompt && (
         <CreatePromptDialog
           onCreate={async (input) => {
-            await promptActions.create(input);
+            const prompt = await promptActions.create(input);
+            rememberNodePlacement(promptNodeId(prompt.id), PROMPT_NODE_WIDTH, PROMPT_NODE_HEIGHT);
           }}
           onClose={() => setCreatingPrompt(false)}
         />

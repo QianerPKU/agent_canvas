@@ -4,6 +4,7 @@ import type { AgentActions, FileActions, PromptActions } from "./useAgentCanvas.
 import {
   buildNodes,
   canvasLayoutFromNodes,
+  centeredNodePosition,
   computeCommitEdges,
   computeFileEdges,
   computeLayout,
@@ -196,6 +197,90 @@ describe("computeFileEdges", () => {
       width: 68,
       height: 48,
       data: { windowState: { minimized: true, restoreWidth: 280, restoreHeight: 240 } },
+    });
+  });
+
+  it("centeredNodePosition returns the top-left coordinate for a centered node", () => {
+    expect(centeredNodePosition({ x: 500, y: 300 }, 360, 240)).toEqual({
+      x: 320,
+      y: 180,
+    });
+  });
+
+  it("buildNodes uses viewport placement overrides for newly created root nodes", () => {
+    const agents: AgentMap = {
+      agent_1: {
+        id: "agent_1",
+        status: "idle",
+        turns: [{ index: 0, status: "idle", lines: [] }],
+        lastSeq: 0,
+      },
+    };
+
+    const nodes = buildNodes(
+      agents,
+      [
+        {
+          id: "file_1",
+          name: "brief",
+          filename: "brief.md",
+          extension: "md",
+          path: "/tmp/brief.md",
+          storage: "isolated",
+          kind: "normal",
+          sharedRead: false,
+          sharedWrite: false,
+          previewKind: "markdown",
+          mimeType: "text/markdown",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+      [
+        {
+          id: "prompt_1",
+          name: "guide",
+          content: "test first",
+          kind: "normal",
+          sharedRead: false,
+          sharedWrite: false,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+      [],
+      [],
+      [],
+      {} as AgentActions,
+      {} as FileActions,
+      {} as PromptActions,
+      [],
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      [],
+      {
+        "agent_1#0": { x: 1000, y: 800 },
+        "file:file_1": { x: 1500, y: 850 },
+        "prompt:prompt_1": { x: 1900, y: 900 },
+      },
+    );
+
+    expect(nodes.find((node) => node.id === "agent_1#0")?.position).toEqual({
+      x: 1000,
+      y: 800,
+    });
+    expect(nodes.find((node) => node.id === "file:file_1")?.position).toEqual({
+      x: 1500,
+      y: 850,
+    });
+    expect(nodes.find((node) => node.id === "prompt:prompt_1")?.position).toEqual({
+      x: 1900,
+      y: 900,
     });
   });
 

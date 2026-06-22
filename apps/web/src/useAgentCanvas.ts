@@ -43,7 +43,7 @@ import {
 
 export interface AgentActions {
   /** 新建一个 agent（出现一个 idle 起始节点）。 */
-  create: (settings: AgentSettings) => Promise<void>;
+  create: (settings: AgentSettings) => Promise<string>;
   /** 更新已创建 agent 的可变设置。 */
   updateSettings: (
     agentId: string,
@@ -278,6 +278,7 @@ export function useAgentCanvas(): UseAgentCanvas {
                 }),
               },
         );
+        return id;
       },
       updateSettings: async (agentId, settings) => {
         const snapshot = await api.updateAgentSettings(agentId, settings);
