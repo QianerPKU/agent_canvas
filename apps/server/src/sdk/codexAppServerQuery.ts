@@ -116,6 +116,7 @@ function createHandle(
       }
       await client.request("turn/steer", {
         threadId,
+        expectedTurnId: turnId,
         input: codexInputs({
           text: inputText(input),
           fileAccess: input.fileAccess,

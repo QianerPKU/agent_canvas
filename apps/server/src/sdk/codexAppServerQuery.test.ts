@@ -86,7 +86,17 @@ function makeFakeSpawn(options: { completeTurnStart?: boolean } = {}) {
         }
         break;
       case "turn/steer":
-        write({ id: message.id, result: { turn: { id: "turn-1" } } });
+        if (message.params?.expectedTurnId !== "turn-1") {
+          write({
+            id: message.id,
+            error: {
+              code: -32602,
+              message: "expectedTurnId is required",
+            },
+          });
+          break;
+        }
+        write({ id: message.id, result: { turnId: "turn-1" } });
         break;
       case "thread/compact/start":
         write({ id: message.id, result: {} });
@@ -302,6 +312,7 @@ describe("Codex app-server query", () => {
     const steer = fake.messages.find((message) => message.method === "turn/steer");
     expect(steer?.params).toEqual({
       threadId: "thread-1",
+      expectedTurnId: "turn-1",
       input: [
         {
           type: "text",
