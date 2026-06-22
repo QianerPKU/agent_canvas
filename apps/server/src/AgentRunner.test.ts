@@ -34,7 +34,7 @@ function resultMsg(extra: Partial<Record<string, unknown>> = {}): SdkMessage {
 }
 
 /** 可手动驱动的假 query：emit 推消息，finish 关闭输出，记录收到的输入与 interrupt。 */
-function makeControllableQuery() {
+function makeControllableQuery(handleOptions: { nativeSteer?: boolean } = {}) {
   let out = new AsyncMessageQueue<SdkMessage>();
   const inputs: SdkUserInput[] = [];
   const steeredInputs: SdkUserInput[] = [];
@@ -56,14 +56,16 @@ function makeControllableQuery() {
       interrupt: async () => {
         interrupted = true;
       },
-      steer: async (input) => {
-        steeredInputs.push(input);
-      },
       terminate: async () => {
         terminated = true;
         out.close();
       },
     };
+    if (handleOptions.nativeSteer !== false) {
+      handle.steer = async (input) => {
+        steeredInputs.push(input);
+      };
+    }
     return handle;
   };
 
@@ -200,6 +202,50 @@ describe("AgentRunner 生命周期", () => {
       text: "请优先看失败测试",
       mode: "steer",
     });
+  });
+
+  it("provider 没有原生 steer 时打断当前轮，并把引导插到普通队列前", async () => {
+    const ctl = makeControllableQuery({ nativeSteer: false });
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("steer-fallback-agent", { query: ctl.query });
+    runner.on((event) => events.push(event));
+
+    runner.start({ prompt: "长任务" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+
+    runner.send("普通排队");
+    await runner.steer("请优先看失败测试");
+
+    expect(ctl.wasInterrupted()).toBe(true);
+    expect(ctl.steeredInputs).toHaveLength(0);
+    expect(events).toContainEqual({
+      kind: "user_input",
+      text: "普通排队",
+      mode: "queued",
+    });
+    expect(events).toContainEqual({
+      kind: "user_input",
+      text: "请优先看失败测试",
+      mode: "steer",
+    });
+
+    ctl.emit(resultMsg());
+    await flush();
+
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual([
+      "长任务",
+      "请优先看失败测试",
+    ]);
+
+    ctl.emit(resultMsg());
+    await flush();
+
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual([
+      "长任务",
+      "请优先看失败测试",
+      "普通排队",
+    ]);
   });
 
   it("provider 发起交互问题时广播到前端，并等待 answerQuestion", async () => {

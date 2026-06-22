@@ -6,3 +6,7 @@ diffs from git and broadcasts the snapshot.
 
 Edges use `sourceTurnIndex`, so a commit remains connected to the exact conversation turn that
 reported it even after the agent continues and that turn becomes historical.
+
+New commit nodes are placed to the right of their source turn. Placement uses the full restored turn
+width even when the source turn is auto-minimized, so the commit node does not overlap the next turn
+that appears below the minimized node.

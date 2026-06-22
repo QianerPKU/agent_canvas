@@ -1,14 +1,146 @@
 import { describe, expect, it } from "vitest";
 import type { AgentMap } from "./agentStore.js";
+import type { AgentActions, FileActions, PromptActions } from "./useAgentCanvas.js";
 import {
+  buildNodes,
   computeCommitEdges,
   computeFileEdges,
+  computeLayout,
   computePromptEdges,
   computePullRequestEdges,
   computeSyncFlowEdges,
 } from "./App.js";
 
 describe("computeFileEdges", () => {
+  it("新一轮节点位于自动最小化的上一轮正下方", () => {
+    const agents: AgentMap = {
+      agent_1: {
+        id: "agent_1",
+        status: "waiting_input",
+        turns: [
+          { index: 0, status: "done", lines: [] },
+          { index: 1, status: "idle", lines: [] },
+        ],
+        lastSeq: 2,
+      },
+    };
+
+    const nodes = buildNodes(
+      agents,
+      [],
+      [],
+      [],
+      [],
+      [],
+      {} as AgentActions,
+      {} as FileActions,
+      {} as PromptActions,
+      [],
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+    );
+
+    const first = nodes.find((node) => node.id === "agent_1#0");
+    const second = nodes.find((node) => node.id === "agent_1#1");
+
+    expect(first).toMatchObject({
+      width: 68,
+      height: 48,
+      data: { windowState: { minimized: true } },
+    });
+    expect(second?.position.x).toBe(first?.position.x);
+    expect(second?.position.y).toBe((first?.position.y ?? 0) + 72);
+  });
+
+  it("commit 节点创建在源对话轮右侧，并避让同源 commit", () => {
+    const agents: AgentMap = {
+      agent_1: {
+        id: "agent_1",
+        status: "waiting_input",
+        turns: [
+          { index: 0, status: "done", lines: [] },
+          { index: 1, status: "idle", lines: [] },
+        ],
+        lastSeq: 2,
+      },
+    };
+
+    const nodes = buildNodes(
+      agents,
+      [],
+      [],
+      [
+        {
+          id: "commit_1",
+          agentId: "agent_1",
+          sourceTurnIndex: 0,
+          commitSha: "abcdef123456",
+          shortSha: "abcdef1",
+          subject: "feat: add thing",
+          summary: "add thing",
+          files: [],
+          createdAt: 1,
+        },
+        {
+          id: "commit_2",
+          agentId: "agent_1",
+          sourceTurnIndex: 0,
+          commitSha: "123456abcdef",
+          shortSha: "123456a",
+          subject: "fix: adjust thing",
+          summary: "adjust thing",
+          files: [],
+          createdAt: 2,
+        },
+      ],
+      [],
+      [],
+      {} as AgentActions,
+      {} as FileActions,
+      {} as PromptActions,
+      [],
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+    );
+
+    const source = nodes.find((node) => node.id === "agent_1#0");
+    const commit1 = nodes.find((node) => node.id === "commit:commit_1");
+    const commit2 = nodes.find((node) => node.id === "commit:commit_2");
+
+    expect(commit1?.position.x).toBeGreaterThan(source?.position.x ?? 0);
+    expect(commit1?.position.y).toBe(source?.position.y);
+    expect(commit2?.position).not.toEqual(commit1?.position);
+  });
+
+  it("默认 agent 列距为右侧派生节点预留空间", () => {
+    const positions = computeLayout({
+      agent_1: {
+        id: "agent_1",
+        status: "idle",
+        turns: [{ index: 0, status: "idle", lines: [] }],
+        lastSeq: 0,
+      },
+      agent_2: {
+        id: "agent_2",
+        status: "idle",
+        turns: [{ index: 0, status: "idle", lines: [] }],
+        lastSeq: 0,
+      },
+    });
+
+    expect(positions["agent_2#0"]!.x - positions["agent_1#0"]!.x).toBeGreaterThan(650);
+  });
+
   it("把连接继承到 Agent 最新一轮，并保留读写方向", () => {
     const agents: AgentMap = {
       agent_1: {

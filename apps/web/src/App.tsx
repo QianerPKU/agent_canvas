@@ -71,7 +71,7 @@ const nodeTypes = {
   syncFlow: SyncFlowNode,
 };
 
-const COL_W = 430;
+const COL_W = 760;
 const ROW_H = 360;
 const FILE_ROW_H = 280;
 const DEFAULT_NODE_WIDTH = 360;
@@ -88,6 +88,9 @@ const SYNC_NODE_WIDTH = 290;
 const SYNC_NODE_HEIGHT = 180;
 const X0 = 40;
 const Y0 = 40;
+const NODE_GAP = 36;
+const TURN_VERTICAL_GAP = 24;
+const DERIVED_NODE_GAP = 24;
 
 type CanvasNode =
   | TurnNodeType
@@ -99,6 +102,8 @@ type CanvasNode =
 type AgentSettingsTarget =
   | { mode: "create" }
   | { mode: "edit"; agentId: string };
+type NodePosition = { x: number; y: number };
+type NodeRect = NodePosition & { width: number; height: number };
 
 function nodeId(agentId: string, turnIndex: number): string {
   return `${agentId}#${turnIndex}`;
@@ -124,13 +129,147 @@ function syncFlowNodeId(flowId: string): string {
   return `sync:${flowId}`;
 }
 
+function fallbackSize(node: CanvasNode): { width: number; height: number } {
+  switch (node.type) {
+    case "file":
+      return { width: FILE_NODE_WIDTH, height: FILE_NODE_HEIGHT };
+    case "prompt":
+      return { width: PROMPT_NODE_WIDTH, height: PROMPT_NODE_HEIGHT };
+    case "commit":
+      return { width: COMMIT_NODE_WIDTH, height: COMMIT_NODE_HEIGHT };
+    case "pullRequest":
+      return { width: PR_NODE_WIDTH, height: PR_NODE_HEIGHT };
+    case "syncFlow":
+      return { width: SYNC_NODE_WIDTH, height: SYNC_NODE_HEIGHT };
+    case "turn":
+    default:
+      return { width: DEFAULT_NODE_WIDTH, height: DEFAULT_NODE_HEIGHT };
+  }
+}
+
+function nodeWidth(node: CanvasNode): number {
+  return node.width ?? node.measured?.width ?? fallbackSize(node).width;
+}
+
+function nodeHeight(node: CanvasNode): number {
+  return node.height ?? node.measured?.height ?? fallbackSize(node).height;
+}
+
+function nodeRect(node: CanvasNode): NodeRect {
+  return {
+    ...node.position,
+    width: nodeWidth(node),
+    height: nodeHeight(node),
+  };
+}
+
+function intersects(a: NodeRect, b: NodeRect): boolean {
+  return (
+    a.x < b.x + b.width + DERIVED_NODE_GAP &&
+    a.x + a.width + DERIVED_NODE_GAP > b.x &&
+    a.y < b.y + b.height + DERIVED_NODE_GAP &&
+    a.y + a.height + DERIVED_NODE_GAP > b.y
+  );
+}
+
+function isFree(position: NodePosition, width: number, height: number, occupied: NodeRect[]): boolean {
+  const candidate = { ...position, width, height };
+  return !occupied.some((rect) => intersects(candidate, rect));
+}
+
+function findFreePosition(
+  preferred: NodePosition,
+  width: number,
+  height: number,
+  occupied: NodeRect[],
+): NodePosition {
+  for (let column = 0; column < 8; column++) {
+    for (let row = 0; row < 10; row++) {
+      const candidate = {
+        x: preferred.x + column * (width + NODE_GAP),
+        y: preferred.y + row * (height + NODE_GAP),
+      };
+      if (isFree(candidate, width, height, occupied)) return candidate;
+    }
+  }
+  return preferred;
+}
+
+function turnPosition(
+  id: string,
+  viewId: string,
+  index: number,
+  layout: Record<string, NodePosition>,
+  placed: Map<string, CanvasNode>,
+  occupied: NodeRect[],
+): NodePosition {
+  if (index === 0) return layout[id] ?? { x: X0, y: Y0 };
+  const previous = placed.get(nodeId(viewId, index - 1));
+  if (!previous) return layout[id] ?? { x: X0, y: Y0 + index * ROW_H };
+  const preferred = {
+    x: previous.position.x,
+    y: previous.position.y + nodeHeight(previous) + TURN_VERTICAL_GAP,
+  };
+  return findFreePosition(preferred, DEFAULT_NODE_WIDTH, DEFAULT_NODE_HEIGHT, occupied);
+}
+
+function anchoredSidePosition(
+  source: CanvasNode | undefined,
+  fallback: NodePosition,
+  width: number,
+  height: number,
+  occupied: NodeRect[],
+): NodePosition {
+  if (!source) return findFreePosition(fallback, width, height, occupied);
+  const sourceWidth =
+    source.type === "turn"
+      ? Math.max(
+          nodeWidth(source),
+          source.data.windowState?.restoreWidth ?? DEFAULT_NODE_WIDTH,
+          DEFAULT_NODE_WIDTH,
+        )
+      : nodeWidth(source);
+  return findFreePosition(
+    {
+      x: source.position.x + sourceWidth + NODE_GAP,
+      y: source.position.y,
+    },
+    width,
+    height,
+    occupied,
+  );
+}
+
+function autoTurnWindowState(
+  existingTurn: TurnNodeType | undefined,
+  turnStatus: TurnNodeType["data"]["turn"]["status"],
+  isLatest: boolean,
+): TurnNodeType["data"]["windowState"] {
+  const existingState = existingTurn?.data.windowState;
+  if (existingState) return existingState;
+  if (isLatest || turnStatus === "idle") return undefined;
+  return {
+    minimized: true,
+    restoreWidth: existingTurn?.width ?? existingTurn?.measured?.width ?? DEFAULT_NODE_WIDTH,
+    restoreHeight: existingTurn?.height ?? existingTurn?.measured?.height ?? DEFAULT_NODE_HEIGHT,
+  };
+}
+
+function turnWidth(windowState: TurnNodeType["data"]["windowState"]): number {
+  return windowState?.minimized ? 68 : DEFAULT_NODE_WIDTH;
+}
+
+function turnHeight(windowState: TurnNodeType["data"]["windowState"]): number {
+  return windowState?.minimized ? 48 : DEFAULT_NODE_HEIGHT;
+}
+
 function anchorIndex(agents: AgentMap, parentId: string, anchorUuid: string): number {
   const parent = agents[parentId];
   if (!parent) return -1;
   return parent.turns.findIndex((turn) => turn.anchorUuid === anchorUuid);
 }
 
-function computeLayout(agents: AgentMap): Record<string, { x: number; y: number }> {
+export function computeLayout(agents: AgentMap): Record<string, { x: number; y: number }> {
   const positions: Record<string, { x: number; y: number }> = {};
   const baseY: Record<string, number> = {};
   let column = 0;
@@ -348,7 +487,7 @@ function isClosedSyncStatus(status: SyncFlowSnapshot["status"]): boolean {
   return ["review_failed", "applied", "timed_out", "cancelled", "blocked"].includes(status);
 }
 
-function buildNodes(
+export function buildNodes(
   agents: AgentMap,
   files: CanvasFileNode[],
   prompts: CanvasPromptNode[],
@@ -370,11 +509,21 @@ function buildNodes(
   const layout = computeLayout(agents);
   const byId = new Map(current.map((node) => [node.id, node]));
   const result: CanvasNode[] = [];
+  const placed = new Map<string, CanvasNode>();
+  const occupied: NodeRect[] = [];
+  const pushNode = (node: CanvasNode) => {
+    result.push(node);
+    placed.set(node.id, node);
+    occupied.push(nodeRect(node));
+  };
+
   for (const view of Object.values(agents)) {
     view.turns.forEach((turn, index) => {
       const id = nodeId(view.id, index);
       const existing = byId.get(id);
       const existingTurn = existing?.type === "turn" ? existing : undefined;
+      const isLatest = index === view.turns.length - 1;
+      const windowState = autoTurnWindowState(existingTurn, turn.status, isLatest);
       const data = {
         agentId: view.id,
         turn,
@@ -382,21 +531,26 @@ function buildNodes(
         provider: view.provider,
         model: view.model,
         providerLocked: !!view.forkOrigin,
-        isLatest: index === view.turns.length - 1,
-        windowState: existingTurn?.data.windowState,
+        isLatest,
+        windowState,
         onOpenHistory,
-        onOpenSettings: index === view.turns.length - 1 ? onOpenAgentSettings : undefined,
+        onOpenSettings: isLatest ? onOpenAgentSettings : undefined,
         actions,
       };
       if (existingTurn) {
-        result.push({ ...existingTurn, data });
+        pushNode({
+          ...existingTurn,
+          width: windowState?.minimized ? 68 : existingTurn.width,
+          height: windowState?.minimized ? 48 : existingTurn.height,
+          data,
+        });
       } else {
-        result.push({
+        pushNode({
           id,
           type: "turn",
-          position: layout[id] ?? { x: X0, y: Y0 },
-          width: DEFAULT_NODE_WIDTH,
-          height: DEFAULT_NODE_HEIGHT,
+          position: turnPosition(id, view.id, index, layout, placed, occupied),
+          width: turnWidth(windowState),
+          height: turnHeight(windowState),
           dragHandle: ".drag-handle",
           data,
         });
@@ -416,13 +570,18 @@ function buildNodes(
       onOpenEditor: onOpenFileEditor,
       windowState: existingFile?.data.windowState,
     };
-    result.push(
+    pushNode(
       existingFile
         ? { ...existingFile, data }
         : {
             id,
             type: "file",
-            position: { x: fileX, y: Y0 + index * FILE_ROW_H },
+            position: findFreePosition(
+              { x: fileX, y: Y0 + index * FILE_ROW_H },
+              FILE_NODE_WIDTH,
+              FILE_NODE_HEIGHT,
+              occupied,
+            ),
             width: FILE_NODE_WIDTH,
             height: FILE_NODE_HEIGHT,
             dragHandle: ".drag-handle",
@@ -441,13 +600,18 @@ function buildNodes(
       actions: promptActions,
       windowState: existingPrompt?.data.windowState,
     };
-    result.push(
+    pushNode(
       existingPrompt
         ? { ...existingPrompt, data }
         : {
             id,
             type: "prompt",
-            position: { x: promptX, y: Y0 + index * FILE_ROW_H },
+            position: findFreePosition(
+              { x: promptX, y: Y0 + index * FILE_ROW_H },
+              PROMPT_NODE_WIDTH,
+              PROMPT_NODE_HEIGHT,
+              occupied,
+            ),
             width: PROMPT_NODE_WIDTH,
             height: PROMPT_NODE_HEIGHT,
             dragHandle: ".drag-handle",
@@ -466,13 +630,20 @@ function buildNodes(
       onOpenDetails: onOpenCommitDetails,
       windowState: existingCommit?.data.windowState,
     };
-    result.push(
+    const source = fixedTurnNodeId(agents, commit.agentId, commit.sourceTurnIndex);
+    pushNode(
       existingCommit
         ? { ...existingCommit, data }
         : {
             id,
             type: "commit",
-            position: { x: commitX, y: Y0 + index * 210 },
+            position: anchoredSidePosition(
+              source ? placed.get(source) ?? byId.get(source) : undefined,
+              { x: commitX, y: Y0 + index * 210 },
+              COMMIT_NODE_WIDTH,
+              COMMIT_NODE_HEIGHT,
+              occupied,
+            ),
             width: COMMIT_NODE_WIDTH,
             height: COMMIT_NODE_HEIGHT,
             dragHandle: ".drag-handle",
@@ -491,13 +662,20 @@ function buildNodes(
       onOpenDetails: onOpenPullRequestDetails,
       windowState: existingPr?.data.windowState,
     };
-    result.push(
+    const source = fixedTurnNodeId(agents, flow.proposerAgentId, flow.sourceTurnIndex);
+    pushNode(
       existingPr
         ? { ...existingPr, data }
         : {
             id,
             type: "pullRequest",
-            position: { x: prX, y: Y0 + index * 220 },
+            position: anchoredSidePosition(
+              source ? placed.get(source) ?? byId.get(source) : undefined,
+              { x: prX, y: Y0 + index * 220 },
+              PR_NODE_WIDTH,
+              PR_NODE_HEIGHT,
+              occupied,
+            ),
             width: PR_NODE_WIDTH,
             height: PR_NODE_HEIGHT,
             dragHandle: ".drag-handle",
@@ -516,13 +694,20 @@ function buildNodes(
       onOpenDetails: onOpenSyncFlowDetails,
       windowState: existingSync?.data.windowState,
     };
-    result.push(
+    const source = fixedTurnNodeId(agents, flow.proposerAgentId, flow.sourceTurnIndex);
+    pushNode(
       existingSync
         ? { ...existingSync, data }
         : {
             id,
             type: "syncFlow",
-            position: { x: syncX, y: Y0 + index * 220 },
+            position: anchoredSidePosition(
+              source ? placed.get(source) ?? byId.get(source) : undefined,
+              { x: syncX, y: Y0 + index * 220 },
+              SYNC_NODE_WIDTH,
+              SYNC_NODE_HEIGHT,
+              occupied,
+            ),
             width: SYNC_NODE_WIDTH,
             height: SYNC_NODE_HEIGHT,
             dragHandle: ".drag-handle",

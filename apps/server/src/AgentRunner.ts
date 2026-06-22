@@ -262,6 +262,9 @@ export class AgentRunner {
     );
     if (this.handle?.steer) {
       await this.handle.steer(input);
+    } else if (this.handle?.interrupt) {
+      this.pendingQueuedInputs.unshift(text);
+      await this.handle.interrupt().catch(() => undefined);
     } else {
       this.inputQueue.push(input);
     }

@@ -107,6 +107,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 ## 多轮对话与 fork（对话历史分叉）
 
 - **多轮**：同一 agent = 同一 provider 会话。每轮 = 一次用户输入 + 一次完整答复，以 `result` 事件收尾。每个 `result` 携带本轮最后一条 assistant 消息的 `anchorUuid`（fork UI 锚点）。
+- **引导**：`POST /api/agents/:id/steer` 优先调用 provider 原生 steer（Codex app-server 的 `turn/steer`）。provider 没有原生 steer 时，AgentRunner 会把引导文本插到普通排队输入前面，并 interrupt 当前轮，让下一轮尽快以该引导开始。
 - **fork**：`POST /:id/fork { anchorUuid, model? }` 会创建独立新 agent 并继承父 provider。Codex 可覆盖目标模型，未指定则继承父启动配置。Claude 使用 `resume + resumeSessionAt + forkSession:true` 从指定 assistant uuid 分叉；Codex 使用 app-server `thread/fork` 从父 thread 分叉（Codex app-server 当前是 thread 级 fork，不是按某个 assistant uuid 回滚）。对话 fork 与 git 分支无关。
 
 ## WebSocket (`/ws`)
