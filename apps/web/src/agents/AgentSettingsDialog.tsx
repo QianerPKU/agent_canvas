@@ -48,7 +48,7 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
   const [submitting, setSubmitting] = useState(false);
   const [creatingBranch, setCreatingBranch] = useState(false);
   const canChangeBranch = props.mode === "create" || props.canChangeBranch;
-  const branches = [...props.branches, ...extraBranches];
+  const branches = mergeBranchOptions(props.branches, extraBranches);
   const selectedBranch = branches.find((branch) => branch.branch === branchName);
 
   useEffect(() => {
@@ -281,4 +281,29 @@ function Segmented({
 
 function codexModel(model: string | undefined): CodexModel {
   return isCodexModel(model) ? model : DEFAULT_CODEX_MODEL;
+}
+
+function mergeBranchOptions(
+  primary: BranchOption[],
+  extra: BranchOption[],
+): BranchOption[] {
+  const byBranch = new Map<string, BranchOption>();
+  for (const option of [...primary, ...extra]) {
+    const current = byBranch.get(option.branch);
+    if (!current || shouldPreferBranchOption(option, current)) {
+      byBranch.set(option.branch, option);
+    }
+  }
+  return [...byBranch.values()];
+}
+
+function shouldPreferBranchOption(
+  candidate: BranchOption,
+  current: BranchOption,
+): boolean {
+  if (candidate.hasWorkspace !== current.hasWorkspace) return candidate.hasWorkspace;
+  if (!!candidate.branchWorkspaceId !== !!current.branchWorkspaceId) {
+    return !!candidate.branchWorkspaceId;
+  }
+  return false;
 }

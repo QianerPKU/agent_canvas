@@ -89,6 +89,57 @@ describe("AgentSettingsDialog", () => {
     );
   });
 
+  it("创建同名远端 branch 后不会在列表中显示重复项", async () => {
+    const onCreateBranch = vi.fn().mockResolvedValue({
+      id: "branch_2",
+      repoId: "repo_1",
+      branch: "feature/a",
+      worktreePath: "E:\\project\\feature-a",
+      scratchRoot: "E:\\project\\feature-a\\.agent-tmp",
+      isDefault: false,
+      createdAt: 2,
+    });
+    const onCreate = vi.fn().mockResolvedValue(undefined);
+    render(
+      <AgentSettingsDialog
+        mode="create"
+        branches={[
+          ...branches,
+          {
+            branch: "feature/a",
+            hasWorkspace: false,
+            isDefault: false,
+          },
+        ]}
+        onCreateBranch={onCreateBranch}
+        onCreate={onCreate}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("新建 branch"), {
+      target: { value: "feature/a" },
+    });
+    fireEvent.click(screen.getByTitle("创建 branch"));
+
+    await waitFor(() => expect(onCreateBranch).toHaveBeenCalledWith("feature/a"));
+    const options = Array.from(
+      (screen.getByLabelText("Agent branch") as HTMLSelectElement).options,
+    ).filter((option) => option.value === "feature/a");
+    expect(options).toHaveLength(1);
+
+    fireEvent.click(screen.getByText("创建"));
+    await waitFor(() =>
+      expect(onCreate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          branchWorkspaceId: "branch_2",
+          branch: "feature/a",
+          cwd: "E:\\project\\feature-a",
+        }),
+      ),
+    );
+  });
+
   it("编辑已创建 Agent 时只提交私有系统提示词", async () => {
     const onUpdate = vi.fn().mockResolvedValue(undefined);
     const agent = newAgentView("agent_1", {
