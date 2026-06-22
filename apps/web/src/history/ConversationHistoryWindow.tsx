@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import type { AgentEvent } from "@agent-canvas/shared";
 import { api } from "../api.js";
@@ -24,26 +24,56 @@ export function ConversationHistoryWindow({
   const [turns, setTurns] = useState<HistoryTurn[]>([]);
   const [error, setError] = useState<string>();
   const [loading, setLoading] = useState(true);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const loadedTargetRef = useRef<string>();
+  const scrollSnapshotRef = useRef<
+    | {
+        top: number;
+        wasNearBottom: boolean;
+      }
+    | undefined
+  >();
 
   useEffect(() => {
     let active = true;
-    setLoading(true);
+    const targetKey = `${target.agentId}:${target.turnIndex}`;
+    const targetChanged = loadedTargetRef.current !== targetKey;
+    const body = bodyRef.current;
+    scrollSnapshotRef.current =
+      !targetChanged && body
+        ? {
+            top: body.scrollTop,
+            wasNearBottom: body.scrollHeight - body.scrollTop - body.clientHeight < 24,
+          }
+        : undefined;
+
+    if (targetChanged) setLoading(true);
     setError(undefined);
     void api
       .history(target.agentId)
       .then((events) => {
-        if (active) setTurns(buildConversationHistory(events, target.turnIndex));
+        if (!active) return;
+        loadedTargetRef.current = targetKey;
+        setTurns(buildConversationHistory(events, target.turnIndex));
       })
       .catch((err: unknown) => {
         if (active) setError(err instanceof Error ? err.message : String(err));
       })
       .finally(() => {
-        if (active) setLoading(false);
+        if (active && targetChanged) setLoading(false);
       });
     return () => {
       active = false;
     };
   }, [target.agentId, target.turnIndex, target.lastSeq]);
+
+  useLayoutEffect(() => {
+    const snapshot = scrollSnapshotRef.current;
+    const body = bodyRef.current;
+    if (!snapshot || !body) return;
+    body.scrollTop = snapshot.wasNearBottom ? body.scrollHeight : snapshot.top;
+    scrollSnapshotRef.current = undefined;
+  }, [turns]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -76,7 +106,7 @@ export function ConversationHistoryWindow({
           </button>
         </header>
 
-        <div className="history-window__body">
+        <div className="history-window__body" ref={bodyRef}>
           {loading && <div className="history-empty">正在读取历史…</div>}
           {error && <div className="history-error">{error}</div>}
           {!loading && !error && turns.every((turn) => turn.items.length === 0) && (
