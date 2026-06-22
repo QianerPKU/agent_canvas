@@ -48,6 +48,10 @@ describe("PullRequestFlowManager integration", () => {
         query: query.query,
         codexQuery: query.query,
         now: nextNow,
+        resolveTurnContext: async (config) => ({
+          branch: config?.branch,
+          cwd: config?.cwd,
+        }),
       });
       const prManager = new PullRequestFlowManager({
         host: agentManager,

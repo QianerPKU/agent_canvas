@@ -252,4 +252,41 @@ describe("AgentManager fork", () => {
     await flush();
     expect(mgr.currentTurnIndex(runner.id)).toBe(1);
   });
+
+  it("records branch and base commit context for a started turn", async () => {
+    const { query } = makeWaitingQuery();
+    const events: string[] = [];
+    const mgr = new AgentManager({
+      query,
+      resolveTurnContext: async (config) => ({
+        branch: config?.branch,
+        cwd: config?.cwd,
+        baseCommitSha: "abcdef1234567890",
+        baseShortSha: "abcdef1",
+      }),
+    });
+    mgr.onEvent((envelope) => events.push(envelope.event.kind));
+
+    const runner = mgr.create({ branch: "feature/a", cwd: "/repo-a" });
+    mgr.startAgent(runner.id, {
+      prompt: "first",
+      branch: "feature/a",
+      cwd: "/repo-a",
+    });
+    await flush();
+    await flush();
+
+    expect(mgr.historyOf(runner.id).map((entry) => entry.event)).toContainEqual({
+      kind: "turn_context",
+      context: {
+        turnIndex: 0,
+        branch: "feature/a",
+        cwd: "/repo-a",
+        baseCommitSha: "abcdef1234567890",
+        baseShortSha: "abcdef1",
+      },
+    });
+    expect(events).toContain("user_input");
+    expect(events).toContain("turn_context");
+  });
 });

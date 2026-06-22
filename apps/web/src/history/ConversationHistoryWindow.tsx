@@ -152,6 +152,15 @@ function HistoryEvent({ item }: { item: HistoryItem }): React.ReactElement {
           content={event.text}
         />
       );
+    case "turn_context":
+      return (
+        <EventBlock
+          tone="system"
+          label="Turn context"
+          time={time}
+          content={turnContextText(event.context)}
+        />
+      );
     case "thinking":
       return <EventBlock tone="thinking" label="思考" time={time} content={event.text} />;
     case "assistant_text":
@@ -282,6 +291,19 @@ function pretty(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function turnContextText(
+  context: Extract<AgentEvent, { kind: "turn_context" }>["context"],
+): string {
+  return [
+    `turn: ${context.turnIndex + 1}`,
+    `branch: ${context.branch ?? "(unknown)"}`,
+    `base: ${context.baseCommitSha ?? "(unknown)"}`,
+    context.cwd ? `cwd: ${context.cwd}` : undefined,
+  ]
+    .filter((line): line is string => !!line)
+    .join("\n");
 }
 
 function resultText(event: Extract<AgentEvent, { kind: "result" }>): string {

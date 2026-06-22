@@ -38,6 +38,7 @@ export interface TurnNodeData {
   agentId: string;
   turn: Turn;
   agentStatus: AgentStatus;
+  agentBranch?: string;
   provider?: AgentProvider;
   model?: string;
   providerLocked?: boolean;
@@ -163,6 +164,15 @@ export function TurnNode({
   const logRef = useRef<HTMLDivElement>(null);
 
   const meta = TURN_META[turn.status];
+  const displayBranch = turn.branch ?? data.agentBranch;
+  const displayShortSha = turn.baseShortSha ?? turn.baseCommitSha?.slice(0, 7);
+  const contextTitle = [
+    displayBranch ? `branch: ${displayBranch}` : undefined,
+    turn.baseCommitSha ? `base commit: ${turn.baseCommitSha}` : undefined,
+    turn.cwd ? `cwd: ${turn.cwd}` : undefined,
+  ]
+    .filter(Boolean)
+    .join("\n");
   // 末尾 idle 轮且可输入：首轮看 agent idle，续轮看 agent waiting_input
   const isActiveInput =
     turn.status === "idle" &&
@@ -215,11 +225,18 @@ export function TurnNode({
         {hasPendingInteraction && <span className="turn-node__interaction-dot" />}
         <button
           className="turn-node__restore drag-handle"
-          title={`恢复 ${agentId} 第 ${turn.index + 1} 轮`}
+          title={
+            contextTitle
+              ? `恢复 ${agentId} 第 ${turn.index + 1} 轮\n${contextTitle}`
+              : `恢复 ${agentId} 第 ${turn.index + 1} 轮`
+          }
           onClick={toggleMinimized}
         >
           <MessageSquare size={17} />
-          <span>{turn.index + 1}</span>
+          <span className="turn-node__restore-text">
+            <span>{turn.index + 1}</span>
+            {displayShortSha && <small>{displayShortSha}</small>}
+          </span>
         </button>
         <NodeHandles resourceAccess={hasResourceHandles} />
       </div>
@@ -309,6 +326,15 @@ export function TurnNode({
           }}
         >
           {meta.label}
+        </span>
+      </div>
+
+      <div className="turn-node__context nodrag" title={contextTitle || undefined}>
+        <span>
+          branch <strong>{displayBranch ?? "(none)"}</strong>
+        </span>
+        <span>
+          base <strong>{displayShortSha ?? "(pending)"}</strong>
         </span>
       </div>
 

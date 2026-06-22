@@ -584,6 +584,7 @@ export function buildNodes(
         agentId: view.id,
         turn,
         agentStatus: view.status,
+        agentBranch: view.branch,
         provider: view.provider,
         model: view.model,
         providerLocked: !!view.forkOrigin,

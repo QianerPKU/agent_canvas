@@ -14,16 +14,33 @@ import type {
   PersistedAgentState,
   UpdateAgentSettingsInput,
 } from "@agent-canvas/shared";
+import { execFile } from "node:child_process";
 import { AgentRunner } from "./AgentRunner.js";
 import type { QueryFn } from "./sdk/types.js";
 
 export type EnvelopeListener = (envelope: AgentEventEnvelope) => void;
+
+export interface AgentTurnContextMetadata {
+  branch?: string;
+  cwd?: string;
+  baseCommitSha?: string;
+  baseShortSha?: string;
+}
+
+export interface AgentTurnContextRequest {
+  agentId: string;
+  turnIndex: number;
+  config: Pick<AgentStartConfig, "cwd" | "branch"> | undefined;
+}
 
 export interface AgentManagerDeps {
   query: QueryFn;
   codexQuery?: QueryFn;
   defaultCwd?: string;
   now?: () => number;
+  resolveTurnContext?: (
+    config: Pick<AgentStartConfig, "cwd" | "branch"> | undefined,
+  ) => Promise<AgentTurnContextMetadata>;
   resolveFileAccess?: (agentId: string) => AgentFileAccess;
   resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
 }
@@ -47,6 +64,9 @@ export class AgentManager {
   private readonly codexQuery?: QueryFn;
   private readonly defaultCwd: string;
   private readonly now: () => number;
+  private readonly resolveTurnContext: (
+    config: Pick<AgentStartConfig, "cwd" | "branch"> | undefined,
+  ) => Promise<AgentTurnContextMetadata>;
   private resolveFileAccess?: (agentId: string) => AgentFileAccess;
   private resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
   private counter = 0;
@@ -57,6 +77,7 @@ export class AgentManager {
     this.codexQuery = deps.codexQuery;
     this.defaultCwd = deps.defaultCwd ?? process.cwd();
     this.now = deps.now ?? Date.now;
+    this.resolveTurnContext = deps.resolveTurnContext ?? defaultResolveTurnContext;
     this.resolveFileAccess = deps.resolveFileAccess;
     this.resolvePromptAccess = deps.resolvePromptAccess;
   }
@@ -306,6 +327,7 @@ export class AgentManager {
 
   private broadcast(agentId: string, event: AgentEvent): void {
     if (this.suppressEvents) return;
+    const turnContextRequest = this.turnContextRequest(agentId, event);
     const seq = (this.seqs.get(agentId) ?? 0) + 1;
     this.seqs.set(agentId, seq);
     const envelope: AgentEventEnvelope = {
@@ -321,6 +343,49 @@ export class AgentManager {
       } catch {
         // 忽略单个订阅者异常
       }
+    }
+    if (turnContextRequest) {
+      void this.emitTurnContext(turnContextRequest);
+    }
+  }
+
+  private turnContextRequest(
+    agentId: string,
+    event: AgentEvent,
+  ): AgentTurnContextRequest | undefined {
+    if (event.kind !== "user_input" || event.mode) return undefined;
+    if (!this.runners.has(agentId)) return undefined;
+    return {
+      agentId,
+      turnIndex: this.currentTurnIndex(agentId),
+      config: this.configOf(agentId),
+    };
+  }
+
+  private async emitTurnContext(request: AgentTurnContextRequest): Promise<void> {
+    try {
+      const metadata = await this.resolveTurnContext(request.config);
+      this.broadcast(request.agentId, {
+        kind: "turn_context",
+        context: {
+          turnIndex: request.turnIndex,
+          branch: metadata.branch ?? request.config?.branch,
+          cwd: metadata.cwd ?? request.config?.cwd,
+          baseCommitSha: metadata.baseCommitSha,
+          baseShortSha:
+            metadata.baseShortSha ??
+            (metadata.baseCommitSha ? metadata.baseCommitSha.slice(0, 7) : undefined),
+        },
+      });
+    } catch {
+      this.broadcast(request.agentId, {
+        kind: "turn_context",
+        context: {
+          turnIndex: request.turnIndex,
+          branch: request.config?.branch,
+          cwd: request.config?.cwd,
+        },
+      });
     }
   }
 
@@ -401,4 +466,37 @@ function mergeDefined(
     }
   }
   return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+async function defaultResolveTurnContext(
+  config: Pick<AgentStartConfig, "cwd" | "branch"> | undefined,
+): Promise<AgentTurnContextMetadata> {
+  const cwd = config?.cwd?.trim();
+  if (!cwd) return { branch: config?.branch };
+  const [shaResult, branchResult] = await Promise.allSettled([
+    runGit(["rev-parse", "--verify", "HEAD"], cwd),
+    runGit(["branch", "--show-current"], cwd),
+  ]);
+  const baseCommitSha =
+    shaResult.status === "fulfilled" ? shaResult.value.trim() || undefined : undefined;
+  const gitBranch =
+    branchResult.status === "fulfilled" ? branchResult.value.trim() || undefined : undefined;
+  return {
+    cwd,
+    branch: gitBranch ?? config?.branch,
+    baseCommitSha,
+    baseShortSha: baseCommitSha?.slice(0, 7),
+  };
+}
+
+async function runGit(args: string[], cwd: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile("git", args, { cwd, windowsHide: true }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error((stderr || error.message).trim()));
+        return;
+      }
+      resolve(stdout.trimEnd());
+    });
+  });
 }

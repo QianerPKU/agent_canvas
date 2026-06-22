@@ -19,6 +19,7 @@ import type {
   AgentSettings,
   AgentSnapshot,
   AgentStatus,
+  AgentTurnContext,
   ForkOrigin,
 } from "@agent-canvas/shared";
 
@@ -55,6 +56,10 @@ export interface Turn {
   index: number;
   /** 该轮的用户输入（前端乐观记录，后端 user_input 事件确认）。 */
   userInput?: string;
+  branch?: string;
+  cwd?: string;
+  baseCommitSha?: string;
+  baseShortSha?: string;
   lines: OutputLine[];
   status: TurnStatus;
   /** fork 锚点：该轮最后一条 assistant 消息 uuid。 */
@@ -275,6 +280,8 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
         userInput: event.text,
         status: turn.status === "idle" ? "running" : turn.status,
       }));
+    case "turn_context":
+      return applyTurnContext(view, event.context);
     case "user_question":
       return pushLineToLast(view, {
         kind: "question",
@@ -393,6 +400,26 @@ function markLastTurn(view: AgentView, status: TurnStatus): AgentView {
 
 function markLastTurnIfIdle(view: AgentView, status: TurnStatus): AgentView {
   return withLastTurn(view, (t) => (t.status === "idle" ? { ...t, status } : t));
+}
+
+function applyTurnContext(view: AgentView, context: AgentTurnContext): AgentView {
+  return {
+    ...view,
+    turns: view.turns.map((turn) =>
+      turn.index === context.turnIndex
+        ? {
+            ...turn,
+            branch: context.branch ?? turn.branch,
+            cwd: context.cwd ?? turn.cwd,
+            baseCommitSha: context.baseCommitSha ?? turn.baseCommitSha,
+            baseShortSha:
+              context.baseShortSha ??
+              turn.baseShortSha ??
+              context.baseCommitSha?.slice(0, 7),
+          }
+        : turn,
+    ),
+  };
 }
 
 function updateQuestionLine(

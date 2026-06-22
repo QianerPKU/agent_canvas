@@ -109,6 +109,49 @@ describe("TurnNode", () => {
     expect(restoreButton.classList.contains("nodrag")).toBe(false);
   });
 
+  it("显示该轮所在 branch 和开始时的 base commit", () => {
+    const actions = makeActions();
+    const turn: Turn = {
+      index: 1,
+      status: "running",
+      branch: "feature/a",
+      baseCommitSha: "abcdef1234567890",
+      baseShortSha: "abcdef1",
+      lines: [],
+    };
+    renderTurn(turn, "running", actions);
+
+    expect(screen.getByText("feature/a")).toBeTruthy();
+    expect(screen.getByText("abcdef1")).toBeTruthy();
+  });
+
+  it("最小化节点显示 base commit 短 hash", () => {
+    const actions = makeActions();
+    const data: TurnNodeData = {
+      agentId: "agent_1",
+      turn: {
+        index: 2,
+        status: "done",
+        branch: "feature/a",
+        baseCommitSha: "abcdef1234567890",
+        baseShortSha: "abcdef1",
+        lines: [],
+      },
+      agentStatus: "waiting_input",
+      isLatest: false,
+      windowState: { minimized: true, restoreWidth: 360, restoreHeight: 300 },
+      onOpenHistory: vi.fn(),
+      actions,
+    };
+    render(
+      <ReactFlowProvider>
+        <TurnNode {...({ data, id: "agent_1#2" } as unknown as NodeProps<TurnNodeType>)} />
+      </ReactFlowProvider>,
+    );
+
+    expect(screen.getByText("abcdef1")).toBeTruthy();
+  });
+
   it("只有最新活跃轮次显示资源读写 Handle", () => {
     const actions = makeActions();
     const { container, rerender } = render(

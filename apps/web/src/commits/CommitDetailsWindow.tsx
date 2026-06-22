@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { ChevronRight, GitCommitHorizontal, X } from "lucide-react";
 import type { AgentCommitSnapshot, CommitChangedFile } from "@agent-canvas/shared";
+import { parseUnifiedDiff, type ParsedDiffLine } from "./diff.js";
 
 export function CommitDetailsWindow({
   commit,
@@ -113,7 +114,38 @@ function CommitFileRow({
           +{file.additions} -{file.deletions}
         </small>
       </button>
-      {open && <pre>{file.diff || "(empty diff)"}</pre>}
+      {open && <DiffViewer diff={file.diff} />}
     </article>
+  );
+}
+
+function DiffViewer({ diff }: { diff: string }): React.ReactElement {
+  const lines = parseUnifiedDiff(diff);
+  if (lines.length === 0) {
+    return <div className="commit-diff commit-diff--empty">(empty diff)</div>;
+  }
+  return (
+    <div className="commit-diff" role="table" aria-label="commit diff">
+      {lines.map((line, index) => (
+        <DiffLine key={`${index}:${line.kind}`} line={line} />
+      ))}
+    </div>
+  );
+}
+
+function DiffLine({ line }: { line: ParsedDiffLine }): React.ReactElement {
+  return (
+    <div className={`commit-diff__row commit-diff__row--${line.kind}`} role="row">
+      <span className="commit-diff__line-no" role="cell">
+        {line.oldLine ?? ""}
+      </span>
+      <span className="commit-diff__line-no" role="cell">
+        {line.newLine ?? ""}
+      </span>
+      <code className="commit-diff__code" role="cell">
+        <span className="commit-diff__prefix">{line.prefix}</span>
+        {line.content}
+      </code>
+    </div>
   );
 }

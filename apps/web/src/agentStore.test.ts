@@ -314,6 +314,39 @@ describe("agentStore 轮次模型", () => {
     expect(v.turns[1]).toMatchObject({ index: 1, status: "idle" });
   });
 
+  it("turn_context 按 turnIndex 写入对应历史轮", () => {
+    seq = 0;
+    let map: AgentMap = { a1: newAgentView("a1") };
+    map = recordInput(map, "a1", "t1");
+    map = applyEnvelope(
+      map,
+      env("a1", { kind: "result", subtype: "success", isError: false, anchorUuid: "u1" }),
+    );
+    map = applyEnvelope(
+      map,
+      env("a1", {
+        kind: "turn_context",
+        context: {
+          turnIndex: 0,
+          branch: "feature/a",
+          cwd: "/repo-a",
+          baseCommitSha: "abcdef1234567890",
+          baseShortSha: "abcdef1",
+        },
+      }),
+    );
+
+    const v = get(map);
+    expect(v.turns[0]).toMatchObject({
+      branch: "feature/a",
+      cwd: "/repo-a",
+      baseCommitSha: "abcdef1234567890",
+      baseShortSha: "abcdef1",
+    });
+    expect(v.turns[1]!.branch).toBeUndefined();
+    expect(v.turns[1]!.baseCommitSha).toBeUndefined();
+  });
+
   it("多轮：第二轮输入折叠进新轮，再 result 又延伸第三轮", () => {
     seq = 0;
     let map: AgentMap = { a1: newAgentView("a1") };

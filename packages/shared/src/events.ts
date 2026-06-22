@@ -145,6 +145,14 @@ export interface AgentApprovalResponse {
   message?: string;
 }
 
+export interface AgentTurnContext {
+  turnIndex: number;
+  branch?: string;
+  cwd?: string;
+  baseCommitSha?: string;
+  baseShortSha?: string;
+}
+
 /**
  * 归一化后的 agent 事件（后端 → 前端，单向流）。
  * `kind` 作为可辨识联合的判别字段。
@@ -152,6 +160,7 @@ export interface AgentApprovalResponse {
 export type AgentEvent =
   | { kind: "status"; status: AgentStatus }
   | { kind: "user_input"; text: string; mode?: UserInputMode }
+  | { kind: "turn_context"; context: AgentTurnContext }
   | { kind: "user_question"; request: AgentQuestionRequest }
   | {
       kind: "user_question_result";
