@@ -10,6 +10,7 @@ import type {
   AgentPromptAccess,
   AgentPromptReference,
   AgentProvider,
+  AgentSnapshot,
   AgentStartConfig,
   AgentStatus,
   UsageInfo,
@@ -94,7 +95,7 @@ export class AgentRunner {
   private approvalCounter = 0;
   private suppressAbortStatus = false;
   private suppressNaturalEndStatus = false;
-  private readonly createdAt: number;
+  private createdAt: number;
 
   constructor(id: string, deps: AgentRunnerDeps) {
     this.id = id;
@@ -129,6 +130,32 @@ export class AgentRunner {
       totalCostUsd: this.totalCostUsd,
       usage: this.usage,
     };
+  }
+
+  restore(snapshot: AgentSnapshot): void {
+    this.inputQueue?.close();
+    this.abortController?.abort();
+    void this.handle?.terminate?.();
+    this.status = restorableStatus(snapshot.status);
+    this.config = snapshot.config;
+    this.sessionId = snapshot.sessionId;
+    this.createdAt = snapshot.createdAt;
+    this.totalCostUsd = snapshot.totalCostUsd;
+    this.usage = snapshot.usage;
+    this.abortController = undefined;
+    this.inputQueue = undefined;
+    this.handle = undefined;
+    this.lastAssistantUuid = undefined;
+    this.compactPending = false;
+    this.promptInjectionPending = false;
+    this.policyPromptInjectionPending = true;
+    this.pendingInjectedPrompts = [];
+    this.pendingQueuedInputs = [];
+    this.cancelPendingQuestions("cancel");
+    this.cancelPendingApprovals("cancel");
+    if (this.status === "waiting_input" && this.sessionId && !this.config.resume) {
+      this.config = { ...this.config, resume: this.sessionId };
+    }
   }
 
   updateSettings(
@@ -638,6 +665,11 @@ export class AgentRunner {
 
 function normalizeProvider(provider: AgentProvider | undefined): AgentProvider {
   return provider ?? "claude";
+}
+
+function restorableStatus(status: AgentStatus): AgentStatus {
+  if (status === "starting" || status === "running") return "stopped";
+  return status;
 }
 
 function definedSettings(

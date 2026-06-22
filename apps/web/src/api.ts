@@ -10,6 +10,7 @@ import type {
   AgentStartConfig,
   BranchOption,
   BranchWorkspace,
+  CanvasLayoutSnapshot,
   CanvasProjectSummary,
   CanvasFileConnection,
   CanvasFileNode,
@@ -52,6 +53,12 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   list: () => call<{ agents: AgentSnapshot[] }>("/agents").then((r) => r.agents),
+  canvasLayout: () => call<CanvasLayoutSnapshot>("/canvas-layout"),
+  saveCanvasLayout: (input: CanvasLayoutSnapshot) =>
+    call<CanvasLayoutSnapshot>("/canvas-layout", {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
   config: () => call<{ defaultCwd: string; projectRoot: string }>("/config"),
   settings: () => call<AgentCanvasSettings>("/settings"),
   updateSettings: (input: Partial<AgentCanvasSettings>) =>

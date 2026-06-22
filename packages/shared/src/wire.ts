@@ -13,6 +13,7 @@ export type ServerFrame =
       prFlows?: PullRequestFlowSnapshot[];
       commits?: AgentCommitSnapshot[];
       syncFlows?: SyncFlowSnapshot[];
+      histories?: Record<string, AgentEventEnvelope[]>;
     } // 连接建立时下发当前全部 agent / PR / sync / commit 快照
   | { type: "event"; envelope: AgentEventEnvelope } // 实时事件
   | { type: "commit"; commit: AgentCommitSnapshot } // Agent 上报的 commit 记录

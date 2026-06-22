@@ -389,6 +389,41 @@ describe("agentStore 轮次模型", () => {
     expect(get(map, "a2").model).toBe("gpt-5.4-mini");
   });
 
+  it("applyHello 携带 histories 时恢复多轮对话节点", () => {
+    seq = 0;
+    const history = [
+      env("a1", { kind: "user_input", text: "first" }),
+      env("a1", SYS),
+      env("a1", { kind: "assistant_text", text: "done", messageUuid: "u1" }),
+      env("a1", { kind: "result", subtype: "success", isError: false, anchorUuid: "u1" }),
+    ];
+    const map = applyHello(
+      [
+        {
+          id: "a1",
+          status: "waiting_input",
+          config: { prompt: "", provider: "claude", systemPrompt: "private" },
+          createdAt: 1,
+          lastEventSeq: history.at(-1)!.seq,
+        },
+      ],
+      { a1: history },
+    );
+
+    expect(get(map).turns).toHaveLength(2);
+    expect(get(map).turns[0]).toMatchObject({
+      userInput: "first",
+      status: "done",
+      anchorUuid: "u1",
+    });
+    expect(get(map).turns[1]).toMatchObject({ status: "idle" });
+    expect(get(map)).toMatchObject({
+      status: "waiting_input",
+      systemPrompt: "private",
+      lastSeq: history.at(-1)!.seq,
+    });
+  });
+
   it("忽略旧 seq", () => {
     let map: AgentMap = { a1: newAgentView("a1", { lastSeq: 5 }) };
     map = applyEnvelope(map, {

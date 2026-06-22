@@ -114,6 +114,19 @@ export class PullRequestFlowManager {
     return [...this.flows.values()];
   }
 
+  exportState(): PullRequestFlowSnapshot[] {
+    return this.list();
+  }
+
+  importState(flows: PullRequestFlowSnapshot[] | undefined): void {
+    for (const flowId of this.timers.keys()) this.closeTimer(flowId);
+    this.flows.clear();
+    for (const flow of flows ?? []) {
+      this.flows.set(flow.id, flow);
+    }
+    this.counter = maxNumericSuffix([...this.flows.keys()]);
+  }
+
   get(id: string): PullRequestFlowSnapshot | undefined {
     return this.flows.get(id);
   }
@@ -954,4 +967,13 @@ function formatFileChanges(files: PullRequestChangedFile[]): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function maxNumericSuffix(ids: string[]): number {
+  let max = 0;
+  for (const id of ids) {
+    const match = id.match(/_(\d+)$/u);
+    if (match) max = Math.max(max, Number(match[1]));
+  }
+  return max;
 }

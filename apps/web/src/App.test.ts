@@ -3,6 +3,7 @@ import type { AgentMap } from "./agentStore.js";
 import type { AgentActions, FileActions, PromptActions } from "./useAgentCanvas.js";
 import {
   buildNodes,
+  canvasLayoutFromNodes,
   computeCommitEdges,
   computeFileEdges,
   computeLayout,
@@ -120,6 +121,118 @@ describe("computeFileEdges", () => {
     expect(commit1?.position.x).toBeGreaterThan(source?.position.x ?? 0);
     expect(commit1?.position.y).toBe(source?.position.y);
     expect(commit2?.position).not.toEqual(commit1?.position);
+  });
+
+  it("buildNodes 使用已保存的节点位置、尺寸和最小化状态", () => {
+    const agents: AgentMap = {
+      agent_1: {
+        id: "agent_1",
+        status: "idle",
+        turns: [{ index: 0, status: "idle", lines: [] }],
+        lastSeq: 0,
+      },
+    };
+
+    const nodes = buildNodes(
+      agents,
+      [
+        {
+          id: "file_1",
+          name: "brief",
+          filename: "brief.md",
+          extension: "md",
+          path: "/tmp/brief.md",
+          storage: "isolated",
+          kind: "normal",
+          sharedRead: false,
+          sharedWrite: false,
+          previewKind: "markdown",
+          mimeType: "text/markdown",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+      [],
+      [],
+      [],
+      [],
+      {} as AgentActions,
+      {} as FileActions,
+      {} as PromptActions,
+      [],
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      [
+        {
+          id: "agent_1#0",
+          type: "turn",
+          position: { x: 111, y: 222 },
+          width: 444,
+          height: 333,
+        },
+        {
+          id: "file:file_1",
+          type: "file",
+          position: { x: 555, y: 666 },
+          width: 68,
+          height: 48,
+          windowState: { minimized: true, restoreWidth: 280, restoreHeight: 240 },
+        },
+      ],
+    );
+
+    expect(nodes.find((node) => node.id === "agent_1#0")).toMatchObject({
+      position: { x: 111, y: 222 },
+      width: 444,
+      height: 333,
+    });
+    expect(nodes.find((node) => node.id === "file:file_1")).toMatchObject({
+      position: { x: 555, y: 666 },
+      width: 68,
+      height: 48,
+      data: { windowState: { minimized: true, restoreWidth: 280, restoreHeight: 240 } },
+    });
+  });
+
+  it("canvasLayoutFromNodes 序列化节点布局和窗口状态", () => {
+    const layout = canvasLayoutFromNodes(
+      [
+        {
+          id: "file:file_1",
+          type: "file",
+          position: { x: 10, y: 20 },
+          width: 68,
+          height: 48,
+          data: {
+            file: {} as never,
+            actions: {} as never,
+            onPreview: () => undefined,
+            onOpenEditor: () => undefined,
+            windowState: { minimized: true, restoreWidth: 280, restoreHeight: 240 },
+          },
+        },
+      ],
+      1234,
+    );
+
+    expect(layout).toEqual({
+      updatedAt: 1234,
+      nodes: [
+        {
+          id: "file:file_1",
+          type: "file",
+          position: { x: 10, y: 20 },
+          width: 68,
+          height: 48,
+          windowState: { minimized: true, restoreWidth: 280, restoreHeight: 240 },
+        },
+      ],
+    });
   });
 
   it("默认 agent 列距为右侧派生节点预留空间", () => {

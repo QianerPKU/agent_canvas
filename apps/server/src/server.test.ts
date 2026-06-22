@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentEventEnvelope, AgentSnapshot } from "@agent-canvas/shared";
@@ -640,5 +640,97 @@ describe("HTTP server", () => {
     expect(listed.json.prompts).toHaveLength(2);
     const connections = await request(port, "GET", "/api/prompt-connections");
     expect(connections.json.connections).toContainEqual(connection.json.connection);
+  });
+
+  it("canvas project 保存并恢复节点快照和布局", async () => {
+    const projectA = await request(port, "POST", "/api/canvas-projects", {
+      name: "persist-a",
+    });
+    expect(projectA.status).toBe(201);
+    await request(port, "POST", "/api/workspace/connect", { localPath: root });
+
+    const agent = await request(port, "POST", "/api/agents", {
+      branch: "main",
+      systemPrompt: "persist me",
+    });
+    const file = await request(port, "POST", "/api/files", {
+      name: "persisted-file",
+      extension: "txt",
+      kind: "normal",
+    });
+    const prompt = await request(port, "POST", "/api/prompts", {
+      name: "persisted-prompt",
+      content: "saved prompt",
+      kind: "normal",
+    });
+    expect(agent.status).toBe(201);
+    expect(file.status).toBe(201);
+    expect(prompt.status).toBe(201);
+
+    const layout = await request(port, "PATCH", "/api/canvas-layout", {
+      nodes: [
+        {
+          id: `${agent.json.id}#0`,
+          type: "turn",
+          position: { x: 123, y: 456 },
+          width: 410,
+          height: 320,
+        },
+        {
+          id: `file:${file.json.file.id}`,
+          type: "file",
+          position: { x: 700, y: 120 },
+          width: 68,
+          height: 48,
+          windowState: { minimized: true, restoreWidth: 280, restoreHeight: 240 },
+        },
+      ],
+    });
+    expect(layout.status).toBe(200);
+
+    const persistedState = JSON.parse(
+      await readFile(path.join(projectA.json.project.projectRoot, "canvas-state.json"), "utf-8"),
+    );
+    expect(persistedState).toMatchObject({
+      version: 1,
+      agents: { agents: [expect.objectContaining({ id: agent.json.id })] },
+      files: { files: [expect.objectContaining({ id: file.json.file.id })] },
+      prompts: { prompts: [expect.objectContaining({ id: prompt.json.prompt.id })] },
+      layout: {
+        nodes: expect.arrayContaining([
+          expect.objectContaining({ id: `${agent.json.id}#0` }),
+        ]),
+      },
+    });
+
+    const projectB = await request(port, "POST", "/api/canvas-projects", {
+      name: "persist-b",
+    });
+    expect(projectB.status).toBe(201);
+    expect((await request(port, "GET", "/api/agents")).json.agents).toHaveLength(0);
+
+    const reopened = await request(port, "POST", "/api/canvas-projects/open", {
+      id: projectA.json.project.id,
+    });
+    expect(reopened.status).toBe(200);
+
+    const restoredAgents = await request(port, "GET", "/api/agents");
+    const restoredFiles = await request(port, "GET", "/api/files");
+    const restoredPrompts = await request(port, "GET", "/api/prompts");
+    const restoredLayout = await request(port, "GET", "/api/canvas-layout");
+
+    expect(restoredAgents.json.agents).toEqual([
+      expect.objectContaining({
+        id: agent.json.id,
+        config: expect.objectContaining({ systemPrompt: "persist me" }),
+      }),
+    ]);
+    expect(restoredFiles.json.files).toEqual([
+      expect.objectContaining({ id: file.json.file.id, name: "persisted-file" }),
+    ]);
+    expect(restoredPrompts.json.prompts).toEqual([
+      expect.objectContaining({ id: prompt.json.prompt.id, content: "saved prompt" }),
+    ]);
+    expect(restoredLayout.json.nodes).toEqual(layout.json.nodes);
   });
 });

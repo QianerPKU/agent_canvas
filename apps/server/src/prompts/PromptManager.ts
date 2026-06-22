@@ -11,6 +11,7 @@ import type {
   CreateCanvasPromptInput,
   PromptConnectionAccess,
   UpdateCanvasPromptInput,
+  PersistedPromptState,
 } from "@agent-canvas/shared";
 
 interface StoredPrompt extends CanvasPromptNode {
@@ -26,7 +27,7 @@ export interface PromptManagerOptions {
 export class PromptManager {
   private readonly prompts = new Map<string, StoredPrompt>();
   private readonly connections = new Map<string, CanvasPromptConnection>();
-  private readonly promptRoot: string;
+  private promptRoot: string;
   private readonly now: () => number;
   private promptCounter = 0;
   private connectionCounter = 0;
@@ -42,6 +43,34 @@ export class PromptManager {
       .map((prompt) => this.refresh(prompt))
       .sort((a, b) => a.createdAt - b.createdAt)
       .map(publicPrompt);
+  }
+
+  setPromptRoot(promptRoot: string): void {
+    this.promptRoot = path.resolve(promptRoot);
+  }
+
+  exportState(): PersistedPromptState {
+    return {
+      prompts: this.list(),
+      connections: this.listConnections(),
+    };
+  }
+
+  async importState(state: PersistedPromptState | undefined): Promise<void> {
+    this.prompts.clear();
+    this.connections.clear();
+    for (const node of state?.prompts ?? []) {
+      const directory = path.join(this.promptRoot, node.id);
+      const promptPath = path.join(directory, "prompt.txt");
+      await mkdir(directory, { recursive: true });
+      await writeFile(promptPath, node.content, "utf-8");
+      this.prompts.set(node.id, { ...node, path: promptPath });
+    }
+    for (const connection of state?.connections ?? []) {
+      if (this.prompts.has(connection.promptId)) this.connections.set(connection.id, connection);
+    }
+    this.promptCounter = maxNumericSuffix([...this.prompts.keys()]);
+    this.connectionCounter = maxNumericSuffix([...this.connections.keys()]);
   }
 
   get(id: string): CanvasPromptNode | undefined {
@@ -238,4 +267,13 @@ function defaultPromptRoot(workspaceRoot: string): string {
     .digest("hex")
     .slice(0, 12);
   return path.join(localDataRoot, "agent_canvas", "prompts", workspaceKey);
+}
+
+function maxNumericSuffix(ids: string[]): number {
+  let max = 0;
+  for (const id of ids) {
+    const match = id.match(/_(\d+)$/u);
+    if (match) max = Math.max(max, Number(match[1]));
+  }
+  return max;
 }

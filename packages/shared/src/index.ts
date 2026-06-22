@@ -1,5 +1,6 @@
 export * from "./events.js";
 export * from "./commits.js";
+export * from "./canvasState.js";
 export * from "./files.js";
 export * from "./prompts.js";
 export * from "./pullRequests.js";

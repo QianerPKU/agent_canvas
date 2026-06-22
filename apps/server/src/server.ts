@@ -1,4 +1,6 @@
 import http from "node:http";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import type {
   AgentApprovalResponse,
@@ -9,6 +11,9 @@ import type {
   AgentSettings,
   AgentStartConfig,
   BranchDiffSummary,
+  CanvasLayoutSnapshot,
+  CanvasNodeLayout,
+  CanvasProjectState,
   ConnectGitHubInput,
   CreateBranchWorkspaceInput,
   CreateAgentInput,
@@ -60,6 +65,16 @@ export interface CreateServerOptions {
   commitManager?: CommitManager;
 }
 
+interface CanvasStateController {
+  getLayout(): CanvasLayoutSnapshot;
+  setLayout(layout: Partial<CanvasLayoutSnapshot>): Promise<CanvasLayoutSnapshot>;
+  loadProjectState(): Promise<void>;
+  saveNow(): Promise<void>;
+  saveSoon(): void;
+}
+
+const CANVAS_STATE_FILE = "canvas-state.json";
+
 /**
  * 组装 HTTP（REST 命令）+ WebSocket（事件广播）服务。
  * 命令端到端：前端 POST /api/... → manager/runner；事件 runner → manager → WS。
@@ -106,6 +121,15 @@ export function createServer(
     });
   const commitManager = options.commitManager ?? new CommitManager();
   manager.setPromptAccessResolver((agentId) => promptManager.accessFor(agentId));
+  const canvasState = createCanvasStateController({
+    manager,
+    fileManager,
+    promptManager,
+    workspaceManager,
+    pullRequestFlowManager,
+    syncFlowManager,
+    commitManager,
+  });
   const httpServer = http.createServer((req, res) => {
     handleHttp(
       req,
@@ -120,56 +144,54 @@ export function createServer(
       defaultCwd,
       options.openFile ?? openFileInVscode,
       options.pickDirectory ?? defaultPickDirectory,
+      canvasState,
+      broadcastHello,
     ).catch((err) => {
       sendJson(res, 500, { error: errMsg(err) });
     });
   });
 
   const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+  const broadcastFrame = (frame: ServerFrame): void => {
+    const data = JSON.stringify(frame);
+    for (const client of wss.clients) {
+      if (client.readyState === client.OPEN) client.send(data);
+    }
+  };
+  const helloFrame = (): ServerFrame => ({
+    type: "hello",
+    agents: manager.list(),
+    histories: manager.exportState().histories,
+    prFlows: pullRequestFlowManager.list(),
+    syncFlows: syncFlowManager.list(),
+    commits: commitManager.list(),
+  });
+  const broadcastHello = (): void => broadcastFrame(helloFrame());
   wss.on("connection", (ws: WebSocket) => {
-    // 连接即下发当前快照
-    send(ws, {
-      type: "hello",
-      agents: manager.list(),
-      prFlows: pullRequestFlowManager.list(),
-      syncFlows: syncFlowManager.list(),
-      commits: commitManager.list(),
-    });
+    send(ws, helloFrame());
   });
 
   // 把 manager 的事件广播到所有 WS 客户端
   manager.onEvent((envelope) => {
     void pullRequestFlowManager.handleAgentEvent(envelope);
     void syncFlowManager.handleAgentEvent(envelope);
-    const frame: ServerFrame = { type: "event", envelope };
-    const data = JSON.stringify(frame);
-    for (const client of wss.clients) {
-      if (client.readyState === client.OPEN) client.send(data);
-    }
+    broadcastFrame({ type: "event", envelope });
+    canvasState.saveSoon();
   });
 
   pullRequestFlowManager.onFlow((flow) => {
-    const frame: ServerFrame = { type: "pr_flow", flow };
-    const data = JSON.stringify(frame);
-    for (const client of wss.clients) {
-      if (client.readyState === client.OPEN) client.send(data);
-    }
+    broadcastFrame({ type: "pr_flow", flow });
+    canvasState.saveSoon();
   });
 
   syncFlowManager.onFlow((flow) => {
-    const frame: ServerFrame = { type: "sync_flow", flow };
-    const data = JSON.stringify(frame);
-    for (const client of wss.clients) {
-      if (client.readyState === client.OPEN) client.send(data);
-    }
+    broadcastFrame({ type: "sync_flow", flow });
+    canvasState.saveSoon();
   });
 
   commitManager.onCommit((commit) => {
-    const frame: ServerFrame = { type: "commit", commit };
-    const data = JSON.stringify(frame);
-    for (const client of wss.clients) {
-      if (client.readyState === client.OPEN) client.send(data);
-    }
+    broadcastFrame({ type: "commit", commit });
+    canvasState.saveSoon();
   });
 
   return {
@@ -198,6 +220,8 @@ async function handleHttp(
   defaultCwd: string,
   openFile: (filePath: string) => Promise<void>,
   pickDirectory: PickDirectory,
+  canvasState: CanvasStateController,
+  broadcastHello: () => void,
 ): Promise<void> {
   setCors(res);
   if (req.method === "OPTIONS") {
@@ -224,7 +248,22 @@ async function handleHttp(
 
   if (method === "PATCH" && path === "/api/settings") {
     const body = await readJson<Partial<AgentCanvasSettings>>(req);
-    return sendJson(res, 200, manager.updateAppSettings(body ?? {}));
+    const settings = manager.updateAppSettings(body ?? {});
+    canvasState.saveSoon();
+    return sendJson(res, 200, settings);
+  }
+
+  if (method === "GET" && path === "/api/canvas-layout") {
+    return sendJson(res, 200, canvasState.getLayout());
+  }
+
+  if (method === "PATCH" && path === "/api/canvas-layout") {
+    const body = await readJson<Partial<CanvasLayoutSnapshot>>(req);
+    try {
+      return sendJson(res, 200, await canvasState.setLayout(body ?? {}));
+    } catch (error) {
+      return sendJson(res, 400, { error: errMsg(error) });
+    }
   }
 
   if (method === "GET" && path === "/api/canvas-projects") {
@@ -235,7 +274,10 @@ async function handleHttp(
     const body = await readJson<CreateCanvasProjectInput>(req);
     if (!body?.name) return sendJson(res, 400, { error: "缺少项目名称" });
     try {
+      await canvasState.saveNow();
       const project = await workspaceManager.createCanvasProject(body);
+      await canvasState.loadProjectState();
+      broadcastHello();
       return sendJson(res, 201, { project, workspace: await workspaceManager.project() });
     } catch (error) {
       return sendJson(res, 400, { error: errMsg(error) });
@@ -246,7 +288,11 @@ async function handleHttp(
     const body = await readJson<OpenCanvasProjectInput>(req);
     if (!body?.id) return sendJson(res, 400, { error: "缺少项目 id" });
     try {
-      return sendJson(res, 200, { workspace: await workspaceManager.openCanvasProject(body) });
+      await canvasState.saveNow();
+      const workspace = await workspaceManager.openCanvasProject(body);
+      await canvasState.loadProjectState();
+      broadcastHello();
+      return sendJson(res, 200, { workspace });
     } catch (error) {
       return sendJson(res, 404, { error: errMsg(error) });
     }
@@ -263,7 +309,9 @@ async function handleHttp(
   if (method === "POST" && path === "/api/workspace/connect") {
     const body = await readJson<ConnectGitHubInput>(req);
     try {
-      return sendJson(res, 200, await workspaceManager.connect(body ?? {}));
+      const workspace = await workspaceManager.connect(body ?? {});
+      canvasState.saveSoon();
+      return sendJson(res, 200, workspace);
     } catch (error) {
       return sendJson(res, 400, { error: errMsg(error) });
     }
@@ -349,8 +397,10 @@ async function handleHttp(
   if (method === "POST" && path === "/api/pr-flows") {
     const body = await readJson<CreatePullRequestFlowInput>(req);
     try {
+      const flow = await pullRequestFlowManager.create(body ?? ({} as CreatePullRequestFlowInput));
+      canvasState.saveSoon();
       return sendJson(res, 201, {
-        flow: await pullRequestFlowManager.create(body ?? ({} as CreatePullRequestFlowInput)),
+        flow,
       });
     } catch (error) {
       return sendJson(res, 400, { error: errMsg(error) });
@@ -360,8 +410,10 @@ async function handleHttp(
   if (method === "POST" && path === "/api/sync-flows") {
     const body = await readJson<CreateSyncFlowInput>(req);
     try {
+      const flow = await syncFlowManager.create(body ?? ({} as CreateSyncFlowInput));
+      canvasState.saveSoon();
       return sendJson(res, 201, {
-        flow: await syncFlowManager.create(body ?? ({} as CreateSyncFlowInput)),
+        flow,
       });
     } catch (error) {
       return sendJson(res, 400, { error: errMsg(error) });
@@ -381,8 +433,10 @@ async function handleHttp(
     if (method === "POST" && action === "pr-created") {
       const body = await readJson<PullRequestCreatedInput>(req);
       try {
+        const flow = await pullRequestFlowManager.recordPrCreated(id, body ?? {});
+        canvasState.saveSoon();
         return sendJson(res, 200, {
-          flow: await pullRequestFlowManager.recordPrCreated(id, body ?? {}),
+          flow,
         });
       } catch (error) {
         return sendJson(res, 400, { error: errMsg(error) });
@@ -390,14 +444,18 @@ async function handleHttp(
     }
     if (method === "POST" && action === "merged") {
       try {
-        return sendJson(res, 200, { flow: pullRequestFlowManager.recordMerged(id) });
+        const flow = pullRequestFlowManager.recordMerged(id);
+        canvasState.saveSoon();
+        return sendJson(res, 200, { flow });
       } catch (error) {
         return sendJson(res, 400, { error: errMsg(error) });
       }
     }
     if (method === "POST" && action === "cancel") {
       try {
-        return sendJson(res, 200, { flow: pullRequestFlowManager.cancel(id) });
+        const flow = pullRequestFlowManager.cancel(id);
+        canvasState.saveSoon();
+        return sendJson(res, 200, { flow });
       } catch (error) {
         return sendJson(res, 404, { error: errMsg(error) });
       }
@@ -417,8 +475,10 @@ async function handleHttp(
     if (method === "POST" && action === "applied") {
       const body = await readJson<SyncFlowAppliedInput>(req);
       try {
+        const flow = syncFlowManager.recordApplied(id, body ?? {});
+        canvasState.saveSoon();
         return sendJson(res, 200, {
-          flow: syncFlowManager.recordApplied(id, body ?? {}),
+          flow,
         });
       } catch (error) {
         return sendJson(res, 400, { error: errMsg(error) });
@@ -426,7 +486,9 @@ async function handleHttp(
     }
     if (method === "POST" && action === "cancel") {
       try {
-        return sendJson(res, 200, { flow: syncFlowManager.cancel(id) });
+        const flow = syncFlowManager.cancel(id);
+        canvasState.saveSoon();
+        return sendJson(res, 200, { flow });
       } catch (error) {
         return sendJson(res, 404, { error: errMsg(error) });
       }
@@ -441,6 +503,7 @@ async function handleHttp(
         defaultCwd,
       );
       const runner = manager.create(settings);
+      canvasState.saveSoon();
       return sendJson(res, 201, { id: runner.id });
     } catch (error) {
       return sendJson(res, 400, { error: errMsg(error) });
@@ -461,7 +524,9 @@ async function handleHttp(
       return sendJson(res, 400, { error: "缺少文件名、节点类型，或文件节点存储位置不是隔离目录" });
     }
     try {
-      return sendJson(res, 201, { file: await fileManager.create(body) });
+      const file = await fileManager.create(body);
+      canvasState.saveSoon();
+      return sendJson(res, 201, { file });
     } catch (error) {
       return sendJson(res, 400, { error: errMsg(error) });
     }
@@ -481,7 +546,9 @@ async function handleHttp(
       return sendJson(res, 400, { error: "缺少提示词名称、内容或节点类型" });
     }
     try {
-      return sendJson(res, 201, { prompt: await promptManager.create(body) });
+      const prompt = await promptManager.create(body);
+      canvasState.saveSoon();
+      return sendJson(res, 201, { prompt });
     } catch (error) {
       return sendJson(res, 400, { error: errMsg(error) });
     }
@@ -496,8 +563,10 @@ async function handleHttp(
     if (method === "PATCH") {
       const body = await readJson<UpdateCanvasPromptInput>(req);
       try {
+        const prompt = await promptManager.update(id, body ?? {});
+        canvasState.saveSoon();
         return sendJson(res, 200, {
-          prompt: await promptManager.update(id, body ?? {}),
+          prompt,
         });
       } catch (error) {
         return sendJson(res, 400, { error: errMsg(error) });
@@ -513,7 +582,9 @@ async function handleHttp(
     if (method === "PATCH" && !action) {
       const body = await readJson<UpdateCanvasFileInput>(req);
       try {
-        return sendJson(res, 200, { file: await fileManager.update(id, body ?? {}) });
+        const file = await fileManager.update(id, body ?? {});
+        canvasState.saveSoon();
+        return sendJson(res, 200, { file });
       } catch (error) {
         return sendJson(res, 400, { error: errMsg(error) });
       }
@@ -571,8 +642,10 @@ async function handleHttp(
       return sendJson(res, 404, { error: `未知 agent: ${body.agentId}` });
     }
     try {
+      const connection = fileManager.connect(body.fileId, body.agentId, body.access);
+      canvasState.saveSoon();
       return sendJson(res, 201, {
-        connection: fileManager.connect(body.fileId, body.agentId, body.access),
+        connection,
       });
     } catch (error) {
       return sendJson(res, 400, { error: errMsg(error) });
@@ -601,8 +674,10 @@ async function handleHttp(
       return sendJson(res, 404, { error: `未知 agent: ${body.agentId}` });
     }
     try {
+      const connection = promptManager.connect(body.promptId, body.agentId, body.access);
+      canvasState.saveSoon();
       return sendJson(res, 201, {
-        connection: promptManager.connect(body.promptId, body.agentId, body.access),
+        connection,
       });
     } catch (error) {
       return sendJson(res, 400, { error: errMsg(error) });
@@ -615,6 +690,7 @@ async function handleHttp(
     if (!promptManager.disconnect(id)) {
       return sendJson(res, 404, { error: `未知提示词连线: ${id}` });
     }
+    canvasState.saveSoon();
     res.writeHead(204);
     res.end();
     return;
@@ -626,6 +702,7 @@ async function handleHttp(
     if (!fileManager.disconnect(id)) {
       return sendJson(res, 404, { error: `未知文件连线: ${id}` });
     }
+    canvasState.saveSoon();
     res.writeHead(204);
     res.end();
     return;
@@ -666,13 +743,15 @@ async function handleHttp(
     if (!manager.get(id)) return sendJson(res, 404, { error: `未知 agent: ${id}` });
     const body = await readJson<ReportAgentCommitInput>(req);
     try {
+      const commit = await commitManager.recordFromAgent(
+        id,
+        manager.configOf(id),
+        manager.currentTurnIndex(id),
+        body ?? {},
+      );
+      canvasState.saveSoon();
       return sendJson(res, 201, {
-        commit: await commitManager.recordFromAgent(
-          id,
-          manager.configOf(id),
-          manager.currentTurnIndex(id),
-          body ?? {},
-        ),
+        commit,
       });
     } catch (error) {
       return sendJson(res, 400, { error: errMsg(error) });
@@ -707,13 +786,11 @@ async function handleHttp(
         const diff = branchChanged
           ? await workspaceManager.diffBetweenBranches(currentConfig?.branch, settings.branch)
           : undefined;
-        return sendJson(
-          res,
-          200,
-          manager.updateSettings(id, settings, {
-            branchSwitchPrompt: branchChanged ? branchSwitchPrompt(diff) : undefined,
-          }),
-        );
+        const snapshot = manager.updateSettings(id, settings, {
+          branchSwitchPrompt: branchChanged ? branchSwitchPrompt(diff) : undefined,
+        });
+        canvasState.saveSoon();
+        return sendJson(res, 200, snapshot);
       } catch (error) {
         return sendJson(res, 400, { error: errMsg(error) });
       }
@@ -738,6 +815,7 @@ async function handleHttp(
       if (!forked) return sendJson(res, 409, { error: "源会话尚未建立，无法 fork" });
       fileManager.copyAgentConnections(id, forked.id);
       promptManager.copyAgentConnections(id, forked.id);
+      canvasState.saveSoon();
       return sendJson(res, 201, { id: forked.id, origin: forked.origin });
     }
     if (method === "POST" && action === "send") {
@@ -822,6 +900,160 @@ function send(ws: WebSocket, frame: ServerFrame): void {
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+interface CanvasStateControllerDeps {
+  manager: AgentManager;
+  fileManager: FileManager;
+  promptManager: PromptManager;
+  workspaceManager: WorkspaceManager;
+  pullRequestFlowManager: PullRequestFlowManager;
+  syncFlowManager: SyncFlowManager;
+  commitManager: CommitManager;
+}
+
+function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasStateController {
+  let layout = emptyCanvasLayout();
+  let saveTimer: ReturnType<typeof setTimeout> | undefined;
+  let saveChain: Promise<void> = Promise.resolve();
+
+  const applyProjectStorageRoots = (projectRoot: string): void => {
+    deps.fileManager.setIsolatedRoot(path.join(projectRoot, "files"));
+    deps.promptManager.setPromptRoot(path.join(projectRoot, "prompts"));
+  };
+
+  const saveCurrentProject = async (): Promise<void> => {
+    let project: Awaited<ReturnType<WorkspaceManager["project"]>>;
+    try {
+      project = await deps.workspaceManager.project();
+    } catch {
+      return;
+    }
+    applyProjectStorageRoots(project.projectRoot);
+    const state: CanvasProjectState = {
+      version: 1,
+      updatedAt: Date.now(),
+      agents: deps.manager.exportState(),
+      files: deps.fileManager.exportState(),
+      prompts: deps.promptManager.exportState(),
+      commits: deps.commitManager.exportState(),
+      prFlows: deps.pullRequestFlowManager.exportState(),
+      syncFlows: deps.syncFlowManager.exportState(),
+      layout,
+    };
+    const statePath = path.join(project.projectRoot, CANVAS_STATE_FILE);
+    await mkdir(path.dirname(statePath), { recursive: true });
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf-8");
+  };
+
+  const saveNow = async (): Promise<void> => {
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = undefined;
+    }
+    saveChain = saveChain.then(saveCurrentProject, saveCurrentProject);
+    await saveChain;
+  };
+
+  return {
+    getLayout: () => layout,
+    setLayout: async (nextLayout) => {
+      layout = sanitizeCanvasLayout(nextLayout);
+      await saveNow();
+      return layout;
+    },
+    loadProjectState: async () => {
+      const project = await deps.workspaceManager.project();
+      applyProjectStorageRoots(project.projectRoot);
+      const state = await readCanvasProjectState(path.join(project.projectRoot, CANVAS_STATE_FILE));
+      deps.manager.importState(state?.agents);
+      deps.fileManager.importState(state?.files);
+      await deps.promptManager.importState(state?.prompts);
+      deps.commitManager.importState(state?.commits);
+      deps.pullRequestFlowManager.importState(state?.prFlows);
+      deps.syncFlowManager.importState(state?.syncFlows);
+      layout = sanitizeCanvasLayout(state?.layout);
+    },
+    saveNow,
+    saveSoon: () => {
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => {
+        saveTimer = undefined;
+        void saveNow();
+      }, 100);
+    },
+  };
+}
+
+async function readCanvasProjectState(
+  statePath: string,
+): Promise<CanvasProjectState | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(statePath, "utf-8")) as CanvasProjectState;
+    if (parsed?.version !== 1) throw new Error("unsupported canvas state version");
+    return parsed;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function emptyCanvasLayout(): CanvasLayoutSnapshot {
+  return { nodes: [], updatedAt: 0 };
+}
+
+function sanitizeCanvasLayout(
+  layout: Partial<CanvasLayoutSnapshot> | undefined,
+): CanvasLayoutSnapshot {
+  const nodes = Array.isArray(layout?.nodes)
+    ? layout.nodes.flatMap((node) => sanitizeCanvasNodeLayout(node))
+    : [];
+  return {
+    nodes,
+    updatedAt: finiteNumber(layout?.updatedAt) ?? Date.now(),
+  };
+}
+
+function sanitizeCanvasNodeLayout(node: unknown): CanvasNodeLayout[] {
+  if (!isRecord(node)) return [];
+  const id = typeof node.id === "string" ? node.id.trim() : "";
+  const position = isRecord(node.position) ? node.position : undefined;
+  const x = finiteNumber(position?.x);
+  const y = finiteNumber(position?.y);
+  if (!id || x === undefined || y === undefined) return [];
+  const windowState = sanitizeWindowState(node.windowState);
+  return [
+    {
+      id,
+      type: typeof node.type === "string" ? node.type : undefined,
+      position: { x, y },
+      width: positiveNumber(node.width),
+      height: positiveNumber(node.height),
+      windowState,
+    },
+  ];
+}
+
+function sanitizeWindowState(value: unknown): CanvasNodeLayout["windowState"] {
+  if (!isRecord(value) || typeof value.minimized !== "boolean") return undefined;
+  return {
+    minimized: value.minimized,
+    restoreWidth: positiveNumber(value.restoreWidth),
+    restoreHeight: positiveNumber(value.restoreHeight),
+  };
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function positiveNumber(value: unknown): number | undefined {
+  const number = finiteNumber(value);
+  return number !== undefined && number > 0 ? number : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function resolveAgentWorkspaceSettings<T extends AgentSettings>(

@@ -40,6 +40,8 @@
 - commit 节点来自后端 commit report：agent 在 `git commit` 后调用 `/api/agents/:id/commits`，`useAgentCanvas` 读取 `hello.commits` 并监听 `commit` 帧。commit 线使用后端记录的 `sourceTurnIndex`，所以旧对话框完成后变成历史轮，commit 线仍连在原来的那一轮上。
 - PR 节点来自 `prFlows`，同样使用 flow 的 `sourceTurnIndex` 连接到发起 PR pipeline 的原始对话轮。节点显示当前状态，点击可看完整流程、审查结果和变更文件。
 - Sync 节点来自 `syncFlows`，使用 flow 的 `sourceTurnIndex` 连接到发起同步 pipeline 的原始对话轮。节点显示 cherry-pick / pull 状态，点击可看 summary、reason、文件范围、审查意见和 applied 结果。
+- 项目打开/新建后，`useAgentCanvas.refresh()` 会重新拉取当前项目的 agents/files/prompts/commits/PR/sync 快照；WebSocket `hello.histories` 用来恢复多轮 agent 对话节点。
+- React Flow 节点布局通过 `GET/PATCH /api/canvas-layout` 保存到当前 canvas 项目的 `canvas-state.json`。前端会 debounce 保存每个节点的位置、尺寸和最小化状态；项目切换期间暂停保存，避免空布局覆盖旧项目。
 - 新建 / fork 后后端不发事件，前端**乐观插入**节点（fork 带 `forkOrigin` 以画连线）。
 - Codex 的 `agentMessage` 流式 delta 按消息 UUID 合并到同一输出段落，避免每个小片段被渲染成独立短行。
 - 每个 agent 的最新运行节点显示输入框：`排队` 会把提示词排到当前轮 result 后执行，`引导` 会尽快追加到当前运行轮，`停止` 保留中止能力。
@@ -74,6 +76,7 @@ npm test --workspace apps/web
 ```
 
 - `agentStore.test.ts`：事件折叠、交互问题/授权行状态、不可变更新、旧 seq 去重、行数封顶（node 环境）
+- `App.test.ts`：自动布局、派生节点锚定、保存布局恢复和 layout 序列化
 - `useAgentCanvas.test.tsx`：StrictMode 下只建立一次 WebSocket
 - `history/*.test.ts(x)`：按轮截断、流式片段合并与完整历史窗口渲染
 - `nodes/TurnNode.test.tsx`：各状态徽标、模型选择、运行中排队/引导/停止、交互问题回答、授权审批红点、Compact/Terminate、历史点击、尺寸保存/恢复与 fork 控件交互

@@ -4,7 +4,7 @@
  *  - 暴露 create/start/stop/send/steer/resume 动作
  *  - 自动断线重连
  */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AgentApprovalResponse,
   AgentCommitSnapshot,
@@ -88,6 +88,7 @@ export interface UseAgentCanvas {
   syncFlows: SyncFlowSnapshot[];
   commits: AgentCommitSnapshot[];
   connected: boolean;
+  refresh: () => Promise<void>;
   actions: AgentActions;
   fileActions: FileActions;
   promptActions: PromptActions;
@@ -150,6 +151,39 @@ export function useAgentCanvas(): UseAgentCanvas {
   const agentsRef = useRef(agents);
   agentsRef.current = agents;
 
+  const refresh = useCallback(async () => {
+    const [
+      nextAgents,
+      nextFiles,
+      nextConnections,
+      nextPrompts,
+      nextPromptConnections,
+      nextPrFlows,
+      nextSyncFlows,
+      nextCommits,
+    ] = await Promise.all([
+      api.list(),
+      api.listFiles(),
+      api.listFileConnections(),
+      api.listPrompts(),
+      api.listPromptConnections(),
+      api.listPullRequestFlows(),
+      api.listSyncFlows(),
+      api.listCommits(),
+    ]);
+    const historyEntries = await Promise.all(
+      nextAgents.map(async (agent) => [agent.id, await api.history(agent.id)] as const),
+    );
+    setAgents(applyHello(nextAgents, Object.fromEntries(historyEntries)));
+    setFiles(nextFiles);
+    setFileConnections(nextConnections);
+    setPrompts(nextPrompts);
+    setPromptConnections(nextPromptConnections);
+    setPrFlows(nextPrFlows);
+    setSyncFlows(nextSyncFlows);
+    setCommits(nextCommits);
+  }, []);
+
   useEffect(() => {
     let closed = false;
     let connectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -172,7 +206,7 @@ export function useAgentCanvas(): UseAgentCanvas {
           return;
         }
         if (frame.type === "hello") {
-          setAgents(applyHello(frame.agents));
+          setAgents(applyHello(frame.agents, frame.histories));
           setPrFlows(frame.prFlows ?? []);
           setSyncFlows(frame.syncFlows ?? []);
           setCommits(frame.commits ?? []);
@@ -200,35 +234,7 @@ export function useAgentCanvas(): UseAgentCanvas {
     // React StrictMode 会在开发环境执行一次 setup→cleanup→setup。
     // 延迟到下一轮事件循环，避免试探性 setup 建立后立刻中断 WebSocket。
     scheduleConnect(0);
-    void Promise.all([
-      api.listFiles(),
-      api.listFileConnections(),
-      api.listPrompts(),
-      api.listPromptConnections(),
-      api.listPullRequestFlows(),
-      api.listSyncFlows(),
-      api.listCommits(),
-    ]).then(
-      ([
-        nextFiles,
-        nextConnections,
-        nextPrompts,
-        nextPromptConnections,
-        nextPrFlows,
-        nextSyncFlows,
-        nextCommits,
-      ]) => {
-        if (closed) return;
-        setFiles(nextFiles);
-        setFileConnections(nextConnections);
-        setPrompts(nextPrompts);
-        setPromptConnections(nextPromptConnections);
-        setPrFlows(nextPrFlows);
-        setSyncFlows(nextSyncFlows);
-        setCommits(nextCommits);
-      },
-      () => undefined,
-    );
+    void refresh().catch(() => undefined);
     const refreshPrompts = () => {
       void api
         .listPrompts()
@@ -249,7 +255,7 @@ export function useAgentCanvas(): UseAgentCanvas {
       if (connectTimer) clearTimeout(connectTimer);
       wsRef.current?.close();
     };
-  }, []);
+  }, [refresh]);
 
   const actions = useMemo<AgentActions>(
     () => ({
@@ -446,6 +452,7 @@ export function useAgentCanvas(): UseAgentCanvas {
     syncFlows,
     commits,
     connected,
+    refresh,
     actions,
     fileActions,
     promptActions,

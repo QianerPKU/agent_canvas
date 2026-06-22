@@ -11,6 +11,7 @@ import type {
   AgentStartConfig,
   AgentPromptAccess,
   ForkOrigin,
+  PersistedAgentState,
   UpdateAgentSettingsInput,
 } from "@agent-canvas/shared";
 import { AgentRunner } from "./AgentRunner.js";
@@ -49,6 +50,7 @@ export class AgentManager {
   private resolveFileAccess?: (agentId: string) => AgentFileAccess;
   private resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
   private counter = 0;
+  private suppressEvents = false;
 
   constructor(deps: AgentManagerDeps) {
     this.query = deps.query;
@@ -66,6 +68,67 @@ export class AgentManager {
 
   create(settings: AgentSettings = {}): AgentRunner {
     const id = `agent_${++this.counter}`;
+    return this.createRunner(id, normalizeSettings(settings, this.defaultCwd));
+  }
+
+  exportState(): PersistedAgentState {
+    return {
+      agents: this.list(),
+      histories: Object.fromEntries(
+        [...this.history.entries()].map(([id, history]) => [id, [...history]]),
+      ),
+      appSettings: this.appSettings(),
+    };
+  }
+
+  importState(state: PersistedAgentState | undefined): void {
+    this.suppressEvents = true;
+    for (const runner of this.runners.values()) {
+      void runner.terminate();
+    }
+    this.runners.clear();
+    this.seqs.clear();
+    this.history.clear();
+    this.forkOrigins.clear();
+    this.forkConfigs.clear();
+    this.draftConfigs.clear();
+    this.appSettingsState.fullPermissionMode = state?.appSettings?.fullPermissionMode ?? false;
+    this.counter = 0;
+
+    const agents = state?.agents ?? [];
+    for (const snapshot of agents) {
+      const restoredSnapshot = { ...snapshot, status: restorableStatus(snapshot.status) };
+      const runner = this.createRunner(snapshot.id, snapshot.config);
+      runner.restore(restoredSnapshot);
+      if (snapshot.forkOrigin) this.forkOrigins.set(snapshot.id, snapshot.forkOrigin);
+      const history = [...(state?.histories[snapshot.id] ?? [])].sort(
+        (left, right) => left.seq - right.seq,
+      );
+      let lastSeq = Math.max(
+        snapshot.lastEventSeq,
+        ...history.map((envelope) => envelope.seq),
+        0,
+      );
+      if (restoredSnapshot.status !== snapshot.status) {
+        lastSeq++;
+        history.push({
+          agentId: snapshot.id,
+          seq: lastSeq,
+          at: this.now(),
+          event: { kind: "status", status: restoredSnapshot.status },
+        });
+      }
+      this.history.set(snapshot.id, history);
+      this.seqs.set(snapshot.id, lastSeq);
+    }
+    this.counter = maxNumericSuffix(agents.map((agent) => agent.id));
+    this.suppressEvents = false;
+  }
+
+  private createRunner(
+    id: string,
+    draftConfig: Partial<AgentStartConfig>,
+  ): AgentRunner {
     const runner = new AgentRunner(id, {
       query: this.query,
       codexQuery: this.codexQuery,
@@ -89,7 +152,7 @@ export class AgentManager {
     this.runners.set(id, runner);
     this.seqs.set(id, 0);
     this.history.set(id, []);
-    this.draftConfigs.set(id, normalizeSettings(settings, this.defaultCwd));
+    this.draftConfigs.set(id, draftConfig);
     runner.on((event) => this.broadcast(id, event));
     return runner;
   }
@@ -242,6 +305,7 @@ export class AgentManager {
   }
 
   private broadcast(agentId: string, event: AgentEvent): void {
+    if (this.suppressEvents) return;
     const seq = (this.seqs.get(agentId) ?? 0) + 1;
     this.seqs.set(agentId, seq);
     const envelope: AgentEventEnvelope = {
@@ -283,6 +347,20 @@ export class AgentManager {
       forkOrigin: this.forkOrigins.get(id),
     };
   }
+}
+
+function restorableStatus(status: AgentSnapshot["status"]): AgentSnapshot["status"] {
+  if (status === "starting" || status === "running") return "stopped";
+  return status;
+}
+
+function maxNumericSuffix(ids: string[]): number {
+  let max = 0;
+  for (const id of ids) {
+    const match = id.match(/_(\d+)$/u);
+    if (match) max = Math.max(max, Number(match[1]));
+  }
+  return max;
 }
 
 function normalizeSettings(

@@ -41,6 +41,20 @@ export class CommitManager {
     return [...this.commits.values()].sort((a, b) => b.createdAt - a.createdAt);
   }
 
+  exportState(): AgentCommitSnapshot[] {
+    return this.list();
+  }
+
+  importState(commits: AgentCommitSnapshot[] | undefined): void {
+    this.commits.clear();
+    this.byAgentAndSha.clear();
+    for (const commit of commits ?? []) {
+      this.commits.set(commit.id, commit);
+      this.byAgentAndSha.set(`${commit.agentId}:${commit.commitSha}`, commit.id);
+    }
+    this.counter = maxNumericSuffix([...this.commits.keys()]);
+  }
+
   get(id: string): AgentCommitSnapshot | undefined {
     return this.commits.get(id);
   }
@@ -230,4 +244,13 @@ function countChangedLines(diff: string, marker: "+" | "-"): number {
       if (marker === "-" && line.startsWith("---")) return false;
       return true;
     }).length;
+}
+
+function maxNumericSuffix(ids: string[]): number {
+  let max = 0;
+  for (const id of ids) {
+    const match = id.match(/_(\d+)$/u);
+    if (match) max = Math.max(max, Number(match[1]));
+  }
+  return max;
 }

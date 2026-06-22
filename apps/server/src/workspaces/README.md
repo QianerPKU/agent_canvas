@@ -10,6 +10,9 @@
 %LOCALAPPDATA%/agent_canvas/projects/index.json
 %LOCALAPPDATA%/agent_canvas/projects/<project-id>/
   workspace.json                 # 当前 repo/branch/shared resource 状态
+  canvas-state.json              # 当前画布节点、agent histories、commit/PR/sync 和布局状态
+  files/                         # 当前 canvas 项目的文件节点隔离目录
+  prompts/                       # 当前 canvas 项目的提示词节点载体
   repos/<repo-id>/repo/          # 默认 branch 的 AppData clone
   worktrees/<repo-id>/<branch>/  # 其他 branch 的 git worktree
   shared/<repo-id>/<resource>/   # 项目级共享资源真实目录

@@ -26,6 +26,8 @@ import type {
   AgentCommitSnapshot,
   BranchOption,
   BranchWorkspace,
+  CanvasLayoutSnapshot,
+  CanvasNodeLayout,
   CanvasProjectSummary,
   CanvasFileConnection,
   CanvasFileNode,
@@ -163,6 +165,51 @@ function nodeRect(node: CanvasNode): NodeRect {
   };
 }
 
+function nodeWindowState(node: CanvasNode): CanvasNodeLayout["windowState"] {
+  switch (node.type) {
+    case "turn":
+    case "file":
+    case "prompt":
+    case "commit":
+    case "pullRequest":
+    case "syncFlow":
+      return node.data.windowState;
+    default:
+      return undefined;
+  }
+}
+
+export function canvasLayoutFromNodes(
+  nodes: CanvasNode[],
+  updatedAt = Date.now(),
+): CanvasLayoutSnapshot {
+  return {
+    updatedAt,
+    nodes: nodes.map((node) => ({
+      id: node.id,
+      type: node.type,
+      position: node.position,
+      width: node.width ?? node.measured?.width,
+      height: node.height ?? node.measured?.height,
+      windowState: nodeWindowState(node),
+    })),
+  };
+}
+
+function layoutById(layout: CanvasNodeLayout[]): Map<string, CanvasNodeLayout> {
+  return new Map(layout.map((node) => [node.id, node]));
+}
+
+function storedLayoutFor(
+  layouts: Map<string, CanvasNodeLayout>,
+  id: string,
+  type: string,
+): CanvasNodeLayout | undefined {
+  const layout = layouts.get(id);
+  if (!layout) return undefined;
+  return layout.type === undefined || layout.type === type ? layout : undefined;
+}
+
 function intersects(a: NodeRect, b: NodeRect): boolean {
   return (
     a.x < b.x + b.width + DERIVED_NODE_GAP &&
@@ -244,8 +291,9 @@ function autoTurnWindowState(
   existingTurn: TurnNodeType | undefined,
   turnStatus: TurnNodeType["data"]["turn"]["status"],
   isLatest: boolean,
+  storedState?: CanvasNodeLayout["windowState"],
 ): TurnNodeType["data"]["windowState"] {
-  const existingState = existingTurn?.data.windowState;
+  const existingState = existingTurn?.data.windowState ?? storedState;
   if (existingState) return existingState;
   if (isLatest || turnStatus === "idle") return undefined;
   return {
@@ -505,9 +553,11 @@ export function buildNodes(
   onOpenCommitDetails: (commitId: string) => void,
   onOpenPullRequestDetails: (flowId: string) => void,
   onOpenSyncFlowDetails: (flowId: string) => void,
+  savedLayout: CanvasNodeLayout[] = [],
 ): CanvasNode[] {
   const layout = computeLayout(agents);
   const byId = new Map(current.map((node) => [node.id, node]));
+  const savedById = layoutById(savedLayout);
   const result: CanvasNode[] = [];
   const placed = new Map<string, CanvasNode>();
   const occupied: NodeRect[] = [];
@@ -522,8 +572,14 @@ export function buildNodes(
       const id = nodeId(view.id, index);
       const existing = byId.get(id);
       const existingTurn = existing?.type === "turn" ? existing : undefined;
+      const stored = storedLayoutFor(savedById, id, "turn");
       const isLatest = index === view.turns.length - 1;
-      const windowState = autoTurnWindowState(existingTurn, turn.status, isLatest);
+      const windowState = autoTurnWindowState(
+        existingTurn,
+        turn.status,
+        isLatest,
+        stored?.windowState,
+      );
       const data = {
         agentId: view.id,
         turn,
@@ -548,9 +604,9 @@ export function buildNodes(
         pushNode({
           id,
           type: "turn",
-          position: turnPosition(id, view.id, index, layout, placed, occupied),
-          width: turnWidth(windowState),
-          height: turnHeight(windowState),
+          position: stored?.position ?? turnPosition(id, view.id, index, layout, placed, occupied),
+          width: stored?.width ?? turnWidth(windowState),
+          height: stored?.height ?? turnHeight(windowState),
           dragHandle: ".drag-handle",
           data,
         });
@@ -563,12 +619,14 @@ export function buildNodes(
     const id = fileNodeId(file.id);
     const existing = byId.get(id);
     const existingFile = existing?.type === "file" ? existing : undefined;
+    const stored = storedLayoutFor(savedById, id, "file");
+    const windowState = existingFile?.data.windowState ?? stored?.windowState;
     const data = {
       file,
       actions: fileActions,
       onPreview: onPreviewFile,
       onOpenEditor: onOpenFileEditor,
-      windowState: existingFile?.data.windowState,
+      windowState,
     };
     pushNode(
       existingFile
@@ -576,14 +634,16 @@ export function buildNodes(
         : {
             id,
             type: "file",
-            position: findFreePosition(
-              { x: fileX, y: Y0 + index * FILE_ROW_H },
-              FILE_NODE_WIDTH,
-              FILE_NODE_HEIGHT,
-              occupied,
-            ),
-            width: FILE_NODE_WIDTH,
-            height: FILE_NODE_HEIGHT,
+            position:
+              stored?.position ??
+              findFreePosition(
+                { x: fileX, y: Y0 + index * FILE_ROW_H },
+                FILE_NODE_WIDTH,
+                FILE_NODE_HEIGHT,
+                occupied,
+              ),
+            width: stored?.width ?? (windowState?.minimized ? 68 : FILE_NODE_WIDTH),
+            height: stored?.height ?? (windowState?.minimized ? 48 : FILE_NODE_HEIGHT),
             dragHandle: ".drag-handle",
             data,
           },
@@ -595,10 +655,12 @@ export function buildNodes(
     const id = promptNodeId(prompt.id);
     const existing = byId.get(id);
     const existingPrompt = existing?.type === "prompt" ? existing : undefined;
+    const stored = storedLayoutFor(savedById, id, "prompt");
+    const windowState = existingPrompt?.data.windowState ?? stored?.windowState;
     const data = {
       prompt,
       actions: promptActions,
-      windowState: existingPrompt?.data.windowState,
+      windowState,
     };
     pushNode(
       existingPrompt
@@ -606,14 +668,16 @@ export function buildNodes(
         : {
             id,
             type: "prompt",
-            position: findFreePosition(
-              { x: promptX, y: Y0 + index * FILE_ROW_H },
-              PROMPT_NODE_WIDTH,
-              PROMPT_NODE_HEIGHT,
-              occupied,
-            ),
-            width: PROMPT_NODE_WIDTH,
-            height: PROMPT_NODE_HEIGHT,
+            position:
+              stored?.position ??
+              findFreePosition(
+                { x: promptX, y: Y0 + index * FILE_ROW_H },
+                PROMPT_NODE_WIDTH,
+                PROMPT_NODE_HEIGHT,
+                occupied,
+              ),
+            width: stored?.width ?? (windowState?.minimized ? 68 : PROMPT_NODE_WIDTH),
+            height: stored?.height ?? (windowState?.minimized ? 48 : PROMPT_NODE_HEIGHT),
             dragHandle: ".drag-handle",
             data,
           },
@@ -625,10 +689,12 @@ export function buildNodes(
     const id = commitNodeId(commit.id);
     const existing = byId.get(id);
     const existingCommit = existing?.type === "commit" ? existing : undefined;
+    const stored = storedLayoutFor(savedById, id, "commit");
+    const windowState = existingCommit?.data.windowState ?? stored?.windowState;
     const data = {
       commit,
       onOpenDetails: onOpenCommitDetails,
-      windowState: existingCommit?.data.windowState,
+      windowState,
     };
     const source = fixedTurnNodeId(agents, commit.agentId, commit.sourceTurnIndex);
     pushNode(
@@ -637,15 +703,17 @@ export function buildNodes(
         : {
             id,
             type: "commit",
-            position: anchoredSidePosition(
-              source ? placed.get(source) ?? byId.get(source) : undefined,
-              { x: commitX, y: Y0 + index * 210 },
-              COMMIT_NODE_WIDTH,
-              COMMIT_NODE_HEIGHT,
-              occupied,
-            ),
-            width: COMMIT_NODE_WIDTH,
-            height: COMMIT_NODE_HEIGHT,
+            position:
+              stored?.position ??
+              anchoredSidePosition(
+                source ? placed.get(source) ?? byId.get(source) : undefined,
+                { x: commitX, y: Y0 + index * 210 },
+                COMMIT_NODE_WIDTH,
+                COMMIT_NODE_HEIGHT,
+                occupied,
+              ),
+            width: stored?.width ?? (windowState?.minimized ? 76 : COMMIT_NODE_WIDTH),
+            height: stored?.height ?? (windowState?.minimized ? 48 : COMMIT_NODE_HEIGHT),
             dragHandle: ".drag-handle",
             data,
           },
@@ -657,10 +725,12 @@ export function buildNodes(
     const id = pullRequestNodeId(flow.id);
     const existing = byId.get(id);
     const existingPr = existing?.type === "pullRequest" ? existing : undefined;
+    const stored = storedLayoutFor(savedById, id, "pullRequest");
+    const windowState = existingPr?.data.windowState ?? stored?.windowState;
     const data = {
       flow,
       onOpenDetails: onOpenPullRequestDetails,
-      windowState: existingPr?.data.windowState,
+      windowState,
     };
     const source = fixedTurnNodeId(agents, flow.proposerAgentId, flow.sourceTurnIndex);
     pushNode(
@@ -669,15 +739,17 @@ export function buildNodes(
         : {
             id,
             type: "pullRequest",
-            position: anchoredSidePosition(
-              source ? placed.get(source) ?? byId.get(source) : undefined,
-              { x: prX, y: Y0 + index * 220 },
-              PR_NODE_WIDTH,
-              PR_NODE_HEIGHT,
-              occupied,
-            ),
-            width: PR_NODE_WIDTH,
-            height: PR_NODE_HEIGHT,
+            position:
+              stored?.position ??
+              anchoredSidePosition(
+                source ? placed.get(source) ?? byId.get(source) : undefined,
+                { x: prX, y: Y0 + index * 220 },
+                PR_NODE_WIDTH,
+                PR_NODE_HEIGHT,
+                occupied,
+              ),
+            width: stored?.width ?? (windowState?.minimized ? 76 : PR_NODE_WIDTH),
+            height: stored?.height ?? (windowState?.minimized ? 48 : PR_NODE_HEIGHT),
             dragHandle: ".drag-handle",
             data,
           },
@@ -689,10 +761,12 @@ export function buildNodes(
     const id = syncFlowNodeId(flow.id);
     const existing = byId.get(id);
     const existingSync = existing?.type === "syncFlow" ? existing : undefined;
+    const stored = storedLayoutFor(savedById, id, "syncFlow");
+    const windowState = existingSync?.data.windowState ?? stored?.windowState;
     const data = {
       flow,
       onOpenDetails: onOpenSyncFlowDetails,
-      windowState: existingSync?.data.windowState,
+      windowState,
     };
     const source = fixedTurnNodeId(agents, flow.proposerAgentId, flow.sourceTurnIndex);
     pushNode(
@@ -701,15 +775,17 @@ export function buildNodes(
         : {
             id,
             type: "syncFlow",
-            position: anchoredSidePosition(
-              source ? placed.get(source) ?? byId.get(source) : undefined,
-              { x: syncX, y: Y0 + index * 220 },
-              SYNC_NODE_WIDTH,
-              SYNC_NODE_HEIGHT,
-              occupied,
-            ),
-            width: SYNC_NODE_WIDTH,
-            height: SYNC_NODE_HEIGHT,
+            position:
+              stored?.position ??
+              anchoredSidePosition(
+                source ? placed.get(source) ?? byId.get(source) : undefined,
+                { x: syncX, y: Y0 + index * 220 },
+                SYNC_NODE_WIDTH,
+                SYNC_NODE_HEIGHT,
+                occupied,
+              ),
+            width: stored?.width ?? (windowState?.minimized ? 76 : SYNC_NODE_WIDTH),
+            height: stored?.height ?? (windowState?.minimized ? 48 : SYNC_NODE_HEIGHT),
             dragHandle: ".drag-handle",
             data,
           },
@@ -729,6 +805,7 @@ export default function App(): React.ReactElement {
     syncFlows,
     commits,
     connected,
+    refresh,
     actions,
     fileActions,
     promptActions,
@@ -737,6 +814,11 @@ export default function App(): React.ReactElement {
   } = useAgentCanvas();
   const [nodes, setNodes, onNodesChange] = useNodesState<CanvasNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
+  const [savedLayout, setSavedLayout] = useState<CanvasLayoutSnapshot>({
+    nodes: [],
+    updatedAt: 0,
+  });
+  const [layoutProjectId, setLayoutProjectId] = useState<string>();
   const [historyTarget, setHistoryTarget] = useState<HistoryTarget>();
   const [openFileId, setOpenFileId] = useState<string>();
   const [fileOpenError, setFileOpenError] = useState<string>();
@@ -806,28 +888,45 @@ export default function App(): React.ReactElement {
     async (id: string) => {
       setProjectError(undefined);
       try {
+        setLayoutProjectId(undefined);
         const nextWorkspace = await api.openCanvasProject(id);
+        const nextLayout = await api.canvasLayout();
+        setNodes([]);
+        setEdges([]);
+        setSavedLayout(nextLayout);
+        await refresh();
         setWorkspace(nextWorkspace);
+        setLayoutProjectId(nextWorkspace.canvasProject?.id);
         setProjects(await api.listCanvasProjects());
         setBranches(nextWorkspace.repo ? await api.listBranchOptions() : []);
       } catch (error) {
         setProjectError(error instanceof Error ? error.message : String(error));
       }
     },
-    [],
+    [refresh, setEdges, setNodes],
   );
 
-  const createProject = useCallback(async (name: string) => {
-    setProjectError(undefined);
-    try {
-      const { workspace: nextWorkspace } = await api.createCanvasProject({ name });
-      setWorkspace(nextWorkspace);
-      setProjects(await api.listCanvasProjects());
-      setBranches([]);
-    } catch (error) {
-      setProjectError(error instanceof Error ? error.message : String(error));
-    }
-  }, []);
+  const createProject = useCallback(
+    async (name: string) => {
+      setProjectError(undefined);
+      try {
+        setLayoutProjectId(undefined);
+        const { workspace: nextWorkspace } = await api.createCanvasProject({ name });
+        const nextLayout = await api.canvasLayout();
+        setNodes([]);
+        setEdges([]);
+        setSavedLayout(nextLayout);
+        await refresh();
+        setWorkspace(nextWorkspace);
+        setLayoutProjectId(nextWorkspace.canvasProject?.id);
+        setProjects(await api.listCanvasProjects());
+        setBranches([]);
+      } catch (error) {
+        setProjectError(error instanceof Error ? error.message : String(error));
+      }
+    },
+    [refresh, setEdges, setNodes],
+  );
 
   const connectRepo = useCallback(
     async (input: { remoteUrl: string; defaultBranch?: string }) => {
@@ -891,6 +990,7 @@ export default function App(): React.ReactElement {
         setOpenCommitId,
         setOpenPullRequestId,
         setOpenSyncFlowId,
+        savedLayout.nodes,
       ),
     );
     setEdges([
@@ -916,9 +1016,20 @@ export default function App(): React.ReactElement {
     openHistory,
     openAgentSettings,
     openFileEditor,
+    savedLayout.nodes,
     setNodes,
     setEdges,
   ]);
+
+  useEffect(() => {
+    if (!workspace?.canvasProject?.id || workspace.canvasProject.id !== layoutProjectId) return;
+    if (nodes.length === 0 && savedLayout.nodes.length > 0) return;
+    const timer = window.setTimeout(() => {
+      const layout = canvasLayoutFromNodes(nodes);
+      void api.saveCanvasLayout(layout).catch(() => undefined);
+    }, 400);
+    return () => window.clearTimeout(timer);
+  }, [layoutProjectId, nodes, savedLayout.nodes.length, workspace?.canvasProject?.id]);
 
   const connect = useCallback(
     async (connection: Connection) => {

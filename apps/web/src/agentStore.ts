@@ -95,8 +95,11 @@ export function newAgentView(id: string, partial: Partial<AgentView> = {}): Agen
   return { id, status: "idle", turns: [idleTurn(0)], lastSeq: 0, ...partial };
 }
 
-/** hello 帧：用快照重建表（每个 agent 仅含一个 idle 轮，不重建历史行）。 */
-export function applyHello(agents: AgentSnapshot[]): AgentMap {
+/** hello 帧：用快照重建表；带 histories 时会恢复多轮对话节点。 */
+export function applyHello(
+  agents: AgentSnapshot[],
+  histories: Record<string, AgentEventEnvelope[]> = {},
+): AgentMap {
   const map: AgentMap = {};
   for (const a of agents) {
     map[a.id] = newAgentView(a.id, {
@@ -111,8 +114,27 @@ export function applyHello(agents: AgentSnapshot[]): AgentMap {
       systemPrompt: a.config.systemPrompt,
       forkOrigin: a.forkOrigin,
       createdAt: a.createdAt,
-      lastSeq: a.lastEventSeq,
+      lastSeq: histories[a.id]?.length ? 0 : a.lastEventSeq,
     });
+    const history = histories[a.id]?.slice().sort((left, right) => left.seq - right.seq) ?? [];
+    for (const envelope of history) {
+      map[a.id] = applyEnvelope(map, envelope)[a.id] ?? map[a.id]!;
+    }
+    map[a.id] = {
+      ...map[a.id]!,
+      provider: a.provider ?? a.config.provider ?? map[a.id]!.provider,
+      status: a.status,
+      sessionId: a.sessionId,
+      model: a.config.model,
+      branchWorkspaceId: a.config.branchWorkspaceId,
+      branch: a.config.branch,
+      cwd: a.config.cwd,
+      scratchDirectory: a.config.scratchDirectory,
+      systemPrompt: a.config.systemPrompt,
+      forkOrigin: a.forkOrigin,
+      createdAt: a.createdAt,
+      lastSeq: a.lastEventSeq,
+    };
   }
   return map;
 }

@@ -10,6 +10,7 @@ import type {
   FileConnectionAccess,
   FilePreviewKind,
   UpdateCanvasFileInput,
+  PersistedFileState,
 } from "@agent-canvas/shared";
 
 export interface FileManagerOptions {
@@ -22,7 +23,7 @@ export class FileManager {
   private readonly files = new Map<string, CanvasFileNode>();
   private readonly connections = new Map<string, CanvasFileConnection>();
   private readonly workspaceRoot: string;
-  private readonly isolatedRoot: string;
+  private isolatedRoot: string;
   private readonly now: () => number;
   private fileCounter = 0;
   private connectionCounter = 0;
@@ -37,6 +38,30 @@ export class FileManager {
 
   list(): CanvasFileNode[] {
     return [...this.files.values()].sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  setIsolatedRoot(isolatedRoot: string): void {
+    this.isolatedRoot = path.resolve(isolatedRoot);
+  }
+
+  exportState(): PersistedFileState {
+    return {
+      files: this.list(),
+      connections: this.listConnections(),
+    };
+  }
+
+  importState(state: PersistedFileState | undefined): void {
+    this.files.clear();
+    this.connections.clear();
+    for (const file of state?.files ?? []) {
+      this.files.set(file.id, file);
+    }
+    for (const connection of state?.connections ?? []) {
+      if (this.files.has(connection.fileId)) this.connections.set(connection.id, connection);
+    }
+    this.fileCounter = maxNumericSuffix([...this.files.keys()]);
+    this.connectionCounter = maxNumericSuffix([...this.connections.keys()]);
   }
 
   get(id: string): CanvasFileNode | undefined {
@@ -350,4 +375,13 @@ function defaultIsolatedRoot(workspaceRoot: string): string {
     .digest("hex")
     .slice(0, 12);
   return path.join(localDataRoot, "agent_canvas", "files", workspaceKey);
+}
+
+function maxNumericSuffix(ids: string[]): number {
+  let max = 0;
+  for (const id of ids) {
+    const match = id.match(/_(\d+)$/u);
+    if (match) max = Math.max(max, Number(match[1]));
+  }
+  return max;
 }

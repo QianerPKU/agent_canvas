@@ -18,7 +18,7 @@
 | `src/pullRequests/PullRequestFlowManager.ts` | PR 审查与授权状态机：活跃 agent 审查、JSON 校验/重试、超时、授权信号 |
 | `src/sync/SyncFlowManager.ts` | cherry-pick / branch pull 的一步审查与授权状态机 |
 | `src/commits/CommitManager.ts` | Agent commit 上报记录：从 git 读取 commit 元信息、变更文件和每文件 diff，并推送给前端 |
-| `src/server.ts` | HTTP(REST) + WebSocket 装配 |
+| `src/server.ts` | HTTP(REST) + WebSocket 装配；读写项目级 `canvas-state.json` |
 | `src/index.ts` | 入口：实例化 manager（注入 Claude/Codex query）并监听端口 |
 
 ## 状态机
@@ -47,6 +47,13 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 - **完整历史**：`AgentRunner` 把每次 start/send/steer/compact 输入记录为 `user_input`；Claude thinking block 与 Codex reasoning delta/summary 统一映射为 `thinking`。`GET /api/agents/:id/history` 因而可回放用户输入、思考、答复、工具调用/结果与轮次结果。
 - **commit 上报**：Agent Canvas 不替 agent 执行 `git commit`，但内置工作区规则要求每次 commit 成功后调用 `POST /api/agents/:id/commits`。后端用该 agent 的 branch workspace 读取 commit hash、message、文件列表和 diff，并记录当时的 `sourceTurnIndex`，让前端 commit 节点始终连回触发它的那一轮对话。
 
+## Canvas Project State
+
+- `WorkspaceManager` 的 `workspace.json` 只保存 repo 连接、branch worktree 和共享资源；画布自身状态保存到当前 canvas 项目根目录的 `canvas-state.json`。
+- `canvas-state.json` 包含 agent 快照和 histories、文件/提示词节点及连线、commit/PR/sync 节点快照，以及 `layout.nodes` 中的节点位置、尺寸和最小化状态。
+- 打开或新建 canvas 项目时，服务端先保存当前项目状态，再加载目标项目的 `canvas-state.json`，并向前端广播新的 `hello` 快照。原先处于 `starting/running` 的 agent 恢复时会变成 `stopped`，避免显示不存在的底层进程仍在运行。
+- 文件节点和提示词节点的物理根目录会跟随 canvas 项目切换到该项目根目录下的 `files/` 和 `prompts/`，避免不同项目里相同节点 id 发生路径冲突。
+
 ## HTTP API
 
 | 方法 路径 | 说明 |
@@ -54,6 +61,8 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 | `GET /api/health` | 健康检查 |
 | `GET /api/settings` | 获取程序级运行时设置 |
 | `PATCH /api/settings` | 更新程序级运行时设置；当前支持 `{ fullPermissionMode }` |
+| `GET /api/canvas-layout` | 获取当前 canvas 项目的节点布局快照 |
+| `PATCH /api/canvas-layout` | 保存当前 canvas 项目的节点位置、尺寸和最小化状态 |
 | `GET /api/canvas-projects` | 列出可打开的 canvas 项目 |
 | `POST /api/canvas-projects` | body=`{ name }`，新建并打开 canvas 项目 |
 | `POST /api/canvas-projects/open` | body=`{ id }`，打开已有 canvas 项目 |
@@ -113,7 +122,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 ## WebSocket (`/ws`)
 
 服务端 → 前端帧（`ServerFrame`）：
-- `{ type: "hello", agents, prFlows, syncFlows, commits }`：连接即下发当前快照
+- `{ type: "hello", agents, histories, prFlows, syncFlows, commits }`：连接即下发当前快照和 agent 历史，用于恢复多轮对话节点
 - `{ type: "event", envelope }`：实时事件（带 `agentId/seq/at`）
 - `{ type: "pr_flow", flow }`：PR flow 快照更新
 - `{ type: "sync_flow", flow }`：cherry-pick / branch pull flow 快照更新
