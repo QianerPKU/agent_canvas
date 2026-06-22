@@ -89,7 +89,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 
 - `PullRequestFlowManager` 只控制流程状态：找出源/目标 branch 上的活跃 agent、发送审查请求、校验固定 JSON、重试、10 分钟超时、聚合意见和发放授权信号。
 - 程序不限制 commit，也不执行具体 `git`/`gh` 命令。提 PR 的 agent 在收到 `create_pr` 授权后可自由处理冲突、更新源 branch 并创建 PR；目标审查通过后再收到 `merge_pr` 授权并自行合并。
-- Agent Canvas 内置工作区规则会注入 PR pipeline 使用协议；用户可以直接在某个 agent 的对话框里要求它提 PR，agent 应先 `POST /api/pr-flows` 发起流程，并在收到 `create_pr` / `merge_pr` 授权后再执行实际 `git`/`gh` 操作。
+- Agent Canvas 内置工作区规则会注入 tool-style PR pipeline 使用协议，明确 `agent_canvas.create_pr_flow` 的触发条件、请求体、禁止事项和授权后的 JSON 回报；用户可以直接在某个 agent 的对话框里要求它提 PR，agent 应先 `POST /api/pr-flows` 发起流程，并在收到 `create_pr` / `merge_pr` 授权后再执行实际 `git`/`gh` 操作。
 - 发起 PR flow 时必须有具体变更文件列表。默认 server 会通过 `WorkspaceManager.diffPullRequestFiles()` 计算 `git diff --name-status <target>...<source>`，并把 `changedFiles` 写入发给审查 agent 的提示词；如果用户或 agent 指定了 `files`，则按该文件范围审查并补齐状态。
 - PR flow 创建时也会记录 `sourceTurnIndex`，因此前端 PR 节点会固定连回发起 PR pipeline 的那一轮对话；后续 agent 继续对话、旧节点成为历史轮也不会断线或漂移。
 - `GET /api/pr-flows` 列出流程；`POST /api/pr-flows` 发起源 branch preflight；`POST /api/pr-flows/:id/pr-created` 可兜底登记 PR 已创建并进入目标 branch 审查；`POST /api/pr-flows/:id/merged` 可兜底登记已合并；`POST /api/pr-flows/:id/cancel` 取消流程。
@@ -102,7 +102,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 - 全部审查通过后，proposer agent 收到 apply authorization；程序只发授权信号，不执行 git 命令。后续 fetch、cherry-pick、merge/rebase/pull、冲突处理、测试和 commit 都由 proposer agent 自己完成。
 - proposer agent 完成后可输出 `agentCanvasSyncEvent="applied"` JSON 自动关闭流程；前端 Sync 面板也提供 `Mark applied` 兜底按钮。
 - 同步流程创建时必须有具体文件范围。`cherry_pick` 默认通过 `git show --name-status` 解析 commit 文件；`branch_pull` 默认复用 `git diff --name-status <target>...<source>`。调用方显式传入 `files` 时，按该范围审查。
-- 内置 `agentCanvasPolicyPrompt` 已注入 sync pipeline 使用协议，因此用户可以直接在 agent 对话框里要求“cherry-pick 某个 commit”或“pull main”，agent 应先调用 `/api/sync-flows`，收到授权后再实际执行 git 操作。
+- 内置 `agentCanvasPolicyPrompt` 已注入 tool-style sync pipeline 使用协议，明确 `agent_canvas.create_sync_flow` 的两类请求：`cherry_pick` 和 `branch_pull`。用户可以直接在 agent 对话框里要求“cherry-pick 某个 commit”或“pull main”，agent 应先调用 `/api/sync-flows`，收到授权后再实际执行 git 操作。
 
 ## 多轮对话与 fork（对话历史分叉）
 
@@ -200,5 +200,5 @@ npm run smoke --workspace apps/server
 - `POST /api/agents` 支持 `provider/model/branchWorkspaceId/cwd/systemPrompt`。新工作流中 `branchWorkspaceId` 决定 `cwd`；`cwd` 只保留兼容和快照展示。fork 会复制父 Agent 的 provider、模型、branch/cwd 和私有系统提示词。
 - `PATCH /api/agents/:id/settings` 可更新 `systemPrompt`，也可在 `idle` / `waiting_input` 状态切换到已有或新建 branch。切换后下一次业务输入会注入 branch 切换说明和 `git diff --name-status <old> <new>` 文件列表；`waiting_input` 下会脱开旧空闲会话，下次输入按新 `cwd` resume。
 - `systemPrompt` 是当前 Agent 私有提示词，不传给 Claude/Codex 原生 system prompt，而是在 `AgentRunner` 中按提示词节点同样的可读提示词机制拼接到业务输入。新 Agent 首轮、手动 compact 后、自动 compact 后、以及运行中更新设置后的下一条业务输入会重新注入。
-- Agent Canvas 内置工作区规则不属于用户可编辑的 `systemPrompt`，即使用户没有设置私有系统提示词也会注入；它约束共享文件默认只读、临时文件只写 `.agent-tmp/<agent-id>/`、其余非共享非临时修改都视为需要 commit 的仓库文件，并内置 PR pipeline、sync pipeline 和 commit report 协议，指导 agent 在用户要求提 PR 时调用 `/api/pr-flows`，在用户要求 cherry-pick/pull branch 时调用 `/api/sync-flows`，在每次 `git commit` 成功后调用 `/api/agents/:id/commits`。
+- Agent Canvas 内置工作区规则不属于用户可编辑的 `systemPrompt`，即使用户没有设置私有系统提示词也会注入；它约束共享文件默认只读、临时文件只写 `.agent-tmp/<agent-id>/`、其余非共享非临时修改都视为需要 commit 的仓库文件，并以 tool-style 协议内置 `agent_canvas.create_pr_flow`、`agent_canvas.create_sync_flow` 和 `agent_canvas.report_commit`，指导 agent 在用户要求提 PR 时调用 `/api/pr-flows`，在用户要求 cherry-pick/pull branch 时调用 `/api/sync-flows`，在每次 `git commit` 成功后调用 `/api/agents/:id/commits`。
 - `POST /api/directories/pick` 通过本机目录选择器返回用户选中的目录；Windows 使用 PowerShell + `System.Windows.Forms.FolderBrowserDialog`，其他平台暂返回明确错误并允许前端继续手动输入路径。

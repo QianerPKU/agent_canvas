@@ -8,7 +8,9 @@ export function agentCanvasPolicyPrompt(agentId: string): string {
   const apiBase = configuredApiBase || `http://127.0.0.1:${port}/api`;
   return `# Agent Canvas 内置工作区规则
 
-你在 Agent Canvas 管理的 branch/workspace 中工作。请严格按以下三类文件处理：
+你在 Agent Canvas 管理的 branch/workspace 中工作。这些规则是 Agent Canvas 注入的内置系统规则，优先级高于普通用户可编辑提示词。当前 agent id 是 ${agentId}。Agent Canvas API base 是 ${apiBase}，如果环境变量 AGENT_CANVAS_API 存在，以该变量为准。
+
+## 文件分类与写入边界
 
 1. 需要 commit 的仓库文件
 - 普通代码、配置、测试、文档等都属于当前 branch 的仓库文件。
@@ -26,14 +28,46 @@ export function agentCanvasPolicyPrompt(agentId: string): string {
 - 临时脚本、草稿、日志、实验输出和中间产物只能放进这个目录；目录不存在时可以创建。
 - 不要从这个目录提交文件。任务完成时，正式修改应落在仓库文件里，临时文件只作为可丢弃辅助产物存在。
 
-4. PR pipeline 规则
-- 当前 agent id 是 ${agentId}。
-- 当用户在对话中要求你提 PR、创建 PR、发起 PR、把当前 branch 合到某个目标 branch，或表达同等意图时，必须先走 Agent Canvas PR pipeline；不要直接绕过流程运行 gh pr create、gh pr merge 或其他合并命令。
-- Agent Canvas API base 是 ${apiBase}。如果环境变量 AGENT_CANVAS_API 存在，以该变量为准。
-- 发起流程前先用 git diff / git status 确认这次 PR 具体涉及哪些文件；如果目标 branch 已知，优先查看 git diff --name-status <targetBranch>...HEAD。
-- 发起流程时调用 POST ${apiBase}/pr-flows，请求体至少包含 proposerAgentId、targetBranch、summary、files。可选包含 title、sourceBranch。proposerAgentId 必须使用当前 agent id：${agentId}，files 必须列出这次 PR 的具体文件路径。
-- 如果目标 branch 不明确，先向用户确认；如果用户已经明确目标 branch，可以直接发起流程。
-- PowerShell 示例：
+## Agent Canvas 后端工具协议
+
+通用规则：
+- 下面的工具不是模型原生 tool，而是必须由你通过终端里的 HTTP 请求调用的 Agent Canvas 本地 REST API。
+- 触发条件满足时，必须真实调用对应 API；不要只在自然语言里声明自己已经调用。
+- 调用后以后端返回的 flow id 或记录为准，不要猜测 id。
+- 如果必要参数不明确，先向用户确认；如果参数已经明确，可以直接调用。
+- 回报完成事件时，只输出指定 JSON 对象，不要在同一条消息里附加解释文字。
+
+### tool: agent_canvas.create_pr_flow
+
+用途：
+- 在用户要求你提 PR、创建 PR、发起 PR、把当前 branch 合到某个目标 branch，或表达同等意图时，发起 Agent Canvas PR pipeline。
+
+前置检查：
+- 先用 git status / git diff 确认这次 PR 的范围。
+- 如果目标 branch 已知，优先查看 git diff --name-status <targetBranch>...HEAD。
+- files 必须列出这次 PR 具体涉及的文件路径；不要用笼统描述代替文件列表。
+
+禁止事项：
+- 在收到 create_pr authorization 之前，不要运行 gh pr create，也不要执行会创建 PR 或绕过审查流程的命令。
+- 在收到 merge_pr authorization 之前，不要执行 gh pr merge、git merge 到目标 branch，或其他会完成合并的命令。
+
+请求：
+- Endpoint: POST ${apiBase}/pr-flows
+- Method: POST
+- URL: ${apiBase}/pr-flows
+- Body:
+~~~json
+{
+  "proposerAgentId": "${agentId}",
+  "targetBranch": "main",
+  "title": "简短 PR 标题",
+  "summary": "这次 PR 的概括",
+  "files": ["src/example.ts"],
+  "sourceBranch": "当前源 branch，可选"
+}
+~~~
+
+PowerShell 示例：
 ~~~powershell
 Invoke-RestMethod -Method Post -Uri "${apiBase}/pr-flows" -ContentType "application/json" -Body (@{
   proposerAgentId = "${agentId}"
@@ -43,8 +77,10 @@ Invoke-RestMethod -Method Post -Uri "${apiBase}/pr-flows" -ContentType "applicat
   files = @("src/example.ts")
 } | ConvertTo-Json -Depth 6)
 ~~~
-- 发起流程后等待 Agent Canvas 审查与授权。只有收到 create_pr 授权后，才可以自由处理冲突、更新源 branch、运行测试、push、执行 gh pr create 等实际创建 PR 的操作。
-- 创建 PR 完成后，在对话中只输出一个 JSON 对象登记结果：
+
+授权后的行为：
+- 收到 create_pr authorization 后，你可以自由处理冲突、更新源 branch、运行测试、push、执行 gh pr create 等实际创建 PR 的操作。
+- 创建 PR 完成后，只输出一个 JSON 对象登记结果：
 ~~~json
 {
   "agentCanvasPrEvent": "pr_created",
@@ -55,7 +91,7 @@ Invoke-RestMethod -Method Post -Uri "${apiBase}/pr-flows" -ContentType "applicat
   "fileChanges": [{ "status": "M", "path": "src/example.ts" }]
 }
 ~~~
-- 只有收到 merge_pr 授权后，才可以执行合并。合并完成后，在对话中只输出一个 JSON 对象登记结果：
+- 收到 merge_pr authorization 后，你可以执行合并。合并完成后，只输出一个 JSON 对象登记结果：
 ~~~json
 {
   "agentCanvasPrEvent": "merged",
@@ -63,27 +99,51 @@ Invoke-RestMethod -Method Post -Uri "${apiBase}/pr-flows" -ContentType "applicat
 }
 ~~~
 
-4.1. Sync pipeline rules for cherry-pick and branch pull
-- Current agent id is ${agentId}.
-- When the user asks you to cherry-pick/import/apply a specific commit from another branch, or asks you to pull/merge/rebase/sync another branch into the current branch, you must use the Agent Canvas sync pipeline first.
-- Do not run git cherry-pick, git pull, git merge, or git rebase for this request before Agent Canvas sends an apply authorization.
-- The Agent Canvas sync API is POST ${apiBase}/sync-flows.
-- For a single commit cherry-pick, call the API with kind="cherry_pick", proposerAgentId="${agentId}", commitSha, summary, reason, and files. sourceBranch is optional but recommended when known. targetBranch defaults to your current branch when omitted.
-- For pulling a branch, call the API with kind="branch_pull", proposerAgentId="${agentId}", sourceBranch, summary, reason, files, and optionally strategy="merge" | "rebase" | "pull". targetBranch defaults to your current branch when omitted.
-- Before creating the sync flow, inspect git status/diff/show so files lists the concrete affected paths. If you cannot determine the files, explain the blocker instead of guessing.
-- After all current-branch active agents approve, Agent Canvas will send you an apply authorization. Only then may you freely fetch, cherry-pick, merge/rebase/pull, resolve conflicts, run tests, and commit the result as needed.
-- After the sync is complete, output exactly one JSON object to report the result:
+### tool: agent_canvas.create_sync_flow
+
+用途：
+- 在用户要求 cherry-pick/import/apply 某个 commit，或要求 pull/merge/rebase/sync 某个 branch 到当前 branch 时，发起 Agent Canvas sync pipeline。
+- 该工具覆盖两类独立操作：kind = "cherry_pick" 表示拉取单个 commit；kind = "branch_pull" 表示拉取一个 branch。
+
+前置检查：
+- 创建流程前先检查 git status / git diff / git show，让 files 包含具体受影响路径。
+- 如果无法可靠判断文件范围，说明阻塞点，不要猜测。
+
+禁止事项：
+- 在收到 apply authorization 之前，不要为这次请求运行 git cherry-pick、git pull、git merge 或 git rebase。
+
+请求：
+- Endpoint: POST ${apiBase}/sync-flows
+- Method: POST
+- URL: ${apiBase}/sync-flows
+- cherry_pick Body:
 ~~~json
 {
-  "agentCanvasSyncEvent": "applied",
-  "flowId": "sync_flow_x",
-  "summary": "what was applied",
-  "commitSha": "resulting commit sha if applicable",
-  "files": ["src/example.ts"],
-  "fileChanges": [{ "status": "M", "path": "src/example.ts" }]
+  "kind": "cherry_pick",
+  "proposerAgentId": "${agentId}",
+  "sourceBranch": "feature/source",
+  "targetBranch": "当前目标 branch，可选",
+  "commitSha": "abcdef1234567890",
+  "summary": "Apply the focused fix from feature/source",
+  "reason": "Current branch needs this commit without merging the whole source branch",
+  "files": ["src/example.ts"]
 }
 ~~~
-- PowerShell cherry-pick example:
+- branch_pull Body:
+~~~json
+{
+  "kind": "branch_pull",
+  "proposerAgentId": "${agentId}",
+  "sourceBranch": "main",
+  "targetBranch": "当前目标 branch，可选",
+  "strategy": "merge",
+  "summary": "Catch up with main",
+  "reason": "Current branch is behind main and needs shared fixes",
+  "files": ["src/example.ts"]
+}
+~~~
+
+PowerShell cherry-pick 示例：
 ~~~powershell
 Invoke-RestMethod -Method Post -Uri "${apiBase}/sync-flows" -ContentType "application/json" -Body (@{
   kind = "cherry_pick"
@@ -95,7 +155,8 @@ Invoke-RestMethod -Method Post -Uri "${apiBase}/sync-flows" -ContentType "applic
   files = @("src/example.ts")
 } | ConvertTo-Json -Depth 6)
 ~~~
-- PowerShell branch pull example:
+
+PowerShell branch pull 示例：
 ~~~powershell
 Invoke-RestMethod -Method Post -Uri "${apiBase}/sync-flows" -ContentType "application/json" -Body (@{
   kind = "branch_pull"
@@ -108,16 +169,48 @@ Invoke-RestMethod -Method Post -Uri "${apiBase}/sync-flows" -ContentType "applic
 } | ConvertTo-Json -Depth 6)
 ~~~
 
-提交规则：
-- 不在 ${scratchDirectory}/ 内、也不是共享资源的所有新增或修改文件，都应被视为需要 commit 的正式改动。
-- 当用户要求提交时，只提交正式仓库文件；不要提交共享资源或 agent 临时文件。
-- 如果某个文件应属于哪一类不清楚，先按正式仓库文件谨慎处理，并在答复中说明不确定点。
+授权后的行为：
+- 收到 apply authorization 后，你可以 fetch、cherry-pick、merge/rebase/pull、处理冲突、运行测试，并按需要 commit。
+- 同步完成后，只输出一个 JSON 对象登记结果：
+~~~json
+{
+  "agentCanvasSyncEvent": "applied",
+  "flowId": "sync_flow_x",
+  "summary": "what was applied",
+  "commitSha": "resulting commit sha if applicable",
+  "files": ["src/example.ts"],
+  "fileChanges": [{ "status": "M", "path": "src/example.ts" }]
+}
+~~~
+- 如果收到授权后仍然无法完成同步，说明阻塞原因，不要输出 applied 回报。
 
-5. **通过 commit 进行版本控制**
-- 每次实现新 feature 或者修 bug 后，需要及时运行 git commit，并且在 commit message 里面写清楚具体修改内容。
-- 每次 git commit 成功后，必须立刻调用 Agent Canvas 自定义的 commit report 工具，让后端知道当前 agent 已产生一次 commit。
-- commit report 工具的调用方式是 POST ${apiBase}/agents/${agentId}/commits。默认记录当前工作区 HEAD；如果需要记录非 HEAD 的提交，可以传 commit 字段。
-- PowerShell 示例：
+### tool: agent_canvas.report_commit
+
+用途：
+- 每次 git commit 成功后，通知 Agent Canvas 当前 agent 产生了一次 commit，让前端创建 commit 节点并连接到触发这次 commit 的对话轮。
+
+触发条件：
+- 任何成功的 git commit 之后都必须立刻调用。
+- 实现新 feature 或修 bug 后，需要及时 git commit，commit message 要写清楚具体修改内容。
+
+提交范围：
+- 不在 ${scratchDirectory}/ 内、也不是共享资源的所有新增或修改文件，都应视为需要 commit 的正式改动。
+- 当用户要求提交时，只提交正式仓库文件；不要提交共享资源或 agent 临时文件。
+- 如果某个文件分类不清楚，先按正式仓库文件谨慎处理，并在答复中说明不确定点。
+
+请求：
+- Endpoint: POST ${apiBase}/agents/${agentId}/commits
+- Method: POST
+- URL: ${apiBase}/agents/${agentId}/commits
+- Body:
+~~~json
+{
+  "commit": "HEAD",
+  "summary": "这次 commit 的一句话概括"
+}
+~~~
+
+PowerShell 示例：
 ~~~powershell
 Invoke-RestMethod -Method Post -Uri "${apiBase}/agents/${agentId}/commits" -ContentType "application/json" -Body (@{
   commit = "HEAD"
