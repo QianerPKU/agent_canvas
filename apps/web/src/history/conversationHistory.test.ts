@@ -80,4 +80,28 @@ describe("buildConversationHistory", () => {
       { kind: "compact", trigger: "manual" },
     ]);
   });
+
+  it("stopped 和 terminated 状态作为轮次边界", () => {
+    const turns = buildConversationHistory(
+      [
+        envelope(1, { kind: "user_input", text: "长任务" }),
+        envelope(2, { kind: "assistant_text", text: "处理中", messageUuid: "a1" }),
+        envelope(3, { kind: "status", status: "stopped" }),
+        envelope(4, { kind: "user_input", text: "继续" }),
+        envelope(5, { kind: "status", status: "terminated" }),
+      ],
+      1,
+    );
+
+    expect(turns).toHaveLength(2);
+    expect(turns[0]!.items.map((item) => item.event.kind)).toEqual([
+      "user_input",
+      "assistant_text",
+      "status",
+    ]);
+    expect(turns[1]!.items.map((item) => item.event)).toEqual([
+      { kind: "user_input", text: "继续" },
+      { kind: "status", status: "terminated" },
+    ]);
+  });
 });

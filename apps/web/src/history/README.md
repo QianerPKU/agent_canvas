@@ -1,5 +1,8 @@
 # Conversation History
 
+`stopped` and `terminated` status events are turn boundaries, so a resumed prompt after an
+interrupted or terminated agent appears in history as the next turn.
+
 画布节点的累计历史窗口。
 
 - `conversationHistory.ts`：按目标轮次截断 agent 事件历史，并合并同一消息的流式答复/思考片段；自动 compact 保留在当前轮，手动 compact 才作为轮次边界。

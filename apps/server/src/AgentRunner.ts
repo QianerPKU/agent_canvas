@@ -93,6 +93,7 @@ export class AgentRunner {
   private readonly pendingApprovals = new Map<string, PendingApproval>();
   private questionCounter = 0;
   private approvalCounter = 0;
+  private interruptedTurnPending = false;
   private suppressAbortStatus = false;
   private suppressNaturalEndStatus = false;
   private createdAt: number;
@@ -151,6 +152,7 @@ export class AgentRunner {
     this.policyPromptInjectionPending = true;
     this.pendingInjectedPrompts = [];
     this.pendingQueuedInputs = [];
+    this.interruptedTurnPending = false;
     this.cancelPendingQuestions("cancel");
     this.cancelPendingApprovals("cancel");
     if (this.status === "waiting_input" && this.sessionId && !this.config.resume) {
@@ -207,6 +209,7 @@ export class AgentRunner {
     this.promptInjectionPending = !config.resume && !extra.resumeSessionId;
     this.policyPromptInjectionPending = true;
     this.pendingQueuedInputs = [];
+    this.interruptedTurnPending = false;
     this.cancelPendingQuestions("cancel");
     this.cancelPendingApprovals("cancel");
 
@@ -243,6 +246,14 @@ export class AgentRunner {
 
   /** 运行中追加一条指令（流式输入干预）。 */
   send(text: string): void {
+    if (this.status === "stopped") {
+      this.sendAfterStopped(text);
+      return;
+    }
+    if (this.status === "terminated") {
+      this.restartAfterClosedTurn(text);
+      return;
+    }
     if (
       this.status === "waiting_input" &&
       (!this.inputQueue || this.inputQueue.isClosed) &&
@@ -312,37 +323,40 @@ export class AgentRunner {
   /** 中止会话。 */
   async stop(): Promise<void> {
     if (isTerminalStatus(this.status) || this.status === "idle") return;
-    this.inputQueue?.close();
     this.compactPending = false;
     this.policyPromptInjectionPending = false;
     this.pendingQueuedInputs = [];
+    this.interruptedTurnPending = true;
     this.cancelPendingQuestions("cancel");
     this.cancelPendingApprovals("cancel");
-    this.abortController?.abort();
+    this.setStatus("stopped");
     try {
       await this.handle?.interrupt?.();
     } catch {
       // interrupt 尽力而为，忽略错误
     }
-    this.setStatus("stopped");
   }
 
   /** 关闭底层 CLI / Query 进程。 */
   async terminate(): Promise<void> {
     if (this.status === "terminated") return;
     this.inputQueue?.close();
+    this.inputQueue = undefined;
     this.compactPending = false;
     this.policyPromptInjectionPending = false;
     this.pendingQueuedInputs = [];
+    this.interruptedTurnPending = false;
     this.cancelPendingQuestions("cancel");
     this.cancelPendingApprovals("cancel");
     this.setStatus("terminated");
     this.abortController?.abort();
+    const handle = this.handle;
+    this.handle = undefined;
     try {
-      if (this.handle?.terminate) {
-        await this.handle.terminate();
+      if (handle?.terminate) {
+        await handle.terminate();
       } else {
-        await this.handle?.interrupt?.();
+        await handle?.interrupt?.();
       }
     } catch {
       // 终止尽力而为；状态仍保持 terminated
@@ -397,10 +411,12 @@ export class AgentRunner {
   private async consume(handle: QueryHandle): Promise<void> {
     try {
       for await (const msg of handle) {
+        if (handle !== this.handle) return;
         for (const event of mapSdkMessage(msg)) {
           this.applyEvent(event);
         }
       }
+      if (handle !== this.handle) return;
       // 迭代自然结束：若仍非终态，视为完成
       if (this.suppressNaturalEndStatus) {
         this.suppressNaturalEndStatus = false;
@@ -408,10 +424,18 @@ export class AgentRunner {
       }
       this.cancelPendingQuestions("cancel");
       this.cancelPendingApprovals("cancel");
+      if (this.status === "stopped") {
+        this.inputQueue?.close();
+        this.inputQueue = undefined;
+        this.handle = undefined;
+        this.interruptedTurnPending = false;
+        return;
+      }
       if (!isTerminalStatus(this.status)) {
         this.setStatus("done");
       }
     } catch (err) {
+      if (handle !== this.handle) return;
       if (this.suppressAbortStatus) {
         this.suppressAbortStatus = false;
         return;
@@ -498,6 +522,10 @@ export class AgentRunner {
   }
 
   private applyEvent(event: AgentEvent): void {
+    if (this.interruptedTurnPending) {
+      if (event.kind === "result") this.interruptedTurnPending = false;
+      return;
+    }
     switch (event.kind) {
       case "system_init":
         this.sessionId = event.sessionId;
@@ -648,6 +676,7 @@ export class AgentRunner {
     this.inputQueue = undefined;
     this.compactPending = false;
     this.pendingQueuedInputs = [];
+    this.interruptedTurnPending = false;
     this.cancelPendingQuestions("cancel");
     this.cancelPendingApprovals("cancel");
     this.suppressAbortStatus = true;
@@ -660,6 +689,52 @@ export class AgentRunner {
       resume,
     };
     this.setStatus("waiting_input");
+  }
+
+  private sendAfterStopped(text: string): void {
+    if (this.interruptedTurnPending) {
+      this.closeDetachedHandle();
+      this.restartAfterClosedTurn(text);
+      return;
+    }
+    if (this.inputQueue && !this.inputQueue.isClosed && this.handle) {
+      this.inputQueue.push(
+        toUserInput(
+          text,
+          this.resolveFileAccess?.(this.id),
+          this.promptAccessForNextInput(),
+        ),
+      );
+      this.setStatus("running");
+      this.emit({ kind: "user_input", text });
+      return;
+    }
+    this.restartAfterClosedTurn(text);
+  }
+
+  private restartAfterClosedTurn(text: string): void {
+    const hasCurrentSession = !!this.sessionId;
+    const resume = this.sessionId ?? this.config?.resume;
+    const next: AgentStartConfig = {
+      ...(this.config ?? { prompt: text, provider: this.activeProvider }),
+      prompt: text,
+    };
+    if (resume) next.resume = resume;
+    else delete next.resume;
+    if (hasCurrentSession) {
+      delete next.resumeSessionAt;
+      delete next.forkSession;
+    }
+    this.start(next);
+  }
+
+  private closeDetachedHandle(): void {
+    const handle = this.handle;
+    this.inputQueue?.close();
+    this.inputQueue = undefined;
+    this.handle = undefined;
+    this.interruptedTurnPending = false;
+    void handle?.terminate?.()?.catch(() => undefined);
   }
 }
 

@@ -311,7 +311,11 @@ export function useAgentCanvas(): UseAgentCanvas {
             scratchDirectory: view?.scratchDirectory,
             systemPrompt: view?.systemPrompt,
           });
-        } else if (view.status === "waiting_input") {
+        } else if (
+          view.status === "waiting_input" ||
+          view.status === "stopped" ||
+          view.status === "terminated"
+        ) {
           setAgents((prev) => recordInput(prev, agentId, text, startProvider, startModel));
           await api.send(agentId, text);
         } else {

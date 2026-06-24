@@ -240,6 +240,38 @@ describe("TurnNode", () => {
     expect(actions.submit).toHaveBeenCalledWith("agent_1", "继续");
   });
 
+  it("中断后延伸出的 idle 尾节点仍可继续发送", () => {
+    const actions = makeActions();
+    renderTurn({ index: 1, status: "idle", lines: [] }, "stopped", actions);
+
+    fireEvent.change(screen.getByPlaceholderText("输入下一轮指令…"), {
+      target: { value: "继续中断后的任务" },
+    });
+    fireEvent.click(screen.getByText("▶ 发送本轮"));
+    expect(actions.submit).toHaveBeenCalledWith("agent_1", "继续中断后的任务");
+  });
+
+  it("terminated 后延伸出的 idle 尾节点仍可继续发送", () => {
+    const actions = makeActions();
+    renderTurn({ index: 1, status: "idle", lines: [] }, "terminated", actions);
+
+    fireEvent.change(screen.getByPlaceholderText("输入下一轮指令…"), {
+      target: { value: "重启后继续" },
+    });
+    fireEvent.click(screen.getByText("▶ 发送本轮"));
+    expect(actions.submit).toHaveBeenCalledWith("agent_1", "重启后继续");
+  });
+
+  it("区分显示中断和 terminated 状态", () => {
+    const actions = makeActions();
+    const { unmount } = renderTurn({ index: 0, status: "stopped", lines: [] }, "stopped", actions);
+    expect(screen.getByText("中断")).toBeTruthy();
+    unmount();
+
+    renderTurn({ index: 0, status: "terminated", lines: [] }, "terminated", actions);
+    expect(screen.getByText("terminated")).toBeTruthy();
+  });
+
   it("等待输入时可 compact，并始终可 terminate CLI", () => {
     const actions = makeActions();
     renderTurn({ index: 1, status: "idle", lines: [] }, "waiting_input", actions);

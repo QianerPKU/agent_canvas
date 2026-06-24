@@ -74,5 +74,10 @@ function mergeTextEvent(previous: AgentEvent, next: AgentEvent): AgentEvent | un
 }
 
 function isTurnBoundary(event: AgentEvent): boolean {
-  return event.kind === "result" || (event.kind === "compact" && event.trigger === "manual");
+  return (
+    event.kind === "result" ||
+    (event.kind === "compact" && event.trigger === "manual") ||
+    (event.kind === "status" &&
+      (event.status === "stopped" || event.status === "terminated"))
+  );
 }

@@ -87,8 +87,8 @@ const TURN_META: Record<TurnStatus, { label: string; color: string }> = {
   running: { label: "运行中", color: "#2563eb" },
   done: { label: "完成", color: "#16a34a" },
   error: { label: "错误", color: "#dc2626" },
-  stopped: { label: "已停止", color: "#6b7280" },
-  terminated: { label: "已终止", color: "#111827" },
+  stopped: { label: "中断", color: "#6b7280" },
+  terminated: { label: "terminated", color: "#111827" },
 };
 
 function short(v: unknown, n = 120): string {
@@ -174,9 +174,12 @@ export function TurnNode({
     .filter(Boolean)
     .join("\n");
   // 末尾 idle 轮且可输入：首轮看 agent idle，续轮看 agent waiting_input
+  const isResumableClosedAgent = agentStatus === "stopped" || agentStatus === "terminated";
   const isActiveInput =
     turn.status === "idle" &&
-    (turn.index === 0 ? agentStatus === "idle" : agentStatus === "waiting_input");
+    (turn.index === 0
+      ? agentStatus === "idle"
+      : agentStatus === "waiting_input" || isResumableClosedAgent);
   const canFork = turn.status === "done" && !!turn.anchorUuid;
   const isRunning = turn.status === "running";
   const canGuideRunningTurn = isLatest && isRunning && agentStatus === "running";
@@ -188,10 +191,11 @@ export function TurnNode({
       agentStatus === "waiting_input");
   const hasResourceHandles =
     isLatest &&
-    agentStatus !== "done" &&
-    agentStatus !== "stopped" &&
-      agentStatus !== "terminated" &&
-      agentStatus !== "error";
+    (isActiveInput ||
+      (agentStatus !== "done" &&
+        agentStatus !== "stopped" &&
+        agentStatus !== "terminated" &&
+        agentStatus !== "error"));
   const minimized = data.windowState?.minimized === true;
   const hasPendingInteraction = turn.lines.some(
     (line) =>

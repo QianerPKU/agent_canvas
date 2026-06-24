@@ -371,7 +371,7 @@ describe("AgentRunner 生命周期", () => {
     expect(events.some((event) => event.kind === "user_approval")).toBe(false);
   });
 
-  it("stop → stopped，调用 interrupt，且之后不可再 send", async () => {
+  it("stop → stopped，调用 interrupt；继续输入时优先复用未关闭的流式会话", async () => {
     const ctl = makeControllableQuery();
     const runner = new AgentRunner("a2", { query: ctl.query });
     runner.start({ prompt: "x" });
@@ -381,7 +381,14 @@ describe("AgentRunner 生命周期", () => {
     await runner.stop();
     expect(runner.getStatus()).toBe("stopped");
     expect(ctl.wasInterrupted()).toBe(true);
-    expect(() => runner.send("y")).toThrow();
+    ctl.emit(resultMsg());
+    await flush();
+
+    runner.send("y");
+    await flush();
+    expect(runner.getStatus()).toBe("running");
+    expect(ctl.wasTerminated()).toBe(false);
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual(["x", "y"]);
   });
 
   it("compact 作为独立一轮，完成后回到 waiting_input", async () => {
@@ -439,7 +446,7 @@ describe("AgentRunner 生命周期", () => {
     expect(runner.getStatus()).toBe("waiting_input");
   });
 
-  it("terminate → terminated，并关闭底层 handle", async () => {
+  it("terminate → terminated，并关闭底层 handle；继续输入时用当前 session 重启", async () => {
     const ctl = makeControllableQuery();
     const runner = new AgentRunner("terminate-agent", { query: ctl.query });
     runner.start({ prompt: "x" });
@@ -450,7 +457,11 @@ describe("AgentRunner 生命周期", () => {
     await flush();
     expect(runner.getStatus()).toBe("terminated");
     expect(ctl.wasTerminated()).toBe(true);
-    expect(() => runner.send("y")).toThrow();
+    runner.send("y");
+    await flush();
+    expect(runner.getStatus()).toBe("starting");
+    expect(ctl.getOptions()?.resume).toBe("s1");
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual(["x", "y"]);
   });
 
   it("built-in workspace policy is injected without user configured prompts and after compact", async () => {

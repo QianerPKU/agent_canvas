@@ -36,6 +36,11 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 ```
 
 - **流式输入干预**：`AgentRunner` 用 `AsyncMessageQueue` 作为 `prompt` 源；首条任务入队即启动。`waiting_input` 下的 `send()` 立即开启下一轮；`running` 下的 `send()` 作为 `user_input mode=queued` 记录，等当前 result 后再成为下一轮输入。Claude SDK 原生消费流式输入；Codex app-server 按 thread 连续启动 turn。
+- **Stop/terminate continuation**: `stop()` marks the current turn `stopped` and calls provider
+  `interrupt` without using `terminate`; if the stream stays alive, the next `send()` reuses it,
+  otherwise it restarts with the saved session id. `terminate()` closes the provider handle and the
+  next `send()` always starts a new handle with `resume`. Both `stopped` and `terminated` are turn
+  boundaries for `currentTurnIndex`.
 - **运行中引导**：`steer()` 仅在 `running` 可用，记录为 `user_input mode=steer`。Codex 走 app-server 原生 `turn/steer` 追加到当前 in-flight turn；Claude 使用同一条 SDK streaming input 通道承载运行中输入。
 - **执行中提问**：底层 provider 主动要求用户回答时不会被自动空答。Codex app-server 的 `item/tool/requestUserInput` 与 `mcpServer/elicitation/request`、Claude SDK 的 `AskUserQuestion` 都会映射成统一 `user_question` 事件；前端通过 `POST /api/agents/:id/questions/:requestId` 回答后，adapter 再翻译回各自原生协议。Agent 状态仍保持 `running`。
 - **执行中授权**：Codex app-server 的命令执行、文件变更、权限扩展审批，以及 Claude SDK 的非 `AskUserQuestion` 工具审批都会映射成统一 `user_approval` 事件；前端通过 `POST /api/agents/:id/approvals/:requestId` 允许、拒绝或取消后，adapter 再翻译回各自原生协议。后端不再默认拒绝授权请求。

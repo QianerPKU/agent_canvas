@@ -253,6 +253,30 @@ describe("AgentManager fork", () => {
     expect(mgr.currentTurnIndex(runner.id)).toBe(1);
   });
 
+  it("currentTurnIndex treats stopped and terminated turns as boundaries", async () => {
+    const { query, out } = makeWaitingQuery();
+    const mgr = new AgentManager({ query });
+    const runner = mgr.create();
+    mgr.startAgent(runner.id, { prompt: "第一轮" });
+    out.push({
+      type: "system",
+      subtype: "init",
+      session_id: "sess-turns",
+      model: "test",
+      cwd: "/repo",
+      tools: [],
+    });
+    await flush();
+
+    await runner.stop();
+    expect(mgr.currentTurnIndex(runner.id)).toBe(1);
+
+    runner.send("第二轮");
+    await flush();
+    await runner.terminate();
+    expect(mgr.currentTurnIndex(runner.id)).toBe(2);
+  });
+
   it("records branch and base commit context for a started turn", async () => {
     const { query } = makeWaitingQuery();
     const events: string[] = [];

@@ -233,8 +233,8 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
     case "status": {
       const v: AgentView = { ...view, status: event.status };
       if (event.status === "error") return markLastTurn(v, "error");
-      if (event.status === "stopped") return markLastTurn(v, "stopped");
-      if (event.status === "terminated") return markLastTurn(v, "terminated");
+      if (event.status === "stopped") return endLastTurn(v, "stopped");
+      if (event.status === "terminated") return endLastTurn(v, "terminated");
       if (event.status === "running") return markLastTurnIfIdle(v, "running");
       return v;
     }
@@ -396,6 +396,16 @@ function appendThinking(
 
 function markLastTurn(view: AgentView, status: TurnStatus): AgentView {
   return withLastTurn(view, (t) => ({ ...t, status }));
+}
+
+function endLastTurn(view: AgentView, status: TurnStatus): AgentView {
+  const finalized = markLastTurn(view, status);
+  const last = finalized.turns.at(-1);
+  if (last?.status === "idle" && !last.userInput && last.lines.length === 0) return finalized;
+  return {
+    ...finalized,
+    turns: [...finalized.turns, idleTurn(finalized.turns.length)],
+  };
 }
 
 function markLastTurnIfIdle(view: AgentView, status: TurnStatus): AgentView {

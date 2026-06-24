@@ -11,6 +11,8 @@
   current viewport center instead of the global canvas origin.
 - Derived nodes such as commit, PR, and sync nodes use the source turn as their anchor, so historical
   edges stay attached to the exact turn that produced the action.
+- Stopped and terminated turns are displayed as distinct completed visual turns (`中断` and
+  `terminated`) and the chain extends a new idle tail node that can accept the next prompt.
 - React Flow layout is persisted per canvas project through `/api/canvas-layout`, including node
   positions, dimensions, and minimized window state.
 - Question and approval panels stop click propagation internally, so answering questions or toggling

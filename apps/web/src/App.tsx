@@ -399,7 +399,7 @@ export function computeFileEdges(
   const edges: Edge[] = [];
   for (const connection of connections) {
     const agent = agents[connection.agentId];
-    if (!agent || ["done", "stopped", "terminated", "error"].includes(agent.status)) continue;
+    if (!agent || !canUseResourceConnections(agent)) continue;
     const activeTurnId = nodeId(agent.id, agent.turns.length - 1);
     if (connection.access === "read") {
       edges.push({
@@ -433,7 +433,7 @@ export function computePromptEdges(
   const edges: Edge[] = [];
   for (const connection of connections) {
     const agent = agents[connection.agentId];
-    if (!agent || ["done", "stopped", "terminated", "error"].includes(agent.status)) continue;
+    if (!agent || !canUseResourceConnections(agent)) continue;
     const activeTurnId = nodeId(agent.id, agent.turns.length - 1);
     if (connection.access === "read") {
       edges.push({
@@ -458,6 +458,12 @@ export function computePromptEdges(
     });
   }
   return edges;
+}
+
+function canUseResourceConnections(agent: AgentMap[string]): boolean {
+  if (agent.status === "done" || agent.status === "error") return false;
+  if (agent.status !== "stopped" && agent.status !== "terminated") return true;
+  return agent.turns.at(-1)?.status === "idle";
 }
 
 export function computeCommitEdges(

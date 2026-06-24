@@ -315,10 +315,7 @@ export class AgentManager {
     if (!this.runners.has(id)) throw new Error(`未知 agent: ${id}`);
     let index = 0;
     for (const envelope of this.historyOf(id)) {
-      if (
-        envelope.event.kind === "result" ||
-        (envelope.event.kind === "compact" && envelope.event.trigger === "manual")
-      ) {
+      if (isTurnBoundaryEvent(envelope.event)) {
         index++;
       }
     }
@@ -412,6 +409,15 @@ export class AgentManager {
       forkOrigin: this.forkOrigins.get(id),
     };
   }
+}
+
+function isTurnBoundaryEvent(event: AgentEvent): boolean {
+  return (
+    event.kind === "result" ||
+    (event.kind === "compact" && event.trigger === "manual") ||
+    (event.kind === "status" &&
+      (event.status === "stopped" || event.status === "terminated"))
+  );
 }
 
 function restorableStatus(status: AgentSnapshot["status"]): AgentSnapshot["status"] {

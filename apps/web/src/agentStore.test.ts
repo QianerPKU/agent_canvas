@@ -367,17 +367,22 @@ describe("agentStore 轮次模型", () => {
     expect(v.turns[2]!.status).toBe("idle");
   });
 
-  it("status=stopped 把当前轮标记 stopped", () => {
+  it("status=stopped 把当前轮标记 stopped，并延伸新的 idle 输入轮", () => {
     seq = 0;
     let map: AgentMap = { a1: newAgentView("a1") };
     map = recordInput(map, "a1", "x");
     map = applyEnvelope(map, env("a1", SYS));
     map = applyEnvelope(map, env("a1", { kind: "status", status: "stopped" }));
+    expect(get(map).turns).toHaveLength(2);
     expect(get(map).turns[0]!.status).toBe("stopped");
+    expect(get(map).turns[1]).toMatchObject({ index: 1, status: "idle" });
     expect(get(map).status).toBe("stopped");
+
+    map = applyEnvelope(map, env("a1", { kind: "user_input", text: "继续" }));
+    expect(get(map).turns[1]).toMatchObject({ userInput: "继续", status: "running" });
   });
 
-  it("status=terminated 把当前轮和 agent 标记为 terminated", () => {
+  it("status=terminated 把当前轮标记 terminated，并延伸新的 idle 输入轮", () => {
     let map: AgentMap = {
       a1: newAgentView("a1", {
         status: "waiting_input",
@@ -385,7 +390,9 @@ describe("agentStore 轮次模型", () => {
       }),
     };
     map = applyEnvelope(map, env("a1", { kind: "status", status: "terminated" }));
+    expect(get(map).turns).toHaveLength(2);
     expect(get(map).turns[0]!.status).toBe("terminated");
+    expect(get(map).turns[1]).toMatchObject({ index: 1, status: "idle" });
     expect(get(map).status).toBe("terminated");
   });
 

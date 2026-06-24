@@ -429,6 +429,29 @@ describe("computeFileEdges", () => {
     ]);
   });
 
+  it("stopped/terminated 后的 idle 尾节点仍继承文件连接", () => {
+    const agents: AgentMap = {
+      agent_1: {
+        id: "agent_1",
+        status: "terminated",
+        turns: [
+          { index: 0, status: "terminated", lines: [] },
+          { index: 1, status: "idle", lines: [] },
+        ],
+        lastSeq: 2,
+      },
+    };
+    const edges = computeFileEdges(agents, [
+      { id: "file_connection_1", fileId: "file_1", agentId: "agent_1", access: "read" },
+    ]);
+
+    expect(edges[0]).toMatchObject({
+      source: "file:file_1",
+      target: "agent_1#1",
+      targetHandle: "resource-read",
+    });
+  });
+
   it("提示词连接继承到 Agent 最新一轮", () => {
     const agents: AgentMap = {
       agent_1: {
@@ -453,6 +476,34 @@ describe("computeFileEdges", () => {
     expect(edges[0]).toMatchObject({
       source: "prompt:prompt_1",
       sourceHandle: "read",
+      target: "agent_1#1",
+      targetHandle: "resource-read",
+    });
+  });
+
+  it("stopped/terminated 后的 idle 尾节点仍继承提示词连接", () => {
+    const agents: AgentMap = {
+      agent_1: {
+        id: "agent_1",
+        status: "stopped",
+        turns: [
+          { index: 0, status: "stopped", lines: [] },
+          { index: 1, status: "idle", lines: [] },
+        ],
+        lastSeq: 2,
+      },
+    };
+    const edges = computePromptEdges(agents, [
+      {
+        id: "prompt_connection_1",
+        promptId: "prompt_1",
+        agentId: "agent_1",
+        access: "read",
+      },
+    ]);
+
+    expect(edges[0]).toMatchObject({
+      source: "prompt:prompt_1",
       target: "agent_1#1",
       targetHandle: "resource-read",
     });

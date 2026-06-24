@@ -35,6 +35,10 @@
 ```
 
 - **命令走 REST，事件走 WS**，单向清晰。`submit` 自动判断首轮 start / 续轮 send；运行中 submit 默认排队到下一轮，`steer` 按钮引导当前 in-flight turn。
+- `stopped` and `terminated` status events also end the current visual turn and extend a new idle
+  tail node. Submitting from that idle tail still uses `/send`: stopped agents reuse the interrupted
+  stream when available, while terminated agents restart from the saved session. File and prompt
+  connections move to that idle tail so resource access stays attached to the next turn.
 - PR 流程也走同一套 REST + WS：`useAgentCanvas` 读取 `hello.prFlows` 并监听 `pr_flow` 帧；顶栏 PR 面板调用 `/api/pr-flows` 发起流程。具体 `git`/`gh`/冲突处理仍由提 PR 的 agent 自己执行。
 - Sync 流程同样走 REST + WS：`useAgentCanvas` 读取 `hello.syncFlows` 并监听 `sync_flow` 帧；顶栏 Sync 面板可发起 `cherry_pick` 或 `branch_pull`，授权后实际 `git cherry-pick` / merge / rebase / pull 仍由 proposer agent 自己执行。
 - commit 节点来自后端 commit report：agent 在 `git commit` 后调用 `/api/agents/:id/commits`，`useAgentCanvas` 读取 `hello.commits` 并监听 `commit` 帧。commit 线使用后端记录的 `sourceTurnIndex`，所以旧对话框完成后变成历史轮，commit 线仍连在原来的那一轮上。

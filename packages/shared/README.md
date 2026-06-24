@@ -25,6 +25,9 @@
 | `ClientCommand` | 客户端→服务端命令：`start / stop / compact / terminate / send / steer / resume` |
 | `AgentSnapshot` | agent 当前快照（REST 列表、重连补齐） |
 
+`stopped` and `terminated` remain terminal provider lifecycle states, but the canvas treats their
+status events as turn boundaries and may accept a later `send` to continue the same agent chain.
+
 ### Commit 模型 (`src/commits.ts`)
 
 `AgentCommitSnapshot` 记录 agent 上报的一次 git commit：agent id、`sourceTurnIndex`、完整/短 hash、branch、作者、message、变更文件和每文件 diff。`ReportAgentCommitInput` 是 agent 调用 commit report 接口时的输入，默认记录当前工作区 `HEAD`。

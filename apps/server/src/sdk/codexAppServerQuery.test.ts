@@ -46,6 +46,7 @@ function makeFakeSpawn(options: { completeTurnStart?: boolean } = {}) {
   });
 
   const write = (message: unknown) => stdout.write(`${JSON.stringify(message)}\n`);
+  let turnCounter = 0;
   const inputLines = readline.createInterface({ input: stdin });
   inputLines.on("line", (line) => {
     const message = JSON.parse(line) as {
@@ -74,16 +75,27 @@ function makeFakeSpawn(options: { completeTurnStart?: boolean } = {}) {
         });
         break;
       case "turn/start":
-        write({ id: message.id, result: { turn: { id: "turn-1" } } });
+        turnCounter += 1;
+        write({ id: message.id, result: { turn: { id: `turn-${turnCounter}` } } });
         if (completeTurnStart) {
           write({
             method: "turn/completed",
             params: {
               threadId: "thread-1",
-              turn: { id: "turn-1", status: "completed" },
+              turn: { id: `turn-${turnCounter}`, status: "completed" },
             },
           });
         }
+        break;
+      case "turn/interrupt":
+        write({ id: message.id, result: {} });
+        write({
+          method: "turn/completed",
+          params: {
+            threadId: "thread-1",
+            turn: { id: message.params?.turnId, status: "interrupted" },
+          },
+        });
         break;
       case "turn/steer":
         if (message.params?.expectedTurnId !== "turn-1") {
@@ -321,6 +333,41 @@ describe("Codex app-server query", () => {
         },
       ],
     });
+
+    await handle.terminate?.();
+  });
+
+  it("interrupt 只中断当前 turn，不关闭 app-server，并可继续下一轮", async () => {
+    const fake = makeFakeSpawn({ completeTurnStart: false });
+    const prompt = new AsyncMessageQueue<SdkUserInput>();
+    prompt.push(userInput("长任务"));
+
+    const handle = createCodexAppServerQuery({ spawnFn: fake.spawnFn })({
+      prompt,
+      options: { model: "gpt-5.5" },
+    });
+    const iterator = handle[Symbol.asyncIterator]();
+    await iterator.next();
+    const pendingTurn = iterator.next();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    await handle.interrupt?.();
+    await pendingTurn;
+    expect(fake.requests).toContain("turn/interrupt");
+    expect(fake.proc.kill).not.toHaveBeenCalled();
+
+    prompt.push(userInput("继续"));
+    const nextTurn = iterator.next();
+    void nextTurn.catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fake.messages.filter((message) => message.method === "turn/start")).toHaveLength(2);
+    expect(fake.messages.at(-1)?.params?.input).toEqual([
+      {
+        type: "text",
+        text: "继续",
+        text_elements: [],
+      },
+    ]);
 
     await handle.terminate?.();
   });

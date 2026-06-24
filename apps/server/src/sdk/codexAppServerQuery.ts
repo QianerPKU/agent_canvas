@@ -106,9 +106,8 @@ function createHandle(
     [Symbol.asyncIterator]: () => iterator,
     interrupt: async () => {
       if (client && threadId && turnId) {
-        void client.request("turn/interrupt", { threadId, turnId }).catch(() => undefined);
+        await client.request("turn/interrupt", { threadId, turnId }).catch(() => undefined);
       }
-      client?.close();
     },
     steer: async (input) => {
       if (!client || !threadId || !turnId) {
