@@ -51,12 +51,69 @@ describe("computeFileEdges", () => {
     const second = nodes.find((node) => node.id === "agent_1#1");
 
     expect(first).toMatchObject({
+      width: 360,
+      height: 300,
+      data: { windowState: undefined },
+    });
+    expect(second?.position.x).toBe(first?.position.x);
+    expect(second?.position.y).toBe((first?.position.y ?? 0) + 324);
+  });
+
+  it("auto-minimizes turns only after they are older than the latest two turns", () => {
+    const agents: AgentMap = {
+      agent_1: {
+        id: "agent_1",
+        status: "waiting_input",
+        turns: [
+          { index: 0, status: "done", lines: [] },
+          { index: 1, status: "done", lines: [] },
+          { index: 2, status: "idle", lines: [] },
+        ],
+        lastSeq: 3,
+      },
+    };
+
+    const nodes = buildNodes(
+      agents,
+      [],
+      [],
+      [],
+      [],
+      [],
+      {} as AgentActions,
+      {} as FileActions,
+      {} as PromptActions,
+      [],
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+    );
+
+    const first = nodes.find((node) => node.id === "agent_1#0");
+    const second = nodes.find((node) => node.id === "agent_1#1");
+    const third = nodes.find((node) => node.id === "agent_1#2");
+
+    expect(first).toMatchObject({
       width: 68,
       height: 48,
       data: { windowState: { minimized: true } },
     });
-    expect(second?.position.x).toBe(first?.position.x);
+    expect(second).toMatchObject({
+      width: 360,
+      height: 300,
+      data: { windowState: undefined },
+    });
+    expect(third).toMatchObject({
+      width: 360,
+      height: 300,
+      data: { windowState: undefined },
+    });
     expect(second?.position.y).toBe((first?.position.y ?? 0) + 72);
+    expect(third?.position.y).toBe((second?.position.y ?? 0) + 324);
   });
 
   it("commit 节点创建在源对话轮右侧，并避让同源 commit", () => {

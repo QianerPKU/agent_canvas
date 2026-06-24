@@ -2,10 +2,11 @@
 
 `TurnNode` renders one agent conversation turn on the canvas.
 
-- When a finished turn becomes historical because a new turn is created, the canvas auto-minimizes
-  that old turn once. If the user restores it manually, later refreshes respect that choice.
-- New turns are positioned under the previous turn's actual canvas position. When the previous turn
-  has auto-minimized, the next turn sits directly under the small node with a compact gap.
+- The tail of each conversation chain keeps the latest turn and the immediately previous completed
+  turn expanded by default. Older completed turns auto-minimize once; if the user changes a node's
+  minimized state manually, later refreshes respect that choice.
+- New turns are positioned under the previous turn's actual canvas position. When an older turn has
+  auto-minimized, the following turn sits directly under the small node with a compact gap.
 - New root nodes created from the toolbar, including agent, file, and prompt nodes, start from the
   current viewport center instead of the global canvas origin.
 - Derived nodes such as commit, PR, and sync nodes use the source turn as their anchor, so historical

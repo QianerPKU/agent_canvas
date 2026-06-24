@@ -304,11 +304,12 @@ function autoTurnWindowState(
   existingTurn: TurnNodeType | undefined,
   turnStatus: TurnNodeType["data"]["turn"]["status"],
   isLatest: boolean,
+  keepExpandedByDefault: boolean,
   storedState?: CanvasNodeLayout["windowState"],
 ): TurnNodeType["data"]["windowState"] {
   const existingState = existingTurn?.data.windowState ?? storedState;
   if (existingState) return existingState;
-  if (isLatest || turnStatus === "idle") return undefined;
+  if (isLatest || keepExpandedByDefault || turnStatus === "idle") return undefined;
   return {
     minimized: true,
     restoreWidth: existingTurn?.width ?? existingTurn?.measured?.width ?? DEFAULT_NODE_WIDTH,
@@ -589,10 +590,12 @@ export function buildNodes(
       const existingTurn = existing?.type === "turn" ? existing : undefined;
       const stored = storedLayoutFor(savedById, id, "turn");
       const isLatest = index === view.turns.length - 1;
+      const keepExpandedByDefault = index >= view.turns.length - 2;
       const windowState = autoTurnWindowState(
         existingTurn,
         turn.status,
         isLatest,
+        keepExpandedByDefault,
         stored?.windowState,
       );
       const data = {
