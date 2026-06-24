@@ -572,7 +572,11 @@ function QuestionLine({
   };
 
   return (
-    <div className="nodrag" style={questionPanelStyle}>
+    <div
+      className="nodrag"
+      style={questionPanelStyle}
+      onClick={(event) => event.stopPropagation()}
+    >
       <div style={questionHeaderStyle}>
         <HelpCircle size={14} />
         <span style={{ fontWeight: 700 }}>{request.title ?? "需要回答"}</span>
@@ -645,7 +649,11 @@ function ApprovalLine({
     void actions.answerApproval(agentId, request.requestId, response);
   };
   return (
-    <div className="nodrag" style={approvalPanelStyle}>
+    <div
+      className="nodrag"
+      style={approvalPanelStyle}
+      onClick={(event) => event.stopPropagation()}
+    >
       <div style={questionHeaderStyle}>
         <ShieldAlert size={14} />
         <span style={{ fontWeight: 700 }}>{request.title}</span>

@@ -351,6 +351,66 @@ describe("TurnNode", () => {
     });
   });
 
+  it("interaction panels do not open the history details window", () => {
+    const actions = makeActions();
+    const onOpenHistory = vi.fn();
+    const data: TurnNodeData = {
+      agentId: "agent_1",
+      turn: {
+        index: 0,
+        status: "running",
+        lines: [
+          {
+            kind: "question",
+            status: "pending",
+            request: {
+              requestId: "question-1",
+              kind: "ask_user_question",
+              title: "Need input",
+              questions: [
+                {
+                  id: "framework",
+                  question: "Pick framework?",
+                  options: [{ label: "React", description: "Use React" }],
+                },
+              ],
+            },
+          },
+          {
+            kind: "approval",
+            status: "pending",
+            request: {
+              requestId: "approval-1",
+              kind: "command",
+              title: "Run command",
+              command: "npm test",
+            },
+          },
+        ],
+      },
+      agentStatus: "running",
+      isLatest: true,
+      onOpenHistory,
+      actions,
+    };
+    const { container } = render(
+      <ReactFlowProvider>
+        <TurnNode {...({ data, id: "agent_1#0" } as unknown as NodeProps<TurnNodeType>)} />
+      </ReactFlowProvider>,
+    );
+
+    fireEvent.click(screen.getByText("Pick framework?"));
+    expect(onOpenHistory).not.toHaveBeenCalled();
+
+    const remember = screen.getByRole("checkbox") as HTMLInputElement;
+    fireEvent.click(remember.closest("label")!);
+    expect(remember.checked).toBe(true);
+    expect(onOpenHistory).not.toHaveBeenCalled();
+
+    fireEvent.click(container.querySelector(".turn-node")!);
+    expect(onOpenHistory).toHaveBeenCalledWith("agent_1", 0);
+  });
+
   it("完成轮（有 anchorUuid）：fork 按钮 + 展示用户输入", () => {
     const actions = makeActions();
     renderTurn(

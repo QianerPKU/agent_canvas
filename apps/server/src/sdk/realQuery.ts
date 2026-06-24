@@ -161,7 +161,8 @@ function includeAskUserQuestion(
   allowedTools: string[] | undefined,
   enabled: boolean,
 ): string[] | undefined {
-  if (!enabled || !allowedTools) return allowedTools;
+  if (!enabled) return allowedTools;
+  if (!allowedTools) return ["AskUserQuestion"];
   return allowedTools.includes("AskUserQuestion")
     ? allowedTools
     : [...allowedTools, "AskUserQuestion"];

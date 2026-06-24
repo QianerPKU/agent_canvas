@@ -13,6 +13,8 @@
   edges stay attached to the exact turn that produced the action.
 - React Flow layout is persisted per canvas project through `/api/canvas-layout`, including node
   positions, dimensions, and minimized window state.
+- Question and approval panels stop click propagation internally, so answering questions or toggling
+  session-level approval memory does not open the turn history details window.
 - Each real input turn can receive a backend `turn_context` event with the branch, cwd, and git HEAD
   commit captured when that turn starts. The node displays the branch and base commit, while
   minimized historical turns keep the short base hash visible.

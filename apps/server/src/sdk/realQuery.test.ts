@@ -200,6 +200,24 @@ describe("realQuery file access", () => {
     });
   });
 
+  it("adds Claude AskUserQuestion when no allowedTools were configured", () => {
+    const requestUserInput = vi.fn().mockResolvedValue({ answers: {} });
+
+    realQuery({
+      prompt: "x",
+      options: {
+        requestUserInput,
+      },
+    });
+
+    const sdkArgs = sdk.query.mock.calls.at(-1)?.[0] as {
+      options: { allowedTools?: string[]; canUseTool?: unknown };
+    };
+
+    expect(sdkArgs.options.allowedTools).toEqual(["AskUserQuestion"]);
+    expect(typeof sdkArgs.options.canUseTool).toBe("function");
+  });
+
   it("把 Claude 非 AskUserQuestion 工具授权转发到前端审批处理器", async () => {
     const requestUserInput = vi.fn().mockResolvedValue({ answers: {} });
     const requestApproval = vi.fn().mockResolvedValue({ action: "approve", remember: true });
