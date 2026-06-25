@@ -591,6 +591,8 @@ export function buildNodes(
   onOpenSyncFlowDetails: (flowId: string) => void,
   savedLayout: CanvasNodeLayout[] = [],
   placementOverrides: NodePlacementOverrides = {},
+  branches: BranchOption[] = [],
+  onCreateBranch?: (branch: string, baseBranch?: string) => Promise<BranchWorkspace>,
 ): CanvasNode[] {
   const layout = computeLayout(agents);
   const byId = new Map(current.map((node) => [node.id, node]));
@@ -632,6 +634,8 @@ export function buildNodes(
         windowState,
         onOpenHistory,
         onOpenSettings: isLatest ? onOpenAgentSettings : undefined,
+        branches,
+        onCreateBranch,
         actions,
       };
       if (existingTurn) {
@@ -1068,8 +1072,8 @@ export default function App(): React.ReactElement {
     setAgentSettingsTarget({ mode: "edit", agentId });
   }, []);
 
-  const createBranch = useCallback(async (branch: string) => {
-    const created = await api.createBranch({ branch });
+  const createBranch = useCallback(async (branch: string, baseBranch?: string) => {
+    const created = await api.createBranch({ branch, baseBranch });
     await refreshBranchOptions();
     return created;
   }, [refreshBranchOptions]);
@@ -1096,6 +1100,8 @@ export default function App(): React.ReactElement {
         setOpenSyncFlowId,
         savedLayout.nodes,
         pendingPlacements,
+        branches,
+        createBranch,
       ),
     );
     setEdges([
@@ -1118,6 +1124,8 @@ export default function App(): React.ReactElement {
     actions,
     fileActions,
     promptActions,
+    branches,
+    createBranch,
     openHistory,
     openAgentSettings,
     openFileEditor,

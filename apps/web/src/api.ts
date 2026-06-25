@@ -24,6 +24,7 @@ import type {
   CreatePullRequestFlowInput,
   CreateSyncFlowInput,
   FileConnectionAccess,
+  ForkAgentInput,
   ForkOrigin,
   PullRequestCreatedInput,
   PullRequestFlowSnapshot,
@@ -169,10 +170,10 @@ export const api = {
   terminate: (id: string) => call(`/agents/${id}/terminate`, { method: "POST" }),
   resume: (id: string, sessionId: string, text: string) =>
     call(`/agents/${id}/resume`, { method: "POST", body: JSON.stringify({ sessionId, text }) }),
-  fork: (id: string, anchorUuid: string, model?: string) =>
+  fork: (id: string, anchorUuid: string, options: Omit<ForkAgentInput, "anchorUuid"> = {}) =>
     call<{ id: string; origin: ForkOrigin }>(`/agents/${id}/fork`, {
       method: "POST",
-      body: JSON.stringify({ anchorUuid, model }),
+      body: JSON.stringify({ anchorUuid, ...options }),
     }),
   listFiles: () => call<{ files: CanvasFileNode[] }>("/files").then((r) => r.files),
   createFile: (input: CreateCanvasFileInput) =>

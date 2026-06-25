@@ -20,6 +20,7 @@ import type {
   AgentSnapshot,
   AgentStatus,
   AgentTurnContext,
+  ForkAgentInput,
   ForkOrigin,
 } from "@agent-canvas/shared";
 
@@ -149,7 +150,7 @@ export function insertForked(
   map: AgentMap,
   id: string,
   origin: ForkOrigin,
-  model?: string,
+  options: Omit<ForkAgentInput, "anchorUuid"> = {},
 ): AgentMap {
   if (map[id]) return map;
   const parent = map[origin.parentAgentId];
@@ -157,11 +158,11 @@ export function insertForked(
     ...map,
     [id]: newAgentView(id, {
       provider: parent?.provider,
-      model: model ?? parent?.model,
-      branchWorkspaceId: parent?.branchWorkspaceId,
-      branch: parent?.branch,
-      cwd: parent?.cwd,
-      scratchDirectory: parent?.scratchDirectory,
+      model: options.model ?? parent?.model,
+      branchWorkspaceId: options.branchWorkspaceId ?? parent?.branchWorkspaceId,
+      branch: options.branch ?? parent?.branch,
+      cwd: options.cwd ?? parent?.cwd,
+      scratchDirectory: options.scratchDirectory ?? parent?.scratchDirectory,
       systemPrompt: parent?.systemPrompt,
       forkOrigin: origin,
     }),

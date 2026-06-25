@@ -213,6 +213,34 @@ describe("AgentManager fork", () => {
     });
   });
 
+  it("fork can override the child branch workspace", async () => {
+    const { query } = makeQuery("sess-parent");
+    const mgr = new AgentManager({ query });
+
+    const parent = mgr.create({
+      cwd: "/repo/main",
+      branchWorkspaceId: "branch_1",
+      branch: "main",
+    });
+    mgr.startAgent(parent.id, { prompt: "p" });
+    await flush();
+
+    const forked = mgr.fork(parent.id, "u-anchor", {
+      branchWorkspaceId: "branch_2",
+      branch: "feature/a",
+      cwd: "/repo/feature-a",
+      scratchDirectory: "/repo/feature-a/.agent-tmp/agent_2",
+    });
+
+    expect(forked).toBeDefined();
+    expect(mgr.snapshot(forked!.id)?.config).toMatchObject({
+      branchWorkspaceId: "branch_2",
+      branch: "feature/a",
+      cwd: "/repo/feature-a",
+      scratchDirectory: "/repo/feature-a/.agent-tmp/agent_2",
+    });
+  });
+
   it("开启完全权限模式会放行已挂起的授权请求", async () => {
     const ctl = makeWaitingQuery();
     const mgr = new AgentManager({ query: ctl.query });

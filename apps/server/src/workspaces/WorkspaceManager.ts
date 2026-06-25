@@ -506,6 +506,15 @@ export class WorkspaceManager {
       );
       return `origin/${branch}`;
     } catch {
+      // New local branch: prefer the selected base branch's remote ref when it exists.
+    }
+    try {
+      await this.runGit(
+        ["fetch", "origin", `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`],
+        { cwd: repo.localRepoPath },
+      );
+      return `origin/${baseBranch}`;
+    } catch {
       return baseBranch;
     }
   }

@@ -18,7 +18,7 @@ type AgentSettingsDialogProps =
       mode: "create";
       branches: BranchOption[];
       onCreate: (settings: AgentSettings) => Promise<void>;
-      onCreateBranch: (branch: string) => Promise<BranchWorkspace>;
+      onCreateBranch: (branch: string, baseBranch?: string) => Promise<BranchWorkspace>;
       onClose: () => void;
     }
   | {
@@ -26,7 +26,7 @@ type AgentSettingsDialogProps =
       agent: AgentView;
       branches: BranchOption[];
       canChangeBranch: boolean;
-      onCreateBranch: (branch: string) => Promise<BranchWorkspace>;
+      onCreateBranch: (branch: string, baseBranch?: string) => Promise<BranchWorkspace>;
       onUpdate: (
         agentId: string,
         settings: UpdateAgentSettingsInput,
@@ -47,6 +47,9 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
   );
   const [extraBranches, setExtraBranches] = useState<BranchOption[]>([]);
   const [newBranch, setNewBranch] = useState("");
+  const [newBranchBase, setNewBranchBase] = useState(
+    agent?.branch ?? (props.mode === "create" ? props.branches[0]?.branch ?? "" : ""),
+  );
   const [systemPrompt, setSystemPrompt] = useState(agent?.systemPrompt ?? "");
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -61,6 +64,7 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
       setCodexModelValue(codexModel(agent.model));
       setClaudeModel(agent.provider === "claude" ? agent.model ?? "" : "");
       setBranchName(agent.branch ?? "");
+      setNewBranchBase(agent.branch ?? "");
       setSystemPrompt(agent.systemPrompt ?? "");
     }
   }, [agent, isCreate]);
@@ -70,6 +74,13 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
       setBranchName(props.branches[0].branch);
     }
   }, [branchName, props]);
+
+  useEffect(() => {
+    if (branches.length === 0) return;
+    if (!newBranchBase || !branches.some((branch) => branch.branch === newBranchBase)) {
+      setNewBranchBase(branchName || branches[0]!.branch);
+    }
+  }, [branchName, branches, newBranchBase]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -120,7 +131,7 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
     setCreatingBranch(true);
     setError("");
     try {
-      const created = await props.onCreateBranch(branch);
+      const created = await props.onCreateBranch(branch, newBranchBase || undefined);
       const option: BranchOption = {
         branch: created.branch,
         branchWorkspaceId: created.id,
@@ -225,6 +236,18 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
               disabled={!canChangeBranch}
               onChange={(event) => setNewBranch(event.target.value)}
             />
+            <select
+              aria-label="新建 branch 继承自"
+              value={newBranchBase}
+              disabled={!canChangeBranch || branches.length === 0}
+              onChange={(event) => setNewBranchBase(event.target.value)}
+            >
+              {branches.map((branch) => (
+                <option key={branch.branch} value={branch.branch}>
+                  {branch.branch}
+                </option>
+              ))}
+            </select>
             <button
               type="button"
               className="icon-button"

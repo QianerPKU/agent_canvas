@@ -1026,7 +1026,8 @@ button:disabled {
 .file-dialog__filename input,
 .file-dialog__filename select,
 .file-dialog__path input,
-.agent-dialog__branch-create input {
+.agent-dialog__branch-create input,
+.agent-dialog__branch-create select {
   height: 34px;
   min-width: 0;
   padding: 5px 8px;
@@ -1069,7 +1070,7 @@ button:disabled {
 
 .agent-dialog__branch-create {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 34px;
+  grid-template-columns: minmax(0, 1fr) minmax(120px, 0.55fr) 34px;
   gap: 6px;
 }
 

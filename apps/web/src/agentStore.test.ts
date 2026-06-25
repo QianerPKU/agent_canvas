@@ -404,7 +404,7 @@ describe("agentStore 轮次模型", () => {
       map,
       "a2",
       { parentAgentId: "a1", anchorUuid: "u1" },
-      "gpt-5.5",
+      { model: "gpt-5.5" },
     );
     const v = get(map, "a2");
     expect(v.forkOrigin).toEqual({ parentAgentId: "a1", anchorUuid: "u1" });
@@ -412,6 +412,26 @@ describe("agentStore 轮次模型", () => {
     expect(v.model).toBe("gpt-5.5");
     expect(v.turns).toHaveLength(1);
     expect(v.turns[0]!.status).toBe("idle");
+  });
+
+  it("insertForked 可以覆盖 fork 子 agent 的 branch", () => {
+    let map: AgentMap = {
+      a1: newAgentView("a1", {
+        provider: "claude",
+        branchWorkspaceId: "branch_1",
+        branch: "main",
+        cwd: "E:\\repo\\main",
+      }),
+    };
+    map = insertForked(map, "a2", { parentAgentId: "a1", anchorUuid: "u1" }, {
+      branchWorkspaceId: "branch_2",
+      branch: "feature/a",
+      cwd: "E:\\repo\\feature-a",
+    });
+    const v = get(map, "a2");
+    expect(v.branchWorkspaceId).toBe("branch_2");
+    expect(v.branch).toBe("feature/a");
+    expect(v.cwd).toBe("E:\\repo\\feature-a");
   });
 
   it("applyHello 携带 forkOrigin", () => {

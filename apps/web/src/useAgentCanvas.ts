@@ -14,6 +14,7 @@ import type {
   CanvasFileNode,
   CanvasPromptConnection,
   CanvasPromptNode,
+  ForkAgentInput,
   CreateCanvasFileInput,
   CreateCanvasPromptInput,
   CreatePullRequestFlowInput,
@@ -73,7 +74,11 @@ export interface AgentActions {
   /** 关闭底层 CLI / Query。 */
   terminate: (agentId: string) => Promise<void>;
   /** 从某轮（anchorUuid）fork 出一个新 agent。 */
-  fork: (agentId: string, anchorUuid: string, model?: string) => Promise<void>;
+  fork: (
+    agentId: string,
+    anchorUuid: string,
+    options?: Omit<ForkAgentInput, "anchorUuid">,
+  ) => Promise<void>;
 }
 
 export interface UseAgentCanvas {
@@ -331,9 +336,9 @@ export function useAgentCanvas(): UseAgentCanvas {
         await api.compact(agentId);
       },
       terminate: (agentId) => api.terminate(agentId).then(() => undefined),
-      fork: async (agentId, anchorUuid, model) => {
-        const { id, origin } = await api.fork(agentId, anchorUuid, model);
-        setAgents((prev) => insertForked(prev, id, origin, model));
+      fork: async (agentId, anchorUuid, options = {}) => {
+        const { id, origin } = await api.fork(agentId, anchorUuid, options);
+        setAgents((prev) => insertForked(prev, id, origin, options));
         const [nextFileConnections, nextPromptConnections] = await Promise.all([
           api.listFileConnections(),
           api.listPromptConnections(),

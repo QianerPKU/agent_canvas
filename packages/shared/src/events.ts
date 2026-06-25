@@ -67,6 +67,15 @@ export interface UpdateAgentSettingsInput {
   scratchDirectory?: string;
 }
 
+export interface ForkAgentInput {
+  anchorUuid: string;
+  model?: string;
+  branchWorkspaceId?: string;
+  branch?: string;
+  cwd?: string;
+  scratchDirectory?: string;
+}
+
 /** token 使用量（来自 SDK result.usage）。 */
 export interface UsageInfo {
   inputTokens?: number;

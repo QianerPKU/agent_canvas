@@ -22,6 +22,7 @@ import type {
   CreateCanvasPromptInput,
   CreateSharedResourceInput,
   CreateSyncFlowInput,
+  ForkAgentInput,
   OpenCanvasProjectInput,
   PullRequestCreatedInput,
   CreatePullRequestFlowInput,
@@ -818,14 +819,39 @@ async function handleHttp(
       return sendJson(res, 202, { ok: true });
     }
     if (method === "POST" && action === "fork") {
-      const body = await readJson<{ anchorUuid?: string; model?: string }>(req);
+      const body = await readJson<Partial<ForkAgentInput>>(req);
       if (!body?.anchorUuid) return sendJson(res, 400, { error: "缺少 anchorUuid" });
-      const forked = manager.fork(id, body.anchorUuid, body.model);
-      if (!forked) return sendJson(res, 409, { error: "源会话尚未建立，无法 fork" });
-      fileManager.copyAgentConnections(id, forked.id);
-      promptManager.copyAgentConnections(id, forked.id);
-      canvasState.saveSoon();
-      return sendJson(res, 201, { id: forked.id, origin: forked.origin });
+      try {
+        const branchChanged =
+          body.branchWorkspaceId !== undefined || body.branch !== undefined;
+        const branchSettings = branchChanged
+          ? await resolveAgentWorkspaceSettings(
+              workspaceManager,
+              {
+                branchWorkspaceId: body.branchWorkspaceId,
+                branch: body.branch,
+                cwd: body.cwd,
+                scratchDirectory: body.scratchDirectory,
+              },
+              defaultCwd,
+              true,
+            )
+          : undefined;
+        const forked = manager.fork(id, body.anchorUuid, {
+          model: body.model,
+          branchWorkspaceId: branchSettings?.branchWorkspaceId,
+          branch: branchSettings?.branch,
+          cwd: branchSettings?.cwd,
+          scratchDirectory: branchSettings?.scratchDirectory,
+        });
+        if (!forked) return sendJson(res, 409, { error: "源会话尚未建立，无法 fork" });
+        fileManager.copyAgentConnections(id, forked.id);
+        promptManager.copyAgentConnections(id, forked.id);
+        canvasState.saveSoon();
+        return sendJson(res, 201, { id: forked.id, origin: forked.origin });
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
     }
     if (method === "POST" && action === "send") {
       const body = await readJson<{ text?: string }>(req);

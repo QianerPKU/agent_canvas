@@ -31,6 +31,7 @@
 - `GET/POST /api/canvas-projects` 管理 canvas 项目；`POST /api/canvas-projects/open` 打开已有项目。打开项目不会自动连接 GitHub repo。
 - `POST /api/workspace/connect` 使用远端 URL 或本地路径 clone 到 AppData 项目目录。
 - 默认 branch 直接使用 AppData clone；其他 branch 不会在连接时全部拉取。只有创建 Agent 或切换 Agent branch 选中了某个尚未创建 workspace 的 branch 时，才会 `fetch` 该 branch 并执行 `git worktree add -B <branch> <path> <startPoint>`。
+- `POST /api/workspace/branches` 支持 `baseBranch`。当目标 branch 不是已有远端 branch 时，新 worktree 会优先从 `origin/<baseBranch>` 创建；如果该远端 ref 不存在，则退回本地已有的 `<baseBranch>`。
 - `GET /api/workspace/branch-options` 会合并远端 branch 与已创建的本地 branch workspace；`hasWorkspace=false` 表示还没有专属 worktree。
 - GitHub 连接当前保存 remote URL、owner/repo 和默认 branch；PR/status 同步后续再加。
 

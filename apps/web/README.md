@@ -8,7 +8,7 @@
 - 一个 agent = 一条**轮次链**。普通轮次 = 一次用户输入 + 一次完整答复，以 `result` 收尾；手动 compact 也单独记为一轮，自动 compact 只作为当前运行轮中的系统记录。
 - 一轮完成后**自动延伸出一个 idle 轮**（"待输入"节点）；在它里面输入下一轮指令即续接。
 - 首轮 idle 节点可选择 provider：`Claude` 或 `Codex`。Codex 可选择 `gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`，默认 `gpt-5.5`。
-- 每个**完成**轮上有 **⑂ fork 按钮** → 从该轮的对话状态分叉出一个独立新 agent（连一条 fork 线），形成对话树。Codex fork 可在分叉时选择模型，子节点继承 provider 与所选模型；fork 不绑定 git。
+- 每个**完成**轮上有 **⑂ fork 按钮** → 从该轮的对话状态分叉出一个独立新 agent（连一条 fork 线），形成对话树。Codex fork 可在分叉时选择模型；fork 控件也可选择已有 branch，或先从指定 base branch 新建目标 branch 再 fork 到那里。
 
 ## 模块
 
@@ -100,7 +100,7 @@ npm test --workspace apps/web
 ## Agent 设置
 
 - 顶栏“新建 Agent”先打开设置窗口，再创建空闲 Agent。窗口中可选择 Claude Code/Codex、Codex 模型、branch 和当前 Agent 私有系统提示词。
-- Branch 列表来自后端 `GET /api/workspace/branch-options`，会展示远端已有但尚未创建 worktree 的 branch；选择这类 branch 创建 Agent 时，后端才 fetch 并创建专属 workspace。弹窗里也可新建 branch。
+- Branch 列表来自后端 `GET /api/workspace/branch-options`，会展示远端已有但尚未创建 worktree 的 branch；选择这类 branch 创建 Agent 时，后端才 fetch 并创建专属 workspace。弹窗里也可新建 branch，并选择新 branch 继承自哪个已有 branch。
 - 已创建 Agent 的最新节点头部显示齿轮按钮，打开后可修改私有系统提示词和后续响应使用的模型；当 Agent 处于 `idle` 或 `waiting_input` 时也可切换 branch。切换后的下一次对话由后端注入 branch 切换说明和 diff 文件列表。
 - `terminated` 和历史轮次不能切换 branch；运行中或已结束状态的 branch 控件禁用。
 - 首轮对话节点不再提供 provider/model 选择，启动时直接使用 Agent 创建时保存的设置。

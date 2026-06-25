@@ -11,6 +11,9 @@
   current viewport center instead of the global canvas origin.
 - Derived nodes such as commit, PR, and sync nodes use the source turn as their anchor, so historical
   edges stay attached to the exact turn that produced the action.
+- Completed turns with a fork anchor can fork into the current branch, another existing branch, or a
+  newly created branch. The inline branch creator passes a selected base branch through to
+  `/api/workspace/branches` before sending the fork request.
 - Stopped and terminated turns are displayed as distinct completed visual turns (`中断` and
   `terminated`) and the chain extends a new idle tail node that can accept the next prompt.
 - React Flow layout is persisted per canvas project through `/api/canvas-layout`, including node

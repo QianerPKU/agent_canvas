@@ -182,12 +182,26 @@ describe("WorkspaceManager", () => {
       const main = project.branches[0];
       if (!main) throw new Error("expected default branch workspace");
       const featureA = await manager.createBranch({ branch: "feature/a" });
+      await writeFile(
+        path.join(featureA.worktreePath, "feature-only.txt"),
+        "from feature/a\n",
+        "utf-8",
+      );
+      await runGit(["add", "feature-only.txt"], featureA.worktreePath);
+      await runGit(["commit", "-m", "feature-only"], featureA.worktreePath);
       const resource = await manager.createSharedResource({
         name: "dataset",
         mountPath: "shared/dataset",
         access: "readWrite",
       });
-      const featureB = await manager.createBranch({ branch: "feature/b" });
+      const featureB = await manager.createBranch({
+        branch: "feature/b",
+        baseBranch: "feature/a",
+      });
+      expect(featureB.baseBranch).toBe("feature/a");
+      await expect(
+        readFile(path.join(featureB.worktreePath, "feature-only.txt"), "utf-8"),
+      ).resolves.toContain("from feature/a");
       const branches = [main, featureA, featureB];
 
       for (const branch of branches) {

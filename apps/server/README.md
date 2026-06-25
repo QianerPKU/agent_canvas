@@ -76,7 +76,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 | `POST /api/workspace/connect` | body=`{ remoteUrl?, localPath?, defaultBranch? }`，把 GitHub/本地 repo clone 到 AppData 项目目录 |
 | `GET /api/workspace/branches` | 列出 branch workspaces |
 | `GET /api/workspace/branch-options` | 列出远端 branch 与已创建 workspace 的合并选项，`hasWorkspace=false` 表示尚未拉取 |
-| `POST /api/workspace/branches` | body=`{ branch, baseBranch? }`，创建 branch workspace |
+| `POST /api/workspace/branches` | body=`{ branch, baseBranch? }`，创建 branch workspace；`baseBranch` 为新 branch 的继承来源 |
 | `GET /api/workspace/shared-resources` | 列出项目级共享资源 |
 | `POST /api/workspace/shared-resources` | body=`{ name, mountPath, access?, sourcePath? }`，创建共享资源并映射到所有 branch workspace |
 | `GET /api/agents` | 列出全部 agent 快照 |
@@ -91,7 +91,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 | `POST /api/agents/:id/commits` | body=`{ commit?, summary? }`，记录该 agent 已完成一次 commit；默认读取当前工作区 `HEAD` |
 | `POST /api/agents/:id/compact` | 手动 compact 当前上下文；仅 `waiting_input` 可用 |
 | `POST /api/agents/:id/resume` | body=`{ sessionId, text }`，续接会话 |
-| `POST /api/agents/:id/fork` | body=`{ anchorUuid, model? }`，从该 agent 某轮 fork 出新 agent，可为 Codex fork 指定模型，返回 `{ id, origin }` |
+| `POST /api/agents/:id/fork` | body=`{ anchorUuid, model?, branchWorkspaceId?, branch?, cwd? }`，从该 agent 某轮 fork 出新 agent，可覆盖模型与目标 branch，返回 `{ id, origin }` |
 | `POST /api/agents/:id/stop` | 中止 |
 | `POST /api/agents/:id/terminate` | 关闭底层 CLI / Query，进入 `terminated` |
 | `GET /api/commits` | 列出已上报 commit 节点快照 |
@@ -123,7 +123,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 
 - **多轮**：同一 agent = 同一 provider 会话。每轮 = 一次用户输入 + 一次完整答复，以 `result` 事件收尾。每个 `result` 携带本轮最后一条 assistant 消息的 `anchorUuid`（fork UI 锚点）。
 - **引导**：`POST /api/agents/:id/steer` 优先调用 provider 原生 steer（Codex app-server 的 `turn/steer`）。provider 没有原生 steer 时，AgentRunner 会把引导文本插到普通排队输入前面，并 interrupt 当前轮，让下一轮尽快以该引导开始。
-- **fork**：`POST /:id/fork { anchorUuid, model? }` 会创建独立新 agent 并继承父 provider。Codex 可覆盖目标模型，未指定则继承父启动配置。Claude 使用 `resume + resumeSessionAt + forkSession:true` 从指定 assistant uuid 分叉；Codex 使用 app-server `thread/fork` 从父 thread 分叉（Codex app-server 当前是 thread 级 fork，不是按某个 assistant uuid 回滚）。对话 fork 与 git 分支无关。
+- **fork**：`POST /:id/fork { anchorUuid, model?, branchWorkspaceId?, branch? }` 会创建独立新 agent 并继承父 provider。Codex 可覆盖目标模型，未指定则继承父启动配置；也可覆盖目标 branch workspace，未指定则继承父 branch。Claude 使用 `resume + resumeSessionAt + forkSession:true` 从指定 assistant uuid 分叉；Codex 使用 app-server `thread/fork` 从父 thread 分叉（Codex app-server 当前是 thread 级 fork，不是按某个 assistant uuid 回滚）。对话 fork 和 git branch 仍是两套概念，但 fork 子 agent 可以被放到任意已有或新建 branch 上。
 
 ## WebSocket (`/ws`)
 
@@ -213,7 +213,7 @@ npm run smoke --workspace apps/server
 ## Agent 设置与 Branch
 
 - 进程入口用 `AGENT_CANVAS_WORKSPACE_ROOT ?? INIT_CWD ?? process.cwd()` 解析默认源仓库目录；WorkspaceManager 会把实际 branch workspace 放到 AppData 项目根。`GET /api/config` 返回 `defaultCwd` 和 `projectRoot`。
-- `POST /api/agents` 支持 `provider/model/branchWorkspaceId/cwd/systemPrompt`。新工作流中 `branchWorkspaceId` 决定 `cwd`；`cwd` 只保留兼容和快照展示。fork 会复制父 Agent 的 provider、模型、branch/cwd 和私有系统提示词。
+- `POST /api/agents` 支持 `provider/model/branchWorkspaceId/cwd/systemPrompt`。新工作流中 `branchWorkspaceId` 决定 `cwd`；`cwd` 只保留兼容和快照展示。fork 默认复制父 Agent 的 provider、模型、branch/cwd 和私有系统提示词，但 fork 请求可覆盖模型和 branch。
 - `PATCH /api/agents/:id/settings` 可更新 `systemPrompt` 和 `model`，也可在 `idle` / `waiting_input` 状态切换到已有或新建 branch。切换后下一次业务输入会注入 branch 切换说明和 `git diff --name-status <old> <new>` 文件列表；`waiting_input` 下会脱开旧空闲会话，下次输入按新 `cwd` resume。
 - `systemPrompt` 是当前 Agent 私有提示词，不传给 Claude/Codex 原生 system prompt，而是在 `AgentRunner` 中按提示词节点同样的可读提示词机制拼接到业务输入。新 Agent 首轮、手动 compact 后、自动 compact 后、以及运行中更新设置后的下一条业务输入会重新注入。
 - Agent Canvas 内置工作区规则不属于用户可编辑的 `systemPrompt`，即使用户没有设置私有系统提示词也会注入；它约束共享文件默认只读、临时文件只写 `.agent-tmp/<agent-id>/`、其余非共享非临时修改都视为需要 commit 的仓库文件，并以 tool-style 协议内置 `agent_canvas.create_pr_flow`、`agent_canvas.create_sync_flow` 和 `agent_canvas.report_commit`，指导 agent 在用户要求提 PR 时调用 `/api/pr-flows`，在用户要求 cherry-pick/pull branch 时调用 `/api/sync-flows`，在每次 `git commit` 成功后调用 `/api/agents/:id/commits`。

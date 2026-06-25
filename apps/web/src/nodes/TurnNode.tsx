@@ -13,6 +13,7 @@ import {
   HelpCircle,
   MessageSquare,
   Minimize2,
+  Plus,
   Send,
   Settings,
   ShieldAlert,
@@ -29,7 +30,10 @@ import {
   type AgentQuestionResponse,
   type AgentProvider,
   type AgentStatus,
+  type BranchOption,
+  type BranchWorkspace,
   type CodexModel,
+  type ForkAgentInput,
 } from "@agent-canvas/shared";
 import type { OutputLine, Turn, TurnStatus } from "../agentStore.js";
 import type { AgentActions } from "../useAgentCanvas.js";
@@ -50,6 +54,8 @@ export interface TurnNodeData {
   };
   onOpenHistory: (agentId: string, turnIndex: number) => void;
   onOpenSettings?: (agentId: string) => void;
+  branches?: BranchOption[];
+  onCreateBranch?: (branch: string, baseBranch?: string) => Promise<BranchWorkspace>;
   actions: AgentActions;
   [key: string]: unknown;
 }
@@ -161,9 +167,21 @@ export function TurnNode({
   const updateNodeInternals = useUpdateNodeInternals();
   const [text, setText] = useState("");
   const [model, setModel] = useState<CodexModel>(codexModel(agentModel));
+  const [forkBranchName, setForkBranchName] = useState(
+    data.agentBranch ?? data.branches?.[0]?.branch ?? "",
+  );
+  const [forkNewBranch, setForkNewBranch] = useState("");
+  const [forkBaseBranch, setForkBaseBranch] = useState(
+    data.agentBranch ?? data.branches?.[0]?.branch ?? "",
+  );
+  const [forkExtraBranches, setForkExtraBranches] = useState<BranchOption[]>([]);
+  const [creatingForkBranch, setCreatingForkBranch] = useState(false);
+  const [forkError, setForkError] = useState("");
   const logRef = useRef<HTMLDivElement>(null);
 
   const meta = TURN_META[turn.status];
+  const forkBranches = mergeBranchOptions(data.branches ?? [], forkExtraBranches);
+  const selectedForkBranch = forkBranches.find((branch) => branch.branch === forkBranchName);
   const displayBranch = turn.branch ?? data.agentBranch;
   const displayShortSha = turn.baseShortSha ?? turn.baseCommitSha?.slice(0, 7);
   const contextTitle = [
@@ -210,6 +228,41 @@ export function TurnNode({
   useEffect(() => {
     setModel(codexModel(agentModel));
   }, [agentModel]);
+
+  useEffect(() => {
+    if (forkBranches.length === 0) return;
+    const preferred = data.agentBranch && forkBranches.some((branch) => branch.branch === data.agentBranch)
+      ? data.agentBranch
+      : forkBranches[0]!.branch;
+    if (!forkBranchName || !forkBranches.some((branch) => branch.branch === forkBranchName)) {
+      setForkBranchName(preferred);
+    }
+    if (!forkBaseBranch || !forkBranches.some((branch) => branch.branch === forkBaseBranch)) {
+      setForkBaseBranch(preferred);
+    }
+  }, [data.agentBranch, forkBaseBranch, forkBranchName, forkBranches]);
+
+  const createForkBranch = async () => {
+    const branch = forkNewBranch.trim();
+    if (!branch || !data.onCreateBranch) return;
+    setCreatingForkBranch(true);
+    setForkError("");
+    try {
+      const created = await data.onCreateBranch(branch, forkBaseBranch || undefined);
+      const option = branchOptionFromWorkspace(created);
+      setForkExtraBranches((current) =>
+        current.some((candidate) => candidate.branch === option.branch)
+          ? current
+          : [...current, option],
+      );
+      setForkBranchName(option.branch);
+      setForkNewBranch("");
+    } catch (reason) {
+      setForkError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setCreatingForkBranch(false);
+    }
+  };
 
   const toggleMinimized = (event: React.MouseEvent) => {
     event.stopPropagation();
@@ -497,6 +550,55 @@ export function TurnNode({
           </button>
         ) : canFork ? (
           <>
+            {forkBranches.length > 0 && (
+              <div style={forkGridStyle}>
+                <select
+                  aria-label="fork branch"
+                  value={forkBranchName}
+                  onChange={(event) => setForkBranchName(event.target.value)}
+                  style={miniSelectStyle}
+                >
+                  {forkBranches.map((branch) => (
+                    <option key={branch.branch} value={branch.branch}>
+                      {branch.branch}
+                      {branch.hasWorkspace ? "" : "（未拉取）"}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  aria-label="fork new branch"
+                  value={forkNewBranch}
+                  placeholder="new branch"
+                  onChange={(event) => setForkNewBranch(event.target.value)}
+                  style={miniInputStyle}
+                />
+                <select
+                  aria-label="fork branch base"
+                  value={forkBaseBranch}
+                  onChange={(event) => setForkBaseBranch(event.target.value)}
+                  style={miniSelectStyle}
+                >
+                  {forkBranches.map((branch) => (
+                    <option key={branch.branch} value={branch.branch}>
+                      {branch.branch}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  style={iconOnlyBtn("#475569")}
+                  disabled={
+                    creatingForkBranch ||
+                    !data.onCreateBranch ||
+                    !forkNewBranch.trim() ||
+                    forkBranches.length === 0
+                  }
+                  title="创建 fork branch"
+                  onClick={() => void createForkBranch()}
+                >
+                  <Plus size={13} />
+                </button>
+              </div>
+            )}
             {agentProvider === "codex" && (
               <CodexModelSelect
                 ariaLabel="fork model"
@@ -504,6 +606,7 @@ export function TurnNode({
                 onChange={setModel}
               />
             )}
+            {forkError && <span style={{ color: "#dc2626", fontSize: 11 }}>{forkError}</span>}
             <button
               style={btn("#7c3aed")}
               title="从这一轮的对话状态分叉出一个新 agent"
@@ -511,7 +614,11 @@ export function TurnNode({
                 void actions.fork(
                   agentId,
                   turn.anchorUuid!,
-                  agentProvider === "codex" ? model : undefined,
+                  forkOptionsFor(
+                    agentProvider === "codex" ? model : undefined,
+                    selectedForkBranch,
+                    forkBranchName,
+                  ),
                 )
               }
             >
@@ -1088,6 +1195,28 @@ const selectStyle: React.CSSProperties = {
   background: "#fff",
 };
 
+const forkGridStyle: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr) 92px 30px",
+  gap: 5,
+};
+
+const miniInputStyle: React.CSSProperties = {
+  minWidth: 0,
+  height: 30,
+  boxSizing: "border-box",
+  fontSize: 11,
+  padding: "4px 6px",
+  border: "1px solid #d1d5db",
+  borderRadius: 6,
+  fontFamily: "inherit",
+  background: "#fff",
+};
+
+const miniSelectStyle: React.CSSProperties = {
+  ...miniInputStyle,
+};
+
 function btn(color: string): React.CSSProperties {
   return {
     background: color,
@@ -1100,6 +1229,16 @@ function btn(color: string): React.CSSProperties {
   };
 }
 
+function iconOnlyBtn(color: string): React.CSSProperties {
+  return {
+    ...btn(color),
+    minHeight: 30,
+    padding: "4px 6px",
+    display: "inline-grid",
+    placeItems: "center",
+  };
+}
+
 function iconBtn(color: string): React.CSSProperties {
   return {
     ...btn(color),
@@ -1109,4 +1248,56 @@ function iconBtn(color: string): React.CSSProperties {
     justifyContent: "center",
     gap: 4,
   };
+}
+
+function branchOptionFromWorkspace(workspace: BranchWorkspace): BranchOption {
+  return {
+    branch: workspace.branch,
+    branchWorkspaceId: workspace.id,
+    worktreePath: workspace.worktreePath,
+    hasWorkspace: true,
+    isDefault: workspace.isDefault,
+  };
+}
+
+function mergeBranchOptions(
+  primary: BranchOption[],
+  extra: BranchOption[],
+): BranchOption[] {
+  const byBranch = new Map<string, BranchOption>();
+  for (const option of [...primary, ...extra]) {
+    const current = byBranch.get(option.branch);
+    if (!current || shouldPreferBranchOption(option, current)) {
+      byBranch.set(option.branch, option);
+    }
+  }
+  return [...byBranch.values()];
+}
+
+function shouldPreferBranchOption(
+  candidate: BranchOption,
+  current: BranchOption,
+): boolean {
+  if (candidate.hasWorkspace !== current.hasWorkspace) return candidate.hasWorkspace;
+  if (!!candidate.branchWorkspaceId !== !!current.branchWorkspaceId) {
+    return !!candidate.branchWorkspaceId;
+  }
+  return false;
+}
+
+function forkOptionsFor(
+  model: string | undefined,
+  branch: BranchOption | undefined,
+  branchName: string,
+): Omit<ForkAgentInput, "anchorUuid"> | undefined {
+  const options: Omit<ForkAgentInput, "anchorUuid"> = {};
+  if (model) options.model = model;
+  if (branch) {
+    options.branchWorkspaceId = branch.branchWorkspaceId;
+    options.branch = branch.branch;
+    options.cwd = branch.worktreePath;
+  } else if (branchName) {
+    options.branch = branchName;
+  }
+  return Object.keys(options).length > 0 ? options : undefined;
 }

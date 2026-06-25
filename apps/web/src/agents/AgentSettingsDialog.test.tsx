@@ -75,7 +75,7 @@ describe("AgentSettingsDialog", () => {
       target: { value: "feature/a" },
     });
     fireEvent.click(screen.getByTitle("创建 branch"));
-    await waitFor(() => expect(onCreateBranch).toHaveBeenCalledWith("feature/a"));
+    await waitFor(() => expect(onCreateBranch).toHaveBeenCalledWith("feature/a", "main"));
 
     fireEvent.click(screen.getByText("创建"));
     await waitFor(() =>
@@ -122,7 +122,7 @@ describe("AgentSettingsDialog", () => {
     });
     fireEvent.click(screen.getByTitle("创建 branch"));
 
-    await waitFor(() => expect(onCreateBranch).toHaveBeenCalledWith("feature/a"));
+    await waitFor(() => expect(onCreateBranch).toHaveBeenCalledWith("feature/a", "main"));
     const options = Array.from(
       (screen.getByLabelText("Agent branch") as HTMLSelectElement).options,
     ).filter((option) => option.value === "feature/a");
@@ -137,6 +137,49 @@ describe("AgentSettingsDialog", () => {
           cwd: "E:\\project\\feature-a",
         }),
       ),
+    );
+  });
+
+  it("新建 branch 时可以选择继承来源", async () => {
+    const onCreateBranch = vi.fn().mockResolvedValue({
+      id: "branch_3",
+      repoId: "repo_1",
+      branch: "feature/from-dev",
+      baseBranch: "develop",
+      worktreePath: "E:\\project\\feature-from-dev",
+      scratchRoot: "E:\\project\\feature-from-dev\\.agent-tmp",
+      isDefault: false,
+      createdAt: 3,
+    });
+    render(
+      <AgentSettingsDialog
+        mode="create"
+        branches={[
+          ...branches,
+          {
+            branch: "develop",
+            branchWorkspaceId: "branch_2",
+            worktreePath: "E:\\project\\develop",
+            hasWorkspace: true,
+            isDefault: false,
+          },
+        ]}
+        onCreateBranch={onCreateBranch}
+        onCreate={vi.fn().mockResolvedValue(undefined)}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("新建 branch"), {
+      target: { value: "feature/from-dev" },
+    });
+    fireEvent.change(screen.getByLabelText("新建 branch 继承自"), {
+      target: { value: "develop" },
+    });
+    fireEvent.click(screen.getByTitle("创建 branch"));
+
+    await waitFor(() =>
+      expect(onCreateBranch).toHaveBeenCalledWith("feature/from-dev", "develop"),
     );
   });
 

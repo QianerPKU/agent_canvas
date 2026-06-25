@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, fireEvent, cleanup } from "@testing-library/react";
+import { render, screen, fireEvent, cleanup, waitFor } from "@testing-library/react";
 import { ReactFlowProvider, type NodeProps } from "@xyflow/react";
 import {
   TurnNode,
@@ -489,7 +489,126 @@ describe("TurnNode", () => {
       target: { value: "gpt-5.5" },
     });
     fireEvent.click(screen.getByText("⑂ 从此轮 fork"));
-    expect(actions.fork).toHaveBeenCalledWith("agent_1", "u-1", "gpt-5.5");
+    expect(actions.fork).toHaveBeenCalledWith("agent_1", "u-1", { model: "gpt-5.5" });
+  });
+
+  it("fork 时可以选择目标 branch", () => {
+    const actions = makeActions();
+    const data: TurnNodeData = {
+      agentId: "agent_1",
+      turn: {
+        index: 0,
+        status: "done",
+        anchorUuid: "u-1",
+        lines: [{ kind: "assistant", text: "完成了" }],
+      },
+      agentStatus: "waiting_input",
+      agentBranch: "main",
+      branches: [
+        {
+          branch: "main",
+          branchWorkspaceId: "branch_1",
+          worktreePath: "E:\\repo\\main",
+          hasWorkspace: true,
+          isDefault: true,
+        },
+        {
+          branch: "feature/a",
+          branchWorkspaceId: "branch_2",
+          worktreePath: "E:\\repo\\feature-a",
+          hasWorkspace: true,
+          isDefault: false,
+        },
+      ],
+      isLatest: false,
+      onOpenHistory: vi.fn(),
+      actions,
+    };
+    render(
+      <ReactFlowProvider>
+        <TurnNode {...({ data } as unknown as NodeProps<TurnNodeType>)} />
+      </ReactFlowProvider>,
+    );
+
+    fireEvent.change(screen.getByLabelText("fork branch"), {
+      target: { value: "feature/a" },
+    });
+    fireEvent.click(screen.getByText("⑂ 从此轮 fork"));
+
+    expect(actions.fork).toHaveBeenCalledWith("agent_1", "u-1", {
+      branchWorkspaceId: "branch_2",
+      branch: "feature/a",
+      cwd: "E:\\repo\\feature-a",
+    });
+  });
+
+  it("fork 时可以从指定 base 新建 branch", async () => {
+    const actions = makeActions();
+    const onCreateBranch = vi.fn().mockResolvedValue({
+      id: "branch_3",
+      repoId: "repo_1",
+      branch: "feature/from-dev",
+      baseBranch: "develop",
+      worktreePath: "E:\\repo\\feature-from-dev",
+      scratchRoot: "E:\\repo\\feature-from-dev\\.agent-tmp",
+      isDefault: false,
+      createdAt: 3,
+    });
+    const data: TurnNodeData = {
+      agentId: "agent_1",
+      turn: {
+        index: 0,
+        status: "done",
+        anchorUuid: "u-1",
+        lines: [{ kind: "assistant", text: "完成了" }],
+      },
+      agentStatus: "waiting_input",
+      agentBranch: "main",
+      branches: [
+        {
+          branch: "main",
+          branchWorkspaceId: "branch_1",
+          worktreePath: "E:\\repo\\main",
+          hasWorkspace: true,
+          isDefault: true,
+        },
+        {
+          branch: "develop",
+          branchWorkspaceId: "branch_2",
+          worktreePath: "E:\\repo\\develop",
+          hasWorkspace: true,
+          isDefault: false,
+        },
+      ],
+      onCreateBranch,
+      isLatest: false,
+      onOpenHistory: vi.fn(),
+      actions,
+    };
+    render(
+      <ReactFlowProvider>
+        <TurnNode {...({ data } as unknown as NodeProps<TurnNodeType>)} />
+      </ReactFlowProvider>,
+    );
+
+    fireEvent.change(screen.getByLabelText("fork new branch"), {
+      target: { value: "feature/from-dev" },
+    });
+    fireEvent.change(screen.getByLabelText("fork branch base"), {
+      target: { value: "develop" },
+    });
+    fireEvent.click(screen.getByTitle("创建 fork branch"));
+
+    await waitFor(() =>
+      expect(onCreateBranch).toHaveBeenCalledWith("feature/from-dev", "develop"),
+    );
+    fireEvent.click(screen.getByText("⑂ 从此轮 fork"));
+
+    expect(actions.fork).toHaveBeenCalledWith("agent_1", "u-1", {
+      branchWorkspaceId: "branch_3",
+      branch: "feature/from-dev",
+      cwd: "E:\\repo\\feature-from-dev",
+    });
   });
 
   it("完成轮但无 anchorUuid：不显示 fork", () => {

@@ -10,6 +10,7 @@ import type {
   AgentSnapshot,
   AgentStartConfig,
   AgentPromptAccess,
+  ForkAgentInput,
   ForkOrigin,
   PersistedAgentState,
   UpdateAgentSettingsInput,
@@ -230,10 +231,11 @@ export class AgentManager {
   fork(
     parentId: string,
     anchorUuid: string,
-    model?: string,
+    options?: string | Omit<ForkAgentInput, "anchorUuid">,
   ): { id: string; origin: ForkOrigin } | undefined {
     const parent = this.runners.get(parentId);
     if (!parent) return undefined;
+    const forkOptions = typeof options === "string" ? { model: options } : options ?? {};
     const parentSnapshot = parent.snapshot();
     const parentSession = parentSnapshot.sessionId;
     if (!parentSession) return undefined;
@@ -248,10 +250,11 @@ export class AgentManager {
     this.forkOrigins.set(runner.id, origin);
     this.forkConfigs.set(runner.id, {
       provider: parentProvider,
-      model: model ?? parentSnapshot.config?.model,
-      cwd: parentCwd,
-      branchWorkspaceId: parentBranchWorkspaceId,
-      branch: parentBranch,
+      model: forkOptions.model ?? parentSnapshot.config?.model,
+      cwd: forkOptions.cwd ?? parentCwd,
+      branchWorkspaceId: forkOptions.branchWorkspaceId ?? parentBranchWorkspaceId,
+      branch: forkOptions.branch ?? parentBranch,
+      scratchDirectory: forkOptions.scratchDirectory,
       systemPrompt: parentSystemPrompt,
       resume: parentSession,
       resumeSessionAt: anchorUuid,
