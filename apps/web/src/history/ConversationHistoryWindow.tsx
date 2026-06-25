@@ -26,6 +26,7 @@ export function ConversationHistoryWindow({
   const [loading, setLoading] = useState(true);
   const bodyRef = useRef<HTMLDivElement>(null);
   const loadedTargetRef = useRef<string>();
+  const pendingInitialScrollRef = useRef(false);
   const scrollSnapshotRef = useRef<
     | {
         top: number;
@@ -47,7 +48,10 @@ export function ConversationHistoryWindow({
           }
         : undefined;
 
-    if (targetChanged) setLoading(true);
+    if (targetChanged) {
+      pendingInitialScrollRef.current = true;
+      setLoading(true);
+    }
     setError(undefined);
     void api
       .history(target.agentId)
@@ -70,10 +74,19 @@ export function ConversationHistoryWindow({
   useLayoutEffect(() => {
     const snapshot = scrollSnapshotRef.current;
     const body = bodyRef.current;
-    if (!snapshot || !body) return;
-    body.scrollTop = snapshot.wasNearBottom ? body.scrollHeight : snapshot.top;
-    scrollSnapshotRef.current = undefined;
-  }, [turns]);
+    if (!body) return;
+
+    if (snapshot) {
+      body.scrollTop = snapshot.wasNearBottom ? body.scrollHeight : snapshot.top;
+      scrollSnapshotRef.current = undefined;
+      return;
+    }
+
+    if (pendingInitialScrollRef.current && !loading) {
+      body.scrollTop = body.scrollHeight;
+      pendingInitialScrollRef.current = false;
+    }
+  }, [loading, turns]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {

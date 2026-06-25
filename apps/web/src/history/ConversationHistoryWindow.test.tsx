@@ -9,6 +9,54 @@ afterEach(() => {
 });
 
 describe("ConversationHistoryWindow", () => {
+  it("scrolls to the latest event when opened", async () => {
+    let resolveFetch!: (value: unknown) => void;
+    const fetchMock = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          resolveFetch = resolve;
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { container } = render(
+      <ConversationHistoryWindow
+        target={{ agentId: "agent_1", turnIndex: 0, lastSeq: 2 }}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const body = container.querySelector(".history-window__body") as HTMLDivElement;
+    Object.defineProperty(body, "scrollHeight", { configurable: true, value: 900 });
+    Object.defineProperty(body, "clientHeight", { configurable: true, value: 200 });
+    body.scrollTop = 0;
+
+    resolveFetch({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        events: [
+          {
+            agentId: "agent_1",
+            seq: 1,
+            at: 1,
+            event: { kind: "user_input", text: "first event" },
+          },
+          {
+            agentId: "agent_1",
+            seq: 2,
+            at: 2,
+            event: { kind: "assistant_text", text: "latest event" },
+          },
+        ],
+      }),
+      text: async () => "",
+    });
+
+    expect(await screen.findByText("latest event")).toBeTruthy();
+    await waitFor(() => expect(body.scrollTop).toBe(900));
+  });
+
   it("加载并展示思考、工具调用和完整结果", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,

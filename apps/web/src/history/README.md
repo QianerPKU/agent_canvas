@@ -1,5 +1,9 @@
 # Conversation History
 
+Opening a conversation history window scrolls to the newest event by default. Live refreshes inside
+an already-open window still preserve the user's current scroll position unless they were already at
+the bottom.
+
 `stopped` and `terminated` status events are turn boundaries, so a resumed prompt after an
 interrupted or terminated agent appears in history as the next turn.
 
