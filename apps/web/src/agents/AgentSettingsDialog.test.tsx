@@ -170,6 +170,77 @@ describe("AgentSettingsDialog", () => {
     await waitFor(() =>
       expect(onUpdate).toHaveBeenCalledWith("agent_1", {
         systemPrompt: "new prompt",
+        model: null,
+      }),
+    );
+  });
+
+  it("编辑 Claude Agent 时可以切换模型", async () => {
+    const onUpdate = vi.fn().mockResolvedValue(undefined);
+    const agent = newAgentView("agent_1", {
+      provider: "claude",
+      branchWorkspaceId: "branch_1",
+      branch: "main",
+      cwd: "E:\\repo",
+      model: "sonnet",
+      systemPrompt: "old",
+    });
+    render(
+      <AgentSettingsDialog
+        mode="edit"
+        agent={agent}
+        branches={branches}
+        canChangeBranch={false}
+        onCreateBranch={vi.fn()}
+        onUpdate={onUpdate}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Claude Code 模型"), {
+      target: { value: "opus" },
+    });
+    fireEvent.click(screen.getByText("保存"));
+
+    await waitFor(() =>
+      expect(onUpdate).toHaveBeenCalledWith("agent_1", {
+        systemPrompt: "old",
+        model: "opus",
+      }),
+    );
+  });
+
+  it("编辑 Codex Agent 时可以切换模型", async () => {
+    const onUpdate = vi.fn().mockResolvedValue(undefined);
+    const agent = newAgentView("agent_1", {
+      provider: "codex",
+      branchWorkspaceId: "branch_1",
+      branch: "main",
+      cwd: "E:\\repo",
+      model: "gpt-5.4",
+      systemPrompt: "old",
+    });
+    render(
+      <AgentSettingsDialog
+        mode="edit"
+        agent={agent}
+        branches={branches}
+        canChangeBranch={false}
+        onCreateBranch={vi.fn()}
+        onUpdate={onUpdate}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Codex 模型"), {
+      target: { value: "gpt-5.4-mini" },
+    });
+    fireEvent.click(screen.getByText("保存"));
+
+    await waitFor(() =>
+      expect(onUpdate).toHaveBeenCalledWith("agent_1", {
+        systemPrompt: "old",
+        model: "gpt-5.4-mini",
       }),
     );
   });
@@ -213,6 +284,7 @@ describe("AgentSettingsDialog", () => {
     await waitFor(() =>
       expect(onUpdate).toHaveBeenCalledWith("agent_1", {
         systemPrompt: "old",
+        model: null,
         branchWorkspaceId: "branch_2",
         branch: "feature/a",
         cwd: "E:\\project\\feature-a",

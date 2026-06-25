@@ -4,6 +4,7 @@ import {
   Controls,
   MiniMap,
   ReactFlow,
+  SelectionMode,
   useEdgesState,
   useNodesState,
   type Connection,
@@ -16,7 +17,9 @@ import {
   GitBranch,
   GitPullRequest,
   Link,
+  Hand,
   MessageSquarePlus,
+  MousePointer2,
   Plus,
   Settings,
   X,
@@ -89,6 +92,19 @@ const PR_NODE_WIDTH = 290;
 const PR_NODE_HEIGHT = 180;
 const SYNC_NODE_WIDTH = 290;
 const SYNC_NODE_HEIGHT = 180;
+type CanvasTool = "select" | "hand";
+
+export function canvasInteractionForTool(tool: CanvasTool): {
+  panOnDrag: number[];
+  selectionOnDrag: boolean;
+  selectionMode: SelectionMode;
+} {
+  return {
+    panOnDrag: tool === "hand" ? [0, 1] : [1],
+    selectionOnDrag: tool === "select",
+    selectionMode: SelectionMode.Partial,
+  };
+}
 const X0 = 40;
 const Y0 = 40;
 const NODE_GAP = 36;
@@ -908,6 +924,7 @@ export default function App(): React.ReactElement {
   const [projectError, setProjectError] = useState<string>();
   const [branches, setBranches] = useState<BranchOption[]>([]);
   const [pendingPlacements, setPendingPlacements] = useState<NodePlacementOverrides>({});
+  const [canvasTool, setCanvasTool] = useState<CanvasTool>("hand");
   const openFile = files.find((file) => file.id === openFileId);
   const openCommit = commits.find((commit) => commit.id === openCommitId);
   const openPullRequest = prFlows.find((flow) => flow.id === openPullRequestId);
@@ -1188,6 +1205,8 @@ export default function App(): React.ReactElement {
     [fileActions, promptActions],
   );
 
+  const canvasInteraction = canvasInteractionForTool(canvasTool);
+
   if (!workspace) {
     return (
       <ProjectGate
@@ -1260,6 +1279,28 @@ export default function App(): React.ReactElement {
       </header>
 
       <div className="canvas-wrap" ref={canvasWrapRef}>
+        <div className="canvas-toolbar" aria-label="Canvas tools">
+          <button
+            type="button"
+            className={canvasTool === "select" ? "is-active" : undefined}
+            title="选择"
+            aria-label="选择工具"
+            aria-pressed={canvasTool === "select"}
+            onClick={() => setCanvasTool("select")}
+          >
+            <MousePointer2 size={18} />
+          </button>
+          <button
+            type="button"
+            className={canvasTool === "hand" ? "is-active" : undefined}
+            title="拖动画布"
+            aria-label="手型工具"
+            aria-pressed={canvasTool === "hand"}
+            onClick={() => setCanvasTool("hand")}
+          >
+            <Hand size={18} />
+          </button>
+        </div>
         <ReactFlow
           nodes={nodes}
           edges={edges}
@@ -1279,6 +1320,9 @@ export default function App(): React.ReactElement {
               }
             }
           }}
+          panOnDrag={canvasInteraction.panOnDrag}
+          selectionOnDrag={canvasInteraction.selectionOnDrag}
+          selectionMode={canvasInteraction.selectionMode}
           fitView
           proOptions={{ hideAttribution: true }}
         >

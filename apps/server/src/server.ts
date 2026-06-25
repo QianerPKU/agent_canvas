@@ -775,13 +775,22 @@ async function handleHttp(
         const currentConfig = manager.configOf(id);
         const branchChanged =
           body?.branchWorkspaceId !== undefined || body?.branch !== undefined;
-        const settings = branchChanged
+        const resolvedWorkspaceSettings = branchChanged
           ? await resolveAgentWorkspaceSettings(
               workspaceManager,
-              { ...currentConfig, ...(body ?? {}) },
+              settingsForWorkspaceResolution(currentConfig, body),
               defaultCwd,
               true,
             )
+          : undefined;
+        const settings = branchChanged
+          ? {
+              ...(body ?? {}),
+              branchWorkspaceId: resolvedWorkspaceSettings?.branchWorkspaceId,
+              branch: resolvedWorkspaceSettings?.branch,
+              cwd: resolvedWorkspaceSettings?.cwd,
+              scratchDirectory: resolvedWorkspaceSettings?.scratchDirectory,
+            }
           : body ?? {};
         const diff = branchChanged
           ? await workspaceManager.diffBetweenBranches(currentConfig?.branch, settings.branch)
@@ -1116,12 +1125,27 @@ function normalizeAgentSettings(
   const provider = input?.provider === "codex" ? "codex" : "claude";
   return {
     provider,
-    model: provider === "codex" ? input?.model : undefined,
+    model: input?.model?.trim() || undefined,
     branchWorkspaceId: input?.branchWorkspaceId,
     branch: input?.branch,
     cwd: input?.cwd?.trim() || defaultCwd,
     scratchDirectory: input?.scratchDirectory,
     systemPrompt: input?.systemPrompt ?? "",
+  };
+}
+
+function settingsForWorkspaceResolution(
+  currentConfig: AgentStartConfig | undefined,
+  input: UpdateAgentSettingsInput | null | undefined,
+): AgentSettings {
+  return {
+    provider: currentConfig?.provider,
+    model: input?.model === null ? undefined : input?.model ?? currentConfig?.model,
+    branchWorkspaceId: input?.branchWorkspaceId ?? currentConfig?.branchWorkspaceId,
+    branch: input?.branch ?? currentConfig?.branch,
+    cwd: input?.cwd ?? currentConfig?.cwd,
+    scratchDirectory: input?.scratchDirectory ?? currentConfig?.scratchDirectory,
+    systemPrompt: input?.systemPrompt ?? currentConfig?.systemPrompt,
   };
 }
 

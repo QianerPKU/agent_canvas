@@ -13,5 +13,8 @@ This folder adapts provider-specific CLI or SDK streams into the internal `Query
 - Codex `QueryHandle.interrupt` sends `turn/interrupt` for the active turn without closing the
   app-server process. `QueryHandle.terminate` is the only adapter-level operation that closes and
   kills the app-server child process.
+- `QueryHandle.setModel(model)` switches the model used by later responses. Claude delegates to the
+  SDK session handle's `setModel`; Codex stores the value locally and sends it on later `turn/start`
+  requests because app-server exposes per-turn model overrides rather than a separate set-model RPC.
 - When a provider has no native `steer`, `AgentRunner` falls back to interrupting the active turn and
   putting the guidance text at the front of the next queued input.

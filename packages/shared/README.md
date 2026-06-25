@@ -53,7 +53,7 @@ npm test --workspace packages/shared        # vitest
 
 ## Agent 设置模型
 
-`src/events.ts` 定义 `AgentSettings`、`CreateAgentInput` 和 `UpdateAgentSettingsInput`。创建 Agent 可带 provider、模型、`branchWorkspaceId`/`branch` 和私有系统提示词；新工作流中 branch workspace 决定实际工作目录，`cwd` 保留兼容与快照展示。更新已创建 Agent 时可调整私有系统提示词，并可在后端允许的活跃状态切换 branch。`AgentStartConfig.systemPrompt` 只表示画布私有提示词，会按提示词节点方式拼接到业务输入中。
+`src/events.ts` 定义 `AgentSettings`、`CreateAgentInput` 和 `UpdateAgentSettingsInput`。创建 Agent 可带 provider、模型、`branchWorkspaceId`/`branch` 和私有系统提示词；新工作流中 branch workspace 决定实际工作目录，`cwd` 保留兼容与快照展示。更新已创建 Agent 时可调整私有系统提示词和模型，并可在后端允许的活跃状态切换 branch。`UpdateAgentSettingsInput.model` 为字符串时表示切换后续响应模型，为 `null` 时表示清回 provider 默认模型。`AgentStartConfig.systemPrompt` 只表示画布私有提示词，会按提示词节点方式拼接到业务输入中。
 
 ## Workspace 模型
 

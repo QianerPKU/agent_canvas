@@ -59,6 +59,8 @@ export interface CreateAgentInput extends AgentSettings {}
 export interface UpdateAgentSettingsInput {
   /** 已创建 agent 可调整私有系统提示词；branch 只允许在当前最新活跃对话上切换。 */
   systemPrompt?: string;
+  /** string = switch model for later responses; null = use provider default. */
+  model?: string | null;
   branchWorkspaceId?: string;
   branch?: string;
   cwd?: string;

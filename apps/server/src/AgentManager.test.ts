@@ -178,6 +178,22 @@ describe("AgentManager fork", () => {
     });
   });
 
+  it("updateSettings can switch and clear the agent model", () => {
+    const { query } = makeQuery();
+    const mgr = new AgentManager({ query, defaultCwd: "/repo" });
+    const agent = mgr.create({
+      provider: "claude",
+      model: "sonnet",
+      cwd: "/work",
+    });
+
+    const updated = mgr.updateSettings(agent.id, { model: "opus" });
+    expect(updated.config.model).toBe("opus");
+
+    const cleared = mgr.updateSettings(agent.id, { model: null });
+    expect(cleared.config.model).toBeUndefined();
+  });
+
   it("fork inherits cwd and private system prompt", async () => {
     const { query } = makeQuery("sess-parent");
     const mgr = new AgentManager({ query });

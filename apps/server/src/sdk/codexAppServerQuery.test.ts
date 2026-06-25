@@ -372,6 +372,30 @@ describe("Codex app-server query", () => {
     await handle.terminate?.();
   });
 
+  it("setModel updates the model sent with later turn/start requests", async () => {
+    const fake = makeFakeSpawn();
+    const prompt = new AsyncMessageQueue<SdkUserInput>();
+    prompt.push(userInput("first"));
+
+    const handle = createCodexAppServerQuery({ spawnFn: fake.spawnFn })({
+      prompt,
+      options: { model: "gpt-5.4" },
+    });
+    const iterator = handle[Symbol.asyncIterator]();
+    await iterator.next();
+    await iterator.next();
+
+    await handle.setModel?.("gpt-5.4-mini");
+    prompt.push(userInput("second"));
+    await iterator.next();
+
+    const turnStarts = fake.messages.filter((message) => message.method === "turn/start");
+    expect(turnStarts[0]?.params?.model).toBe("gpt-5.4");
+    expect(turnStarts[1]?.params?.model).toBe("gpt-5.4-mini");
+
+    await handle.terminate?.();
+  });
+
   it("将 Codex requestUserInput 转发给前端处理器并回写 answers", async () => {
     const fake = makeFakeSpawn({ completeTurnStart: false });
     const prompt = new AsyncMessageQueue<SdkUserInput>();

@@ -174,12 +174,13 @@ export function recordAgentSettings(
   settings: AgentSettings,
 ): AgentMap {
   const prev = map[agentId] ?? newAgentView(agentId);
+  const hasModel = Object.prototype.hasOwnProperty.call(settings, "model");
   return {
     ...map,
     [agentId]: {
       ...prev,
       provider: settings.provider ?? prev.provider,
-      model: settings.model ?? prev.model,
+      model: hasModel ? settings.model ?? undefined : prev.model,
       branchWorkspaceId: settings.branchWorkspaceId ?? prev.branchWorkspaceId,
       branch: settings.branch ?? prev.branch,
       cwd: settings.cwd ?? prev.cwd,

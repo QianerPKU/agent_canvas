@@ -3,6 +3,7 @@ import type { AgentMap } from "./agentStore.js";
 import type { AgentActions, FileActions, PromptActions } from "./useAgentCanvas.js";
 import {
   buildNodes,
+  canvasInteractionForTool,
   canvasLayoutFromNodes,
   centeredNodePosition,
   computeCommitEdges,
@@ -12,6 +13,25 @@ import {
   computePullRequestEdges,
   computeSyncFlowEdges,
 } from "./App.js";
+import { SelectionMode } from "@xyflow/react";
+
+describe("canvasInteractionForTool", () => {
+  it("select tool enables drag selection while keeping middle mouse panning", () => {
+    expect(canvasInteractionForTool("select")).toEqual({
+      panOnDrag: [1],
+      selectionOnDrag: true,
+      selectionMode: SelectionMode.Partial,
+    });
+  });
+
+  it("hand tool pans with left or middle mouse and disables drag selection", () => {
+    expect(canvasInteractionForTool("hand")).toEqual({
+      panOnDrag: [0, 1],
+      selectionOnDrag: false,
+      selectionMode: SelectionMode.Partial,
+    });
+  });
+});
 
 describe("computeFileEdges", () => {
   it("新一轮节点位于自动最小化的上一轮正下方", () => {

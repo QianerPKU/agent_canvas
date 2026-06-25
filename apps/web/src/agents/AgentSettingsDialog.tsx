@@ -9,6 +9,7 @@ import {
   type BranchOption,
   type BranchWorkspace,
   type CodexModel,
+  type UpdateAgentSettingsInput,
 } from "@agent-canvas/shared";
 import type { AgentView } from "../agentStore.js";
 
@@ -28,7 +29,7 @@ type AgentSettingsDialogProps =
       onCreateBranch: (branch: string) => Promise<BranchWorkspace>;
       onUpdate: (
         agentId: string,
-        settings: Pick<AgentSettings, "systemPrompt" | "branchWorkspaceId" | "branch" | "cwd">,
+        settings: UpdateAgentSettingsInput,
       ) => Promise<void>;
       onClose: () => void;
     };
@@ -37,7 +38,10 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
   const isCreate = props.mode === "create";
   const agent = props.mode === "edit" ? props.agent : undefined;
   const [provider, setProvider] = useState<AgentProvider>(agent?.provider ?? "claude");
-  const [model, setModel] = useState<CodexModel>(codexModel(agent?.model));
+  const [codexModelValue, setCodexModelValue] = useState<CodexModel>(codexModel(agent?.model));
+  const [claudeModel, setClaudeModel] = useState(
+    agent?.provider === "claude" ? agent.model ?? "" : "",
+  );
   const [branchName, setBranchName] = useState(
     agent?.branch ?? (props.mode === "create" ? props.branches[0]?.branch ?? "" : ""),
   );
@@ -54,7 +58,8 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
   useEffect(() => {
     if (!isCreate && agent) {
       setProvider(agent.provider ?? "claude");
-      setModel(codexModel(agent.model));
+      setCodexModelValue(codexModel(agent.model));
+      setClaudeModel(agent.provider === "claude" ? agent.model ?? "" : "");
       setBranchName(agent.branch ?? "");
       setSystemPrompt(agent.systemPrompt ?? "");
     }
@@ -82,7 +87,7 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
       if (props.mode === "create") {
         await props.onCreate({
           provider,
-          model: provider === "codex" ? model : undefined,
+          model: selectedModel(provider, codexModelValue, claudeModel) ?? undefined,
           branchWorkspaceId: selectedBranch?.branchWorkspaceId,
           branch: selectedBranch?.branch,
           cwd: selectedBranch?.worktreePath,
@@ -91,6 +96,7 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
       } else {
         await props.onUpdate(props.agent.id, {
           systemPrompt,
+          model: selectedModel(provider, codexModelValue, claudeModel),
           ...(canChangeBranch
             ? {
                 branchWorkspaceId: selectedBranch?.branchWorkspaceId,
@@ -164,14 +170,13 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
           />
         </fieldset>
 
-        {provider === "codex" && (
+        {provider === "codex" ? (
           <label className="file-dialog__field">
             <span>Codex 模型</span>
             <select
               aria-label="Codex 模型"
-              value={model}
-              disabled={!isCreate}
-              onChange={(event) => setModel(event.target.value as CodexModel)}
+              value={codexModelValue}
+              onChange={(event) => setCodexModelValue(event.target.value as CodexModel)}
             >
               {CODEX_MODELS.map((candidate) => (
                 <option key={candidate} value={candidate}>
@@ -179,6 +184,16 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
                 </option>
               ))}
             </select>
+          </label>
+        ) : (
+          <label className="file-dialog__field">
+            <span>Claude Code 模型</span>
+            <input
+              aria-label="Claude Code 模型"
+              value={claudeModel}
+              placeholder="留空使用 CLI 默认模型"
+              onChange={(event) => setClaudeModel(event.target.value)}
+            />
           </label>
         )}
 
@@ -281,6 +296,14 @@ function Segmented({
 
 function codexModel(model: string | undefined): CodexModel {
   return isCodexModel(model) ? model : DEFAULT_CODEX_MODEL;
+}
+
+function selectedModel(
+  provider: AgentProvider,
+  codexModelValue: CodexModel,
+  claudeModel: string,
+): string | null {
+  return provider === "codex" ? codexModelValue : claudeModel.trim() || null;
 }
 
 function mergeBranchOptions(

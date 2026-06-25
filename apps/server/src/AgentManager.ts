@@ -214,13 +214,10 @@ export class AgentManager {
       throw new Error("只有待输入或尚未启动的活跃 agent 可以切换 branch");
     }
     const draft = this.draftConfigs.get(id) ?? {};
-    const next = {
-      ...draft,
-      ...definedSettings(input),
-    };
+    const next = applySettings(draft, input);
     this.draftConfigs.set(id, next);
     if (Object.keys(input).length > 0 || options.branchSwitchPrompt) {
-      runner.updateSettings(definedSettings(input), options.branchSwitchPrompt);
+      runner.updateSettings(input, options.branchSwitchPrompt);
     }
     return this.snapshotOf(id);
   }
@@ -449,9 +446,16 @@ function normalizeSettings(
   };
 }
 
-function definedSettings(input: UpdateAgentSettingsInput): Partial<AgentStartConfig> {
-  const next: Partial<AgentStartConfig> = {};
+function applySettings(
+  config: Partial<AgentStartConfig>,
+  input: UpdateAgentSettingsInput,
+): Partial<AgentStartConfig> {
+  const next: Partial<AgentStartConfig> = { ...config };
   if (input.systemPrompt !== undefined) next.systemPrompt = input.systemPrompt;
+  if (input.model !== undefined) {
+    if (input.model === null) delete next.model;
+    else next.model = input.model;
+  }
   if (input.branchWorkspaceId !== undefined) next.branchWorkspaceId = input.branchWorkspaceId;
   if (input.branch !== undefined) next.branch = input.branch;
   if (input.cwd !== undefined) next.cwd = input.cwd;

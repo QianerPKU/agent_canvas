@@ -27,6 +27,7 @@ import type {
   SyncFlowSnapshot,
   UpdateCanvasFileInput,
   UpdateCanvasPromptInput,
+  UpdateAgentSettingsInput,
 } from "@agent-canvas/shared";
 import { api } from "./api.js";
 import {
@@ -47,10 +48,7 @@ export interface AgentActions {
   /** 更新已创建 agent 的可变设置。 */
   updateSettings: (
     agentId: string,
-    settings: Pick<
-      AgentSettings,
-      "systemPrompt" | "branchWorkspaceId" | "branch" | "cwd" | "scratchDirectory"
-    >,
+    settings: UpdateAgentSettingsInput,
   ) => Promise<void>;
   /** 在末尾 idle 轮提交输入：首轮→start，续轮→send（自动判断）。 */
   submit: (agentId: string, text: string) => Promise<void>;
@@ -297,7 +295,7 @@ export function useAgentCanvas(): UseAgentCanvas {
       submit: async (agentId, text) => {
         const view = agentsRef.current[agentId];
         const startProvider = view?.provider;
-        const startModel = startProvider === "codex" ? view?.model : undefined;
+        const startModel = view?.model;
         // 首轮（idle）用 start（fork 出来的 agent 由后端合并 fork 配置）；续轮用 send
         if (!view || view.status === "idle") {
           setAgents((prev) => recordInput(prev, agentId, text, startProvider, startModel));

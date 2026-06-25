@@ -46,6 +46,7 @@
 - Sync 节点来自 `syncFlows`，使用 flow 的 `sourceTurnIndex` 连接到发起同步 pipeline 的原始对话轮。节点显示 cherry-pick / pull 状态，点击可看 summary、reason、文件范围、审查意见和 applied 结果。
 - 项目打开/新建后，`useAgentCanvas.refresh()` 会重新拉取当前项目的 agents/files/prompts/commits/PR/sync 快照；WebSocket `hello.histories` 用来恢复多轮 agent 对话节点。
 - React Flow 节点布局通过 `GET/PATCH /api/canvas-layout` 保存到当前 canvas 项目的 `canvas-state.json`。前端会 debounce 保存每个节点的位置、尺寸和最小化状态；项目切换期间暂停保存，避免空布局覆盖旧项目。
+- 左侧 canvas toolbar 提供选择工具和手型工具。选择工具下左键拖拽框选多个节点，选中后可一起拖动；手型工具下左键拖动画布。鼠标中键在两种工具下都保持拖动画布。
 - 新建 / fork 后后端不发事件，前端**乐观插入**节点（fork 带 `forkOrigin` 以画连线）。
 - Codex 的 `agentMessage` 流式 delta 按消息 UUID 合并到同一输出段落，避免每个小片段被渲染成独立短行。
 - 每个 agent 的最新运行节点显示输入框：`排队` 会把提示词排到当前轮 result 后执行，`引导` 会尽快追加到当前运行轮，`停止` 保留中止能力。
@@ -100,7 +101,7 @@ npm test --workspace apps/web
 
 - 顶栏“新建 Agent”先打开设置窗口，再创建空闲 Agent。窗口中可选择 Claude Code/Codex、Codex 模型、branch 和当前 Agent 私有系统提示词。
 - Branch 列表来自后端 `GET /api/workspace/branch-options`，会展示远端已有但尚未创建 worktree 的 branch；选择这类 branch 创建 Agent 时，后端才 fetch 并创建专属 workspace。弹窗里也可新建 branch。
-- 已创建 Agent 的最新节点头部显示齿轮按钮，打开后可修改私有系统提示词；当 Agent 处于 `idle` 或 `waiting_input` 时也可切换 branch。切换后的下一次对话由后端注入 branch 切换说明和 diff 文件列表。
+- 已创建 Agent 的最新节点头部显示齿轮按钮，打开后可修改私有系统提示词和后续响应使用的模型；当 Agent 处于 `idle` 或 `waiting_input` 时也可切换 branch。切换后的下一次对话由后端注入 branch 切换说明和 diff 文件列表。
 - `terminated` 和历史轮次不能切换 branch；运行中或已结束状态的 branch 控件禁用。
 - 首轮对话节点不再提供 provider/model 选择，启动时直接使用 Agent 创建时保存的设置。
 - 新建文件节点固定放在隔离目录；项目内需要 commit 的文件应由 Agent 在所选 branch workspace 中直接创建。

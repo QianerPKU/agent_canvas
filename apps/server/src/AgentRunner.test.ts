@@ -38,6 +38,7 @@ function makeControllableQuery(handleOptions: { nativeSteer?: boolean } = {}) {
   let out = new AsyncMessageQueue<SdkMessage>();
   const inputs: SdkUserInput[] = [];
   const steeredInputs: SdkUserInput[] = [];
+  const modelUpdates: Array<string | undefined> = [];
   let interrupted = false;
   let terminated = false;
   let lastOptions: QueryOptions | undefined;
@@ -66,6 +67,9 @@ function makeControllableQuery(handleOptions: { nativeSteer?: boolean } = {}) {
         steeredInputs.push(input);
       };
     }
+    handle.setModel = async (model) => {
+      modelUpdates.push(model);
+    };
     return handle;
   };
 
@@ -75,6 +79,7 @@ function makeControllableQuery(handleOptions: { nativeSteer?: boolean } = {}) {
     finish: () => out.close(),
     inputs,
     steeredInputs,
+    modelUpdates,
     wasInterrupted: () => interrupted,
     wasTerminated: () => terminated,
     getOptions: () => lastOptions,
@@ -550,6 +555,36 @@ describe("AgentRunner 生命周期", () => {
       "new private rules",
       "先写测试",
     ]);
+  });
+
+  it("updateSettings switches the provider model for later responses", async () => {
+    const ctl = makeControllableQuery();
+    const runner = new AgentRunner("model-switch-agent", { query: ctl.query });
+
+    runner.start({ prompt: "first", model: "old-model" });
+    ctl.emit(SYSTEM_INIT);
+    ctl.emit(resultMsg());
+    await flush();
+
+    runner.updateSettings({ model: "new-model" });
+
+    expect(runner.snapshot().config?.model).toBe("new-model");
+    expect(ctl.modelUpdates).toEqual(["new-model"]);
+  });
+
+  it("updateSettings can clear the provider model back to default", async () => {
+    const ctl = makeControllableQuery();
+    const runner = new AgentRunner("model-clear-agent", { query: ctl.query });
+
+    runner.start({ prompt: "first", model: "old-model" });
+    ctl.emit(SYSTEM_INIT);
+    ctl.emit(resultMsg());
+    await flush();
+
+    runner.updateSettings({ model: null });
+
+    expect(runner.snapshot().config?.model).toBeUndefined();
+    expect(ctl.modelUpdates).toEqual([undefined]);
   });
 
   it("branch switch prompt is injected once on the next business input", async () => {

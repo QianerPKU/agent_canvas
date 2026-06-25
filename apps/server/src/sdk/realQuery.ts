@@ -289,6 +289,7 @@ function adaptQuery(handle: ReturnType<typeof sdkQuery>): ReturnType<QueryFn> {
   return {
     [Symbol.asyncIterator]: () => handle,
     interrupt: () => handle.interrupt(),
+    setModel: (model) => handle.setModel(model),
     terminate: async () => {
       await handle.interrupt().catch(() => undefined);
       await handle.return(undefined).catch(() => undefined);

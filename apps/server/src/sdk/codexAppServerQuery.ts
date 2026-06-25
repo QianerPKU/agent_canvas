@@ -62,6 +62,7 @@ function createHandle(
   let client: CodexAppServerClient | undefined;
   let threadId: string | undefined;
   let turnId: string | undefined;
+  let currentModel = options?.model;
 
   const run = async function* (): AsyncGenerator<SdkMessage> {
     client = new CodexAppServerClient(deps, options?.requestUserInput, options?.requestApproval);
@@ -73,8 +74,8 @@ function createHandle(
       const first = await promptIterator.next();
       if (first.done) return;
 
-      const initResult = await openThread(client, options);
-      const initMessage = mapCodexThreadInit(initResult, options);
+      const initResult = await openThread(client, options, currentModel);
+      const initMessage = mapCodexThreadInit(initResult, { ...options, model: currentModel });
       threadId = (initMessage as { session_id?: string }).session_id ?? "";
       state.threadId = threadId;
       yield initMessage;
@@ -86,7 +87,7 @@ function createHandle(
           yield* client.readCompactMessages(threadId);
         } else {
           const started = await client.request("turn/start", {
-            ...turnOverrides(options, next.value.fileAccess, next.value.promptAccess),
+            ...turnOverrides(options, currentModel, next.value.fileAccess, next.value.promptAccess),
             threadId,
             input: codexInputs(next.value),
           });
@@ -123,6 +124,9 @@ function createHandle(
         }),
       });
     },
+    setModel: async (model) => {
+      currentModel = model;
+    },
     terminate: async () => {
       client?.close();
       await iterator.return(undefined).catch(() => undefined);
@@ -133,8 +137,9 @@ function createHandle(
 async function openThread(
   client: CodexAppServerClient,
   options: QueryOptions | undefined,
+  model: string | undefined,
 ): Promise<unknown> {
-  const params = threadParams(options);
+  const params = threadParams(options, model);
   const sourceThreadId = stringValue(options?.resume);
   if (options?.forkSession && sourceThreadId) {
     return client.request("thread/fork", { ...params, threadId: sourceThreadId });
@@ -145,9 +150,12 @@ async function openThread(
   return client.request("thread/start", params);
 }
 
-function threadParams(options: QueryOptions | undefined): Record<string, unknown> {
+function threadParams(
+  options: QueryOptions | undefined,
+  model: string | undefined,
+): Record<string, unknown> {
   const params: Record<string, unknown> = {
-    model: options?.model ?? null,
+    model: model ?? null,
     cwd: options?.cwd ?? null,
     threadSource: "appServer",
   };
@@ -161,6 +169,7 @@ function threadParams(options: QueryOptions | undefined): Record<string, unknown
 
 function turnOverrides(
   options: QueryOptions | undefined,
+  model: string | undefined,
   fileAccess: AgentFileAccess | undefined,
   promptAccess: AgentPromptAccess | undefined,
 ): Record<string, unknown> {
@@ -178,7 +187,7 @@ function turnOverrides(
     writableDirectories.length > 0,
   );
   if (approvalPolicy) params.approvalPolicy = approvalPolicy;
-  if (options?.model) params.model = options.model;
+  if (model) params.model = model;
   const sandboxPolicy = sandboxPolicyFor(
     options?.permissionMode,
     options?.cwd,

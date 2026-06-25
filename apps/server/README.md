@@ -46,6 +46,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 - **执行中授权**：Codex app-server 的命令执行、文件变更、权限扩展审批，以及 Claude SDK 的非 `AskUserQuestion` 工具审批都会映射成统一 `user_approval` 事件；前端通过 `POST /api/agents/:id/approvals/:requestId` 允许、拒绝或取消后，adapter 再翻译回各自原生协议。后端不再默认拒绝授权请求。
 - **完全权限模式**：`AgentManager` 维护程序级 `fullPermissionMode`。开启后新授权请求直接返回允许，并立即允许所有已挂起授权；它不自动回答普通 `AskUserQuestion` / MCP elicitation 问题。
 - **provider / model 选择**：`AgentStartConfig.provider` 可为 `claude` 或 `codex`，未指定时默认 `claude`。Codex UI 提供 `gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`，模型通过 app-server 的 `thread/start` / `thread/fork` / `turn/start` 参数传递。
+- **runtime model update**: `PATCH /api/agents/:id/settings` may include `model`. Claude forwards the change to the active SDK handle's `setModel()` for later responses. Codex app-server does not expose a standalone set-model RPC, so the adapter stores the new value and sends it on later `turn/start` requests. The change is not retroactive to an already-running generation.
 - **手动 compact**：只允许在 `waiting_input` 执行。Claude 将内置 `/compact` 送入现有流式会话，并等待 manual `compact_boundary`；Codex 调用原生 `thread/compact/start`，等待 `contextCompaction` 完成。两者都投影成统一 `compact` 事件，前端把它记录为一轮完成的对话。
 - **自动 compact**：provider 在业务轮中途触发的 `compact_boundary/contextCompaction` 会投影成 `compact trigger=auto`。它不结束当前业务轮，只记录为当前轮系统事件，并标记下一条业务输入重新注入可读提示词。
 - **terminate**：调用 QueryHandle 的终止能力并关闭输入流。Claude adapter 会 interrupt 后结束 Query generator；Codex adapter 关闭并 kill 对应 app-server 子进程，状态进入 `terminated`。
@@ -213,7 +214,7 @@ npm run smoke --workspace apps/server
 
 - 进程入口用 `AGENT_CANVAS_WORKSPACE_ROOT ?? INIT_CWD ?? process.cwd()` 解析默认源仓库目录；WorkspaceManager 会把实际 branch workspace 放到 AppData 项目根。`GET /api/config` 返回 `defaultCwd` 和 `projectRoot`。
 - `POST /api/agents` 支持 `provider/model/branchWorkspaceId/cwd/systemPrompt`。新工作流中 `branchWorkspaceId` 决定 `cwd`；`cwd` 只保留兼容和快照展示。fork 会复制父 Agent 的 provider、模型、branch/cwd 和私有系统提示词。
-- `PATCH /api/agents/:id/settings` 可更新 `systemPrompt`，也可在 `idle` / `waiting_input` 状态切换到已有或新建 branch。切换后下一次业务输入会注入 branch 切换说明和 `git diff --name-status <old> <new>` 文件列表；`waiting_input` 下会脱开旧空闲会话，下次输入按新 `cwd` resume。
+- `PATCH /api/agents/:id/settings` 可更新 `systemPrompt` 和 `model`，也可在 `idle` / `waiting_input` 状态切换到已有或新建 branch。切换后下一次业务输入会注入 branch 切换说明和 `git diff --name-status <old> <new>` 文件列表；`waiting_input` 下会脱开旧空闲会话，下次输入按新 `cwd` resume。
 - `systemPrompt` 是当前 Agent 私有提示词，不传给 Claude/Codex 原生 system prompt，而是在 `AgentRunner` 中按提示词节点同样的可读提示词机制拼接到业务输入。新 Agent 首轮、手动 compact 后、自动 compact 后、以及运行中更新设置后的下一条业务输入会重新注入。
 - Agent Canvas 内置工作区规则不属于用户可编辑的 `systemPrompt`，即使用户没有设置私有系统提示词也会注入；它约束共享文件默认只读、临时文件只写 `.agent-tmp/<agent-id>/`、其余非共享非临时修改都视为需要 commit 的仓库文件，并以 tool-style 协议内置 `agent_canvas.create_pr_flow`、`agent_canvas.create_sync_flow` 和 `agent_canvas.report_commit`，指导 agent 在用户要求提 PR 时调用 `/api/pr-flows`，在用户要求 cherry-pick/pull branch 时调用 `/api/sync-flows`，在每次 `git commit` 成功后调用 `/api/agents/:id/commits`。
 - `POST /api/directories/pick` 通过本机目录选择器返回用户选中的目录；Windows 使用 PowerShell + `System.Windows.Forms.FolderBrowserDialog`，其他平台暂返回明确错误并允许前端继续手动输入路径。

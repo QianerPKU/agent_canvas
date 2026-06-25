@@ -166,15 +166,19 @@ export class AgentRunner {
         AgentStartConfig,
         "systemPrompt" | "branchWorkspaceId" | "branch" | "cwd" | "scratchDirectory"
       >
-    >,
+    > & { model?: string | null },
     pendingPrompt?: AgentPromptReference,
   ): void {
-    this.config = {
-      ...(this.config ?? { prompt: "" }),
-      ...definedSettings(settings),
-    };
+    this.config = applySettings(this.config ?? { prompt: "" }, settings);
     if (settings.systemPrompt !== undefined && this.status !== "idle") {
       this.promptInjectionPending = true;
+    }
+    if (settings.model !== undefined && this.status !== "idle") {
+      const nextModel = settings.model ?? undefined;
+      void this.handle?.setModel?.(nextModel).catch(() => undefined);
+      if (!this.handle?.setModel && this.status === "waiting_input" && this.sessionId) {
+        this.detachIdleSessionForNextStart();
+      }
     }
     if (pendingPrompt) {
       this.pendingInjectedPrompts.push(pendingPrompt);
@@ -747,19 +751,24 @@ function restorableStatus(status: AgentStatus): AgentStatus {
   return status;
 }
 
-function definedSettings(
+function applySettings(
+  config: AgentStartConfig,
   settings: Partial<
     Pick<
       AgentStartConfig,
       "systemPrompt" | "branchWorkspaceId" | "branch" | "cwd" | "scratchDirectory"
     >
-  >,
-): Partial<AgentStartConfig> {
-  const next: Partial<AgentStartConfig> = {};
+  > & { model?: string | null },
+): AgentStartConfig {
+  const next: AgentStartConfig = { ...config };
   for (const [key, value] of Object.entries(settings) as Array<
-    [keyof AgentStartConfig, AgentStartConfig[keyof AgentStartConfig]]
+    [keyof AgentStartConfig, AgentStartConfig[keyof AgentStartConfig] | null]
   >) {
-    if (value !== undefined) next[key] = value as never;
+    if (key === "model" && value === null) {
+      delete next.model;
+    } else if (value !== undefined) {
+      next[key] = value as never;
+    }
   }
   return next;
 }
