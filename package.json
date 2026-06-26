@@ -10,7 +10,8 @@
   "scripts": {
     "test": "npm run test --workspaces --if-present",
     "build": "npm run build --workspaces --if-present",
-    "dev:server": "npm run dev --workspace apps/server"
+    "dev:server": "npm run dev --workspace apps/server",
+    "start:app": "powershell -NoProfile -ExecutionPolicy Bypass -File ./start-agent-canvas.ps1"
   },
   "engines": {
     "node": ">=20"
