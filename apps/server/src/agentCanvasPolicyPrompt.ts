@@ -216,5 +216,14 @@ Invoke-RestMethod -Method Post -Uri "${apiBase}/agents/${agentId}/commits" -Cont
   commit = "HEAD"
   summary = "这次 commit 的一句话概括"
 } | ConvertTo-Json -Depth 4)
-~~~`;
+~~~
+
+## 工作原则
+
+### git版本控制
+
+- 每次完成一个feature或者修改一个bug后，都需要及时按规定commit。
+- 每次commit或者pull、merge、rebase等等之后，都需要及时push到远程仓库。
+
+`;
 }
