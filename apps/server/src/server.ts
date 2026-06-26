@@ -808,6 +808,16 @@ async function handleHttp(
     if (method === "GET" && action === "history") {
       return sendJson(res, 200, { events: manager.historyOf(id) });
     }
+    if (method === "POST" && action === "open-workspace") {
+      const cwd = manager.configOf(id)?.cwd?.trim();
+      if (!cwd) return sendJson(res, 400, { error: "该 agent 尚未绑定 branch 工作目录" });
+      try {
+        await openFile(cwd);
+        return sendJson(res, 202, { ok: true });
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
+    }
     if (method === "POST" && action === "start") {
       const body = await readJson<AgentStartConfig>(req);
       if (!body?.prompt) return sendJson(res, 400, { error: "缺少 prompt" });

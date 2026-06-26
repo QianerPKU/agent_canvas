@@ -25,6 +25,7 @@ function makeActions(): AgentActions {
     stop: vi.fn().mockResolvedValue(undefined),
     compact: vi.fn().mockResolvedValue(undefined),
     terminate: vi.fn().mockResolvedValue(undefined),
+    openWorkspace: vi.fn().mockResolvedValue(undefined),
     fork: vi.fn().mockResolvedValue(undefined),
   };
 }
@@ -639,5 +640,29 @@ describe("TurnNode", () => {
 
     fireEvent.click(screen.getByText("Terminate"));
     expect(onOpenHistory).toHaveBeenCalledOnce();
+  });
+
+  it("点击 VS Code 按钮打开 agent 当前工作目录且不打开历史", () => {
+    const actions = makeActions();
+    const onOpenHistory = vi.fn();
+    const data: TurnNodeData = {
+      agentId: "agent_1",
+      turn: { index: 0, status: "idle", lines: [] },
+      agentStatus: "idle",
+      agentCwd: "E:\\repo\\feature-a",
+      isLatest: true,
+      onOpenHistory,
+      actions,
+    };
+    render(
+      <ReactFlowProvider>
+        <TurnNode {...({ data, id: "agent_1#0" } as unknown as NodeProps<TurnNodeType>)} />
+      </ReactFlowProvider>,
+    );
+
+    fireEvent.click(screen.getByTitle("用 VS Code 打开 E:\\repo\\feature-a"));
+
+    expect(actions.openWorkspace).toHaveBeenCalledWith("agent_1");
+    expect(onOpenHistory).not.toHaveBeenCalled();
   });
 });

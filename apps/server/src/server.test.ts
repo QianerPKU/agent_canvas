@@ -333,6 +333,24 @@ describe("HTTP server", () => {
     expect(listed.json.agents.length).toBeGreaterThanOrEqual(1);
   });
 
+  it("opens an agent branch workspace with VS Code", async () => {
+    const feature = await request(port, "POST", "/api/workspace/branches", {
+      branch: "feature/open-workspace",
+    });
+    expect(feature.status).toBe(201);
+
+    const created = await request(port, "POST", "/api/agents", {
+      branchWorkspaceId: feature.json.branch.id,
+    });
+    expect(created.status).toBe(201);
+
+    openFile.mockClear();
+    const opened = await request(port, "POST", `/api/agents/${created.json.id}/open-workspace`);
+
+    expect(opened).toEqual({ status: 202, json: { ok: true } });
+    expect(openFile).toHaveBeenCalledWith(feature.json.branch.worktreePath);
+  });
+
   it("creates agents with settings and updates private system prompt", async () => {
     const created = await request(port, "POST", "/api/agents", {
       provider: "codex",

@@ -23,3 +23,5 @@
 - Each real input turn can receive a backend `turn_context` event with the branch, cwd, and git HEAD
   commit captured when that turn starts. The node displays the branch and base commit, while
   minimized historical turns keep the short base hash visible.
+- The turn header includes a folder shortcut that calls `/api/agents/:id/open-workspace` and opens
+  the agent's current branch workspace in VS Code without triggering the history details window.

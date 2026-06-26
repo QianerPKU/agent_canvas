@@ -10,6 +10,7 @@ import {
 } from "@xyflow/react";
 import {
   Check,
+  FolderOpen,
   HelpCircle,
   MessageSquare,
   Minimize2,
@@ -43,6 +44,7 @@ export interface TurnNodeData {
   turn: Turn;
   agentStatus: AgentStatus;
   agentBranch?: string;
+  agentCwd?: string;
   provider?: AgentProvider;
   model?: string;
   providerLocked?: boolean;
@@ -177,12 +179,14 @@ export function TurnNode({
   const [forkExtraBranches, setForkExtraBranches] = useState<BranchOption[]>([]);
   const [creatingForkBranch, setCreatingForkBranch] = useState(false);
   const [forkError, setForkError] = useState("");
+  const [workspaceOpenError, setWorkspaceOpenError] = useState("");
   const logRef = useRef<HTMLDivElement>(null);
 
   const meta = TURN_META[turn.status];
   const forkBranches = mergeBranchOptions(data.branches ?? [], forkExtraBranches);
   const selectedForkBranch = forkBranches.find((branch) => branch.branch === forkBranchName);
   const displayBranch = turn.branch ?? data.agentBranch;
+  const workspacePath = data.agentCwd;
   const displayShortSha = turn.baseShortSha ?? turn.baseCommitSha?.slice(0, 7);
   const contextTitle = [
     displayBranch ? `branch: ${displayBranch}` : undefined,
@@ -276,6 +280,16 @@ export function TurnNode({
     data.onOpenHistory(agentId, turn.index);
   };
 
+  const openWorkspace = async (event: React.MouseEvent) => {
+    event.stopPropagation();
+    setWorkspaceOpenError("");
+    try {
+      await actions.openWorkspace(agentId);
+    } catch (reason) {
+      setWorkspaceOpenError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
   if (minimized) {
     return (
       <div className="turn-node turn-node--minimized">
@@ -352,27 +366,35 @@ export function TurnNode({
       >
         <span style={{ fontWeight: 600 }}>第 {turn.index + 1} 轮</span>
         <span style={{ color: "#9ca3af", fontSize: 10 }}>{agentId}</span>
-        {isLatest && data.onOpenSettings && (
+        <div style={{ marginLeft: "auto", display: "inline-flex", gap: 4 }}>
           <button
             className="icon-button nodrag"
-            title="Agent 设置"
-            onClick={(event) => {
-              event.stopPropagation();
-              data.onOpenSettings?.(agentId);
-            }}
-            style={{ marginLeft: "auto" }}
+            title={workspacePath ? `用 VS Code 打开 ${workspacePath}` : "该 agent 尚未绑定工作目录"}
+            disabled={!workspacePath}
+            onClick={(event) => void openWorkspace(event)}
           >
-            <Settings size={14} />
+            <FolderOpen size={14} />
           </button>
-        )}
-        <button
-          className="icon-button nodrag"
-          title="最小化节点"
-          onClick={toggleMinimized}
-          style={isLatest && data.onOpenSettings ? undefined : { marginLeft: "auto" }}
-        >
-          <Minimize2 size={14} />
-        </button>
+          {isLatest && data.onOpenSettings && (
+            <button
+              className="icon-button nodrag"
+              title="Agent 设置"
+              onClick={(event) => {
+                event.stopPropagation();
+                data.onOpenSettings?.(agentId);
+              }}
+            >
+              <Settings size={14} />
+            </button>
+          )}
+          <button
+            className="icon-button nodrag"
+            title="最小化节点"
+            onClick={toggleMinimized}
+          >
+            <Minimize2 size={14} />
+          </button>
+        </div>
         <span
           style={{
             color: "#fff",
@@ -394,6 +416,11 @@ export function TurnNode({
           base <strong>{displayShortSha ?? "(pending)"}</strong>
         </span>
       </div>
+      {workspaceOpenError && (
+        <div className="turn-node__context nodrag" style={{ color: "#dc2626" }}>
+          {workspaceOpenError}
+        </div>
+      )}
 
       {/* 该轮用户输入 */}
       {turn.userInput && (

@@ -73,6 +73,8 @@ export interface AgentActions {
   compact: (agentId: string) => Promise<void>;
   /** 关闭底层 CLI / Query。 */
   terminate: (agentId: string) => Promise<void>;
+  /** 用 VS Code 打开该 agent 当前 branch workspace。 */
+  openWorkspace: (agentId: string) => Promise<void>;
   /** 从某轮（anchorUuid）fork 出一个新 agent。 */
   fork: (
     agentId: string,
@@ -336,6 +338,7 @@ export function useAgentCanvas(): UseAgentCanvas {
         await api.compact(agentId);
       },
       terminate: (agentId) => api.terminate(agentId).then(() => undefined),
+      openWorkspace: (agentId) => api.openAgentWorkspace(agentId).then(() => undefined),
       fork: async (agentId, anchorUuid, options = {}) => {
         const { id, origin } = await api.fork(agentId, anchorUuid, options);
         setAgents((prev) => insertForked(prev, id, origin, options));

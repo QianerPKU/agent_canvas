@@ -168,6 +168,10 @@ export const api = {
   compact: (id: string) => call(`/agents/${id}/compact`, { method: "POST" }),
   stop: (id: string) => call(`/agents/${id}/stop`, { method: "POST" }),
   terminate: (id: string) => call(`/agents/${id}/terminate`, { method: "POST" }),
+  openAgentWorkspace: (id: string) =>
+    call<{ ok: true }>(`/agents/${encodeURIComponent(id)}/open-workspace`, {
+      method: "POST",
+    }),
   resume: (id: string, sessionId: string, text: string) =>
     call(`/agents/${id}/resume`, { method: "POST", body: JSON.stringify({ sessionId, text }) }),
   fork: (id: string, anchorUuid: string, options: Omit<ForkAgentInput, "anchorUuid"> = {}) =>
