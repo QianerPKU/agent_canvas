@@ -164,6 +164,13 @@ body {
   gap: 8px;
 }
 
+.project-create__path {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
 .project-create input,
 .project-gate input {
   min-height: 34px;

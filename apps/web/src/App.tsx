@@ -1015,11 +1015,14 @@ export default function App(): React.ReactElement {
   );
 
   const createProject = useCallback(
-    async (name: string) => {
+    async (name: string, projectRoot?: string) => {
       setProjectError(undefined);
       try {
         setLayoutProjectId(undefined);
-        const { workspace: nextWorkspace } = await api.createCanvasProject({ name });
+        const { workspace: nextWorkspace } = await api.createCanvasProject({
+          name,
+          projectRoot: projectRoot?.trim() || undefined,
+        });
         const nextLayout = await api.canvasLayout();
         setNodes([]);
         setEdges([]);
@@ -1456,7 +1459,7 @@ export default function App(): React.ReactElement {
   );
 }
 
-function ProjectGate({
+export function ProjectGate({
   connected,
   projects,
   error,
@@ -1467,18 +1470,29 @@ function ProjectGate({
   projects: CanvasProjectSummary[];
   error?: string;
   onOpen: (id: string) => Promise<void>;
-  onCreate: (name: string) => Promise<void>;
+  onCreate: (name: string, projectRoot?: string) => Promise<void>;
 }): React.ReactElement {
   const [name, setName] = useState("");
+  const [projectRoot, setProjectRoot] = useState("");
   const [busy, setBusy] = useState(false);
+  const [pickError, setPickError] = useState("");
   const create = async () => {
     const trimmed = name.trim();
     if (!trimmed) return;
     setBusy(true);
     try {
-      await onCreate(trimmed);
+      await onCreate(trimmed, projectRoot);
     } finally {
       setBusy(false);
+    }
+  };
+  const browse = async () => {
+    setPickError("");
+    try {
+      const picked = await api.pickDirectory(projectRoot.trim() || undefined);
+      if (picked.path) setProjectRoot(picked.path);
+    } catch (reason) {
+      setPickError(reason instanceof Error ? reason.message : String(reason));
     }
   };
   return (
@@ -1522,9 +1536,21 @@ function ProjectGate({
               <Plus size={16} />
               新建
             </button>
+            <div className="project-create__path">
+              <input
+                aria-label="Canvas 项目文件夹"
+                value={projectRoot}
+                placeholder="项目文件夹，可留空使用默认位置"
+                onChange={(event) => setProjectRoot(event.target.value)}
+              />
+              <button type="button" disabled={busy} onClick={() => void browse()}>
+                <FolderOpen size={16} />
+                浏览
+              </button>
+            </div>
           </div>
         </section>
-        {error && <div className="file-dialog__error">{error}</div>}
+        {(error || pickError) && <div className="file-dialog__error">{error ?? pickError}</div>}
       </main>
     </div>
   );

@@ -1,6 +1,8 @@
 param(
   [int]$ServerPort = 4317,
   [int]$WebPort = 5317,
+  [string]$ProjectsRoot = "",
+  [string]$ProjectRoot = "",
   [switch]$NoBrowser
 )
 
@@ -68,12 +70,21 @@ if (-not (Test-Path (Join-Path $Root "node_modules"))) {
 }
 
 $escapedRoot = Escape-PowerShellSingleQuotedString $Root
+$escapedProjectsRoot = Escape-PowerShellSingleQuotedString $ProjectsRoot
+$escapedProjectRoot = Escape-PowerShellSingleQuotedString $ProjectRoot
+$projectEnvCommand = ""
+if ($ProjectsRoot.Trim().Length -gt 0) {
+  $projectEnvCommand += "`$env:AGENT_CANVAS_PROJECTS_ROOT='$escapedProjectsRoot'; "
+}
+if ($ProjectRoot.Trim().Length -gt 0) {
+  $projectEnvCommand += "`$env:AGENT_CANVAS_PROJECT_ROOT='$escapedProjectRoot'; "
+}
 
 if (Test-TcpPort $ServerPort) {
   Write-Host "Backend port $ServerPort is already in use; reusing the existing process."
 } else {
   Write-Host "Starting Agent Canvas backend on port $ServerPort..."
-  Start-AgentCanvasProcess "Agent Canvas Backend" "Set-Location -LiteralPath '$escapedRoot'; `$env:PORT='$ServerPort'; npm run dev --workspace apps/server"
+  Start-AgentCanvasProcess "Agent Canvas Backend" "Set-Location -LiteralPath '$escapedRoot'; $projectEnvCommand`$env:PORT='$ServerPort'; npm run dev --workspace apps/server"
 }
 
 Wait-HttpOk "http://127.0.0.1:$ServerPort/api/health" 45
@@ -82,7 +93,7 @@ if (Test-TcpPort $WebPort) {
   Write-Host "Frontend port $WebPort is already in use; reusing the existing process."
 } else {
   Write-Host "Starting Agent Canvas frontend on port $WebPort..."
-  Start-AgentCanvasProcess "Agent Canvas Frontend" "Set-Location -LiteralPath '$escapedRoot'; `$env:SERVER_PORT='$ServerPort'; npm run dev --workspace apps/web -- --host 127.0.0.1 --port $WebPort"
+  Start-AgentCanvasProcess "Agent Canvas Frontend" "Set-Location -LiteralPath '$escapedRoot'; $projectEnvCommand`$env:SERVER_PORT='$ServerPort'; npm run dev --workspace apps/web -- --host 127.0.0.1 --port $WebPort"
 }
 
 $url = "http://127.0.0.1:$WebPort/"

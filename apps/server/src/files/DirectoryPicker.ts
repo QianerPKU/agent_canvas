@@ -1,12 +1,15 @@
 import { execFile } from "node:child_process";
 
 export type PickDirectory = (initialDirectory?: string) => Promise<string | undefined>;
+type PickAttempt =
+  | { status: "picked"; path: string }
+  | { status: "cancelled" }
+  | { status: "unavailable" };
 
 export const pickDirectory: PickDirectory = async (initialDirectory) => {
-  if (process.platform !== "win32") {
-    throw new Error("当前平台暂不支持目录浏览，请手动输入目录路径");
-  }
-  return pickWindowsDirectory(initialDirectory);
+  if (process.platform === "win32") return pickWindowsDirectory(initialDirectory);
+  if (process.platform === "linux") return pickLinuxDirectory(initialDirectory);
+  throw new Error("当前平台暂不支持目录浏览，请手动输入目录路径");
 };
 
 function pickWindowsDirectory(initialDirectory: string | undefined): Promise<string | undefined> {
@@ -40,6 +43,51 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
       },
     );
   });
+}
+
+async function pickLinuxDirectory(initialDirectory: string | undefined): Promise<string | undefined> {
+  if (!process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
+    throw new Error("当前 Linux 环境没有图形会话，请手动输入目录路径");
+  }
+  const initial = initialDirectory?.trim();
+  const zenity = await tryPickWith("zenity", [
+    "--file-selection",
+    "--directory",
+    ...(initial ? ["--filename", initial.endsWith("/") ? initial : `${initial}/`] : []),
+  ]);
+  if (zenity.status === "picked") return zenity.path;
+  if (zenity.status === "cancelled") return undefined;
+
+  const kdialog = await tryPickWith("kdialog", [
+    "--getexistingdirectory",
+    initial || process.env.HOME || ".",
+  ]);
+  if (kdialog.status === "picked") return kdialog.path;
+  if (kdialog.status === "cancelled") return undefined;
+
+  return failNoLinuxPicker();
+}
+
+function tryPickWith(command: string, args: string[]): Promise<PickAttempt> {
+  return new Promise((resolve) => {
+    execFile(command, args, { encoding: "utf8" }, (error, stdout) => {
+      const exitCode = typeof error?.code === "number" ? error.code : undefined;
+      if (exitCode === 1) {
+        resolve({ status: "cancelled" });
+        return;
+      }
+      if (error) {
+        resolve({ status: "unavailable" });
+        return;
+      }
+      const directory = stdout.trim();
+      resolve(directory ? { status: "picked", path: directory } : { status: "cancelled" });
+    });
+  });
+}
+
+function failNoLinuxPicker(): never {
+  throw new Error("找不到 Linux 图形目录选择器 zenity/kdialog，请手动输入目录路径");
 }
 
 function powershellString(value: string): string {

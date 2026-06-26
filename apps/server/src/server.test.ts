@@ -660,6 +660,24 @@ describe("HTTP server", () => {
     expect(connections.json.connections).toContainEqual(connection.json.connection);
   });
 
+  it("canvas project REST 支持自定义项目文件夹", async () => {
+    const customProjectRoot = path.join(root, "custom-project-root");
+    const created = await request(port, "POST", "/api/canvas-projects", {
+      name: "custom-root",
+      projectRoot: customProjectRoot,
+    });
+
+    expect(created.status).toBe(201);
+    expect(created.json.project).toMatchObject({
+      name: "custom-root",
+      projectRoot: customProjectRoot,
+    });
+    expect(created.json.workspace.projectRoot).toBe(customProjectRoot);
+    await expect(readFile(path.join(customProjectRoot, "workspace.json"), "utf-8")).resolves.toContain(
+      '"branches": []',
+    );
+  });
+
   it("canvas project 保存并恢复节点快照和布局", async () => {
     const projectA = await request(port, "POST", "/api/canvas-projects", {
       name: "persist-a",

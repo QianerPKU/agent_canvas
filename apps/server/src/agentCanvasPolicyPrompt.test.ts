@@ -21,6 +21,7 @@ describe("agentCanvasPolicyPrompt", () => {
     expect(prompt).toContain('"targetBranch": "main"');
     expect(prompt).toContain('"files": ["src/example.ts"]');
     expect(prompt).toContain('proposerAgentId = "agent_42"');
+    expect(prompt).toContain('curl -sS -X POST "http://127.0.0.1:4317/api/pr-flows"');
     expect(prompt).toContain("create_pr authorization");
     expect(prompt).toContain("merge_pr authorization");
     expect(prompt).toContain('"agentCanvasPrEvent": "pr_created"');
@@ -32,12 +33,16 @@ describe("agentCanvasPolicyPrompt", () => {
     expect(prompt).toContain('"kind": "branch_pull"');
     expect(prompt).toContain('kind = "cherry_pick"');
     expect(prompt).toContain('kind = "branch_pull"');
+    expect(prompt).toContain('curl -sS -X POST "http://127.0.0.1:4317/api/sync-flows"');
     expect(prompt).toContain("apply authorization");
     expect(prompt).toContain('"agentCanvasSyncEvent": "applied"');
     expect(prompt).toContain("tool: agent_canvas.report_commit");
     expect(prompt).toContain("POST http://127.0.0.1:4317/api/agents/agent_42/commits");
     expect(prompt).toContain('"commit": "HEAD"');
     expect(prompt).toContain('commit = "HEAD"');
+    expect(prompt).toContain(
+      'curl -sS -X POST "http://127.0.0.1:4317/api/agents/agent_42/commits"',
+    );
   });
 
   it("uses AGENT_CANVAS_API when configured", () => {

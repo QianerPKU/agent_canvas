@@ -78,6 +78,19 @@ Invoke-RestMethod -Method Post -Uri "${apiBase}/pr-flows" -ContentType "applicat
 } | ConvertTo-Json -Depth 6)
 ~~~
 
+curl 示例：
+~~~bash
+curl -sS -X POST "${apiBase}/pr-flows" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "proposerAgentId": "${agentId}",
+    "targetBranch": "main",
+    "title": "简短 PR 标题",
+    "summary": "这次 PR 的概括",
+    "files": ["src/example.ts"]
+  }'
+~~~
+
 授权后的行为：
 - 收到 create_pr authorization 后，你可以自由处理冲突、更新源 branch、运行测试、push、执行 gh pr create 等实际创建 PR 的操作。
 - 创建 PR 完成后，只输出一个 JSON 对象登记结果：
@@ -156,6 +169,21 @@ Invoke-RestMethod -Method Post -Uri "${apiBase}/sync-flows" -ContentType "applic
 } | ConvertTo-Json -Depth 6)
 ~~~
 
+curl cherry-pick 示例：
+~~~bash
+curl -sS -X POST "${apiBase}/sync-flows" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "kind": "cherry_pick",
+    "proposerAgentId": "${agentId}",
+    "sourceBranch": "feature/source",
+    "commitSha": "abcdef1234567890",
+    "summary": "Apply the focused fix from feature/source",
+    "reason": "Current branch needs this commit without merging the whole source branch",
+    "files": ["src/example.ts"]
+  }'
+~~~
+
 PowerShell branch pull 示例：
 ~~~powershell
 Invoke-RestMethod -Method Post -Uri "${apiBase}/sync-flows" -ContentType "application/json" -Body (@{
@@ -167,6 +195,21 @@ Invoke-RestMethod -Method Post -Uri "${apiBase}/sync-flows" -ContentType "applic
   reason = "Current branch is behind main and needs shared fixes"
   files = @("src/example.ts")
 } | ConvertTo-Json -Depth 6)
+~~~
+
+curl branch pull 示例：
+~~~bash
+curl -sS -X POST "${apiBase}/sync-flows" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "kind": "branch_pull",
+    "proposerAgentId": "${agentId}",
+    "sourceBranch": "main",
+    "strategy": "merge",
+    "summary": "Catch up with main",
+    "reason": "Current branch is behind main and needs shared fixes",
+    "files": ["src/example.ts"]
+  }'
 ~~~
 
 授权后的行为：
@@ -216,6 +259,16 @@ Invoke-RestMethod -Method Post -Uri "${apiBase}/agents/${agentId}/commits" -Cont
   commit = "HEAD"
   summary = "这次 commit 的一句话概括"
 } | ConvertTo-Json -Depth 4)
+~~~
+
+curl 示例：
+~~~bash
+curl -sS -X POST "${apiBase}/agents/${agentId}/commits" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "commit": "HEAD",
+    "summary": "这次 commit 的一句话概括"
+  }'
 ~~~
 
 ## 工作原则

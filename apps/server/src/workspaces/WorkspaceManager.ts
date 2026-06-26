@@ -106,8 +106,11 @@ export class WorkspaceManager {
 
   async createCanvasProject(input: CreateCanvasProjectInput): Promise<CanvasProjectSummary> {
     const name = normalizeName(input.name);
-    const id = `${safePathPart(name)}-${this.now().toString(36)}`;
-    const projectRoot = path.join(this.projectsRoot, id);
+    const explicitRoot = normalizeOptionalProjectRoot(input.projectRoot);
+    const id = explicitRoot
+      ? projectIdFromExplicitRoot(explicitRoot)
+      : `${safePathPart(name)}-${this.now().toString(36)}`;
+    const projectRoot = explicitRoot ?? path.join(this.projectsRoot, id);
     const project: CanvasProjectSummary = {
       id,
       name,
@@ -709,6 +712,11 @@ function normalizeName(value: string): string {
   return name;
 }
 
+function normalizeOptionalProjectRoot(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? path.resolve(trimmed) : undefined;
+}
+
 function normalizeRelativePath(value: string): string {
   const normalized = value.replace(/\\/gu, "/").trim().replace(/^\/+/u, "");
   if (!normalized || path.isAbsolute(normalized) || normalized.split("/").includes("..")) {
@@ -736,6 +744,12 @@ function maxNumericSuffix(ids: string[]): number {
 
 function projectIdFromRoot(root: string): string {
   return safePathPart(path.basename(root)) || createHash("sha256").update(root).digest("hex").slice(0, 12);
+}
+
+function projectIdFromExplicitRoot(root: string): string {
+  const name = safePathPart(path.basename(root));
+  const hash = createHash("sha256").update(path.resolve(root).toLowerCase()).digest("hex").slice(0, 12);
+  return name ? `${name}-${hash}` : hash;
 }
 
 function defaultProjectRoot(defaultSourcePath: string): string {

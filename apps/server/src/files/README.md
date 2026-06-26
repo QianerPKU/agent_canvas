@@ -10,5 +10,6 @@
 - `readPreview` 为画布节点提供最多 256 KiB 的快速预览；`readContent` 为独立窗口读取完整文本。
 - `VscodeFileOpener` 通过 VS Code CLI 打开任意格式的真实文件或目录；文件节点打开真实文件，agent 工作区快捷入口打开对应 branch worktree 目录。Windows 使用 `code.cmd`，并通过隐藏的 `cmd.exe` 进行参数转发；等待 CLI 退出后才向前端报告成功，非零退出码和 stderr 会返回为接口错误。
 - Windows 支持标准安装路径、PATH 中的 `bin` 目录以及 `AGENT_CANVAS_VSCODE_PATH` 覆盖。覆盖值可以是 `code.cmd`，也可以是能解析到同目录 `bin\code.cmd` 的 `Code.exe`。
+- `DirectoryPicker` 在 Windows 使用 PowerShell Forms，在 Linux 有图形会话时尝试 `zenity`/`kdialog`；远程无 GUI 环境会提示手动输入路径。
 
 当前与其他 M1 状态一致，节点元数据保存在内存中；真实文件保留在磁盘。

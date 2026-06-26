@@ -20,12 +20,24 @@ Agent Canvas 是一个本地运行的多 agent 开发/实验画布。你可以�
 npm install
 ```
 
-## 一键启动
+## 启动
 
 Windows 下双击根目录的：
 
 ```text
 start-agent-canvas.cmd
+```
+
+Linux / macOS 下可以运行：
+
+```bash
+./start-agent-canvas.sh
+```
+
+跨平台命令行入口：
+
+```bash
+npm run start:app
 ```
 
 它会启动后端和前端，并自动打开：
@@ -34,16 +46,39 @@ start-agent-canvas.cmd
 http://127.0.0.1:5317/
 ```
 
-也可以用命令行启动：
+如需换端口：
 
 ```bash
-npm run start:app
+npm run start:app -- --server-port 4318 --web-port 5318
 ```
 
-如需换端口：
+Windows 旧入口仍可用：
 
 ```powershell
 .\start-agent-canvas.ps1 -ServerPort 4318 -WebPort 5318
+```
+
+## Canvas 项目位置
+
+新建 Canvas 项目时，可以在界面里填写“项目文件夹”。填写后，该项目的 `workspace.json`、`canvas-state.json`、branch worktree、文件节点、提示词节点和共享资源都会放在这个文件夹内。
+
+不填写时，默认项目列表根目录为：
+
+```text
+Windows: %LOCALAPPDATA%/agent_canvas/projects/
+Linux:   ~/.local/share/agent_canvas/projects/
+```
+
+也可以启动时指定默认项目列表根目录：
+
+```bash
+npm run start:app -- --projects-root /data/agent-canvas-projects
+```
+
+或者指定并自动打开某一个项目根目录：
+
+```bash
+npm run start:app -- --project-root /data/agent-canvas-projects/my-canvas
 ```
 
 ## 配置 Claude / Codex
@@ -72,13 +107,28 @@ Codex：
 7. 需要文件上下文时，新建文件节点或提示词节点并连到 agent。
 8. agent 完成 commit / PR / 同步流程后，画布会保留对应节点和连线。
 
-## 数据位置
+## 远程服务器使用
 
-Canvas 项目、branch worktree、文件节点、提示词节点和共享资源默认保存在用户本地数据目录：
+远程服务器不需要浏览器。先在服务器上启动：
+
+```bash
+cd agent_canvas
+npm run start:app -- --no-browser
+```
+
+在本地电脑开 SSH 隧道：
+
+```bash
+ssh -N -L 5317:127.0.0.1:5317 user@your-server
+```
+
+然后在本地浏览器打开：
 
 ```text
-%LOCALAPPDATA%/agent_canvas/projects/
+http://127.0.0.1:5317/
 ```
+
+前端 dev server 会把 `/api` 和 `/ws` 代理到服务器上的后端，所以通常只转发 `5317` 即可。不要把服务直接暴露到公网；当前程序默认没有登录鉴权。
 
 不要把凭据、Claude 本地状态、模型权重或大型数据集提交进 git。大型共享数据建议用项目共享资源映射。
 

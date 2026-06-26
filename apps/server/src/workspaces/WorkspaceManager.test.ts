@@ -31,6 +31,38 @@ describe("WorkspaceManager", () => {
     }
   });
 
+  it("creates canvas projects in a custom project folder", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-custom-project-"));
+    try {
+      const customProjectRoot = path.join(root, "custom", "canvas-a");
+      const manager = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot: path.join(root, "projects"),
+        autoOpenDefault: false,
+        now: () => 789,
+      });
+
+      const created = await manager.createCanvasProject({
+        name: "Custom Canvas",
+        projectRoot: customProjectRoot,
+      });
+
+      expect(created).toMatchObject({
+        name: "Custom Canvas",
+        projectRoot: customProjectRoot,
+      });
+      expect(await readFile(path.join(customProjectRoot, "workspace.json"), "utf-8")).toContain(
+        '"branches": []',
+      );
+      expect(await manager.listCanvasProjects()).toEqual([created]);
+      await expect(manager.openCanvasProject({ id: created.id })).resolves.toMatchObject({
+        projectRoot: customProjectRoot,
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("connects a repo into app data, creates branch workspaces and maps shared resources", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-workspaces-"));
     const source = path.join(root, "source-repo");

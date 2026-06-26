@@ -71,7 +71,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 | `GET /api/canvas-layout` | 获取当前 canvas 项目的节点布局快照 |
 | `PATCH /api/canvas-layout` | 保存当前 canvas 项目的节点位置、尺寸和最小化状态 |
 | `GET /api/canvas-projects` | 列出可打开的 canvas 项目 |
-| `POST /api/canvas-projects` | body=`{ name }`，新建并打开 canvas 项目 |
+| `POST /api/canvas-projects` | body=`{ name, projectRoot? }`，新建并打开 canvas 项目；`projectRoot` 可把该项目固定到自定义文件夹 |
 | `POST /api/canvas-projects/open` | body=`{ id }`，打开已有 canvas 项目 |
 | `GET /api/workspace` | 当前 AppData 项目、GitHub/repo 连接、branch workspace 与共享资源快照 |
 | `POST /api/workspace/connect` | body=`{ remoteUrl?, localPath?, defaultBranch? }`，把 GitHub/本地 repo clone 到 AppData 项目目录 |
@@ -183,7 +183,7 @@ npm run smoke --workspace apps/server
 
 ## GitHub / Branch Workspace / 三类文件
 
-- Agent Canvas 项目根默认位于用户本地数据目录 `agent_canvas/projects/<project-id>/`。正常启动先由前端选择或新建 canvas 项目，再手动连接 GitHub repo；`AGENT_CANVAS_PROJECT_ROOT` 仅用于测试/调试时覆盖并自动打开项目。
+- Agent Canvas 项目根默认位于用户本地数据目录 `agent_canvas/projects/<project-id>/`。正常启动先由前端选择或新建 canvas 项目，再手动连接 GitHub repo；新建项目可传 `projectRoot` 直接指定该项目文件夹。`AGENT_CANVAS_PROJECTS_ROOT` 可覆盖默认项目列表根目录，`AGENT_CANVAS_PROJECT_ROOT` 可覆盖并自动打开单个项目根目录。
 - 连接 repo 只 clone 默认 branch，不会把远端所有 branch 全部拉成 worktree。新建 Agent 或切换 Agent branch 选中某个未创建 workspace 的 branch 时，后端才 fetch 该 branch 并创建专属 `git worktree`。
 - 新建 Agent 推荐传 `branchWorkspaceId` 或 `branch`；后端据此懒创建/解析为对应 branch workspace，并把 `cwd` 写成 worktree 路径。旧的裸 `cwd` 仅保留兼容。
 - 三类文件分开管理：仓库文件在各 branch workspace 中并默认需要 commit；共享资源真实目录在项目根的 `shared/` 中，通过 junction/symlink 映射进每个 branch；临时文件在 `<worktree>/.agent-tmp/<agent-id>/`，写入本地 git exclude。

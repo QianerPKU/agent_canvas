@@ -10,6 +10,7 @@ export interface CanvasProjectSummary {
 
 export interface CreateCanvasProjectInput {
   name: string;
+  projectRoot?: string;
 }
 
 export interface OpenCanvasProjectInput {
