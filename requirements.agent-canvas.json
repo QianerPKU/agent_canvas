@@ -1,0 +1,49 @@
+{
+  "core": [
+    {
+      "name": "Node.js",
+      "minimumVersion": "20",
+      "commands": ["node", "npm"],
+      "reason": "runs the server, web dev server, build scripts, and npm workspace install"
+    },
+    {
+      "name": "Git",
+      "commands": ["git"],
+      "reason": "clones repositories, creates branch worktrees, reads diffs, and records commits"
+    }
+  ],
+  "recommendedLinux": [
+    {
+      "name": "bubblewrap",
+      "commands": ["bwrap"],
+      "reason": "recommended by the Codex CLI manual for reliable Linux sandbox support"
+    },
+    {
+      "name": "zenity or kdialog",
+      "commands": ["zenity", "kdialog"],
+      "reason": "enables graphical directory picking on Linux desktop sessions"
+    }
+  ],
+  "optional": [
+    {
+      "name": "Codex CLI",
+      "commands": ["codex"],
+      "reason": "required when creating Codex agents; run codex login after installation"
+    },
+    {
+      "name": "Claude Code / Claude CLI",
+      "commands": ["claude"],
+      "reason": "required when creating Claude Code agents, unless ANTHROPIC_API_KEY is configured"
+    },
+    {
+      "name": "GitHub CLI",
+      "commands": ["gh"],
+      "reason": "useful for agent-managed PR creation and merging"
+    },
+    {
+      "name": "VS Code CLI",
+      "commands": ["code"],
+      "reason": "enables Agent Canvas buttons that open files and branch workspaces"
+    }
+  ]
+}

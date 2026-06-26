@@ -12,13 +12,35 @@ Agent Canvas 是一个本地运行的多 agent 开发/实验画布。你可以�
 - Git 流程节点：agent commit、PR pipeline、cherry-pick / branch pull 会在画布上生成可查看详情的节点。
 - 运行中交互：支持排队输入、引导当前轮、回答 CLI/SDK 提问、处理授权请求。
 
-## 安装
+## 安装依赖
 
-需要 Node.js 20 或更高版本。
+依赖清单见 `requirements.agent-canvas.json`。一键安装脚本会尽量安装核心依赖，并执行 `npm install`：
+
+Windows：
+
+```text
+setup-agent-canvas.cmd
+```
+
+Linux / macOS：
 
 ```bash
-npm install
+./setup-agent-canvas.sh
 ```
+
+脚本会安装或检查：
+
+- Node.js 20+ 和 npm
+- Git
+- 项目 npm workspace 依赖
+
+可选依赖可以用 `--install-optional` 尝试安装：
+
+```bash
+./setup-agent-canvas.sh --install-optional
+```
+
+Codex CLI、Claude Code / Claude CLI、VS Code CLI、GitHub CLI 需要按你的使用场景安装或登录。脚本会检查它们是否存在，并提示下一步；不会自动替你登录账号或写入凭据。
 
 ## 启动
 
