@@ -9,6 +9,8 @@
   auto-minimized, the following turn sits directly under the small node with a compact gap.
 - New root nodes created from the toolbar, including agent, file, and prompt nodes, start from the
   current viewport center instead of the global canvas origin.
+- Newly forked agent root nodes start beside the parent turn that was used as the fork anchor, unless
+  the user already saved or manually placed that node.
 - Derived nodes such as result file, commit, PR, and sync nodes use the source turn as their anchor, so historical
   edges stay attached to the exact turn that produced the action.
 - Completed turns with a fork anchor can fork into the current branch, another existing branch, or a

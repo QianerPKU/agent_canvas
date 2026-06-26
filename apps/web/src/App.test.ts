@@ -202,6 +202,53 @@ describe("computeFileEdges", () => {
     expect(commit2?.position).not.toEqual(commit1?.position);
   });
 
+  it("forked agent root node starts beside its parent anchor turn", () => {
+    const agents: AgentMap = {
+      agent_1: {
+        id: "agent_1",
+        status: "waiting_input",
+        turns: [
+          { index: 0, status: "done", lines: [], anchorUuid: "anchor-0" },
+          { index: 1, status: "idle", lines: [] },
+        ],
+        lastSeq: 2,
+      },
+      agent_2: {
+        id: "agent_2",
+        status: "idle",
+        turns: [{ index: 0, status: "idle", lines: [] }],
+        forkOrigin: { parentAgentId: "agent_1", anchorUuid: "anchor-0" },
+        lastSeq: 0,
+      },
+    };
+
+    const nodes = buildNodes(
+      agents,
+      [],
+      [],
+      [],
+      [],
+      [],
+      {} as AgentActions,
+      {} as FileActions,
+      {} as PromptActions,
+      [],
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+    );
+
+    const parent = nodes.find((node) => node.id === "agent_1#0");
+    const forked = nodes.find((node) => node.id === "agent_2#0");
+
+    expect(forked?.position.x).toBeGreaterThan(parent?.position.x ?? 0);
+    expect(forked?.position.y).toBe(parent?.position.y);
+  });
+
   it("agent result files are placed beside and connected to the source turn", () => {
     const agents: AgentMap = {
       agent_1: {

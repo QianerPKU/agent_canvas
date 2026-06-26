@@ -681,13 +681,39 @@ export function buildNodes(
           data,
         });
       } else {
-        const fallbackPosition = turnPosition(id, view.id, index, layout, placed, occupied);
+        const width = stored?.width ?? turnWidth(windowState);
+        const height = stored?.height ?? turnHeight(windowState);
+        const forkAnchorIndex =
+          index === 0 && view.forkOrigin
+            ? anchorIndex(
+                agents,
+                view.forkOrigin.parentAgentId,
+                view.forkOrigin.anchorUuid,
+              )
+            : -1;
+        const forkAnchorId =
+          forkAnchorIndex >= 0 && view.forkOrigin
+            ? nodeId(view.forkOrigin.parentAgentId, forkAnchorIndex)
+            : undefined;
+        const forkAnchorNode = forkAnchorId
+          ? placed.get(forkAnchorId) ?? byId.get(forkAnchorId)
+          : undefined;
+        const fallbackPosition =
+          index === 0 && forkAnchorNode
+            ? anchoredSidePosition(
+                forkAnchorNode,
+                layout[id] ?? { x: X0, y: Y0 },
+                width,
+                height,
+                occupied,
+              )
+            : turnPosition(id, view.id, index, layout, placed, occupied);
         const positionedAt =
           index === 0 && placement
             ? findFreePosition(
                 placement,
-                stored?.width ?? turnWidth(windowState),
-                stored?.height ?? turnHeight(windowState),
+                width,
+                height,
                 occupied,
               )
             : fallbackPosition;
@@ -695,8 +721,8 @@ export function buildNodes(
           id,
           type: "turn",
           position: stored?.position ?? positionedAt,
-          width: stored?.width ?? turnWidth(windowState),
-          height: stored?.height ?? turnHeight(windowState),
+          width,
+          height,
           dragHandle: ".drag-handle",
           data,
         });
