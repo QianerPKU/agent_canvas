@@ -9,7 +9,7 @@ import {
   type NodeProps,
 } from "@xyflow/react";
 import { Check, ExternalLink, Eye, File, FileText, Image, Minimize2, Pencil, X } from "lucide-react";
-import type { CanvasFileNode } from "@agent-canvas/shared";
+import type { AgentResultReportKind, CanvasFileNode } from "@agent-canvas/shared";
 import { api } from "../api.js";
 import type { FileActions } from "../useAgentCanvas.js";
 
@@ -66,6 +66,7 @@ export function FileNode({ id, data }: NodeProps<FileNodeType>): React.ReactElem
   const [name, setName] = useState(file.name);
   const [extension, setExtension] = useState(file.extension);
   const minimized = data.windowState?.minimized === true;
+  const isAgentResult = file.origin?.kind === "agent_result";
 
   useEffect(() => {
     setName(file.name);
@@ -127,7 +128,7 @@ export function FileNode({ id, data }: NodeProps<FileNodeType>): React.ReactElem
           onClick={toggleMinimized}
         >
           <FileKindIcon file={file} />
-          <span>文件</span>
+          <span>{isAgentResult ? "结果" : "文件"}</span>
         </button>
         <FileNodeHandles file={file} />
       </div>
@@ -245,7 +246,7 @@ export function FileNode({ id, data }: NodeProps<FileNodeType>): React.ReactElem
       </div>
 
       <div className="file-node__footer nodrag">
-        <span>隔离文件</span>
+        <span>{isAgentResult ? "Agent 汇报结果" : "隔离文件"}</span>
         {file.kind === "shared" ? (
           <div className="file-node__toggles">
             <label>
@@ -270,7 +271,9 @@ export function FileNode({ id, data }: NodeProps<FileNodeType>): React.ReactElem
             </label>
           </div>
         ) : (
-          <span className="file-node__badge">普通</span>
+          <span className="file-node__badge">
+            {isAgentResult ? resultKindLabel(file.origin?.resultKind) : "普通"}
+          </span>
         )}
       </div>
     </div>
@@ -299,6 +302,13 @@ function FileNodeHandles({ file }: { file: CanvasFileNode }): React.ReactElement
       <span className="file-node__handle-label file-node__handle-label--read">读</span>
     </>
   );
+}
+
+function resultKindLabel(kind: AgentResultReportKind | undefined): string {
+  if (kind === "image") return "图片";
+  if (kind === "table") return "表格";
+  if (kind === "document") return "文档";
+  return "结果";
 }
 
 function FileKindIcon({ file }: { file: CanvasFileNode }): React.ReactElement {

@@ -271,6 +271,71 @@ curl -sS -X POST "${apiBase}/agents/${agentId}/commits" \\
   }'
 ~~~
 
+### tool: agent_canvas.report_result
+
+用途：
+- 当你完成一次实验、评估、分析、可视化、表格汇总或说明文档，并且这些结果应该在 Agent Canvas 画布上一目了然地展示时，调用这个工具。
+- 后端会创建一个文件节点，放在当前 agent 对话节点旁边，并用连线连接到触发上报的对话轮。
+
+触发条件：
+- 用户明确要求“汇报结果”“展示实验结果”“把图/表/文档放到画布上”时必须调用。
+- 你主动完成了有复用价值的实验图、结果表格、分析报告或说明文档时，应该调用。
+
+文件边界：
+- 汇报结果文件保存在 Agent Canvas 的文件节点隔离目录中，不属于当前 branch workspace，也不需要 git commit。
+- 如果结果已经写在当前 workspace 或 ${scratchDirectory}/ 内，优先传 sourcePath，让后端复制真实文件，尤其适合 png/jpg/webp/csv/xlsx/pdf/html 等结果。
+- sourcePath 必须是当前 workspace 内的相对路径或绝对路径；不要用它上报 workspace 之外的任意文件。
+- 如果结果是较短的 Markdown、CSV、JSON 或文本，可以直接传 content。
+- sourcePath 和 content 二选一，不要同时传。
+
+请求：
+- Endpoint: POST ${apiBase}/agents/${agentId}/report-result
+- Method: POST
+- URL: ${apiBase}/agents/${agentId}/report-result
+- Body:
+~~~json
+{
+  "name": "accuracy-curve",
+  "extension": "png",
+  "resultKind": "image",
+  "title": "Accuracy curve",
+  "summary": "Validation accuracy improved after the scheduler change",
+  "sourcePath": "${scratchDirectory}/accuracy-curve.png"
+}
+~~~
+
+可用 resultKind：
+- image：实验图、截图、曲线图等图片。
+- table：CSV/TSV/HTML/Markdown 表格或其他表格文件。
+- document：Markdown、文本、HTML、PDF 等说明文档。
+- artifact：其他需要在画布上留存的结果文件。
+
+PowerShell sourcePath 示例：
+~~~powershell
+Invoke-RestMethod -Method Post -Uri "${apiBase}/agents/${agentId}/report-result" -ContentType "application/json" -Body (@{
+  name = "accuracy-curve"
+  extension = "png"
+  resultKind = "image"
+  title = "Accuracy curve"
+  summary = "Validation accuracy improved after the scheduler change"
+  sourcePath = "${scratchDirectory}/accuracy-curve.png"
+} | ConvertTo-Json -Depth 6)
+~~~
+
+curl content 示例：
+~~~bash
+curl -sS -X POST "${apiBase}/agents/${agentId}/report-result" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "name": "metrics-summary",
+    "extension": "md",
+    "resultKind": "document",
+    "title": "Metrics summary",
+    "summary": "Compact experiment result summary",
+    "content": "## Metrics\\n\\n| metric | value |\\n| --- | ---: |\\n| accuracy | 0.92 |"
+  }'
+~~~
+
 ## 工作原则
 
 ### git版本控制

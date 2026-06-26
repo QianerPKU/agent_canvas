@@ -1,5 +1,5 @@
 import http from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import type {
@@ -11,6 +11,7 @@ import type {
   AgentSettings,
   AgentStartConfig,
   BranchDiffSummary,
+  CanvasFileNode,
   CanvasLayoutSnapshot,
   CanvasNodeLayout,
   CanvasProjectState,
@@ -27,6 +28,7 @@ import type {
   PullRequestCreatedInput,
   CreatePullRequestFlowInput,
   ReportAgentCommitInput,
+  ReportAgentResultInput,
   ServerFrame,
   SyncFlowAppliedInput,
   UpdateAgentSettingsInput,
@@ -147,6 +149,7 @@ export function createServer(
       options.pickDirectory ?? defaultPickDirectory,
       canvasState,
       broadcastHello,
+      broadcastFrame,
     ).catch((err) => {
       sendJson(res, 500, { error: errMsg(err) });
     });
@@ -223,6 +226,7 @@ async function handleHttp(
   pickDirectory: PickDirectory,
   canvasState: CanvasStateController,
   broadcastHello: () => void,
+  broadcastFrame: (frame: ServerFrame) => void,
 ): Promise<void> {
   setCors(res);
   if (req.method === "OPTIONS") {
@@ -759,6 +763,28 @@ async function handleHttp(
     }
   }
 
+  const resultReportMatch = path.match(/^\/api\/agents\/([^/]+)\/report-result$/);
+  if (resultReportMatch) {
+    const id = decodeURIComponent(resultReportMatch[1]!);
+    if (method !== "POST") return sendJson(res, 405, { error: "method not allowed" });
+    if (!manager.get(id)) return sendJson(res, 404, { error: `unknown agent: ${id}` });
+    const body = await readJson<ReportAgentResultInput>(req);
+    try {
+      const file = await createAgentResultFile(
+        fileManager,
+        id,
+        manager.configOf(id),
+        manager.currentTurnIndex(id),
+        body ?? ({} as ReportAgentResultInput),
+      );
+      canvasState.saveSoon();
+      broadcastFrame({ type: "file", file });
+      return sendJson(res, 201, { file });
+    } catch (error) {
+      return sendJson(res, 400, { error: errMsg(error) });
+    }
+  }
+
   // /api/agents/:id(/action)
   const m = path.match(/^\/api\/agents\/([^/]+)(?:\/([^/]+))?$/);
   if (m) {
@@ -1183,6 +1209,116 @@ function settingsForWorkspaceResolution(
     scratchDirectory: input?.scratchDirectory ?? currentConfig?.scratchDirectory,
     systemPrompt: input?.systemPrompt ?? currentConfig?.systemPrompt,
   };
+}
+
+async function createAgentResultFile(
+  fileManager: FileManager,
+  agentId: string,
+  config: AgentStartConfig | undefined,
+  sourceTurnIndex: number,
+  input: ReportAgentResultInput,
+): Promise<CanvasFileNode> {
+  const hasSourcePath = typeof input.sourcePath === "string" && input.sourcePath.trim() !== "";
+  const hasContent = input.content !== undefined;
+  if (hasSourcePath && hasContent) {
+    throw new Error("report result accepts either sourcePath or content, not both");
+  }
+  if (!hasSourcePath && !hasContent) {
+    throw new Error("report result requires content or sourcePath");
+  }
+  const sourcePath = hasSourcePath ? input.sourcePath!.trim() : undefined;
+  const { name, extension } = reportFileNameParts(input, sourcePath);
+  const resultKind = normalizeResultReportKind(input.resultKind);
+  const content =
+    sourcePath !== undefined
+      ? await readReportSourceFile(sourcePath, config?.cwd)
+      : reportContentBuffer(input);
+
+  return await fileManager.createWithContent(
+    {
+      name,
+      extension,
+      storage: "isolated",
+      kind: "normal",
+    },
+    content,
+    {
+      origin: {
+        kind: "agent_result",
+        agentId,
+        sourceTurnIndex,
+        resultKind,
+        title: trimmedOptional(input.title),
+        summary: trimmedOptional(input.summary),
+      },
+    },
+  );
+}
+
+function reportFileNameParts(
+  input: ReportAgentResultInput,
+  sourcePath: string | undefined,
+): { name: string; extension?: string } {
+  let name = input.name?.trim();
+  if (!name) throw new Error("report result requires a file name");
+  let extension = input.extension?.trim();
+  if (!extension) {
+    const nameExtension = path.extname(name);
+    if (nameExtension && name.length > nameExtension.length) {
+      name = name.slice(0, -nameExtension.length);
+      extension = nameExtension.slice(1);
+    }
+  }
+  if (!extension && sourcePath) {
+    const sourceExtension = path.extname(sourcePath);
+    if (sourceExtension) extension = sourceExtension.slice(1);
+  }
+  if (extension) {
+    const normalizedExtension = extension.replace(/^\./u, "");
+    const suffix = `.${normalizedExtension}`;
+    if (name.toLowerCase().endsWith(suffix.toLowerCase())) {
+      name = name.slice(0, -suffix.length);
+    }
+  }
+  return { name, extension };
+}
+
+async function readReportSourceFile(sourcePath: string, cwd: string | undefined): Promise<Buffer> {
+  const base = cwd?.trim();
+  if (!base) throw new Error("agent has no workspace cwd for sourcePath report");
+  const resolvedBase = path.resolve(base);
+  const resolvedPath = path.resolve(resolvedBase, sourcePath);
+  if (!isPathInside(resolvedPath, resolvedBase)) {
+    throw new Error("sourcePath must be inside the agent workspace");
+  }
+  const info = await stat(resolvedPath);
+  if (!info.isFile()) throw new Error("sourcePath must point to a file");
+  return await readFile(resolvedPath);
+}
+
+function reportContentBuffer(input: ReportAgentResultInput): string | Buffer {
+  const content = input.content ?? "";
+  if (input.encoding === undefined || input.encoding === "utf8") return content;
+  if (input.encoding === "base64") return Buffer.from(content, "base64");
+  throw new Error("unsupported report result encoding");
+}
+
+function normalizeResultReportKind(
+  value: ReportAgentResultInput["resultKind"],
+): ReportAgentResultInput["resultKind"] {
+  if (value === undefined) return undefined;
+  if (["image", "table", "document", "artifact"].includes(value)) return value;
+  throw new Error("unsupported report result kind");
+}
+
+function trimmedOptional(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function isPathInside(candidate: string, root: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
 function mergeFileAccess(...items: AgentFileAccess[]): AgentFileAccess {

@@ -6,6 +6,7 @@ import type {
   AgentFileAccess,
   CanvasFileConnection,
   CanvasFileNode,
+  CanvasFileOrigin,
   CreateCanvasFileInput,
   FileConnectionAccess,
   FilePreviewKind,
@@ -69,6 +70,14 @@ export class FileManager {
   }
 
   async create(input: CreateCanvasFileInput): Promise<CanvasFileNode> {
+    return await this.createWithContent(input, "");
+  }
+
+  async createWithContent(
+    input: CreateCanvasFileInput,
+    content: string | Buffer,
+    options: { origin?: CanvasFileOrigin } = {},
+  ): Promise<CanvasFileNode> {
     const id = `file_${++this.fileCounter}`;
     const name = normalizeName(input.name);
     const extension = normalizeExtension(input.extension);
@@ -77,7 +86,7 @@ export class FileManager {
     await mkdir(baseDirectory, { recursive: true });
     const filePath = path.join(baseDirectory, filename);
     await ensureMissing(filePath);
-    await writeFile(filePath, "");
+    await writeFile(filePath, content);
 
     const at = this.now();
     const node: CanvasFileNode = {
@@ -94,6 +103,7 @@ export class FileManager {
       mimeType: mimeTypeForExtension(extension),
       createdAt: at,
       updatedAt: at,
+      origin: options.origin,
     };
     this.files.set(id, node);
     return node;

@@ -43,6 +43,11 @@ describe("agentCanvasPolicyPrompt", () => {
     expect(prompt).toContain(
       'curl -sS -X POST "http://127.0.0.1:4317/api/agents/agent_42/commits"',
     );
+    expect(prompt).toContain("tool: agent_canvas.report_result");
+    expect(prompt).toContain("POST http://127.0.0.1:4317/api/agents/agent_42/report-result");
+    expect(prompt).toContain('"resultKind": "image"');
+    expect(prompt).toContain('"sourcePath": ".agent-tmp/agent_42/accuracy-curve.png"');
+    expect(prompt).toContain('"content": "## Metrics');
   });
 
   it("uses AGENT_CANVAS_API when configured", () => {
@@ -56,6 +61,9 @@ describe("agentCanvasPolicyPrompt", () => {
     );
     expect(agentCanvasPolicyPrompt("agent_1")).toContain(
       "POST http://127.0.0.1:9999/api/agents/agent_1/commits",
+    );
+    expect(agentCanvasPolicyPrompt("agent_1")).toContain(
+      "POST http://127.0.0.1:9999/api/agents/agent_1/report-result",
     );
   });
 });

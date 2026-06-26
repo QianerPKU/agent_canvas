@@ -5,6 +5,7 @@
 - `CreateFileDialog` 只选择文件名、后缀和普通/共享类型。文件节点固定创建在后端隔离文件夹中，不进入任何 branch workspace。
 - 后缀名使用普通输入框，不限制选项；服务端统一规范化后缀并决定文本、Markdown、CSV、图片或不预览。
 - `FileNode` 展示文本、Markdown、CSV 和图片预览；其他格式只显示文件名。
+- Agent 调用 `report_result` 后会生成带来源元数据的结果文件节点，复用同一套文本/Markdown/CSV/图片预览，并自动连接到产生结果的对话轮。
 - 点击文件节点的内容区域或标题栏外链按钮，会通过后端用 VS Code 打开真实文件，不区分文件格式。
 - 标题栏眼睛按钮打开 `FileContentWindow`：文本读取完整内容，图片显示原图，其他二进制格式提示改用 VS Code。
 - 普通节点左侧 `write` 是输入端，右侧 `read` 是输出端。

@@ -55,6 +55,35 @@ describe("FileManager", () => {
     expect(file.storage).toBe("isolated");
   });
 
+  it("creates agent result files with content and origin metadata", async () => {
+    const file = await manager.createWithContent(
+      {
+        name: "result",
+        extension: "md",
+        kind: "normal",
+      },
+      "# Result",
+      {
+        origin: {
+          kind: "agent_result",
+          agentId: "agent_1",
+          sourceTurnIndex: 2,
+          resultKind: "document",
+          summary: "experiment report",
+        },
+      },
+    );
+
+    expect(await readFile(file.path, "utf-8")).toBe("# Result");
+    expect(file.origin).toMatchObject({
+      kind: "agent_result",
+      agentId: "agent_1",
+      sourceTurnIndex: 2,
+      resultKind: "document",
+      summary: "experiment report",
+    });
+  });
+
   it("共享读写开关对全部 Agent 生效", async () => {
     const file = await manager.create({
       name: "shared",

@@ -442,6 +442,32 @@ export function computeFileEdges(
   return edges;
 }
 
+export function computeResultFileEdges(
+  agents: AgentMap,
+  files: CanvasFileNode[],
+): Edge[] {
+  const edges: Edge[] = [];
+  for (const file of files) {
+    if (file.origin?.kind !== "agent_result") continue;
+    const source = fixedTurnNodeId(
+      agents,
+      file.origin.agentId,
+      file.origin.sourceTurnIndex,
+    );
+    if (!source) continue;
+    edges.push({
+      id: `result-file-edge:${file.id}`,
+      source,
+      target: fileNodeId(file.id),
+      animated: false,
+      style: { stroke: "#2563eb" },
+      label: "result",
+      deletable: false,
+    });
+  }
+  return edges;
+}
+
 export function computePromptEdges(
   agents: AgentMap,
   connections: CanvasPromptConnection[],
@@ -686,6 +712,11 @@ export function buildNodes(
     const existingFile = existing?.type === "file" ? existing : undefined;
     const stored = storedLayoutFor(savedById, id, "file");
     const windowState = existingFile?.data.windowState ?? stored?.windowState;
+    const source =
+      file.origin?.kind === "agent_result"
+        ? fixedTurnNodeId(agents, file.origin.agentId, file.origin.sourceTurnIndex)
+        : undefined;
+    const sourceNode = source ? placed.get(source) ?? byId.get(source) : undefined;
     const data = {
       file,
       actions: fileActions,
@@ -712,12 +743,27 @@ export function buildNodes(
             type: "file",
             position:
               stored?.position ??
-              findFreePosition(
-                placement ?? { x: fileX, y: Y0 + index * FILE_ROW_H },
-                FILE_NODE_WIDTH,
-                FILE_NODE_HEIGHT,
-                occupied,
-              ),
+              (placement
+                ? findFreePosition(
+                    placement,
+                    FILE_NODE_WIDTH,
+                    FILE_NODE_HEIGHT,
+                    occupied,
+                  )
+                : sourceNode
+                  ? anchoredSidePosition(
+                      sourceNode,
+                      { x: fileX, y: Y0 + index * FILE_ROW_H },
+                      FILE_NODE_WIDTH,
+                      FILE_NODE_HEIGHT,
+                      occupied,
+                    )
+                  : findFreePosition(
+                      { x: fileX, y: Y0 + index * FILE_ROW_H },
+                      FILE_NODE_WIDTH,
+                      FILE_NODE_HEIGHT,
+                      occupied,
+                    )),
             width: stored?.width ?? (windowState?.minimized ? 68 : FILE_NODE_WIDTH),
             height: stored?.height ?? (windowState?.minimized ? 48 : FILE_NODE_HEIGHT),
             dragHandle: ".drag-handle",
@@ -1111,6 +1157,7 @@ export default function App(): React.ReactElement {
     setEdges([
       ...computeConversationEdges(agents),
       ...computeFileEdges(agents, fileConnections),
+      ...computeResultFileEdges(agents, files),
       ...computePromptEdges(agents, promptConnections),
       ...computeCommitEdges(agents, commits),
       ...computePullRequestEdges(agents, prFlows),

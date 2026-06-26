@@ -223,6 +223,8 @@ export function useAgentCanvas(): UseAgentCanvas {
           setSyncFlows((prev) => upsertSyncFlow(prev, frame.flow));
         } else if (frame.type === "commit") {
           setCommits((prev) => upsertCommit(prev, frame.commit));
+        } else if (frame.type === "file") {
+          setFiles((prev) => upsertFile(prev, frame.file));
         }
       };
     };
@@ -357,12 +359,12 @@ export function useAgentCanvas(): UseAgentCanvas {
     () => ({
       create: async (input) => {
         const file = await api.createFile(input);
-        setFiles((current) => [...current, file]);
+        setFiles((current) => upsertFile(current, file));
         return file;
       },
       update: async (id, input) => {
         const file = await api.updateFile(id, input);
-        setFiles((current) => current.map((candidate) => (candidate.id === id ? file : candidate)));
+        setFiles((current) => upsertFile(current, file));
       },
       connect: async (fileId, agentId, access) => {
         const connection = await api.connectFile(fileId, agentId, access);
@@ -488,6 +490,12 @@ function upsertCommit(
   return commits.some((candidate) => candidate.id === commit.id)
     ? commits.map((candidate) => (candidate.id === commit.id ? commit : candidate))
     : [commit, ...commits];
+}
+
+function upsertFile(files: CanvasFileNode[], file: CanvasFileNode): CanvasFileNode[] {
+  return files.some((candidate) => candidate.id === file.id)
+    ? files.map((candidate) => (candidate.id === file.id ? file : candidate))
+    : [...files, file];
 }
 
 function upsertSyncFlow(

@@ -9,7 +9,7 @@
   auto-minimized, the following turn sits directly under the small node with a compact gap.
 - New root nodes created from the toolbar, including agent, file, and prompt nodes, start from the
   current viewport center instead of the global canvas origin.
-- Derived nodes such as commit, PR, and sync nodes use the source turn as their anchor, so historical
+- Derived nodes such as result file, commit, PR, and sync nodes use the source turn as their anchor, so historical
   edges stay attached to the exact turn that produced the action.
 - Completed turns with a fork anchor can fork into the current branch, another existing branch, or a
   newly created branch. The inline branch creator passes a selected base branch through to

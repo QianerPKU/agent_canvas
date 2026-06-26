@@ -9,6 +9,7 @@ Agent Canvas 是一个本地运行的多 agent 开发/实验画布。你可以�
 - Branch workspace：一个 branch 对应一个本地 worktree；新建 branch 可选择继承自哪个已有 branch。
 - Agent 工作区快捷入口：每个 agent 节点可一键用 VS Code 打开它当前 branch 对应的项目目录。
 - 文件与提示词节点：把文件或提示词连到 agent，控制读写权限。
+- 结果汇报节点：agent 可以调用内置 `report_result` API，把实验图、结果表格或说明文档作为文件节点放到对应对话旁边预览。
 - Git 流程节点：agent commit、PR pipeline、cherry-pick / branch pull 会在画布上生成可查看详情的节点。
 - 运行中交互：支持排队输入、引导当前轮、回答 CLI/SDK 提问、处理授权请求。
 
@@ -127,7 +128,8 @@ Codex：
 5. 运行中可排队下一轮输入，也可用“引导”尽快影响当前轮。
 6. 需要查看该 branch 的真实项目目录时，点击 agent 节点标题栏的文件夹按钮用 VS Code 打开。
 7. 需要文件上下文时，新建文件节点或提示词节点并连到 agent。
-8. agent 完成 commit / PR / 同步流程后，画布会保留对应节点和连线。
+8. agent 完成实验或分析后，可以要求它“汇报结果”，画布会生成可预览的结果文件节点。
+9. agent 完成 commit / PR / 同步流程后，画布会保留对应节点和连线。
 
 ## 远程服务器使用
 

@@ -424,6 +424,89 @@ describe("HTTP server", () => {
     );
   });
 
+  it("agent can report result files from content or a workspace sourcePath", async () => {
+    const created = await request(port, "POST", "/api/agents", {
+      branch: "feature/server-test",
+    });
+    expect(created.status).toBe(201);
+
+    const reported = await request(
+      port,
+      "POST",
+      `/api/agents/${created.json.id}/report-result`,
+      {
+        name: "metrics-summary",
+        extension: "md",
+        resultKind: "document",
+        title: "Metrics summary",
+        summary: "small report",
+        content: "## Metrics\n\naccuracy: 0.92",
+      },
+    );
+
+    expect(reported.status).toBe(201);
+    expect(reported.json.file).toMatchObject({
+      name: "metrics-summary",
+      filename: "metrics-summary.md",
+      previewKind: "markdown",
+      origin: {
+        kind: "agent_result",
+        agentId: created.json.id,
+        sourceTurnIndex: 0,
+        resultKind: "document",
+        title: "Metrics summary",
+        summary: "small report",
+      },
+    });
+    const content = await request(
+      port,
+      "GET",
+      `/api/files/${reported.json.file.id}/content?full=1`,
+    );
+    expect(content.json.content).toBe("## Metrics\n\naccuracy: 0.92");
+
+    const agents = await request(port, "GET", "/api/agents");
+    const snapshot = agents.json.agents.find(
+      (agent: { id: string }) => agent.id === created.json.id,
+    );
+    if (!snapshot) throw new Error("missing created agent snapshot");
+    const sourceDirectory = path.join(snapshot.config.cwd, ".agent-tmp", created.json.id);
+    await mkdir(sourceDirectory, { recursive: true });
+    await writeFile(path.join(sourceDirectory, "table.csv"), "metric,value\naccuracy,0.92\n");
+
+    const copied = await request(
+      port,
+      "POST",
+      `/api/agents/${created.json.id}/report-result`,
+      {
+        name: "table.csv",
+        resultKind: "table",
+        summary: "copied csv",
+        sourcePath: `.agent-tmp/${created.json.id}/table.csv`,
+      },
+    );
+
+    expect(copied.status).toBe(201);
+    expect(copied.json.file).toMatchObject({
+      name: "table",
+      filename: "table.csv",
+      previewKind: "csv",
+      origin: {
+        kind: "agent_result",
+        agentId: created.json.id,
+        sourceTurnIndex: 0,
+        resultKind: "table",
+        summary: "copied csv",
+      },
+    });
+    const copiedContent = await request(
+      port,
+      "GET",
+      `/api/files/${copied.json.file.id}/content?full=1`,
+    );
+    expect(copiedContent.json.content).toBe("metric,value\naccuracy,0.92\n");
+  });
+
   it("sync flow REST supports create, review authorization and applied fallback", async () => {
     const created = await request(port, "POST", "/api/sync-flows", {
       kind: "cherry_pick",

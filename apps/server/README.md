@@ -18,6 +18,7 @@
 | `src/pullRequests/PullRequestFlowManager.ts` | PR 审查与授权状态机：活跃 agent 审查、JSON 校验/重试、超时、授权信号 |
 | `src/sync/SyncFlowManager.ts` | cherry-pick / branch pull 的一步审查与授权状态机 |
 | `src/commits/CommitManager.ts` | Agent commit 上报记录：从 git 读取 commit 元信息、变更文件和每文件 diff，并推送给前端 |
+| `src/files/FileManager.ts` | 画布文件节点、隔离文件存储、读写连线，以及 agent 结果汇报文件 |
 | `src/server.ts` | HTTP(REST) + WebSocket 装配；读写项目级 `canvas-state.json` |
 | `src/index.ts` | 入口：实例化 manager（注入 Claude/Codex query）并监听端口 |
 
@@ -52,6 +53,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 - **terminate**：调用 QueryHandle 的终止能力并关闭输入流。Claude adapter 会 interrupt 后结束 Query generator；Codex adapter 关闭并 kill 对应 app-server 子进程，状态进入 `terminated`。
 - **完整历史**：`AgentRunner` 把每次 start/send/steer/compact 输入记录为 `user_input`；Claude thinking block 与 Codex reasoning delta/summary 统一映射为 `thinking`。`GET /api/agents/:id/history` 因而可回放用户输入、思考、答复、工具调用/结果与轮次结果。
 - **commit 上报**：Agent Canvas 不替 agent 执行 `git commit`，但内置工作区规则要求每次 commit 成功后调用 `POST /api/agents/:id/commits`。后端用该 agent 的 branch workspace 读取 commit hash、message、文件列表和 diff，并记录当时的 `sourceTurnIndex`，让前端 commit 节点始终连回触发它的那一轮对话。
+- **结果汇报**：agent 可以调用 `POST /api/agents/:id/report-result` 把 Markdown/CSV/图片等结果复制成隔离文件节点。记录会带来源 agent 与 `sourceTurnIndex`，前端把它放到对应对话轮旁边并保留连线。
 - **VS Code 工作区入口**：`POST /api/agents/:id/open-workspace` 会用 VS Code CLI 打开该 agent 当前配置中的 branch worktree 目录，供前端节点标题栏的文件夹按钮调用。
 
 ## Canvas Project State
@@ -91,6 +93,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 | `POST /api/agents/:id/questions/:requestId` | body=`AgentQuestionResponse`，回答或拒绝底层 CLI/SDK 发出的交互问题 |
 | `POST /api/agents/:id/approvals/:requestId` | body=`AgentApprovalResponse`，允许、拒绝或取消底层 CLI/SDK 发出的授权请求 |
 | `POST /api/agents/:id/commits` | body=`{ commit?, summary? }`，记录该 agent 已完成一次 commit；默认读取当前工作区 `HEAD` |
+| `POST /api/agents/:id/report-result` | body=`{ name, extension?, resultKind?, title?, summary?, content? | sourcePath?, encoding? }`，创建一个结果文件节点；`sourcePath` 只能指向该 agent workspace 内文件 |
 | `POST /api/agents/:id/compact` | 手动 compact 当前上下文；仅 `waiting_input` 可用 |
 | `POST /api/agents/:id/resume` | body=`{ sessionId, text }`，续接会话 |
 | `POST /api/agents/:id/fork` | body=`{ anchorUuid, model?, branchWorkspaceId?, branch?, cwd? }`，从该 agent 某轮 fork 出新 agent，可覆盖模型与目标 branch，返回 `{ id, origin }` |
@@ -135,6 +138,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 - `{ type: "pr_flow", flow }`：PR flow 快照更新
 - `{ type: "sync_flow", flow }`：cherry-pick / branch pull flow 快照更新
 - `{ type: "commit", commit }`：Agent 上报 commit 后的 commit 快照
+- `{ type: "file", file }`：Agent 上报结果后创建或更新的文件节点快照
 
 ## 测试（CLAUDE.md 原则 #1）
 

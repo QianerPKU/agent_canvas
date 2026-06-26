@@ -4,6 +4,17 @@ export type CanvasFileKind = "normal" | "shared";
 export type CanvasFileStorage = "isolated";
 export type FilePreviewKind = "text" | "markdown" | "csv" | "image" | "none";
 export type FileConnectionAccess = "read" | "write";
+export type AgentResultReportKind = "image" | "table" | "document" | "artifact";
+export type AgentResultReportEncoding = "utf8" | "base64";
+
+export interface CanvasFileOrigin {
+  kind: "agent_result";
+  agentId: string;
+  sourceTurnIndex: number;
+  resultKind?: AgentResultReportKind;
+  title?: string;
+  summary?: string;
+}
 
 export interface CanvasFileNode {
   id: string;
@@ -19,6 +30,7 @@ export interface CanvasFileNode {
   mimeType: string;
   createdAt: number;
   updatedAt: number;
+  origin?: CanvasFileOrigin;
 }
 
 export interface CreateCanvasFileInput {
@@ -34,6 +46,17 @@ export interface UpdateCanvasFileInput {
   extension?: string;
   sharedRead?: boolean;
   sharedWrite?: boolean;
+}
+
+export interface ReportAgentResultInput {
+  name: string;
+  extension?: string;
+  resultKind?: AgentResultReportKind;
+  title?: string;
+  summary?: string;
+  content?: string;
+  encoding?: AgentResultReportEncoding;
+  sourcePath?: string;
 }
 
 export interface CanvasFileConnection {
