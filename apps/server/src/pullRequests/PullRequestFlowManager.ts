@@ -87,7 +87,6 @@ const ACTIVE_STATUSES: PullRequestFlowStatus[] = [
   "target_review_collecting",
   "merge_authorized",
 ];
-
 export class PullRequestFlowManager {
   private readonly host: PullRequestAgentHost;
   private readonly resolveChangedFiles?: ResolvePullRequestChangedFiles;
@@ -500,14 +499,26 @@ export class PullRequestFlowManager {
       .filter((agent) => agent.config.branch === branch && isActiveAgentStatus(agent.status));
   }
 
-  private hasActiveBranchConflict(sourceBranch: string, targetBranch: string): boolean {
+  private hasActiveBranchConflict(
+    sourceBranch: string,
+    targetBranch: string,
+    options: { ignoredFlowId?: string; queuedBefore?: number } = {},
+  ): boolean {
     return this.list().some(
-      (flow) =>
-        ACTIVE_STATUSES.includes(flow.status) &&
-        (flow.sourceBranch === sourceBranch ||
-          flow.targetBranch === targetBranch ||
-          flow.sourceBranch === targetBranch ||
-          flow.targetBranch === sourceBranch),
+      (flow) => {
+        if (flow.id === options.ignoredFlowId) return false;
+        const reservesBranch =
+          ACTIVE_STATUSES.includes(flow.status) ||
+          (flow.status === "queued" &&
+            (options.queuedBefore === undefined || flow.createdAt < options.queuedBefore));
+        return (
+          reservesBranch &&
+          (flow.sourceBranch === sourceBranch ||
+            flow.targetBranch === targetBranch ||
+            flow.sourceBranch === targetBranch ||
+            flow.targetBranch === sourceBranch)
+        );
+      },
     );
   }
 
@@ -522,7 +533,15 @@ export class PullRequestFlowManager {
             candidate.targetBranch === flow.targetBranch),
       )
       .sort((a, b) => a.createdAt - b.createdAt)[0];
-    if (!next || this.hasActiveBranchConflict(next.sourceBranch, next.targetBranch)) return;
+    if (
+      !next ||
+      this.hasActiveBranchConflict(next.sourceBranch, next.targetBranch, {
+        ignoredFlowId: next.id,
+        queuedBefore: next.createdAt,
+      })
+    ) {
+      return;
+    }
     this.save({
       ...next,
       status: "source_review_collecting",
