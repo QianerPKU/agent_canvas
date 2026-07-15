@@ -56,15 +56,41 @@ class CodexUsageClient {
       stdio: "pipe",
       windowsHide: true,
     });
+    this.child.once("error", (error) => {
+      this.rejectPending(error instanceof Error ? error : new Error("Codex app-server failed to start"));
+    });
     this.child.once("exit", () => {
-      for (const pending of this.pending.values()) {
-        clearTimeout(pending.timer);
-        pending.reject(new Error("Codex app-server exited before usage response"));
-      }
-      this.pending.clear();
+      this.rejectPending(new Error("Codex app-server exited before usage response"));
     });
     readline.createInterface({ input: this.child.stdout }).on("line", (line) => {
       this.handleLine(line);
+    });
+    await new Promise<void>((resolve, reject) => {
+      const child = this.child;
+      if (!child) {
+        reject(new Error("Codex usage client is not started"));
+        return;
+      }
+      let settled = false;
+      const cleanup = () => {
+        child.off("error", onError);
+        child.off("spawn", onSpawn);
+      };
+      const settle = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        callback();
+      };
+      const onError = (error: Error) => {
+        settle(() => reject(error));
+      };
+      const onSpawn = () => {
+        settle(resolve);
+      };
+      child.once("error", onError);
+      child.once("spawn", onSpawn);
+      setImmediate(() => settle(resolve));
     });
   }
 
@@ -106,6 +132,14 @@ class CodexUsageClient {
       return;
     }
     pending.resolve(message.result);
+  }
+
+  private rejectPending(error: Error): void {
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pending.clear();
   }
 }
 
