@@ -13,6 +13,8 @@ import type {
   BranchOption,
   BranchWorkspace,
   CanvasLayoutSnapshot,
+  CodexAuthStatus,
+  CodexLoginSession,
   CanvasProjectSummary,
   CanvasFileConnection,
   CanvasFileNode,
@@ -103,6 +105,16 @@ export const api = {
     call<{ flows: SyncFlowSnapshot[] }>("/sync-flows").then((r) => r.flows),
   listCommits: () =>
     call<{ commits: AgentCommitSnapshot[] }>("/commits").then((r) => r.commits),
+  codexAuthStatus: () =>
+    call<{ status: CodexAuthStatus; login: CodexLoginSession | null }>("/codex-auth/status"),
+  startCodexLogin: () =>
+    call<{ login: CodexLoginSession }>("/codex-auth/login", { method: "POST" }).then(
+      (r) => r.login,
+    ),
+  cancelCodexLogin: () =>
+    call<{ login: CodexLoginSession | null }>("/codex-auth/login/cancel", {
+      method: "POST",
+    }).then((r) => r.login),
   createPullRequestFlow: (input: CreatePullRequestFlowInput) =>
     call<{ flow: PullRequestFlowSnapshot }>("/pr-flows", {
       method: "POST",

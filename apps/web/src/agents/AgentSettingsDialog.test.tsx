@@ -4,6 +4,24 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { AgentSettingsDialog } from "./AgentSettingsDialog.js";
 import { newAgentView } from "../agentStore.js";
 
+vi.mock("../api.js", () => ({
+  api: {
+    codexAuthStatus: vi.fn().mockResolvedValue({
+      status: { state: "unauthenticated", message: "Not logged in" },
+      login: null,
+    }),
+    startCodexLogin: vi.fn().mockResolvedValue({
+      id: "codex_login_1",
+      state: "running",
+      startedAt: 1,
+      updatedAt: 1,
+      loginUrl: "https://auth.openai.com/device",
+      userCode: "ABCD-EFGH",
+      output: "",
+    }),
+  },
+}));
+
 afterEach(cleanup);
 
 describe("AgentSettingsDialog", () => {

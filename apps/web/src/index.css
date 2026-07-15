@@ -1180,6 +1180,82 @@ button:disabled {
   box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
 }
 
+.codex-login-panel {
+  display: grid;
+  gap: 8px;
+  margin: 12px 16px 0;
+  padding: 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #f8fafc;
+  font-size: 12px;
+}
+
+.codex-login-panel > div:first-child,
+.codex-login-panel footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.codex-login-panel span {
+  color: #b45309;
+  font-weight: 600;
+}
+
+.codex-login-panel span.is-authenticated {
+  color: #047857;
+}
+
+.codex-login-panel p {
+  margin: 0;
+  color: #475569;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.codex-login-panel__device {
+  display: grid;
+  gap: 7px;
+  padding: 8px;
+  border-radius: 5px;
+  background: #fff;
+}
+
+.codex-login-panel__device a {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #1d4ed8;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.codex-login-panel__device code,
+.codex-login-panel__device pre {
+  max-width: 100%;
+  overflow: auto;
+  margin: 0;
+  padding: 6px;
+  border-radius: 4px;
+  background: #e2e8f0;
+  font: 12px/1.45 Consolas, "Courier New", monospace;
+}
+
+.codex-login-panel footer button {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 9px;
+  border: 1px solid #cbd5e1;
+  border-radius: 5px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 12px;
+}
+
 .file-dialog__error {
   margin: 12px 16px 0;
   padding: 8px 10px;

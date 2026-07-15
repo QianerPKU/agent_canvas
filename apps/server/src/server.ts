@@ -45,6 +45,7 @@ import { FileManager } from "./files/FileManager.js";
 import { openFileInVscode } from "./files/VscodeFileOpener.js";
 import { PromptManager } from "./prompts/PromptManager.js";
 import { PullRequestFlowManager } from "./pullRequests/PullRequestFlowManager.js";
+import { CodexAuthManager } from "./sdk/CodexAuthManager.js";
 import { SyncFlowManager } from "./sync/SyncFlowManager.js";
 import { WorkspaceManager } from "./workspaces/WorkspaceManager.js";
 
@@ -58,6 +59,7 @@ export interface CreateServerResult {
   pullRequestFlowManager: PullRequestFlowManager;
   syncFlowManager: SyncFlowManager;
   commitManager: CommitManager;
+  codexAuthManager: CodexAuthManager;
 }
 
 export interface CreateServerOptions {
@@ -69,6 +71,7 @@ export interface CreateServerOptions {
   pullRequestFlowManager?: PullRequestFlowManager;
   syncFlowManager?: SyncFlowManager;
   commitManager?: CommitManager;
+  codexAuthManager?: CodexAuthManager;
   codexModelDetection?: Promise<CodexModelDetection> | CodexModelDetection;
 }
 
@@ -130,6 +133,7 @@ export function createServer(
       },
     });
   const commitManager = options.commitManager ?? new CommitManager();
+  const codexAuthManager = options.codexAuthManager ?? new CodexAuthManager();
   manager.setPromptAccessResolver((agentId) => promptManager.accessFor(agentId));
   const canvasState = createCanvasStateController({
     manager,
@@ -151,6 +155,7 @@ export function createServer(
       pullRequestFlowManager,
       syncFlowManager,
       commitManager,
+      codexAuthManager,
       defaultCwd,
       codexModels,
       options.openFile ?? openFileInVscode,
@@ -216,6 +221,7 @@ export function createServer(
     pullRequestFlowManager,
     syncFlowManager,
     commitManager,
+    codexAuthManager,
   };
 }
 
@@ -229,6 +235,7 @@ async function handleHttp(
   pullRequestFlowManager: PullRequestFlowManager,
   syncFlowManager: SyncFlowManager,
   commitManager: CommitManager,
+  codexAuthManager: CodexAuthManager,
   defaultCwd: string,
   codexModels: Promise<CodexModelDetection>,
   openFile: (filePath: string) => Promise<void>,
@@ -414,6 +421,29 @@ async function handleHttp(
 
   if (method === "GET" && path === "/api/commits") {
     return sendJson(res, 200, { commits: commitManager.list() });
+  }
+
+  if (method === "GET" && path === "/api/codex-auth/status") {
+    try {
+      return sendJson(res, 200, {
+        status: await codexAuthManager.status(),
+        login: codexAuthManager.loginSession() ?? null,
+      });
+    } catch (error) {
+      return sendJson(res, 500, { error: errMsg(error) });
+    }
+  }
+
+  if (method === "POST" && path === "/api/codex-auth/login") {
+    try {
+      return sendJson(res, 202, { login: codexAuthManager.startDeviceLogin() });
+    } catch (error) {
+      return sendJson(res, 500, { error: errMsg(error) });
+    }
+  }
+
+  if (method === "POST" && path === "/api/codex-auth/login/cancel") {
+    return sendJson(res, 200, { login: codexAuthManager.cancelLogin() ?? null });
   }
 
   if (method === "POST" && path === "/api/pr-flows") {
