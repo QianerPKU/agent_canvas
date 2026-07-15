@@ -467,6 +467,15 @@ async function handleHttp(
         return sendJson(res, 404, { error: errMsg(error) });
       }
     }
+    if (method === "POST" && action === "retry") {
+      try {
+        const flow = await pullRequestFlowManager.retryQueued(id);
+        canvasState.saveSoon();
+        return sendJson(res, 200, { flow });
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
+    }
   }
 
   const syncFlowMatch = path.match(/^\/api\/sync-flows\/([^/]+)(?:\/([^/]+))?$/);

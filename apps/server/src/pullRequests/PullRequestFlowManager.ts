@@ -268,6 +268,15 @@ export class PullRequestFlowManager {
     return next;
   }
 
+  async retryQueued(flowId: string): Promise<PullRequestFlowSnapshot> {
+    const flow = this.requireFlow(flowId);
+    if (flow.status !== "queued") {
+      throw new Error("only queued PR flows can be retried");
+    }
+    await this.maybeStartQueuedFlow(flow);
+    return this.requireFlow(flowId);
+  }
+
   async handleAgentEvent(envelope: AgentEventEnvelope): Promise<void> {
     if (envelope.event.kind !== "result") return;
     await Promise.resolve();
@@ -546,8 +555,11 @@ export class PullRequestFlowManager {
             candidate.targetBranch === flow.targetBranch),
       )
       .sort((a, b) => a.createdAt - b.createdAt)[0];
+    if (next) await this.maybeStartQueuedFlow(next);
+  }
+
+  private async maybeStartQueuedFlow(next: PullRequestFlowSnapshot): Promise<void> {
     if (
-      !next ||
       this.hasActiveBranchConflict(next.sourceBranch, next.targetBranch, {
         ignoredFlowId: next.id,
         queuedBefore: next.createdAt,

@@ -14,6 +14,8 @@ PR flows reserve both their `sourceBranch` and `targetBranch` while they are `qu
 
 When a flow closes (`merged`, `cancelled`, `timed_out`, `source_review_failed`, `target_review_failed`, or `blocked`), the manager starts the oldest queued flow whose source and target branches are now free. This preserves FIFO ordering for all flows that share a source or target branch.
 
+If a queued flow fails the branch readiness recheck because its source no longer includes the target branch head, it remains queued with a `failureReason`. After the proposer syncs and pushes the source branch, `POST /api/pr-flows/:id/retry` rechecks readiness and starts source review when the branches are ready.
+
 ## Flow
 
 1. The caller creates a PR flow with proposer agent, source branch, target branch, summary, and optional file scope.

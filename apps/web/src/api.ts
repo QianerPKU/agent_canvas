@@ -118,6 +118,10 @@ export const api = {
     call<{ flow: PullRequestFlowSnapshot }>(`/pr-flows/${encodeURIComponent(id)}/cancel`, {
       method: "POST",
     }).then((r) => r.flow),
+  retryPullRequestFlow: (id: string) =>
+    call<{ flow: PullRequestFlowSnapshot }>(`/pr-flows/${encodeURIComponent(id)}/retry`, {
+      method: "POST",
+    }).then((r) => r.flow),
   createSyncFlow: (input: CreateSyncFlowInput) =>
     call<{ flow: SyncFlowSnapshot }>("/sync-flows", {
       method: "POST",

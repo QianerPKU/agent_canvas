@@ -216,6 +216,11 @@ function PullRequestFlowRow({
         </div>
       )}
       <footer>
+        {flow.status === "queued" && (
+          <button disabled={busy} onClick={() => void actions.retry(flow.id)}>
+            重试
+          </button>
+        )}
         {flow.status === "merge_authorized" && (
           <button disabled={busy} onClick={() => void actions.recordMerged(flow.id)}>
             已合并

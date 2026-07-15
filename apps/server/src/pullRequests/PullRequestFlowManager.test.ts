@@ -386,6 +386,15 @@ describe("PullRequestFlowManager", () => {
     expect(stillQueued.status).toBe("queued");
     expect(stillQueued.failureReason).toContain("waiting for branch sync");
     expect(proposerB.sent).toHaveLength(0);
+
+    ready = true;
+    proposerB.setStatus("waiting_input");
+    const retried = await manager.retryQueued(second.id);
+
+    expect(retried.status).toBe("source_review_collecting");
+    expect(retried.failureReason).toBeUndefined();
+    expect(proposerB.sent).toHaveLength(1);
+    expect(proposerB.sent[0]).toContain(`flowId: ${second.id}`);
   });
 
   it("treats queued flows as branch reservations so later flows cannot skip them", async () => {
