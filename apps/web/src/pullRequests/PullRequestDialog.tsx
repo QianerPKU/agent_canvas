@@ -255,6 +255,7 @@ function isClosed(status: PullRequestFlowSnapshot["status"]): boolean {
 
 function statusLabel(status: PullRequestFlowSnapshot["status"]): string {
   const labels: Record<PullRequestFlowSnapshot["status"], string> = {
+    queued: "排队中",
     source_review_collecting: "源审查",
     source_review_failed: "源拒绝",
     create_pr_authorized: "可提 PR",

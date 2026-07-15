@@ -141,6 +141,7 @@ export function statusMeta(status: PullRequestFlowSnapshot["status"]): {
   color: string;
 } {
   const labels: Record<PullRequestFlowSnapshot["status"], { label: string; color: string }> = {
+    queued: { label: "排队等待审核", color: "#64748b" },
     source_review_collecting: { label: "源 branch 审核中", color: "#2563eb" },
     source_review_failed: { label: "源 branch 已拒绝", color: "#dc2626" },
     create_pr_authorized: { label: "正在提交 PR", color: "#7c3aed" },

@@ -1,30 +1,33 @@
 # Pull Request Flow Manager
 
-`PullRequestFlowManager` 管理 Agent Canvas 内的 PR 审查与授权流程。它只控制流程状态、超时、审查 JSON 校验、重试和授权信号；具体 `git`/`gh` 命令、冲突处理、提交和合并操作都交给提 PR 的 agent 自行执行。
+`PullRequestFlowManager` manages PR review and authorization inside Agent Canvas. It only controls flow state, branch queueing, timeouts, review JSON validation, retries, and authorization signals. Concrete `git`/`gh` commands, conflict handling, pushing, PR creation, and merging are still performed by the proposer agent after authorization.
 
-流程可以由前端 PR 面板发起，也可以由提 PR 的 agent 自己发起。`agentCanvasPolicyPrompt` 会把 `POST /api/pr-flows` 的使用协议注入给每个 agent，因此用户在 agent 对话框里直接要求“提 PR”时，agent 应先调用该接口进入 Agent Canvas 审查流程。
+Flows can be created from the web PR panel or by an agent through `POST /api/pr-flows`, as described in the injected Agent Canvas workspace policy.
 
-每次审查请求都会包含具体变更文件。默认 server 通过 `WorkspaceManager.diffPullRequestFiles()` 计算 `git diff --name-status <target>...<source>` 并写入 `changedFiles`；如果发起流程时显式传入 `files`，则按这次 PR 的文件范围审查并补齐对应状态。无法确定任何变更文件时，后端会拒绝创建 PR flow。
+Each review request includes a concrete changed-file list. By default the server uses `WorkspaceManager.diffPullRequestFiles()` to compute `git diff --name-status <target>...<source>` and stores it as `changedFiles`. If the caller passes `files`, the flow reviews that explicit scope and fills in status from the resolved diff when available. If no changed files can be determined, the backend rejects the PR flow.
 
-每个 flow 创建时会记录 proposer agent 当前的 `sourceTurnIndex`。前端 PR 节点用这个字段固定连回发起 PR pipeline 的对话轮，避免 agent 继续运行后连线漂移到最新轮。
+## Queueing
 
-审查 prompt 的核心目标是让每个 reviewer 反馈“这个 PR 对我当前工作是否可接受”。源 branch agent 需要判断 PR 是否和自己正在做的部分冲突、是否应等当前工作完成后再提；目标 branch agent 需要判断合入是否会影响自己正在做的工作、实验或验证。若影响不可接受，应拒绝或要求修改，并在 JSON 的 `summary/risks/requiredChanges` 中说明。
+PR flows reserve both their `sourceBranch` and `targetBranch` while they are `queued` or active. If a new flow shares either branch with an existing queued or active flow, it enters `queued` and does not send review prompts yet.
 
-## 流程
+When a flow closes (`merged`, `cancelled`, `timed_out`, `source_review_failed`, `target_review_failed`, or `blocked`), the manager starts the oldest queued flow whose source and target branches are now free. This preserves FIFO ordering for all flows that share a source or target branch.
 
-1. 用户通过 `POST /api/pr-flows` 发起流程，指定提 PR 的 agent、目标 branch、概括和可选文件范围。
-2. 后端找到源 branch 上所有活跃 agent（`running` 或 `waiting_input`），发送 source preflight 审查请求。
-3. 审查 agent 必须输出固定 JSON。非法 JSON 会触发一次重试；重试后仍非法则记为 `blocked`。
-4. 全部源审查通过后，后端给提 PR agent 发出 `create_pr` 授权信号。该 agent 可自由处理冲突、更新源 branch、运行 `gh pr create` 等命令。
-5. 提 PR agent 创建 PR 后输出 `agentCanvasPrEvent: "pr_created"` JSON，或前端兜底调用 `POST /api/pr-flows/:id/pr-created`。
-6. 后端找到目标 branch 上所有活跃 agent，发送 target merge 审查请求。
-7. 全部目标审查通过后，后端给提 PR agent 发出 `merge_pr` 授权信号。该 agent 自行执行合并。
+## Flow
 
-任一审查阶段默认 10 分钟超时。超时后流程进入 `timed_out`，不再继续授权。
+1. The caller creates a PR flow with proposer agent, source branch, target branch, summary, and optional file scope.
+2. If the relevant branches are reserved, the flow becomes `queued`.
+3. Otherwise, active agents on the source branch receive a source preflight review request.
+4. Review agents must return the fixed JSON schema. Invalid JSON is retried once, then recorded as `blocked`.
+5. After all source reviews approve, the proposer receives `create_pr` authorization.
+6. After the proposer creates the GitHub PR, it reports `agentCanvasPrEvent: "pr_created"` or the UI calls `POST /api/pr-flows/:id/pr-created`.
+7. Active agents on the target branch receive a target merge review request.
+8. After all target reviews approve, the proposer receives `merge_pr` authorization.
 
-## Agent 输出协议
+Any review or authorization stage defaults to a 2 hour timeout. After timeout, the flow enters `timed_out`, no further authorization is granted, and the manager attempts to start the next queued flow for the affected branches.
 
-审查输出：
+## Agent Output Protocol
+
+Review output:
 
 ```json
 {
@@ -39,7 +42,7 @@
 }
 ```
 
-PR 创建输出：
+PR-created output:
 
 ```json
 {
@@ -52,7 +55,7 @@ PR 创建输出：
 }
 ```
 
-合并完成输出：
+Merge-complete output:
 
 ```json
 {
@@ -61,14 +64,8 @@ PR 创建输出：
 }
 ```
 
-## 测试
+## Tests
 
-`PullRequestFlowManager.test.ts` 使用 fake agent host 覆盖源审查通过、PR 创建、目标审查通过、合并授权、非法 JSON 重试失败和超时。
+`PullRequestFlowManager.test.ts` covers source review approval, PR creation, target review approval, merge authorization, invalid JSON retry failure, timeout behavior, branch queueing, queued branch reservation, and changed-file resolution.
 
-`PullRequestFlowManager.integration.test.ts` 会创建真实临时 git repo 和 bare remote，经 `WorkspaceManager` clone 出 `main`、`feature/pr-flow`、`feature/other` 三个 branch workspace，再启动多个 fake agent。测试覆盖：
-
-- 源 branch 多个活跃 agent 同时审查，`running` agent 走 steer，`waiting_input` agent 走 send。
-- 目标 branch 多个活跃 agent 在 PR 创建后审查。
-- 非相关 branch 的活跃 agent 不收到审查请求。
-- 目标审查中的非法 JSON 会触发重试，重试通过后才发合并授权。
-- 提 PR agent 输出 `pr_created` / `merged` JSON 后流程自动推进和闭合。
+`PullRequestFlowManager.integration.test.ts` creates a real temporary git repository and bare remote, uses `WorkspaceManager` to clone `main`, `feature/pr-flow`, and `feature/other`, starts multiple fake agents, and verifies review delivery across source and target branches.

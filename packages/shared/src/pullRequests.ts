@@ -9,6 +9,7 @@ export type PullRequestReviewDecision =
   | "blocked";
 
 export type PullRequestFlowStatus =
+  | "queued"
   | "source_review_collecting"
   | "source_review_failed"
   | "create_pr_authorized"
