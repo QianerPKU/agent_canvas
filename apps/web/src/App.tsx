@@ -25,8 +25,10 @@ import {
   X,
 } from "lucide-react";
 import { api } from "./api.js";
+import { CODEX_MODELS, DEFAULT_CODEX_MODEL } from "@agent-canvas/shared";
 import type {
   AgentCanvasSettings,
+  AgentCanvasConfig,
   AgentCommitSnapshot,
   BranchOption,
   BranchWorkspace,
@@ -618,6 +620,8 @@ export function buildNodes(
   savedLayout: CanvasNodeLayout[] = [],
   placementOverrides: NodePlacementOverrides = {},
   branches: BranchOption[] = [],
+  codexModels: readonly string[] = CODEX_MODELS,
+  defaultCodexModel: string = DEFAULT_CODEX_MODEL,
   onCreateBranch?: (branch: string, baseBranch?: string) => Promise<BranchWorkspace>,
 ): CanvasNode[] {
   const layout = computeLayout(agents);
@@ -662,6 +666,8 @@ export function buildNodes(
         onOpenHistory,
         onOpenSettings: isLatest ? onOpenAgentSettings : undefined,
         branches,
+        codexModels,
+        defaultCodexModel,
         onCreateBranch,
         actions,
       };
@@ -995,6 +1001,12 @@ export default function App(): React.ReactElement {
   const [appSettings, setAppSettings] = useState<AgentCanvasSettings>({
     fullPermissionMode: false,
   });
+  const [serverConfig, setServerConfig] = useState<AgentCanvasConfig>({
+    defaultCwd: "",
+    projectRoot: "",
+    codexModels: [...CODEX_MODELS],
+    defaultCodexModel: DEFAULT_CODEX_MODEL,
+  });
   const [agentSettingsTarget, setAgentSettingsTarget] = useState<AgentSettingsTarget>();
   const [projects, setProjects] = useState<CanvasProjectSummary[]>([]);
   const [workspace, setWorkspace] = useState<WorkspaceProject>();
@@ -1041,6 +1053,12 @@ export default function App(): React.ReactElement {
 
   useEffect(() => {
     let cancelled = false;
+    void api.config().then(
+      (config) => {
+        if (!cancelled) setServerConfig(config);
+      },
+      () => undefined,
+    );
     void api.settings().then(
       (settings) => {
         if (!cancelled) setAppSettings(settings);
@@ -1177,6 +1195,8 @@ export default function App(): React.ReactElement {
         savedLayout.nodes,
         pendingPlacements,
         branches,
+        serverConfig.codexModels,
+        serverConfig.defaultCodexModel,
         createBranch,
       ),
     );
@@ -1202,6 +1222,8 @@ export default function App(): React.ReactElement {
     fileActions,
     promptActions,
     branches,
+    serverConfig.codexModels,
+    serverConfig.defaultCodexModel,
     createBranch,
     openHistory,
     openAgentSettings,
@@ -1430,6 +1452,8 @@ export default function App(): React.ReactElement {
         <AgentSettingsDialog
           mode="create"
           branches={branches}
+          codexModels={serverConfig.codexModels}
+          defaultCodexModel={serverConfig.defaultCodexModel}
           onCreateBranch={createBranch}
           onCreate={async (settings) => {
             const id = await actions.create(settings);
@@ -1444,6 +1468,8 @@ export default function App(): React.ReactElement {
           mode="edit"
           agent={settingsAgent}
           branches={branches}
+          codexModels={serverConfig.codexModels}
+          defaultCodexModel={serverConfig.defaultCodexModel}
           canChangeBranch={
             settingsAgent.status === "idle" || settingsAgent.status === "waiting_input"
           }

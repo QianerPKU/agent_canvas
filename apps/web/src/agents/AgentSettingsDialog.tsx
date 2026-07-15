@@ -17,6 +17,8 @@ type AgentSettingsDialogProps =
   | {
       mode: "create";
       branches: BranchOption[];
+      codexModels?: readonly string[];
+      defaultCodexModel?: string;
       onCreate: (settings: AgentSettings) => Promise<void>;
       onCreateBranch: (branch: string, baseBranch?: string) => Promise<BranchWorkspace>;
       onClose: () => void;
@@ -25,6 +27,8 @@ type AgentSettingsDialogProps =
       mode: "edit";
       agent: AgentView;
       branches: BranchOption[];
+      codexModels?: readonly string[];
+      defaultCodexModel?: string;
       canChangeBranch: boolean;
       onCreateBranch: (branch: string, baseBranch?: string) => Promise<BranchWorkspace>;
       onUpdate: (
@@ -37,8 +41,12 @@ type AgentSettingsDialogProps =
 export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.ReactElement {
   const isCreate = props.mode === "create";
   const agent = props.mode === "edit" ? props.agent : undefined;
+  const codexModels = props.codexModels?.length ? props.codexModels : CODEX_MODELS;
+  const defaultCodexModel = props.defaultCodexModel ?? DEFAULT_CODEX_MODEL;
   const [provider, setProvider] = useState<AgentProvider>(agent?.provider ?? "claude");
-  const [codexModelValue, setCodexModelValue] = useState<CodexModel>(codexModel(agent?.model));
+  const [codexModelValue, setCodexModelValue] = useState<CodexModel>(
+    codexModel(agent?.model, codexModels, defaultCodexModel),
+  );
   const [claudeModel, setClaudeModel] = useState(
     agent?.provider === "claude" ? agent.model ?? "" : "",
   );
@@ -61,13 +69,13 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
   useEffect(() => {
     if (!isCreate && agent) {
       setProvider(agent.provider ?? "claude");
-      setCodexModelValue(codexModel(agent.model));
+      setCodexModelValue(codexModel(agent.model, codexModels, defaultCodexModel));
       setClaudeModel(agent.provider === "claude" ? agent.model ?? "" : "");
       setBranchName(agent.branch ?? "");
       setNewBranchBase(agent.branch ?? "");
       setSystemPrompt(agent.systemPrompt ?? "");
     }
-  }, [agent, isCreate]);
+  }, [agent, codexModels, defaultCodexModel, isCreate]);
 
   useEffect(() => {
     if (props.mode === "create" && !branchName && props.branches[0]) {
@@ -189,7 +197,7 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
               value={codexModelValue}
               onChange={(event) => setCodexModelValue(event.target.value as CodexModel)}
             >
-              {CODEX_MODELS.map((candidate) => (
+              {codexModels.map((candidate) => (
                 <option key={candidate} value={candidate}>
                   {candidate}
                 </option>
@@ -317,8 +325,12 @@ function Segmented({
   );
 }
 
-function codexModel(model: string | undefined): CodexModel {
-  return isCodexModel(model) ? model : DEFAULT_CODEX_MODEL;
+function codexModel(
+  model: string | undefined,
+  models: readonly string[],
+  defaultModel: string,
+): CodexModel {
+  return isCodexModel(model, models) ? model : defaultModel;
 }
 
 function selectedModel(

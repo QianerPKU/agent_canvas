@@ -33,11 +33,22 @@ export type AgentProvider = "claude" | "codex";
 
 /** Codex 当前在本项目 UI 中提供的模型。 */
 export const CODEX_MODELS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"] as const;
-export type CodexModel = (typeof CODEX_MODELS)[number];
+export type CodexModel = string;
 export const DEFAULT_CODEX_MODEL: CodexModel = "gpt-5.5";
 
-export function isCodexModel(model: string | undefined): model is CodexModel {
-  return CODEX_MODELS.some((candidate) => candidate === model);
+export function isCodexModel(
+  model: string | undefined,
+  models: readonly string[] = CODEX_MODELS,
+): model is CodexModel {
+  return !!model && models.some((candidate) => candidate === model);
+}
+
+export interface AgentCanvasConfig {
+  defaultCwd: string;
+  projectRoot: string;
+  codexModels: string[];
+  defaultCodexModel: string;
+  codexVersion?: string;
 }
 
 export interface AgentSettings {

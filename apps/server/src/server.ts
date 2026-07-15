@@ -5,6 +5,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import type {
   AgentApprovalResponse,
   AgentCanvasSettings,
+  AgentCanvasConfig,
   AgentFileAccess,
   AgentQuestionResponse,
   AgentPromptReference,
@@ -36,6 +37,7 @@ import type {
   UpdateCanvasPromptInput,
 } from "@agent-canvas/shared";
 import { AgentManager } from "./AgentManager.js";
+import { detectCodexModels, type CodexModelDetection } from "./codexModels.js";
 import { CommitManager } from "./commits/CommitManager.js";
 import { pickDirectory as defaultPickDirectory, type PickDirectory } from "./files/DirectoryPicker.js";
 import { FileManager } from "./files/FileManager.js";
@@ -66,6 +68,7 @@ export interface CreateServerOptions {
   pullRequestFlowManager?: PullRequestFlowManager;
   syncFlowManager?: SyncFlowManager;
   commitManager?: CommitManager;
+  codexModelDetection?: Promise<CodexModelDetection> | CodexModelDetection;
 }
 
 interface CanvasStateController {
@@ -88,6 +91,7 @@ export function createServer(
   options: CreateServerOptions = {},
 ): CreateServerResult {
   const defaultCwd = options.defaultCwd ?? process.cwd();
+  const codexModels = Promise.resolve(options.codexModelDetection ?? detectCodexModels());
   fileManager ??= new FileManager({
     workspaceRoot: defaultCwd,
   });
@@ -145,6 +149,7 @@ export function createServer(
       syncFlowManager,
       commitManager,
       defaultCwd,
+      codexModels,
       options.openFile ?? openFileInVscode,
       options.pickDirectory ?? defaultPickDirectory,
       canvasState,
@@ -222,6 +227,7 @@ async function handleHttp(
   syncFlowManager: SyncFlowManager,
   commitManager: CommitManager,
   defaultCwd: string,
+  codexModels: Promise<CodexModelDetection>,
   openFile: (filePath: string) => Promise<void>,
   pickDirectory: PickDirectory,
   canvasState: CanvasStateController,
@@ -244,7 +250,7 @@ async function handleHttp(
   }
 
   if (method === "GET" && path === "/api/config") {
-    return sendJson(res, 200, { defaultCwd, projectRoot: workspaceManager.root() });
+    return sendJson(res, 200, await serverConfig(defaultCwd, workspaceManager, codexModels));
   }
 
   if (method === "GET" && path === "/api/settings") {
@@ -971,6 +977,21 @@ function send(ws: WebSocket, frame: ServerFrame): void {
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+async function serverConfig(
+  defaultCwd: string,
+  workspaceManager: WorkspaceManager,
+  codexModels: Promise<CodexModelDetection>,
+): Promise<AgentCanvasConfig> {
+  const detected = await codexModels;
+  return {
+    defaultCwd,
+    projectRoot: workspaceManager.root(),
+    codexModels: detected.models,
+    defaultCodexModel: detected.defaultModel,
+    codexVersion: detected.version,
+  };
 }
 
 interface CanvasStateControllerDeps {

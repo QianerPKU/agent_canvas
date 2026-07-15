@@ -57,6 +57,8 @@ export interface TurnNodeData {
   onOpenHistory: (agentId: string, turnIndex: number) => void;
   onOpenSettings?: (agentId: string) => void;
   branches?: BranchOption[];
+  codexModels?: readonly string[];
+  defaultCodexModel?: string;
   onCreateBranch?: (branch: string, baseBranch?: string) => Promise<BranchWorkspace>;
   actions: AgentActions;
   [key: string]: unknown;
@@ -167,8 +169,12 @@ export function TurnNode({
   } = data;
   const reactFlow = useReactFlow<TurnNodeType>();
   const updateNodeInternals = useUpdateNodeInternals();
+  const codexModels = data.codexModels?.length ? data.codexModels : CODEX_MODELS;
+  const defaultCodexModel = data.defaultCodexModel ?? DEFAULT_CODEX_MODEL;
   const [text, setText] = useState("");
-  const [model, setModel] = useState<CodexModel>(codexModel(agentModel));
+  const [model, setModel] = useState<CodexModel>(
+    codexModel(agentModel, codexModels, defaultCodexModel),
+  );
   const [forkBranchName, setForkBranchName] = useState(
     data.agentBranch ?? data.branches?.[0]?.branch ?? "",
   );
@@ -230,8 +236,8 @@ export function TurnNode({
   }, [turn.lines.length]);
 
   useEffect(() => {
-    setModel(codexModel(agentModel));
-  }, [agentModel]);
+    setModel(codexModel(agentModel, codexModels, defaultCodexModel));
+  }, [agentModel, codexModels, defaultCodexModel]);
 
   useEffect(() => {
     if (forkBranches.length === 0) return;
@@ -630,6 +636,7 @@ export function TurnNode({
               <CodexModelSelect
                 ariaLabel="fork model"
                 value={model}
+                models={codexModels}
                 onChange={setModel}
               />
             )}
@@ -967,10 +974,12 @@ function NodeHandles({ resourceAccess }: { resourceAccess: boolean }): React.Rea
 function CodexModelSelect({
   ariaLabel,
   value,
+  models,
   onChange,
 }: {
   ariaLabel: string;
   value: CodexModel;
+  models: readonly string[];
   onChange: (model: CodexModel) => void;
 }): React.ReactElement {
   return (
@@ -980,7 +989,7 @@ function CodexModelSelect({
       onChange={(event) => onChange(event.target.value as CodexModel)}
       style={selectStyle}
     >
-      {CODEX_MODELS.map((candidate) => (
+      {models.map((candidate) => (
         <option key={candidate} value={candidate}>
           {candidate}
         </option>
@@ -989,8 +998,12 @@ function CodexModelSelect({
   );
 }
 
-function codexModel(model: string | undefined): CodexModel {
-  return isCodexModel(model) ? model : DEFAULT_CODEX_MODEL;
+function codexModel(
+  model: string | undefined,
+  models: readonly string[],
+  defaultModel: string,
+): CodexModel {
+  return isCodexModel(model, models) ? model : defaultModel;
 }
 
 function hasAnswer(value: string | string[] | undefined): boolean {

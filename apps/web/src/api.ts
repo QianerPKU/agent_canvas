@@ -2,6 +2,7 @@
 import type {
   AgentApprovalResponse,
   AgentCanvasSettings,
+  AgentCanvasConfig,
   AgentCommitSnapshot,
   AgentEventEnvelope,
   AgentQuestionResponse,
@@ -60,7 +61,7 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(input),
     }),
-  config: () => call<{ defaultCwd: string; projectRoot: string }>("/config"),
+  config: () => call<AgentCanvasConfig>("/config"),
   settings: () => call<AgentCanvasSettings>("/settings"),
   updateSettings: (input: Partial<AgentCanvasSettings>) =>
     call<AgentCanvasSettings>("/settings", {
