@@ -555,9 +555,24 @@ export class PullRequestFlowManager {
     ) {
       return;
     }
+    try {
+      await this.ensureBranchesReady?.({
+        proposerAgentId: next.proposerAgentId,
+        sourceBranch: next.sourceBranch,
+        targetBranch: next.targetBranch,
+      });
+    } catch (error) {
+      this.save({
+        ...next,
+        failureReason: `Queued PR flow is waiting for branch sync: ${errorMessage(error)}`,
+        updatedAt: this.now(),
+      });
+      return;
+    }
     this.save({
       ...next,
       status: "source_review_collecting",
+      failureReason: undefined,
       updatedAt: this.now(),
     });
     await this.startReviewStage(next.id, "source_preflight");
