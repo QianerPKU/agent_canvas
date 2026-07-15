@@ -164,7 +164,12 @@ export class AgentRunner {
     settings: Partial<
       Pick<
         AgentStartConfig,
-        "systemPrompt" | "branchWorkspaceId" | "branch" | "cwd" | "scratchDirectory"
+        | "systemPrompt"
+        | "branchWorkspaceId"
+        | "branch"
+        | "cwd"
+        | "scratchDirectory"
+        | "reasoningEffort"
       >
     > & { model?: string | null },
     pendingPrompt?: AgentPromptReference,
@@ -177,6 +182,13 @@ export class AgentRunner {
       const nextModel = settings.model ?? undefined;
       void this.handle?.setModel?.(nextModel).catch(() => undefined);
       if (!this.handle?.setModel && this.status === "waiting_input" && this.sessionId) {
+        this.detachIdleSessionForNextStart();
+      }
+    }
+    if (settings.reasoningEffort !== undefined && this.status !== "idle") {
+      const nextReasoningEffort = settings.reasoningEffort ?? undefined;
+      void this.handle?.setReasoningEffort?.(nextReasoningEffort).catch(() => undefined);
+      if (!this.handle?.setReasoningEffort && this.status === "waiting_input" && this.sessionId) {
         this.detachIdleSessionForNextStart();
       }
     }
@@ -756,7 +768,12 @@ function applySettings(
   settings: Partial<
     Pick<
       AgentStartConfig,
-      "systemPrompt" | "branchWorkspaceId" | "branch" | "cwd" | "scratchDirectory"
+      | "systemPrompt"
+      | "branchWorkspaceId"
+      | "branch"
+      | "cwd"
+      | "scratchDirectory"
+      | "reasoningEffort"
     >
   > & { model?: string | null },
 ): AgentStartConfig {
@@ -766,6 +783,8 @@ function applySettings(
   >) {
     if (key === "model" && value === null) {
       delete next.model;
+    } else if (key === "reasoningEffort" && value === null) {
+      delete next.reasoningEffort;
     } else if (value !== undefined) {
       next[key] = value as never;
     }

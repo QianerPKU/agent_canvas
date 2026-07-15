@@ -251,6 +251,7 @@ export class AgentManager {
     this.forkConfigs.set(runner.id, {
       provider: parentProvider,
       model: forkOptions.model ?? parentSnapshot.config?.model,
+      reasoningEffort: forkOptions.reasoningEffort ?? parentSnapshot.config?.reasoningEffort,
       cwd: forkOptions.cwd ?? parentCwd,
       branchWorkspaceId: forkOptions.branchWorkspaceId ?? parentBranchWorkspaceId,
       branch: forkOptions.branch ?? parentBranch,
@@ -441,6 +442,7 @@ function normalizeSettings(
   return {
     provider: settings.provider ?? "claude",
     model: settings.model,
+    reasoningEffort: settings.reasoningEffort,
     branchWorkspaceId: settings.branchWorkspaceId,
     branch: settings.branch,
     cwd: settings.cwd?.trim() || defaultCwd,
@@ -458,6 +460,10 @@ function applySettings(
   if (input.model !== undefined) {
     if (input.model === null) delete next.model;
     else next.model = input.model;
+  }
+  if (input.reasoningEffort !== undefined) {
+    if (input.reasoningEffort === null) delete next.reasoningEffort;
+    else next.reasoningEffort = input.reasoningEffort;
   }
   if (input.branchWorkspaceId !== undefined) next.branchWorkspaceId = input.branchWorkspaceId;
   if (input.branch !== undefined) next.branch = input.branch;

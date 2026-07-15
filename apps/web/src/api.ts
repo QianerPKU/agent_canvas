@@ -2,7 +2,9 @@
 import type {
   AgentApprovalResponse,
   AgentCanvasSettings,
+  AgentCanvasConfig,
   AgentCommitSnapshot,
+  CodexUsageSnapshot,
   AgentEventEnvelope,
   AgentQuestionResponse,
   AgentSettings,
@@ -60,7 +62,8 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(input),
     }),
-  config: () => call<{ defaultCwd: string; projectRoot: string }>("/config"),
+  config: () => call<AgentCanvasConfig>("/config"),
+  codexUsage: () => call<CodexUsageSnapshot>("/codex/usage"),
   settings: () => call<AgentCanvasSettings>("/settings"),
   updateSettings: (input: Partial<AgentCanvasSettings>) =>
     call<AgentCanvasSettings>("/settings", {

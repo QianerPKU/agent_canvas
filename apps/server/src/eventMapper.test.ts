@@ -167,7 +167,11 @@ describe("mapSdkMessage", () => {
       usage: {
         input_tokens: 100,
         output_tokens: 50,
+        total_tokens: 160,
+        reasoning_output_tokens: 5,
         cache_read_input_tokens: 10,
+        context_window: 128000,
+        context_tokens: 4096,
       },
     };
     expect(mapSdkMessage(msg)).toEqual([
@@ -182,8 +186,12 @@ describe("mapSdkMessage", () => {
         usage: {
           inputTokens: 100,
           outputTokens: 50,
+          totalTokens: 160,
+          reasoningOutputTokens: 5,
           cacheCreationInputTokens: undefined,
           cacheReadInputTokens: 10,
+          contextWindow: 128000,
+          contextTokens: 4096,
         },
       },
     ]);

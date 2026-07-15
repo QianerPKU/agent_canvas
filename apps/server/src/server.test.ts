@@ -190,6 +190,11 @@ describe("HTTP server", () => {
       promptManager,
       workspaceManager,
       syncFlowManager,
+      codexModelDetection: {
+        models: ["gpt-5.6", "gpt-5.5"],
+        defaultModel: "gpt-5.6",
+        version: "0.141.0",
+      },
       commitManager: new CommitManager({
         runGit: async (args) => {
           if (args[0] === "rev-parse") return "abcdef1234567890";
@@ -228,7 +233,7 @@ describe("HTTP server", () => {
 
   afterAll(async () => {
     await new Promise<void>((r) => server.close(() => r()));
-    await rm(root, { recursive: true, force: true });
+    await removeTempRoot(root);
   });
 
   it("GET /api/health → 200 ok", async () => {
@@ -239,7 +244,16 @@ describe("HTTP server", () => {
 
   it("exposes default cwd and directory picker", async () => {
     const config = await request(port, "GET", "/api/config");
-    expect(config).toEqual({ status: 200, json: { defaultCwd: root, projectRoot } });
+    expect(config).toEqual({
+      status: 200,
+      json: {
+        defaultCwd: root,
+        projectRoot,
+        codexModels: ["gpt-5.6", "gpt-5.5"],
+        defaultCodexModel: "gpt-5.6",
+        codexVersion: "0.141.0",
+      },
+    });
 
     const picked = await request(port, "POST", "/api/directories/pick", {
       initialDirectory: root,
@@ -853,3 +867,15 @@ describe("HTTP server", () => {
     expect(restoredLayout.json.nodes).toEqual(layout.json.nodes);
   });
 });
+
+async function removeTempRoot(root: string): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await rm(root, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (attempt === 4 || (error as NodeJS.ErrnoException).code !== "EBUSY") throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+}

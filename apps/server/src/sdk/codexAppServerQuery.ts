@@ -63,6 +63,7 @@ function createHandle(
   let threadId: string | undefined;
   let turnId: string | undefined;
   let currentModel = options?.model;
+  let currentReasoningEffort = stringValue(options?.reasoningEffort);
 
   const run = async function* (): AsyncGenerator<SdkMessage> {
     client = new CodexAppServerClient(deps, options?.requestUserInput, options?.requestApproval);
@@ -88,6 +89,7 @@ function createHandle(
         } else {
           const started = await client.request("turn/start", {
             ...turnOverrides(options, currentModel, next.value.fileAccess, next.value.promptAccess),
+            ...reasoningOverride(currentReasoningEffort),
             threadId,
             input: codexInputs(next.value),
           });
@@ -126,6 +128,9 @@ function createHandle(
     },
     setModel: async (model) => {
       currentModel = model;
+    },
+    setReasoningEffort: async (reasoningEffort) => {
+      currentReasoningEffort = stringValue(reasoningEffort);
     },
     terminate: async () => {
       client?.close();
@@ -195,6 +200,10 @@ function turnOverrides(
   );
   if (sandboxPolicy) params.sandboxPolicy = sandboxPolicy;
   return params;
+}
+
+function reasoningOverride(reasoningEffort: string): Record<string, unknown> {
+  return reasoningEffort ? { effort: reasoningEffort } : {};
 }
 
 function approvalPolicyFor(

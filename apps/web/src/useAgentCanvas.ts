@@ -278,6 +278,7 @@ export function useAgentCanvas(): UseAgentCanvas {
                 [id]: newAgentView(id, {
                   provider: settings.provider,
                   model: settings.model,
+                  reasoningEffort: settings.reasoningEffort,
                   branchWorkspaceId: settings.branchWorkspaceId,
                   branch: settings.branch,
                   cwd: settings.cwd,
@@ -294,6 +295,7 @@ export function useAgentCanvas(): UseAgentCanvas {
           recordAgentSettings(prev, agentId, {
             provider: snapshot.config.provider,
             model: snapshot.config.model,
+            reasoningEffort: snapshot.config.reasoningEffort,
             branchWorkspaceId: snapshot.config.branchWorkspaceId,
             branch: snapshot.config.branch,
             cwd: snapshot.config.cwd,
@@ -306,6 +308,7 @@ export function useAgentCanvas(): UseAgentCanvas {
         const view = agentsRef.current[agentId];
         const startProvider = view?.provider;
         const startModel = view?.model;
+        const startReasoningEffort = view?.reasoningEffort;
         // 首轮（idle）用 start（fork 出来的 agent 由后端合并 fork 配置）；续轮用 send
         if (!view || view.status === "idle") {
           setAgents((prev) => recordInput(prev, agentId, text, startProvider, startModel));
@@ -313,6 +316,7 @@ export function useAgentCanvas(): UseAgentCanvas {
             prompt: text,
             provider: startProvider,
             model: startModel,
+            reasoningEffort: startReasoningEffort,
             branchWorkspaceId: view?.branchWorkspaceId,
             branch: view?.branch,
             cwd: view?.cwd,

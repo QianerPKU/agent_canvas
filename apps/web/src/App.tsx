@@ -25,8 +25,10 @@ import {
   X,
 } from "lucide-react";
 import { api } from "./api.js";
+import { CODEX_MODELS, DEFAULT_CODEX_MODEL } from "@agent-canvas/shared";
 import type {
   AgentCanvasSettings,
+  AgentCanvasConfig,
   AgentCommitSnapshot,
   BranchOption,
   BranchWorkspace,
@@ -37,6 +39,7 @@ import type {
   CanvasFileNode,
   CanvasPromptConnection,
   CanvasPromptNode,
+  CodexUsageSnapshot,
   WorkspaceProject,
   PullRequestFlowSnapshot,
   SyncFlowSnapshot,
@@ -618,6 +621,8 @@ export function buildNodes(
   savedLayout: CanvasNodeLayout[] = [],
   placementOverrides: NodePlacementOverrides = {},
   branches: BranchOption[] = [],
+  codexModels: readonly string[] = CODEX_MODELS,
+  defaultCodexModel: string = DEFAULT_CODEX_MODEL,
   onCreateBranch?: (branch: string, baseBranch?: string) => Promise<BranchWorkspace>,
 ): CanvasNode[] {
   const layout = computeLayout(agents);
@@ -656,12 +661,15 @@ export function buildNodes(
         agentCwd: view.cwd,
         provider: view.provider,
         model: view.model,
+        reasoningEffort: view.reasoningEffort,
         providerLocked: !!view.forkOrigin,
         isLatest,
         windowState,
         onOpenHistory,
         onOpenSettings: isLatest ? onOpenAgentSettings : undefined,
         branches,
+        codexModels,
+        defaultCodexModel,
         onCreateBranch,
         actions,
       };
@@ -995,6 +1003,14 @@ export default function App(): React.ReactElement {
   const [appSettings, setAppSettings] = useState<AgentCanvasSettings>({
     fullPermissionMode: false,
   });
+  const [codexUsage, setCodexUsage] = useState<CodexUsageSnapshot>();
+  const [codexUsageError, setCodexUsageError] = useState<string>();
+  const [serverConfig, setServerConfig] = useState<AgentCanvasConfig>({
+    defaultCwd: "",
+    projectRoot: "",
+    codexModels: [...CODEX_MODELS],
+    defaultCodexModel: DEFAULT_CODEX_MODEL,
+  });
   const [agentSettingsTarget, setAgentSettingsTarget] = useState<AgentSettingsTarget>();
   const [projects, setProjects] = useState<CanvasProjectSummary[]>([]);
   const [workspace, setWorkspace] = useState<WorkspaceProject>();
@@ -1041,6 +1057,12 @@ export default function App(): React.ReactElement {
 
   useEffect(() => {
     let cancelled = false;
+    void api.config().then(
+      (config) => {
+        if (!cancelled) setServerConfig(config);
+      },
+      () => undefined,
+    );
     void api.settings().then(
       (settings) => {
         if (!cancelled) setAppSettings(settings);
@@ -1056,6 +1078,19 @@ export default function App(): React.ReactElement {
     const updated = await api.updateSettings(settings);
     setAppSettings(updated);
   }, []);
+
+  const refreshCodexUsage = useCallback(async () => {
+    setCodexUsageError(undefined);
+    try {
+      setCodexUsage(await api.codexUsage());
+    } catch (error) {
+      setCodexUsageError(error instanceof Error ? error.message : String(error));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (showingSettings) void refreshCodexUsage();
+  }, [refreshCodexUsage, showingSettings]);
 
   const refreshBranchOptions = useCallback(async () => {
     const nextBranches = await api.listBranchOptions();
@@ -1177,6 +1212,8 @@ export default function App(): React.ReactElement {
         savedLayout.nodes,
         pendingPlacements,
         branches,
+        serverConfig.codexModels,
+        serverConfig.defaultCodexModel,
         createBranch,
       ),
     );
@@ -1202,6 +1239,8 @@ export default function App(): React.ReactElement {
     fileActions,
     promptActions,
     branches,
+    serverConfig.codexModels,
+    serverConfig.defaultCodexModel,
     createBranch,
     openHistory,
     openAgentSettings,
@@ -1430,6 +1469,8 @@ export default function App(): React.ReactElement {
         <AgentSettingsDialog
           mode="create"
           branches={branches}
+          codexModels={serverConfig.codexModels}
+          defaultCodexModel={serverConfig.defaultCodexModel}
           onCreateBranch={createBranch}
           onCreate={async (settings) => {
             const id = await actions.create(settings);
@@ -1444,6 +1485,8 @@ export default function App(): React.ReactElement {
           mode="edit"
           agent={settingsAgent}
           branches={branches}
+          codexModels={serverConfig.codexModels}
+          defaultCodexModel={serverConfig.defaultCodexModel}
           canChangeBranch={
             settingsAgent.status === "idle" || settingsAgent.status === "waiting_input"
           }
@@ -1482,7 +1525,10 @@ export default function App(): React.ReactElement {
       {showingSettings && (
         <AppSettingsDialog
           settings={appSettings}
+          codexUsage={codexUsage}
+          codexUsageError={codexUsageError}
           onUpdate={updateAppSettings}
+          onRefreshCodexUsage={refreshCodexUsage}
           onClose={() => setShowingSettings(false)}
         />
       )}
@@ -1717,20 +1763,35 @@ function RepoConnectGate({
 
 function AppSettingsDialog({
   settings,
+  codexUsage,
+  codexUsageError,
   onUpdate,
+  onRefreshCodexUsage,
   onClose,
 }: {
   settings: AgentCanvasSettings;
+  codexUsage?: CodexUsageSnapshot;
+  codexUsageError?: string;
   onUpdate: (settings: Partial<AgentCanvasSettings>) => Promise<void>;
+  onRefreshCodexUsage: () => Promise<void>;
   onClose: () => void;
 }): React.ReactElement {
   const [busy, setBusy] = useState(false);
+  const [usageBusy, setUsageBusy] = useState(false);
   const toggleFullPermission = async (fullPermissionMode: boolean) => {
     setBusy(true);
     try {
       await onUpdate({ fullPermissionMode });
     } finally {
       setBusy(false);
+    }
+  };
+  const refreshUsage = async () => {
+    setUsageBusy(true);
+    try {
+      await onRefreshCodexUsage();
+    } finally {
+      setUsageBusy(false);
     }
   };
   return (
@@ -1757,7 +1818,60 @@ function AppSettingsDialog({
             <small>开启后所有授权请求由后端直接允许，不再等待前端审批。</small>
           </span>
         </label>
+        <section className="settings-panel">
+          <div className="settings-panel__header">
+            <strong>Codex 用量</strong>
+            <button type="button" disabled={usageBusy} onClick={() => void refreshUsage()}>
+              刷新
+            </button>
+          </div>
+          {codexUsageError ? (
+            <div className="file-dialog__error">{codexUsageError}</div>
+          ) : (
+            <dl className="settings-metrics">
+              <div>
+                <dt>累计 token</dt>
+                <dd>{formatMetric(codexUsage?.tokenUsage?.lifetimeTokens)}</dd>
+              </div>
+              <div>
+                <dt>单日峰值</dt>
+                <dd>{formatMetric(codexUsage?.tokenUsage?.peakDailyTokens)}</dd>
+              </div>
+              <div>
+                <dt>连续使用</dt>
+                <dd>{formatMetric(codexUsage?.tokenUsage?.currentStreakDays, " 天")}</dd>
+              </div>
+              <div>
+                <dt>限额</dt>
+                <dd>{rateLimitSummary(codexUsage?.rateLimits)}</dd>
+              </div>
+            </dl>
+          )}
+        </section>
       </section>
     </div>
   );
+}
+
+function formatMetric(value: number | null | undefined, suffix = ""): string {
+  if (value === null || value === undefined) return "未知";
+  return `${value.toLocaleString()}${suffix}`;
+}
+
+function rateLimitSummary(value: unknown): string {
+  const limits = value as
+    | {
+        rateLimits?: {
+          primary?: { usedPercent?: number | null } | null;
+          secondary?: { usedPercent?: number | null } | null;
+        };
+      }
+    | undefined;
+  const primary = limits?.rateLimits?.primary?.usedPercent;
+  const secondary = limits?.rateLimits?.secondary?.usedPercent;
+  const parts = [
+    typeof primary === "number" ? `primary ${primary}%` : undefined,
+    typeof secondary === "number" ? `secondary ${secondary}%` : undefined,
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(" / ") : "未知";
 }

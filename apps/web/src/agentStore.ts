@@ -20,6 +20,7 @@ import type {
   AgentSnapshot,
   AgentStatus,
   AgentTurnContext,
+  UsageInfo,
   ForkAgentInput,
   ForkOrigin,
 } from "@agent-canvas/shared";
@@ -66,6 +67,7 @@ export interface Turn {
   /** fork 锚点：该轮最后一条 assistant 消息 uuid。 */
   anchorUuid?: string;
   costUsd?: number;
+  usage?: UsageInfo;
 }
 
 export interface AgentView {
@@ -73,6 +75,7 @@ export interface AgentView {
   provider?: AgentProvider;
   sessionId?: string;
   model?: string;
+  reasoningEffort?: string;
   branchWorkspaceId?: string;
   branch?: string;
   cwd?: string;
@@ -113,6 +116,7 @@ export function applyHello(
       status: a.status,
       sessionId: a.sessionId,
       model: a.config.model,
+      reasoningEffort: a.config.reasoningEffort,
       branchWorkspaceId: a.config.branchWorkspaceId,
       branch: a.config.branch,
       cwd: a.config.cwd,
@@ -132,6 +136,7 @@ export function applyHello(
       status: a.status,
       sessionId: a.sessionId,
       model: a.config.model,
+      reasoningEffort: a.config.reasoningEffort,
       branchWorkspaceId: a.config.branchWorkspaceId,
       branch: a.config.branch,
       cwd: a.config.cwd,
@@ -159,6 +164,7 @@ export function insertForked(
     [id]: newAgentView(id, {
       provider: parent?.provider,
       model: options.model ?? parent?.model,
+      reasoningEffort: options.reasoningEffort ?? parent?.reasoningEffort,
       branchWorkspaceId: options.branchWorkspaceId ?? parent?.branchWorkspaceId,
       branch: options.branch ?? parent?.branch,
       cwd: options.cwd ?? parent?.cwd,
@@ -176,12 +182,16 @@ export function recordAgentSettings(
 ): AgentMap {
   const prev = map[agentId] ?? newAgentView(agentId);
   const hasModel = Object.prototype.hasOwnProperty.call(settings, "model");
+  const hasReasoningEffort = Object.prototype.hasOwnProperty.call(settings, "reasoningEffort");
   return {
     ...map,
     [agentId]: {
       ...prev,
       provider: settings.provider ?? prev.provider,
       model: hasModel ? settings.model ?? undefined : prev.model,
+      reasoningEffort: hasReasoningEffort
+        ? settings.reasoningEffort ?? undefined
+        : prev.reasoningEffort,
       branchWorkspaceId: settings.branchWorkspaceId ?? prev.branchWorkspaceId,
       branch: settings.branch ?? prev.branch,
       cwd: settings.cwd ?? prev.cwd,
@@ -324,6 +334,7 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
         status: event.isError ? "error" : "done",
         anchorUuid: event.anchorUuid ?? t.anchorUuid,
         costUsd: event.costUsd ?? t.costUsd,
+        usage: event.usage ?? t.usage,
         lines: pushLine(t.lines, { kind: "result", text: `本轮完成 · ${event.subtype}${cost}` }),
       }));
       // 自动延伸一个新的 idle 轮（待输入节点）

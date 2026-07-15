@@ -148,8 +148,12 @@ function mapUsage(u: SdkUsage | undefined): UsageInfo | undefined {
   return {
     inputTokens: u.input_tokens,
     outputTokens: u.output_tokens,
+    totalTokens: u.total_tokens,
+    reasoningOutputTokens: u.reasoning_output_tokens,
     cacheCreationInputTokens: u.cache_creation_input_tokens,
     cacheReadInputTokens: u.cache_read_input_tokens,
+    contextWindow: u.context_window,
+    contextTokens: u.context_tokens,
   };
 }
 

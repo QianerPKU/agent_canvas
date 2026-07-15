@@ -85,8 +85,12 @@ export interface SdkUserMessage {
 export interface SdkUsage {
   input_tokens?: number;
   output_tokens?: number;
+  total_tokens?: number;
+  reasoning_output_tokens?: number;
   cache_creation_input_tokens?: number;
   cache_read_input_tokens?: number;
+  context_window?: number;
+  context_tokens?: number;
 }
 export interface SdkResultMessage {
   type: "result";
@@ -140,6 +144,7 @@ export type QueryPrompt = string | AsyncIterable<SdkUserInput>;
 export interface QueryOptions {
   cwd?: string;
   model?: string;
+  reasoningEffort?: string;
   systemPrompt?: string | { type: "preset"; preset: string; append?: string };
   allowedTools?: string[];
   permissionMode?: string;
@@ -162,6 +167,8 @@ export interface QueryHandle extends AsyncIterable<SdkMessage> {
   steer?(input: SdkUserInput): Promise<void>;
   /** Change the model used by later provider responses when the transport supports it. */
   setModel?(model?: string): Promise<void>;
+  /** Change Codex reasoning effort used by later provider responses when supported. */
+  setReasoningEffort?(reasoningEffort?: string): Promise<void>;
   /** 关闭底层 CLI / transport，不再保留会话进程。 */
   terminate?(): Promise<void>;
 }

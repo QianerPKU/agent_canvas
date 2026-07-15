@@ -5,6 +5,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import type {
   AgentApprovalResponse,
   AgentCanvasSettings,
+  AgentCanvasConfig,
   AgentFileAccess,
   AgentQuestionResponse,
   AgentPromptReference,
@@ -36,6 +37,8 @@ import type {
   UpdateCanvasPromptInput,
 } from "@agent-canvas/shared";
 import { AgentManager } from "./AgentManager.js";
+import { detectCodexModels, type CodexModelDetection } from "./codexModels.js";
+import { readCodexUsage } from "./codexUsage.js";
 import { CommitManager } from "./commits/CommitManager.js";
 import { pickDirectory as defaultPickDirectory, type PickDirectory } from "./files/DirectoryPicker.js";
 import { FileManager } from "./files/FileManager.js";
@@ -66,6 +69,7 @@ export interface CreateServerOptions {
   pullRequestFlowManager?: PullRequestFlowManager;
   syncFlowManager?: SyncFlowManager;
   commitManager?: CommitManager;
+  codexModelDetection?: Promise<CodexModelDetection> | CodexModelDetection;
 }
 
 interface CanvasStateController {
@@ -88,6 +92,7 @@ export function createServer(
   options: CreateServerOptions = {},
 ): CreateServerResult {
   const defaultCwd = options.defaultCwd ?? process.cwd();
+  const codexModels = Promise.resolve(options.codexModelDetection ?? detectCodexModels());
   fileManager ??= new FileManager({
     workspaceRoot: defaultCwd,
   });
@@ -147,6 +152,7 @@ export function createServer(
       syncFlowManager,
       commitManager,
       defaultCwd,
+      codexModels,
       options.openFile ?? openFileInVscode,
       options.pickDirectory ?? defaultPickDirectory,
       canvasState,
@@ -224,6 +230,7 @@ async function handleHttp(
   syncFlowManager: SyncFlowManager,
   commitManager: CommitManager,
   defaultCwd: string,
+  codexModels: Promise<CodexModelDetection>,
   openFile: (filePath: string) => Promise<void>,
   pickDirectory: PickDirectory,
   canvasState: CanvasStateController,
@@ -246,7 +253,15 @@ async function handleHttp(
   }
 
   if (method === "GET" && path === "/api/config") {
-    return sendJson(res, 200, { defaultCwd, projectRoot: workspaceManager.root() });
+    return sendJson(res, 200, await serverConfig(defaultCwd, workspaceManager, codexModels));
+  }
+
+  if (method === "GET" && path === "/api/codex/usage") {
+    try {
+      return sendJson(res, 200, await readCodexUsage());
+    } catch (error) {
+      return sendJson(res, 503, { error: errMsg(error) });
+    }
   }
 
   if (method === "GET" && path === "/api/settings") {
@@ -879,6 +894,7 @@ async function handleHttp(
                 branch: body.branch,
                 cwd: body.cwd,
                 scratchDirectory: body.scratchDirectory,
+                reasoningEffort: body.reasoningEffort,
               },
               defaultCwd,
               true,
@@ -886,6 +902,7 @@ async function handleHttp(
           : undefined;
         const forked = manager.fork(id, body.anchorUuid, {
           model: body.model,
+          reasoningEffort: body.reasoningEffort,
           branchWorkspaceId: branchSettings?.branchWorkspaceId,
           branch: branchSettings?.branch,
           cwd: branchSettings?.cwd,
@@ -982,6 +999,21 @@ function send(ws: WebSocket, frame: ServerFrame): void {
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+async function serverConfig(
+  defaultCwd: string,
+  workspaceManager: WorkspaceManager,
+  codexModels: Promise<CodexModelDetection>,
+): Promise<AgentCanvasConfig> {
+  const detected = await codexModels;
+  return {
+    defaultCwd,
+    projectRoot: workspaceManager.root(),
+    codexModels: detected.models,
+    defaultCodexModel: detected.defaultModel,
+    codexVersion: detected.version,
+  };
 }
 
 interface CanvasStateControllerDeps {
@@ -1199,6 +1231,7 @@ function normalizeAgentSettings(
   return {
     provider,
     model: input?.model?.trim() || undefined,
+    reasoningEffort: input?.reasoningEffort?.trim() || undefined,
     branchWorkspaceId: input?.branchWorkspaceId,
     branch: input?.branch,
     cwd: input?.cwd?.trim() || defaultCwd,
@@ -1214,6 +1247,10 @@ function settingsForWorkspaceResolution(
   return {
     provider: currentConfig?.provider,
     model: input?.model === null ? undefined : input?.model ?? currentConfig?.model,
+    reasoningEffort:
+      input?.reasoningEffort === null
+        ? undefined
+        : input?.reasoningEffort ?? currentConfig?.reasoningEffort,
     branchWorkspaceId: input?.branchWorkspaceId ?? currentConfig?.branchWorkspaceId,
     branch: input?.branch ?? currentConfig?.branch,
     cwd: input?.cwd ?? currentConfig?.cwd,
