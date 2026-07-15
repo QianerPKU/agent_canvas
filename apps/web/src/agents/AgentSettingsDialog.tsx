@@ -44,7 +44,7 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
   const agent = props.mode === "edit" ? props.agent : undefined;
   const codexModels = props.codexModels?.length ? props.codexModels : CODEX_MODELS;
   const defaultCodexModel = props.defaultCodexModel ?? DEFAULT_CODEX_MODEL;
-  const [provider, setProvider] = useState<AgentProvider>(agent?.provider ?? "claude");
+  const [provider, setProvider] = useState<AgentProvider>(agent?.provider ?? "codex");
   const [codexModelValue, setCodexModelValue] = useState<CodexModel>(
     codexModel(agent?.model, codexModels, defaultCodexModel),
   );
@@ -103,6 +103,7 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
+    if (creatingBranch) return;
     setSubmitting(true);
     setError("");
     const reasoningEffortUpdate = codexReasoningEffortUpdate(
@@ -195,10 +196,7 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
           <Segmented
             value={provider}
             disabled={!isCreate}
-            options={[
-              ["claude", "Claude Code"],
-              ["codex", "Codex"],
-            ]}
+            options={isCreate ? [["codex", "Codex"]] : providerOptionsFor(agent?.provider)}
             onChange={(value) => setProvider(value as AgentProvider)}
           />
         </fieldset>
@@ -319,7 +317,7 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
           <button
             type="submit"
             className="file-dialog__primary"
-            disabled={submitting || (isCreate && !branchName)}
+            disabled={submitting || creatingBranch || (isCreate && !branchName)}
           >
             {isCreate ? "创建" : "保存"}
           </button>
@@ -363,6 +361,12 @@ function codexModel(
   defaultModel: string,
 ): CodexModel {
   return isCodexModel(model, models) ? model : defaultModel;
+}
+
+function providerOptionsFor(provider: AgentProvider | undefined): Array<[AgentProvider, string]> {
+  return provider === "claude"
+    ? [["claude", "Claude Code"]]
+    : [["codex", "Codex"]];
 }
 
 function selectedModel(

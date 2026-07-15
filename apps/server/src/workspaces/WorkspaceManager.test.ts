@@ -183,6 +183,65 @@ describe("WorkspaceManager", () => {
     }
   });
 
+  it("requires PR source branches to include the latest target branch", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-pr-ready-"));
+    const source = path.join(root, "source-repo");
+    const projectRoot = path.join(root, "project");
+    await mkdir(source, { recursive: true });
+    const calls: string[][] = [];
+    let sourceIncludesTarget = true;
+
+    const runGit: GitRunner = async (args, options) => {
+      calls.push(args.map(String));
+      if (args[0] === "remote") return "https://github.com/acme/demo.git";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      if (args[0] === "fetch") return "";
+      if (args[0] === "merge-base") {
+        if (sourceIncludesTarget) return "";
+        throw new Error("not ancestor");
+      }
+      return "";
+    };
+
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: source,
+        projectRoot,
+        runGit,
+      });
+      await manager.connect({ localPath: source });
+
+      await expect(
+        manager.ensurePullRequestBranchesReady("feature/a", "main"),
+      ).resolves.toBeUndefined();
+      expect(calls).toContainEqual([
+        "fetch",
+        "origin",
+        "+refs/heads/main:refs/remotes/origin/main",
+      ]);
+      expect(calls).toContainEqual([
+        "merge-base",
+        "--is-ancestor",
+        "origin/main",
+        "feature/a",
+      ]);
+
+      sourceIncludesTarget = false;
+      await expect(
+        manager.ensurePullRequestBranchesReady("feature/a", "main"),
+      ).rejects.toThrow("pull, merge, or rebase main into feature/a");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("maps one read-write shared resource into every real git branch worktree", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-real-git-"));
     const source = path.join(root, "source-repo");

@@ -216,6 +216,11 @@ function PullRequestFlowRow({
         </div>
       )}
       <footer>
+        {flow.status === "queued" && (
+          <button disabled={busy} onClick={() => void actions.retry(flow.id)}>
+            重试
+          </button>
+        )}
         {flow.status === "merge_authorized" && (
           <button disabled={busy} onClick={() => void actions.recordMerged(flow.id)}>
             已合并
@@ -255,6 +260,7 @@ function isClosed(status: PullRequestFlowSnapshot["status"]): boolean {
 
 function statusLabel(status: PullRequestFlowSnapshot["status"]): string {
   const labels: Record<PullRequestFlowSnapshot["status"], string> = {
+    queued: "排队中",
     source_review_collecting: "源审查",
     source_review_failed: "源拒绝",
     create_pr_authorized: "可提 PR",

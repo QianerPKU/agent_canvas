@@ -127,6 +127,7 @@ export interface PullRequestActions {
   create: (input: CreatePullRequestFlowInput) => Promise<void>;
   recordCreated: (id: string, input: PullRequestCreatedInput) => Promise<void>;
   recordMerged: (id: string) => Promise<void>;
+  retry: (id: string) => Promise<void>;
   cancel: (id: string) => Promise<void>;
 }
 
@@ -431,6 +432,10 @@ export function useAgentCanvas(): UseAgentCanvas {
       },
       recordMerged: async (id) => {
         const flow = await api.recordPullRequestMerged(id);
+        setPrFlows((current) => upsertFlow(current, flow));
+      },
+      retry: async (id) => {
+        const flow = await api.retryPullRequestFlow(id);
         setPrFlows((current) => upsertFlow(current, flow));
       },
       cancel: async (id) => {

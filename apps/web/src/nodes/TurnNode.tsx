@@ -509,7 +509,7 @@ export function TurnNode({
 
       {/* 控制区 */}
       <div
-        className="nodrag"
+        className="nodrag nowheel"
         onClick={(event) => event.stopPropagation()}
         style={{ padding: 10, display: "flex", flexDirection: "column", gap: 6 }}
       >
@@ -742,7 +742,7 @@ function QuestionLine({
 
   return (
     <div
-      className="nodrag"
+      className="nodrag nowheel"
       style={questionPanelStyle}
       onClick={(event) => event.stopPropagation()}
     >
@@ -819,7 +819,7 @@ function ApprovalLine({
   };
   return (
     <div
-      className="nodrag"
+      className="nodrag nowheel"
       style={approvalPanelStyle}
       onClick={(event) => event.stopPropagation()}
     >
