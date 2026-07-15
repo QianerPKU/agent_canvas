@@ -259,11 +259,18 @@ function toolResult(
 
 function mapUsage(tokenUsage: Record<string, unknown> | undefined): SdkUsage | undefined {
   const last = asRecord(tokenUsage?.last);
+  const total = asRecord(tokenUsage?.total);
   if (!last) return undefined;
   return {
     input_tokens: numberValue(last.inputTokens),
     output_tokens: numberValue(last.outputTokens),
+    total_tokens: numberValue(last.totalTokens),
+    reasoning_output_tokens: numberValue(last.reasoningOutputTokens),
     cache_read_input_tokens: numberValue(last.cachedInputTokens),
+    context_window: numberValue(tokenUsage?.modelContextWindow),
+    context_tokens:
+      numberValue(total?.totalTokens) ??
+      numberValue(last.totalTokens),
   };
 }
 

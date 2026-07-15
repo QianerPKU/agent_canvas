@@ -34,6 +34,7 @@ describe("PullRequestDialog", () => {
       create: vi.fn().mockResolvedValue(undefined),
       recordCreated: vi.fn().mockResolvedValue(undefined),
       recordMerged: vi.fn().mockResolvedValue(undefined),
+      retry: vi.fn().mockResolvedValue(undefined),
       cancel: vi.fn().mockResolvedValue(undefined),
     };
 

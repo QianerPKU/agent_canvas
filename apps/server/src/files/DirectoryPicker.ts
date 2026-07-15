@@ -20,12 +20,25 @@ Add-Type -AssemblyName System.Windows.Forms
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
 $dialog.Description = '选择目录'
 $dialog.ShowNewFolderButton = $true
+$owner = New-Object System.Windows.Forms.Form
+$owner.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+$owner.Width = 1
+$owner.Height = 1
+$owner.ShowInTaskbar = $false
+$owner.TopMost = $true
 if (${selectedPath}.Length -gt 0 -and [System.IO.Directory]::Exists(${selectedPath})) {
   $dialog.SelectedPath = ${selectedPath}
 }
-$result = $dialog.ShowDialog()
-if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
-  [Console]::WriteLine($dialog.SelectedPath)
+try {
+  $owner.Show()
+  $owner.Activate()
+  $result = $dialog.ShowDialog($owner)
+  if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+    [Console]::WriteLine($dialog.SelectedPath)
+  }
+} finally {
+  $owner.Dispose()
+  $dialog.Dispose()
 }
 `;
   return new Promise((resolve, reject) => {

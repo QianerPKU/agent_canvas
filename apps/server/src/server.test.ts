@@ -227,6 +227,11 @@ describe("HTTP server", () => {
       workspaceManager,
       syncFlowManager,
       codexAuthManager: new FakeCodexAuthManager(),
+      codexModelDetection: {
+        models: ["gpt-5.6", "gpt-5.5"],
+        defaultModel: "gpt-5.6",
+        version: "0.141.0",
+      },
       commitManager: new CommitManager({
         runGit: async (args) => {
           if (args[0] === "rev-parse") return "abcdef1234567890";
@@ -276,7 +281,16 @@ describe("HTTP server", () => {
 
   it("exposes default cwd and directory picker", async () => {
     const config = await request(port, "GET", "/api/config");
-    expect(config).toEqual({ status: 200, json: { defaultCwd: root, projectRoot } });
+    expect(config).toEqual({
+      status: 200,
+      json: {
+        defaultCwd: root,
+        projectRoot,
+        codexModels: ["gpt-5.6", "gpt-5.5"],
+        defaultCodexModel: "gpt-5.6",
+        codexVersion: "0.141.0",
+      },
+    });
 
     const picked = await request(port, "POST", "/api/directories/pick", {
       initialDirectory: root,
@@ -920,7 +934,7 @@ async function removeTempRoot(target: string): Promise<void> {
       return;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EBUSY" || attempt === 4) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }
 }

@@ -7,7 +7,7 @@
 
 - 一个 agent = 一条**轮次链**。普通轮次 = 一次用户输入 + 一次完整答复，以 `result` 收尾；手动 compact 也单独记为一轮，自动 compact 只作为当前运行轮中的系统记录。
 - 一轮完成后**自动延伸出一个 idle 轮**（"待输入"节点）；在它里面输入下一轮指令即续接。
-- 首轮 idle 节点可选择 provider：`Claude` 或 `Codex`。Codex 可选择 `gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`，默认 `gpt-5.5`。
+- 首轮 idle 节点可选择 provider：`Claude` 或 `Codex`。Codex 模型选项由后端根据本机 Codex CLI 版本检测后提供；检测失败时回退到内置列表。
 - 每个**完成**轮上有 **⑂ fork 按钮** → 从该轮的对话状态分叉出一个独立新 agent（连一条 fork 线），形成对话树。Codex fork 可在分叉时选择模型；fork 控件也可选择已有 branch，或先从指定 base branch 新建目标 branch 再 fork 到那里。
 
 ## 模块

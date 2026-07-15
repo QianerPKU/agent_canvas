@@ -396,6 +396,30 @@ describe("Codex app-server query", () => {
     await handle.terminate?.();
   });
 
+  it("setReasoningEffort updates the effort sent with later turn/start requests", async () => {
+    const fake = makeFakeSpawn();
+    const prompt = new AsyncMessageQueue<SdkUserInput>();
+    prompt.push(userInput("first"));
+
+    const handle = createCodexAppServerQuery({ spawnFn: fake.spawnFn })({
+      prompt,
+      options: { reasoningEffort: "low" },
+    });
+    const iterator = handle[Symbol.asyncIterator]();
+    await iterator.next();
+    await iterator.next();
+
+    await handle.setReasoningEffort?.("high");
+    prompt.push(userInput("second"));
+    await iterator.next();
+
+    const turnStarts = fake.messages.filter((message) => message.method === "turn/start");
+    expect(turnStarts[0]?.params?.effort).toBe("low");
+    expect(turnStarts[1]?.params?.effort).toBe("high");
+
+    await handle.terminate?.();
+  });
+
   it("将 Codex requestUserInput 转发给前端处理器并回写 answers", async () => {
     const fake = makeFakeSpawn({ completeTurnStart: false });
     const prompt = new AsyncMessageQueue<SdkUserInput>();

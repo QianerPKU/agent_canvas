@@ -10,6 +10,11 @@
       "name": "Git",
       "commands": ["git"],
       "reason": "clones repositories, creates branch worktrees, reads diffs, and records commits"
+    },
+    {
+      "name": "GitHub CLI",
+      "commands": ["gh"],
+      "reason": "creates and merges GitHub pull requests after Agent Canvas PR flow authorization; run gh auth login after installation"
     }
   ],
   "recommendedLinux": [
@@ -34,11 +39,6 @@
       "name": "Claude Code / Claude CLI",
       "commands": ["claude"],
       "reason": "required when creating Claude Code agents, unless ANTHROPIC_API_KEY is configured"
-    },
-    {
-      "name": "GitHub CLI",
-      "commands": ["gh"],
-      "reason": "useful for agent-managed PR creation and merging"
     },
     {
       "name": "VS Code CLI",

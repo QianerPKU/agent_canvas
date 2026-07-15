@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { ExternalLink, GitBranch, LogIn, Plus, RefreshCw, Settings, X } from "lucide-react";
 import {
   CODEX_MODELS,
+  CODEX_REASONING_EFFORTS,
   DEFAULT_CODEX_MODEL,
   isCodexModel,
   type AgentProvider,
@@ -20,6 +21,8 @@ type AgentSettingsDialogProps =
   | {
       mode: "create";
       branches: BranchOption[];
+      codexModels?: readonly string[];
+      defaultCodexModel?: string;
       onCreate: (settings: AgentSettings) => Promise<void>;
       onCreateBranch: (branch: string, baseBranch?: string) => Promise<BranchWorkspace>;
       onClose: () => void;
@@ -28,6 +31,8 @@ type AgentSettingsDialogProps =
       mode: "edit";
       agent: AgentView;
       branches: BranchOption[];
+      codexModels?: readonly string[];
+      defaultCodexModel?: string;
       canChangeBranch: boolean;
       onCreateBranch: (branch: string, baseBranch?: string) => Promise<BranchWorkspace>;
       onUpdate: (
@@ -40,8 +45,13 @@ type AgentSettingsDialogProps =
 export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.ReactElement {
   const isCreate = props.mode === "create";
   const agent = props.mode === "edit" ? props.agent : undefined;
-  const [provider, setProvider] = useState<AgentProvider>(agent?.provider ?? "claude");
-  const [codexModelValue, setCodexModelValue] = useState<CodexModel>(codexModel(agent?.model));
+  const codexModels = props.codexModels?.length ? props.codexModels : CODEX_MODELS;
+  const defaultCodexModel = props.defaultCodexModel ?? DEFAULT_CODEX_MODEL;
+  const [provider, setProvider] = useState<AgentProvider>(agent?.provider ?? "codex");
+  const [codexModelValue, setCodexModelValue] = useState<CodexModel>(
+    codexModel(agent?.model, codexModels, defaultCodexModel),
+  );
+  const [reasoningEffort, setReasoningEffort] = useState(agent?.reasoningEffort ?? "");
   const [claudeModel, setClaudeModel] = useState(
     agent?.provider === "claude" ? agent.model ?? "" : "",
   );
@@ -67,13 +77,14 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
   useEffect(() => {
     if (!isCreate && agent) {
       setProvider(agent.provider ?? "claude");
-      setCodexModelValue(codexModel(agent.model));
+      setCodexModelValue(codexModel(agent.model, codexModels, defaultCodexModel));
+      setReasoningEffort(agent.reasoningEffort ?? "");
       setClaudeModel(agent.provider === "claude" ? agent.model ?? "" : "");
       setBranchName(agent.branch ?? "");
       setNewBranchBase(agent.branch ?? "");
       setSystemPrompt(agent.systemPrompt ?? "");
     }
-  }, [agent, isCreate]);
+  }, [agent, codexModels, defaultCodexModel, isCreate]);
 
   useEffect(() => {
     if (props.mode === "create" && !branchName && props.branches[0]) {
@@ -134,13 +145,22 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
+    if (creatingBranch) return;
     setSubmitting(true);
     setError("");
+    const reasoningEffortUpdate = codexReasoningEffortUpdate(
+      provider,
+      reasoningEffort,
+      agent?.reasoningEffort,
+    );
     try {
       if (props.mode === "create") {
         await props.onCreate({
           provider,
           model: selectedModel(provider, codexModelValue, claudeModel) ?? undefined,
+          ...(reasoningEffortUpdate !== undefined
+            ? { reasoningEffort: reasoningEffortUpdate ?? undefined }
+            : {}),
           branchWorkspaceId: selectedBranch?.branchWorkspaceId,
           branch: selectedBranch?.branch,
           cwd: selectedBranch?.worktreePath,
@@ -150,6 +170,9 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
         await props.onUpdate(props.agent.id, {
           systemPrompt,
           model: selectedModel(provider, codexModelValue, claudeModel),
+          ...(reasoningEffortUpdate !== undefined
+            ? { reasoningEffort: reasoningEffortUpdate }
+            : {}),
           ...(canChangeBranch
             ? {
                 branchWorkspaceId: selectedBranch?.branchWorkspaceId,
@@ -215,38 +238,26 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
           <Segmented
             value={provider}
             disabled={!isCreate}
-            options={[
-              ["claude", "Claude Code"],
-              ["codex", "Codex"],
-            ]}
+            options={isCreate ? [["codex", "Codex"]] : providerOptionsFor(agent?.provider)}
             onChange={(value) => setProvider(value as AgentProvider)}
           />
         </fieldset>
 
         {provider === "codex" ? (
-          <>
-            <label className="file-dialog__field">
-              <span>Codex 模型</span>
-              <select
-                aria-label="Codex 模型"
-                value={codexModelValue}
-                onChange={(event) => setCodexModelValue(event.target.value as CodexModel)}
-              >
-                {CODEX_MODELS.map((candidate) => (
-                  <option key={candidate} value={candidate}>
-                    {candidate}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <CodexLoginPanel
-              status={codexAuth}
-              login={codexLogin}
-              busy={authBusy}
-              onRefresh={() => void refreshCodexAuth()}
-              onStartLogin={() => void startCodexLogin()}
-            />
-          </>
+          <label className="file-dialog__field">
+            <span>Codex 模型</span>
+            <select
+              aria-label="Codex 模型"
+              value={codexModelValue}
+              onChange={(event) => setCodexModelValue(event.target.value as CodexModel)}
+            >
+              {codexModels.map((candidate) => (
+                <option key={candidate} value={candidate}>
+                  {candidate}
+                </option>
+              ))}
+            </select>
+          </label>
         ) : (
           <label className="file-dialog__field">
             <span>Claude Code 模型</span>
@@ -256,6 +267,34 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
               placeholder="留空使用 CLI 默认模型"
               onChange={(event) => setClaudeModel(event.target.value)}
             />
+          </label>
+        )}
+
+        {provider === "codex" && (
+          <CodexLoginPanel
+            status={codexAuth}
+            login={codexLogin}
+            busy={authBusy}
+            onRefresh={() => void refreshCodexAuth()}
+            onStartLogin={() => void startCodexLogin()}
+          />
+        )}
+
+        {provider === "codex" && (
+          <label className="file-dialog__field">
+            <span>Codex 推理强度</span>
+            <select
+              aria-label="Codex 推理强度"
+              value={reasoningEffort}
+              onChange={(event) => setReasoningEffort(event.target.value)}
+            >
+              <option value="">默认</option>
+              {CODEX_REASONING_EFFORTS.map((candidate) => (
+                <option key={candidate} value={candidate}>
+                  {candidate}
+                </option>
+              ))}
+            </select>
           </label>
         )}
 
@@ -330,7 +369,7 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
           <button
             type="submit"
             className="file-dialog__primary"
-            disabled={submitting || (isCreate && !branchName)}
+            disabled={submitting || creatingBranch || (isCreate && !branchName)}
           >
             {isCreate ? "创建" : "保存"}
           </button>
@@ -423,8 +462,18 @@ function Segmented({
   );
 }
 
-function codexModel(model: string | undefined): CodexModel {
-  return isCodexModel(model) ? model : DEFAULT_CODEX_MODEL;
+function codexModel(
+  model: string | undefined,
+  models: readonly string[],
+  defaultModel: string,
+): CodexModel {
+  return isCodexModel(model, models) ? model : defaultModel;
+}
+
+function providerOptionsFor(provider: AgentProvider | undefined): Array<[AgentProvider, string]> {
+  return provider === "claude"
+    ? [["claude", "Claude Code"]]
+    : [["codex", "Codex"]];
 }
 
 function selectedModel(
@@ -433,6 +482,23 @@ function selectedModel(
   claudeModel: string,
 ): string | null {
   return provider === "codex" ? codexModelValue : claudeModel.trim() || null;
+}
+
+function selectedReasoningEffort(
+  provider: AgentProvider,
+  reasoningEffort: string,
+): string | null {
+  return provider === "codex" ? reasoningEffort.trim() || null : null;
+}
+
+function codexReasoningEffortUpdate(
+  provider: AgentProvider,
+  reasoningEffort: string,
+  previous: string | undefined,
+): string | null | undefined {
+  if (provider !== "codex") return undefined;
+  const selected = selectedReasoningEffort(provider, reasoningEffort);
+  return selected !== null || previous ? selected : undefined;
 }
 
 function mergeBranchOptions(

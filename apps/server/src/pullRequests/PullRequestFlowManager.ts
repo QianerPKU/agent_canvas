@@ -29,6 +29,7 @@ export interface PullRequestAgentHost {
 export interface PullRequestFlowManagerOptions {
   host: PullRequestAgentHost;
   resolveChangedFiles?: ResolvePullRequestChangedFiles;
+  ensureBranchesReady?: EnsurePullRequestBranchesReady;
   now?: () => number;
   reviewTimeoutMs?: number;
   reviewRetryLimit?: number;
@@ -47,6 +48,10 @@ export interface ResolvePullRequestChangedFilesContext {
 
 export interface ResolvePullRequestChangedFiles {
   (context: ResolvePullRequestChangedFilesContext): Promise<PullRequestChangedFile[] | undefined>;
+}
+
+export interface EnsurePullRequestBranchesReady {
+  (context: ResolvePullRequestChangedFilesContext): Promise<void>;
 }
 
 interface ParsedReview {
@@ -71,7 +76,7 @@ interface ParsedAgentEvent {
   fileChanges?: PullRequestChangedFile[];
 }
 
-const DEFAULT_REVIEW_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_REVIEW_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_REVIEW_RETRY_LIMIT = 1;
 const CLOSED_STATUSES: PullRequestFlowStatus[] = [
   "source_review_failed",
@@ -81,10 +86,16 @@ const CLOSED_STATUSES: PullRequestFlowStatus[] = [
   "cancelled",
   "blocked",
 ];
-
+const ACTIVE_STATUSES: PullRequestFlowStatus[] = [
+  "source_review_collecting",
+  "create_pr_authorized",
+  "target_review_collecting",
+  "merge_authorized",
+];
 export class PullRequestFlowManager {
   private readonly host: PullRequestAgentHost;
   private readonly resolveChangedFiles?: ResolvePullRequestChangedFiles;
+  private readonly ensureBranchesReady?: EnsurePullRequestBranchesReady;
   private readonly now: () => number;
   private readonly reviewTimeoutMs: number;
   private readonly reviewRetryLimit: number;
@@ -98,6 +109,7 @@ export class PullRequestFlowManager {
   constructor(options: PullRequestFlowManagerOptions) {
     this.host = options.host;
     this.resolveChangedFiles = options.resolveChangedFiles;
+    this.ensureBranchesReady = options.ensureBranchesReady;
     this.now = options.now ?? Date.now;
     this.reviewTimeoutMs = options.reviewTimeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
     this.reviewRetryLimit = options.reviewRetryLimit ?? DEFAULT_REVIEW_RETRY_LIMIT;
@@ -142,10 +154,17 @@ export class PullRequestFlowManager {
     }
     const sourceBranch = input.sourceBranch?.trim() || proposer.config.branch;
     if (!sourceBranch) throw new Error("missing sourceBranch");
+    const targetBranch = input.targetBranch.trim();
+    await this.ensureBranchesReady?.({
+      proposerAgentId: input.proposerAgentId,
+      sourceBranch,
+      targetBranch,
+      sourceCwd: proposer.config.cwd,
+    });
     const fileChanges = await this.changedFilesFor({
       proposerAgentId: input.proposerAgentId,
       sourceBranch,
-      targetBranch: input.targetBranch.trim(),
+      targetBranch,
       sourceCwd: proposer.config.cwd,
       files: input.files,
     });
@@ -154,24 +173,31 @@ export class PullRequestFlowManager {
     }
     const files = pathsFromFileChanges(fileChanges);
 
+    const status: PullRequestFlowStatus = this.hasActiveBranchConflict(sourceBranch, targetBranch)
+      ? "queued"
+      : "source_review_collecting";
     const flow: PullRequestFlowSnapshot = {
       id: `pr_flow_${++this.counter}`,
       proposerAgentId: input.proposerAgentId,
       sourceTurnIndex: this.host.currentTurnIndex?.(input.proposerAgentId),
       sourceBranch,
-      targetBranch: input.targetBranch.trim(),
+      targetBranch,
       title: input.title?.trim() || undefined,
       summary: input.summary.trim(),
       files,
       fileChanges,
-      status: "source_review_collecting",
+      status,
       createdAt: this.now(),
       updatedAt: this.now(),
-      currentStage: "source_preflight",
+      currentStage: undefined,
       reviewRequests: [],
     };
     this.flows.set(flow.id, flow);
-    await this.startReviewStage(flow.id, "source_preflight");
+    if (status === "source_review_collecting") {
+      await this.startReviewStage(flow.id, "source_preflight");
+    } else {
+      this.save(flow);
+    }
     return this.requireFlow(flow.id);
   }
 
@@ -223,6 +249,7 @@ export class PullRequestFlowManager {
       closedAt: this.now(),
     };
     this.save(next);
+    void this.startNextQueuedFlowAfter();
     return next;
   }
 
@@ -237,7 +264,17 @@ export class PullRequestFlowManager {
       closedAt: this.now(),
     };
     this.save(next);
+    void this.startNextQueuedFlowAfter();
     return next;
+  }
+
+  async retryQueued(flowId: string): Promise<PullRequestFlowSnapshot> {
+    const flow = this.requireFlow(flowId);
+    if (flow.status !== "queued") {
+      throw new Error("only queued PR flows can be retried");
+    }
+    await this.maybeStartQueuedFlow(flow);
+    return this.requireFlow(flowId);
   }
 
   async handleAgentEvent(envelope: AgentEventEnvelope): Promise<void> {
@@ -295,10 +332,16 @@ export class PullRequestFlowManager {
 
   private async captureReviewResult(agentId: string): Promise<void> {
     const openRequests = this.listOpenRequestsFor(agentId);
+    if (openRequests.length === 0) return;
     for (const { flow, request } of openRequests) {
-      const rawText = assistantTextSince(this.host.historyOf(agentId), request.requestedAt);
-      const parsed = parseReview(rawText, flow.id, request.stage);
+      const parsedReviews = parseReviews(
+        assistantTextSince(this.host.historyOf(agentId), request.requestedAt),
+      );
+      const parsed = parsedReviews.find(
+        (review) => review.flowId === flow.id && review.stage === request.stage,
+      );
       if (!parsed) {
+        if (parsedReviews.length > 0) continue;
         await this.handleInvalidReview(flow.id, request.stage, agentId);
         continue;
       }
@@ -323,13 +366,18 @@ export class PullRequestFlowManager {
         flow.proposerAgentId === agentId &&
         (flow.status === "create_pr_authorized" || flow.status === "merge_authorized"),
     );
-    for (const flow of possibleFlows) {
-      const since =
+    if (possibleFlows.length === 0) return;
+    const since = Math.min(
+      ...possibleFlows.map((flow) =>
         flow.status === "create_pr_authorized"
           ? flow.createAuthorization?.issuedAt ?? flow.updatedAt
-          : flow.mergeAuthorization?.issuedAt ?? flow.updatedAt;
-      const parsed = parseAgentPrEvent(assistantTextSince(this.host.historyOf(agentId), since));
-      if (!parsed || parsed.flowId !== flow.id) continue;
+          : flow.mergeAuthorization?.issuedAt ?? flow.updatedAt,
+      ),
+    );
+    const parsedEvents = parseAgentPrEvents(assistantTextSince(this.host.historyOf(agentId), since));
+    for (const flow of possibleFlows) {
+      const parsed = parsedEvents.find((event) => event.flowId === flow.id);
+      if (!parsed) continue;
       if (parsed.agentCanvasPrEvent === "pr_created") {
         await this.recordPrCreated(flow.id, parsed, agentId);
       } else if (parsed.agentCanvasPrEvent === "merged") {
@@ -449,6 +497,7 @@ export class PullRequestFlowManager {
       failureReason: reason,
     };
     this.save(next);
+    void this.startNextQueuedFlowAfter();
     return next;
   }
 
@@ -470,6 +519,70 @@ export class PullRequestFlowManager {
     return this.host
       .list()
       .filter((agent) => agent.config.branch === branch && isActiveAgentStatus(agent.status));
+  }
+
+  private hasActiveBranchConflict(
+    sourceBranch: string,
+    targetBranch: string,
+    options: { ignoredFlowId?: string; queuedBefore?: number } = {},
+  ): boolean {
+    return this.list().some(
+      (flow) => {
+        if (flow.id === options.ignoredFlowId) return false;
+        const reservesBranch =
+          ACTIVE_STATUSES.includes(flow.status) ||
+          (flow.status === "queued" &&
+            (options.queuedBefore === undefined || flow.createdAt < options.queuedBefore));
+        return (
+          reservesBranch &&
+          (flow.sourceBranch === sourceBranch ||
+            flow.targetBranch === targetBranch ||
+            flow.sourceBranch === targetBranch ||
+            flow.targetBranch === sourceBranch)
+        );
+      },
+    );
+  }
+
+  private async startNextQueuedFlowAfter(): Promise<void> {
+    const queued = this.list()
+      .filter((candidate) => candidate.status === "queued")
+      .sort((a, b) => a.createdAt - b.createdAt);
+    for (const next of queued) {
+      await this.maybeStartQueuedFlow(next);
+    }
+  }
+
+  private async maybeStartQueuedFlow(next: PullRequestFlowSnapshot): Promise<void> {
+    if (
+      this.hasActiveBranchConflict(next.sourceBranch, next.targetBranch, {
+        ignoredFlowId: next.id,
+        queuedBefore: next.createdAt,
+      })
+    ) {
+      return;
+    }
+    try {
+      await this.ensureBranchesReady?.({
+        proposerAgentId: next.proposerAgentId,
+        sourceBranch: next.sourceBranch,
+        targetBranch: next.targetBranch,
+      });
+    } catch (error) {
+      this.save({
+        ...next,
+        failureReason: `Queued PR flow is waiting for branch sync: ${errorMessage(error)}`,
+        updatedAt: this.now(),
+      });
+      return;
+    }
+    this.save({
+      ...next,
+      status: "source_review_collecting",
+      failureReason: undefined,
+      updatedAt: this.now(),
+    });
+    await this.startReviewStage(next.id, "source_preflight");
   }
 
   private async changedFilesFor(
@@ -568,15 +681,17 @@ export class PullRequestFlowManager {
       this.setTimer(() => {
         const flow = this.flows.get(flowId);
         if (!flow || CLOSED_STATUSES.includes(flow.status)) return;
-        this.save({
+        const next = {
           ...flow,
           status: "timed_out",
           currentStage: undefined,
           updatedAt: this.now(),
           closedAt: this.now(),
           failureReason: "PR flow timed out before all required agent responses arrived.",
-        });
+        } as PullRequestFlowSnapshot;
+        this.save(next);
         this.closeTimer(flowId);
+        void this.startNextQueuedFlowAfter();
       }, delay),
     );
   }
@@ -624,39 +739,38 @@ function assistantTextSince(history: AgentEventEnvelope[], at: number): string {
     .join("");
 }
 
-function parseReview(
-  text: string,
-  flowId: string,
-  stage: PullRequestReviewStage,
-): ParsedReview | undefined {
+function parseReviews(text: string): ParsedReview[] {
+  const reviews: ParsedReview[] = [];
   for (const candidate of parseJsonObjects(text)) {
     if (!isRecord(candidate)) continue;
     if (candidate.agentCanvasPrReview !== true) continue;
-    if (candidate.flowId !== flowId || candidate.stage !== stage) continue;
+    if (typeof candidate.flowId !== "string") continue;
+    if (candidate.stage !== "source_preflight" && candidate.stage !== "target_merge") continue;
     if (!isReviewDecision(candidate.decision)) continue;
     if (typeof candidate.summary !== "string" || !candidate.summary.trim()) continue;
-    return {
+    reviews.push({
       agentCanvasPrReview: true,
-      flowId,
-      stage,
+      flowId: candidate.flowId,
+      stage: candidate.stage,
       decision: candidate.decision,
       summary: candidate.summary,
       risks: stringArray(candidate.risks),
       filesReviewed: stringArray(candidate.filesReviewed),
       requiredChanges: stringArray(candidate.requiredChanges),
-    };
+    });
   }
-  return undefined;
+  return reviews;
 }
 
-function parseAgentPrEvent(text: string): ParsedAgentEvent | undefined {
+function parseAgentPrEvents(text: string): ParsedAgentEvent[] {
+  const events: ParsedAgentEvent[] = [];
   for (const candidate of parseJsonObjects(text)) {
     if (!isRecord(candidate)) continue;
     if (candidate.agentCanvasPrEvent !== "pr_created" && candidate.agentCanvasPrEvent !== "merged") {
       continue;
     }
     if (typeof candidate.flowId !== "string") continue;
-    return {
+    events.push({
       agentCanvasPrEvent: candidate.agentCanvasPrEvent,
       flowId: candidate.flowId,
       prNumber: typeof candidate.prNumber === "number" ? candidate.prNumber : undefined,
@@ -665,9 +779,9 @@ function parseAgentPrEvent(text: string): ParsedAgentEvent | undefined {
       summary: typeof candidate.summary === "string" ? candidate.summary : undefined,
       files: stringArray(candidate.files),
       fileChanges: fileChangeArray(candidate.fileChanges),
-    };
+    });
   }
-  return undefined;
+  return events;
 }
 
 function parseJsonObjects(text: string): unknown[] {

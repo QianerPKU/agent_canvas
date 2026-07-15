@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 import {
   CODEX_MODELS,
+  CODEX_REASONING_EFFORTS,
   DEFAULT_CODEX_MODEL,
   isCodexModel,
   type AgentApprovalResponse,
@@ -47,6 +48,7 @@ export interface TurnNodeData {
   agentCwd?: string;
   provider?: AgentProvider;
   model?: string;
+  reasoningEffort?: string;
   providerLocked?: boolean;
   isLatest: boolean;
   windowState?: {
@@ -57,6 +59,8 @@ export interface TurnNodeData {
   onOpenHistory: (agentId: string, turnIndex: number) => void;
   onOpenSettings?: (agentId: string) => void;
   branches?: BranchOption[];
+  codexModels?: readonly string[];
+  defaultCodexModel?: string;
   onCreateBranch?: (branch: string, baseBranch?: string) => Promise<BranchWorkspace>;
   actions: AgentActions;
   [key: string]: unknown;
@@ -162,13 +166,19 @@ export function TurnNode({
     agentStatus,
     provider: agentProvider,
     model: agentModel,
+    reasoningEffort: agentReasoningEffort,
     isLatest,
     actions,
   } = data;
   const reactFlow = useReactFlow<TurnNodeType>();
   const updateNodeInternals = useUpdateNodeInternals();
+  const codexModels = data.codexModels?.length ? data.codexModels : CODEX_MODELS;
+  const defaultCodexModel = data.defaultCodexModel ?? DEFAULT_CODEX_MODEL;
   const [text, setText] = useState("");
-  const [model, setModel] = useState<CodexModel>(codexModel(agentModel));
+  const [model, setModel] = useState<CodexModel>(
+    codexModel(agentModel, codexModels, defaultCodexModel),
+  );
+  const [reasoningEffort, setReasoningEffort] = useState(agentReasoningEffort ?? "");
   const [forkBranchName, setForkBranchName] = useState(
     data.agentBranch ?? data.branches?.[0]?.branch ?? "",
   );
@@ -230,8 +240,12 @@ export function TurnNode({
   }, [turn.lines.length]);
 
   useEffect(() => {
-    setModel(codexModel(agentModel));
-  }, [agentModel]);
+    setModel(codexModel(agentModel, codexModels, defaultCodexModel));
+  }, [agentModel, codexModels, defaultCodexModel]);
+
+  useEffect(() => {
+    setReasoningEffort(agentReasoningEffort ?? "");
+  }, [agentReasoningEffort]);
 
   useEffect(() => {
     if (forkBranches.length === 0) return;
@@ -415,6 +429,15 @@ export function TurnNode({
         <span>
           base <strong>{displayShortSha ?? "(pending)"}</strong>
         </span>
+        {turn.usage?.contextTokens != null && (
+          <span>
+            context{" "}
+            <strong>
+              {formatTokens(turn.usage.contextTokens)}
+              {turn.usage.contextWindow ? ` / ${formatTokens(turn.usage.contextWindow)}` : ""}
+            </strong>
+          </span>
+        )}
       </div>
       {workspaceOpenError && (
         <div className="turn-node__context nodrag" style={{ color: "#dc2626" }}>
@@ -486,7 +509,7 @@ export function TurnNode({
 
       {/* 控制区 */}
       <div
-        className="nodrag"
+        className="nodrag nowheel"
         onClick={(event) => event.stopPropagation()}
         style={{ padding: 10, display: "flex", flexDirection: "column", gap: 6 }}
       >
@@ -627,11 +650,18 @@ export function TurnNode({
               </div>
             )}
             {agentProvider === "codex" && (
-              <CodexModelSelect
-                ariaLabel="fork model"
-                value={model}
-                onChange={setModel}
-              />
+              <>
+                <CodexModelSelect
+                  ariaLabel="fork model"
+                  value={model}
+                  models={codexModels}
+                  onChange={setModel}
+                />
+                <ReasoningEffortSelect
+                  value={reasoningEffort}
+                  onChange={setReasoningEffort}
+                />
+              </>
             )}
             {forkError && <span style={{ color: "#dc2626", fontSize: 11 }}>{forkError}</span>}
             <button
@@ -643,6 +673,7 @@ export function TurnNode({
                   turn.anchorUuid!,
                   forkOptionsFor(
                     agentProvider === "codex" ? model : undefined,
+                    agentProvider === "codex" ? reasoningEffort : undefined,
                     selectedForkBranch,
                     forkBranchName,
                   ),
@@ -711,7 +742,7 @@ function QuestionLine({
 
   return (
     <div
-      className="nodrag"
+      className="nodrag nowheel"
       style={questionPanelStyle}
       onClick={(event) => event.stopPropagation()}
     >
@@ -788,7 +819,7 @@ function ApprovalLine({
   };
   return (
     <div
-      className="nodrag"
+      className="nodrag nowheel"
       style={approvalPanelStyle}
       onClick={(event) => event.stopPropagation()}
     >
@@ -967,10 +998,12 @@ function NodeHandles({ resourceAccess }: { resourceAccess: boolean }): React.Rea
 function CodexModelSelect({
   ariaLabel,
   value,
+  models,
   onChange,
 }: {
   ariaLabel: string;
   value: CodexModel;
+  models: readonly string[];
   onChange: (model: CodexModel) => void;
 }): React.ReactElement {
   return (
@@ -980,7 +1013,7 @@ function CodexModelSelect({
       onChange={(event) => onChange(event.target.value as CodexModel)}
       style={selectStyle}
     >
-      {CODEX_MODELS.map((candidate) => (
+      {models.map((candidate) => (
         <option key={candidate} value={candidate}>
           {candidate}
         </option>
@@ -989,8 +1022,36 @@ function CodexModelSelect({
   );
 }
 
-function codexModel(model: string | undefined): CodexModel {
-  return isCodexModel(model) ? model : DEFAULT_CODEX_MODEL;
+function ReasoningEffortSelect({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (reasoningEffort: string) => void;
+}): React.ReactElement {
+  return (
+    <select
+      aria-label="fork reasoning effort"
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+      style={selectStyle}
+    >
+      <option value="">默认推理强度</option>
+      {CODEX_REASONING_EFFORTS.map((candidate) => (
+        <option key={candidate} value={candidate}>
+          {candidate}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function codexModel(
+  model: string | undefined,
+  models: readonly string[],
+  defaultModel: string,
+): CodexModel {
+  return isCodexModel(model, models) ? model : defaultModel;
 }
 
 function hasAnswer(value: string | string[] | undefined): boolean {
@@ -1067,6 +1128,10 @@ function approvalStatusStyle(
 function prettyShort(value: unknown): string {
   const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
   return text && text.length > 1400 ? `${text.slice(0, 1400)}...` : text || "";
+}
+
+function formatTokens(tokens: number): string {
+  return tokens >= 1000 ? `${(tokens / 1000).toFixed(tokens >= 10000 ? 0 : 1)}k` : String(tokens);
 }
 
 const questionPanelStyle: React.CSSProperties = {
@@ -1314,11 +1379,13 @@ function shouldPreferBranchOption(
 
 function forkOptionsFor(
   model: string | undefined,
+  reasoningEffort: string | undefined,
   branch: BranchOption | undefined,
   branchName: string,
 ): Omit<ForkAgentInput, "anchorUuid"> | undefined {
   const options: Omit<ForkAgentInput, "anchorUuid"> = {};
   if (model) options.model = model;
+  if (reasoningEffort?.trim()) options.reasoningEffort = reasoningEffort.trim();
   if (branch) {
     options.branchWorkspaceId = branch.branchWorkspaceId;
     options.branch = branch.branch;

@@ -292,6 +292,38 @@ export class WorkspaceManager {
     );
   }
 
+  async ensurePullRequestBranchesReady(
+    sourceBranch: string | undefined,
+    targetBranch: string | undefined,
+  ): Promise<void> {
+    const source = sourceBranch?.trim();
+    const target = targetBranch?.trim();
+    if (!source || !target || source === target) return;
+    await this.ensureProjectOpen();
+    await this.loadStateIfNeeded();
+    const repo = this.state.repo;
+    if (!repo) return;
+    let targetRef = target;
+    try {
+      await this.runGit(
+        ["fetch", "origin", `+refs/heads/${target}:refs/remotes/origin/${target}`],
+        { cwd: repo.localRepoPath },
+      );
+      targetRef = `origin/${target}`;
+    } catch {
+      // Local-only targets can still be checked by branch name.
+    }
+    try {
+      await this.runGit(["merge-base", "--is-ancestor", targetRef, source], {
+        cwd: repo.localRepoPath,
+      });
+    } catch {
+      throw new Error(
+        `source branch ${source} must include ${targetRef}; pull, merge, or rebase ${target} into ${source} before creating a PR flow`,
+      );
+    }
+  }
+
   async changedFilesForCommit(
     commitRef: string | undefined,
     sourceBranch: string | undefined,

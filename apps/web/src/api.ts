@@ -2,7 +2,9 @@
 import type {
   AgentApprovalResponse,
   AgentCanvasSettings,
+  AgentCanvasConfig,
   AgentCommitSnapshot,
+  CodexUsageSnapshot,
   AgentEventEnvelope,
   AgentQuestionResponse,
   AgentSettings,
@@ -62,7 +64,8 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(input),
     }),
-  config: () => call<{ defaultCwd: string; projectRoot: string }>("/config"),
+  config: () => call<AgentCanvasConfig>("/config"),
+  codexUsage: () => call<CodexUsageSnapshot>("/codex/usage"),
   settings: () => call<AgentCanvasSettings>("/settings"),
   updateSettings: (input: Partial<AgentCanvasSettings>) =>
     call<AgentCanvasSettings>("/settings", {
@@ -128,6 +131,10 @@ export const api = {
     }).then((r) => r.flow),
   cancelPullRequestFlow: (id: string) =>
     call<{ flow: PullRequestFlowSnapshot }>(`/pr-flows/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+    }).then((r) => r.flow),
+  retryPullRequestFlow: (id: string) =>
+    call<{ flow: PullRequestFlowSnapshot }>(`/pr-flows/${encodeURIComponent(id)}/retry`, {
       method: "POST",
     }).then((r) => r.flow),
   createSyncFlow: (input: CreateSyncFlowInput) =>
