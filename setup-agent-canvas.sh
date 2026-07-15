@@ -135,6 +135,14 @@ ensure_git() {
   fi
 }
 
+ensure_gh() {
+  if have gh; then
+    echo "[ok] GitHub CLI"
+  else
+    install_packages gh
+  fi
+}
+
 try_install_optional() {
   package="$1"
   label="$2"
@@ -165,6 +173,7 @@ show_optional_status() {
 echo "== Agent Canvas dependency setup =="
 ensure_node
 ensure_git
+ensure_gh
 
 if [ "$INSTALL_OPTIONAL" -eq 1 ]; then
   if [ "$(pm)" = "apt" ] || [ "$(pm)" = "dnf" ] || [ "$(pm)" = "pacman" ]; then
@@ -186,11 +195,11 @@ fi
 
 show_optional_status codex "Codex CLI" "Install Codex, then run 'codex login'."
 show_optional_status claude "Claude Code / Claude CLI" "Install Claude Code/CLI or set ANTHROPIC_API_KEY."
-show_optional_status gh "GitHub CLI" "Install it if agents should create or merge PRs with gh."
 show_optional_status code "VS Code CLI" "Install it if you want file/workspace open buttons."
 show_optional_status bwrap "bubblewrap" "Recommended for Codex sandbox support on Linux/WSL."
 
 echo
 echo "Done. Next steps:"
-echo "  1. Authenticate at least one agent backend: codex login, claude login, or ANTHROPIC_API_KEY."
-echo "  2. Start Agent Canvas: npm run start:app -- --no-browser"
+echo "  1. Authenticate GitHub CLI for PR flows: gh auth login."
+echo "  2. Authenticate at least one agent backend: codex login, claude login, or ANTHROPIC_API_KEY."
+echo "  3. Start Agent Canvas: npm run start:app -- --no-browser"
