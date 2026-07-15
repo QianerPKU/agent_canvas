@@ -108,6 +108,8 @@ export function createServer(
     options.pullRequestFlowManager ??
     new PullRequestFlowManager({
       host: manager,
+      ensureBranchesReady: async ({ sourceBranch, targetBranch }) =>
+        await workspaceManager.ensurePullRequestBranchesReady(sourceBranch, targetBranch),
       resolveChangedFiles: async ({ sourceBranch, targetBranch }) =>
         (await workspaceManager.diffPullRequestFiles(sourceBranch, targetBranch))?.files ?? [],
     });

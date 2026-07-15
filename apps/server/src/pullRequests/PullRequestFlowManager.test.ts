@@ -238,6 +238,29 @@ describe("PullRequestFlowManager", () => {
     expect(flow.reviewRequests[0]?.deadlineAt).toBe(now + 2 * 60 * 60 * 1000);
   });
 
+  it("rejects PR flows when the source branch has not incorporated the target branch", async () => {
+    const host = new FakeHost();
+    host.addAgent("agent_1", "feature/a", "waiting_input");
+    const manager = new PullRequestFlowManager({
+      host,
+      ensureBranchesReady: async () => {
+        throw new Error("source branch feature/a must include origin/main");
+      },
+      resolveChangedFiles: async () => {
+        throw new Error("changed files should not be resolved before branch readiness");
+      },
+    });
+
+    await expect(
+      manager.create({
+        proposerAgentId: "agent_1",
+        targetBranch: "main",
+        summary: "Not synced",
+        files: ["src/not-synced.ts"],
+      }),
+    ).rejects.toThrow("must include origin/main");
+  });
+
   it("queues PR flows that target the same branch and starts them in order", async () => {
     let now = 6000;
     const host = new FakeHost();

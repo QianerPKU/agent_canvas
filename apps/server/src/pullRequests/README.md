@@ -6,6 +6,8 @@ Flows can be created from the web PR panel or by an agent through `POST /api/pr-
 
 Each review request includes a concrete changed-file list. By default the server uses `WorkspaceManager.diffPullRequestFiles()` to compute `git diff --name-status <target>...<source>` and stores it as `changedFiles`. If the caller passes `files`, the flow reviews that explicit scope and fills in status from the resolved diff when available. If no changed files can be determined, the backend rejects the PR flow.
 
+Before a PR flow can be created, the source branch must already include the target branch head. The server fetches the target branch and rejects the flow unless `origin/<target>` is an ancestor of the source branch, so the proposer must pull, merge, or rebase the target branch into the source branch first.
+
 ## Queueing
 
 PR flows reserve both their `sourceBranch` and `targetBranch` while they are `queued` or active. If a new flow shares either branch with an existing queued or active flow, it enters `queued` and does not send review prompts yet.

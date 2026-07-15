@@ -29,6 +29,7 @@ export interface PullRequestAgentHost {
 export interface PullRequestFlowManagerOptions {
   host: PullRequestAgentHost;
   resolveChangedFiles?: ResolvePullRequestChangedFiles;
+  ensureBranchesReady?: EnsurePullRequestBranchesReady;
   now?: () => number;
   reviewTimeoutMs?: number;
   reviewRetryLimit?: number;
@@ -47,6 +48,10 @@ export interface ResolvePullRequestChangedFilesContext {
 
 export interface ResolvePullRequestChangedFiles {
   (context: ResolvePullRequestChangedFilesContext): Promise<PullRequestChangedFile[] | undefined>;
+}
+
+export interface EnsurePullRequestBranchesReady {
+  (context: ResolvePullRequestChangedFilesContext): Promise<void>;
 }
 
 interface ParsedReview {
@@ -90,6 +95,7 @@ const ACTIVE_STATUSES: PullRequestFlowStatus[] = [
 export class PullRequestFlowManager {
   private readonly host: PullRequestAgentHost;
   private readonly resolveChangedFiles?: ResolvePullRequestChangedFiles;
+  private readonly ensureBranchesReady?: EnsurePullRequestBranchesReady;
   private readonly now: () => number;
   private readonly reviewTimeoutMs: number;
   private readonly reviewRetryLimit: number;
@@ -103,6 +109,7 @@ export class PullRequestFlowManager {
   constructor(options: PullRequestFlowManagerOptions) {
     this.host = options.host;
     this.resolveChangedFiles = options.resolveChangedFiles;
+    this.ensureBranchesReady = options.ensureBranchesReady;
     this.now = options.now ?? Date.now;
     this.reviewTimeoutMs = options.reviewTimeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
     this.reviewRetryLimit = options.reviewRetryLimit ?? DEFAULT_REVIEW_RETRY_LIMIT;
@@ -147,10 +154,17 @@ export class PullRequestFlowManager {
     }
     const sourceBranch = input.sourceBranch?.trim() || proposer.config.branch;
     if (!sourceBranch) throw new Error("missing sourceBranch");
+    const targetBranch = input.targetBranch.trim();
+    await this.ensureBranchesReady?.({
+      proposerAgentId: input.proposerAgentId,
+      sourceBranch,
+      targetBranch,
+      sourceCwd: proposer.config.cwd,
+    });
     const fileChanges = await this.changedFilesFor({
       proposerAgentId: input.proposerAgentId,
       sourceBranch,
-      targetBranch: input.targetBranch.trim(),
+      targetBranch,
       sourceCwd: proposer.config.cwd,
       files: input.files,
     });
@@ -159,7 +173,6 @@ export class PullRequestFlowManager {
     }
     const files = pathsFromFileChanges(fileChanges);
 
-    const targetBranch = input.targetBranch.trim();
     const status: PullRequestFlowStatus = this.hasActiveBranchConflict(sourceBranch, targetBranch)
       ? "queued"
       : "source_review_collecting";

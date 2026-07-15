@@ -45,6 +45,7 @@ export function agentCanvasPolicyPrompt(agentId: string): string {
 前置检查：
 - 先用 git status / git diff 确认这次 PR 的范围。
 - 如果目标 branch 已知，优先查看 git diff --name-status <targetBranch>...HEAD。
+- 在调用 POST ${apiBase}/pr-flows 前，必须先把目标 branch 拉入当前 source branch：fetch/pull 目标 branch，使用 merge 或 rebase 完成同步，解决冲突，按需要运行测试、提交同步结果，并 push 更新后的 source branch。
 - files 必须列出这次 PR 具体涉及的文件路径；不要用笼统描述代替文件列表。
 
 禁止事项：
