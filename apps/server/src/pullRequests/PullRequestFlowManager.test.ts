@@ -221,6 +221,23 @@ describe("PullRequestFlowManager", () => {
     expect(manager.get(flow.id)?.status).toBe("timed_out");
   });
 
+  it("uses a two hour default timeout for PR reviews", async () => {
+    let now = 5000;
+    const host = new FakeHost();
+    host.addAgent("agent_1", "feature/a", "waiting_input");
+    const manager = new PullRequestFlowManager({ host, now: () => now });
+
+    const flow = await manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "main",
+      summary: "Default timeout",
+      files: ["src/default-timeout.ts"],
+    });
+
+    expect(flow.deadlineAt).toBe(now + 2 * 60 * 60 * 1000);
+    expect(flow.reviewRequests[0]?.deadlineAt).toBe(now + 2 * 60 * 60 * 1000);
+  });
+
   it("resolves changed files when a flow is created without explicit files", async () => {
     let now = 3000;
     const host = new FakeHost();

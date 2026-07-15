@@ -71,7 +71,7 @@ interface ParsedAgentEvent {
   fileChanges?: PullRequestChangedFile[];
 }
 
-const DEFAULT_REVIEW_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_REVIEW_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_REVIEW_RETRY_LIMIT = 1;
 const CLOSED_STATUSES: PullRequestFlowStatus[] = [
   "source_review_failed",
