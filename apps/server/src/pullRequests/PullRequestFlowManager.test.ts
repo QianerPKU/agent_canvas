@@ -238,6 +238,68 @@ describe("PullRequestFlowManager", () => {
     expect(flow.reviewRequests[0]?.deadlineAt).toBe(now + 2 * 60 * 60 * 1000);
   });
 
+  it("queues PR flows that target the same branch and starts them in order", async () => {
+    let now = 6000;
+    const host = new FakeHost();
+    const proposerA = host.addAgent("agent_a", "feature/a", "waiting_input");
+    const proposerB = host.addAgent("agent_b", "feature/b", "waiting_input");
+    const targetReviewer = host.addAgent("agent_main", "main", "waiting_input");
+    const manager = new PullRequestFlowManager({ host, now: () => now });
+
+    let first = await manager.create({
+      proposerAgentId: "agent_a",
+      targetBranch: "main",
+      summary: "First PR",
+      files: ["src/a.ts"],
+    });
+    const second = await manager.create({
+      proposerAgentId: "agent_b",
+      targetBranch: "main",
+      summary: "Second PR",
+      files: ["src/b.ts"],
+    });
+
+    expect(first.status).toBe("source_review_collecting");
+    expect(second.status).toBe("queued");
+    expect(proposerA.sent).toHaveLength(1);
+    expect(proposerB.sent).toHaveLength(0);
+
+    now += 1;
+    proposerA.setStatus("waiting_input");
+    host.assistant("agent_a", reviewJson(first, "source_preflight", "approve"), now);
+    await manager.handleAgentEvent(host.result("agent_a", now));
+
+    first = manager.get(first.id)!;
+    expect(first.status).toBe("create_pr_authorized");
+
+    now += 1;
+    proposerA.setStatus("waiting_input");
+    host.assistant(
+      "agent_a",
+      JSON.stringify({ agentCanvasPrEvent: "pr_created", flowId: first.id, prNumber: 1 }),
+      now,
+    );
+    await manager.handleAgentEvent(host.result("agent_a", now));
+
+    first = manager.get(first.id)!;
+    expect(first.status).toBe("target_review_collecting");
+
+    now += 1;
+    targetReviewer.setStatus("waiting_input");
+    host.assistant("agent_main", reviewJson(first, "target_merge", "approve"), now);
+    await manager.handleAgentEvent(host.result("agent_main", now));
+
+    first = manager.get(first.id)!;
+    expect(first.status).toBe("merge_authorized");
+
+    manager.recordMerged(first.id);
+
+    const startedSecond = manager.get(second.id)!;
+    expect(startedSecond.status).toBe("source_review_collecting");
+    expect(proposerB.sent).toHaveLength(1);
+    expect(proposerB.sent[0]).toContain(`flowId: ${second.id}`);
+  });
+
   it("resolves changed files when a flow is created without explicit files", async () => {
     let now = 3000;
     const host = new FakeHost();
