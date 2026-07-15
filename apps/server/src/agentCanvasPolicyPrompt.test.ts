@@ -16,6 +16,8 @@ describe("agentCanvasPolicyPrompt", () => {
     expect(prompt).toContain("下面的工具不是模型原生 tool");
     expect(prompt).toContain("tool: agent_canvas.create_pr_flow");
     expect(prompt).toContain("git diff --name-status <targetBranch>...HEAD");
+    expect(prompt).toContain("在调用 POST http://127.0.0.1:4317/api/pr-flows 前");
+    expect(prompt).toContain("使用 merge 或 rebase 完成同步");
     expect(prompt).toContain("POST http://127.0.0.1:4317/api/pr-flows");
     expect(prompt).toContain('"proposerAgentId": "agent_42"');
     expect(prompt).toContain('"targetBranch": "main"');

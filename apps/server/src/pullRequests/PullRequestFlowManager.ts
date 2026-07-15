@@ -29,6 +29,7 @@ export interface PullRequestAgentHost {
 export interface PullRequestFlowManagerOptions {
   host: PullRequestAgentHost;
   resolveChangedFiles?: ResolvePullRequestChangedFiles;
+  ensureBranchesReady?: EnsurePullRequestBranchesReady;
   now?: () => number;
   reviewTimeoutMs?: number;
   reviewRetryLimit?: number;
@@ -47,6 +48,10 @@ export interface ResolvePullRequestChangedFilesContext {
 
 export interface ResolvePullRequestChangedFiles {
   (context: ResolvePullRequestChangedFilesContext): Promise<PullRequestChangedFile[] | undefined>;
+}
+
+export interface EnsurePullRequestBranchesReady {
+  (context: ResolvePullRequestChangedFilesContext): Promise<void>;
 }
 
 interface ParsedReview {
@@ -90,6 +95,7 @@ const ACTIVE_STATUSES: PullRequestFlowStatus[] = [
 export class PullRequestFlowManager {
   private readonly host: PullRequestAgentHost;
   private readonly resolveChangedFiles?: ResolvePullRequestChangedFiles;
+  private readonly ensureBranchesReady?: EnsurePullRequestBranchesReady;
   private readonly now: () => number;
   private readonly reviewTimeoutMs: number;
   private readonly reviewRetryLimit: number;
@@ -103,6 +109,7 @@ export class PullRequestFlowManager {
   constructor(options: PullRequestFlowManagerOptions) {
     this.host = options.host;
     this.resolveChangedFiles = options.resolveChangedFiles;
+    this.ensureBranchesReady = options.ensureBranchesReady;
     this.now = options.now ?? Date.now;
     this.reviewTimeoutMs = options.reviewTimeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
     this.reviewRetryLimit = options.reviewRetryLimit ?? DEFAULT_REVIEW_RETRY_LIMIT;
@@ -147,10 +154,17 @@ export class PullRequestFlowManager {
     }
     const sourceBranch = input.sourceBranch?.trim() || proposer.config.branch;
     if (!sourceBranch) throw new Error("missing sourceBranch");
+    const targetBranch = input.targetBranch.trim();
+    await this.ensureBranchesReady?.({
+      proposerAgentId: input.proposerAgentId,
+      sourceBranch,
+      targetBranch,
+      sourceCwd: proposer.config.cwd,
+    });
     const fileChanges = await this.changedFilesFor({
       proposerAgentId: input.proposerAgentId,
       sourceBranch,
-      targetBranch: input.targetBranch.trim(),
+      targetBranch,
       sourceCwd: proposer.config.cwd,
       files: input.files,
     });
@@ -159,7 +173,6 @@ export class PullRequestFlowManager {
     }
     const files = pathsFromFileChanges(fileChanges);
 
-    const targetBranch = input.targetBranch.trim();
     const status: PullRequestFlowStatus = this.hasActiveBranchConflict(sourceBranch, targetBranch)
       ? "queued"
       : "source_review_collecting";
@@ -236,7 +249,7 @@ export class PullRequestFlowManager {
       closedAt: this.now(),
     };
     this.save(next);
-    void this.startNextQueuedFlowAfter(next);
+    void this.startNextQueuedFlowAfter();
     return next;
   }
 
@@ -251,8 +264,17 @@ export class PullRequestFlowManager {
       closedAt: this.now(),
     };
     this.save(next);
-    void this.startNextQueuedFlowAfter(next);
+    void this.startNextQueuedFlowAfter();
     return next;
+  }
+
+  async retryQueued(flowId: string): Promise<PullRequestFlowSnapshot> {
+    const flow = this.requireFlow(flowId);
+    if (flow.status !== "queued") {
+      throw new Error("only queued PR flows can be retried");
+    }
+    await this.maybeStartQueuedFlow(flow);
+    return this.requireFlow(flowId);
   }
 
   async handleAgentEvent(envelope: AgentEventEnvelope): Promise<void> {
@@ -475,7 +497,7 @@ export class PullRequestFlowManager {
       failureReason: reason,
     };
     this.save(next);
-    void this.startNextQueuedFlowAfter(next);
+    void this.startNextQueuedFlowAfter();
     return next;
   }
 
@@ -522,19 +544,17 @@ export class PullRequestFlowManager {
     );
   }
 
-  private async startNextQueuedFlowAfter(flow: PullRequestFlowSnapshot): Promise<void> {
-    const next = this.list()
-      .filter(
-        (candidate) =>
-          candidate.status === "queued" &&
-          (candidate.sourceBranch === flow.sourceBranch ||
-            candidate.sourceBranch === flow.targetBranch ||
-            candidate.targetBranch === flow.sourceBranch ||
-            candidate.targetBranch === flow.targetBranch),
-      )
-      .sort((a, b) => a.createdAt - b.createdAt)[0];
+  private async startNextQueuedFlowAfter(): Promise<void> {
+    const queued = this.list()
+      .filter((candidate) => candidate.status === "queued")
+      .sort((a, b) => a.createdAt - b.createdAt);
+    for (const next of queued) {
+      await this.maybeStartQueuedFlow(next);
+    }
+  }
+
+  private async maybeStartQueuedFlow(next: PullRequestFlowSnapshot): Promise<void> {
     if (
-      !next ||
       this.hasActiveBranchConflict(next.sourceBranch, next.targetBranch, {
         ignoredFlowId: next.id,
         queuedBefore: next.createdAt,
@@ -542,9 +562,24 @@ export class PullRequestFlowManager {
     ) {
       return;
     }
+    try {
+      await this.ensureBranchesReady?.({
+        proposerAgentId: next.proposerAgentId,
+        sourceBranch: next.sourceBranch,
+        targetBranch: next.targetBranch,
+      });
+    } catch (error) {
+      this.save({
+        ...next,
+        failureReason: `Queued PR flow is waiting for branch sync: ${errorMessage(error)}`,
+        updatedAt: this.now(),
+      });
+      return;
+    }
     this.save({
       ...next,
       status: "source_review_collecting",
+      failureReason: undefined,
       updatedAt: this.now(),
     });
     await this.startReviewStage(next.id, "source_preflight");
@@ -656,7 +691,7 @@ export class PullRequestFlowManager {
         } as PullRequestFlowSnapshot;
         this.save(next);
         this.closeTimer(flowId);
-        void this.startNextQueuedFlowAfter(next);
+        void this.startNextQueuedFlowAfter();
       }, delay),
     );
   }
