@@ -4,6 +4,7 @@ import type {
   AgentCanvasSettings,
   AgentCanvasConfig,
   AgentCommitSnapshot,
+  CodexUsageSnapshot,
   AgentEventEnvelope,
   AgentQuestionResponse,
   AgentSettings,
@@ -62,6 +63,7 @@ export const api = {
       body: JSON.stringify(input),
     }),
   config: () => call<AgentCanvasConfig>("/config"),
+  codexUsage: () => call<CodexUsageSnapshot>("/codex/usage"),
   settings: () => call<AgentCanvasSettings>("/settings"),
   updateSettings: (input: Partial<AgentCanvasSettings>) =>
     call<AgentCanvasSettings>("/settings", {

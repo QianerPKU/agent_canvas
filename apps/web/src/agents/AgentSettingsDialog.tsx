@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { GitBranch, Plus, Settings, X } from "lucide-react";
 import {
   CODEX_MODELS,
+  CODEX_REASONING_EFFORTS,
   DEFAULT_CODEX_MODEL,
   isCodexModel,
   type AgentProvider,
@@ -47,6 +48,7 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
   const [codexModelValue, setCodexModelValue] = useState<CodexModel>(
     codexModel(agent?.model, codexModels, defaultCodexModel),
   );
+  const [reasoningEffort, setReasoningEffort] = useState(agent?.reasoningEffort ?? "");
   const [claudeModel, setClaudeModel] = useState(
     agent?.provider === "claude" ? agent.model ?? "" : "",
   );
@@ -70,6 +72,7 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
     if (!isCreate && agent) {
       setProvider(agent.provider ?? "claude");
       setCodexModelValue(codexModel(agent.model, codexModels, defaultCodexModel));
+      setReasoningEffort(agent.reasoningEffort ?? "");
       setClaudeModel(agent.provider === "claude" ? agent.model ?? "" : "");
       setBranchName(agent.branch ?? "");
       setNewBranchBase(agent.branch ?? "");
@@ -102,11 +105,19 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
     event.preventDefault();
     setSubmitting(true);
     setError("");
+    const reasoningEffortUpdate = codexReasoningEffortUpdate(
+      provider,
+      reasoningEffort,
+      agent?.reasoningEffort,
+    );
     try {
       if (props.mode === "create") {
         await props.onCreate({
           provider,
           model: selectedModel(provider, codexModelValue, claudeModel) ?? undefined,
+          ...(reasoningEffortUpdate !== undefined
+            ? { reasoningEffort: reasoningEffortUpdate ?? undefined }
+            : {}),
           branchWorkspaceId: selectedBranch?.branchWorkspaceId,
           branch: selectedBranch?.branch,
           cwd: selectedBranch?.worktreePath,
@@ -116,6 +127,9 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
         await props.onUpdate(props.agent.id, {
           systemPrompt,
           model: selectedModel(provider, codexModelValue, claudeModel),
+          ...(reasoningEffortUpdate !== undefined
+            ? { reasoningEffort: reasoningEffortUpdate }
+            : {}),
           ...(canChangeBranch
             ? {
                 branchWorkspaceId: selectedBranch?.branchWorkspaceId,
@@ -213,6 +227,24 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
               placeholder="留空使用 CLI 默认模型"
               onChange={(event) => setClaudeModel(event.target.value)}
             />
+          </label>
+        )}
+
+        {provider === "codex" && (
+          <label className="file-dialog__field">
+            <span>Codex 推理强度</span>
+            <select
+              aria-label="Codex 推理强度"
+              value={reasoningEffort}
+              onChange={(event) => setReasoningEffort(event.target.value)}
+            >
+              <option value="">默认</option>
+              {CODEX_REASONING_EFFORTS.map((candidate) => (
+                <option key={candidate} value={candidate}>
+                  {candidate}
+                </option>
+              ))}
+            </select>
           </label>
         )}
 
@@ -339,6 +371,23 @@ function selectedModel(
   claudeModel: string,
 ): string | null {
   return provider === "codex" ? codexModelValue : claudeModel.trim() || null;
+}
+
+function selectedReasoningEffort(
+  provider: AgentProvider,
+  reasoningEffort: string,
+): string | null {
+  return provider === "codex" ? reasoningEffort.trim() || null : null;
+}
+
+function codexReasoningEffortUpdate(
+  provider: AgentProvider,
+  reasoningEffort: string,
+  previous: string | undefined,
+): string | null | undefined {
+  if (provider !== "codex") return undefined;
+  const selected = selectedReasoningEffort(provider, reasoningEffort);
+  return selected !== null || previous ? selected : undefined;
 }
 
 function mergeBranchOptions(

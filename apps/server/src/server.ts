@@ -38,6 +38,7 @@ import type {
 } from "@agent-canvas/shared";
 import { AgentManager } from "./AgentManager.js";
 import { detectCodexModels, type CodexModelDetection } from "./codexModels.js";
+import { readCodexUsage } from "./codexUsage.js";
 import { CommitManager } from "./commits/CommitManager.js";
 import { pickDirectory as defaultPickDirectory, type PickDirectory } from "./files/DirectoryPicker.js";
 import { FileManager } from "./files/FileManager.js";
@@ -251,6 +252,14 @@ async function handleHttp(
 
   if (method === "GET" && path === "/api/config") {
     return sendJson(res, 200, await serverConfig(defaultCwd, workspaceManager, codexModels));
+  }
+
+  if (method === "GET" && path === "/api/codex/usage") {
+    try {
+      return sendJson(res, 200, await readCodexUsage());
+    } catch (error) {
+      return sendJson(res, 503, { error: errMsg(error) });
+    }
   }
 
   if (method === "GET" && path === "/api/settings") {
@@ -874,6 +883,7 @@ async function handleHttp(
                 branch: body.branch,
                 cwd: body.cwd,
                 scratchDirectory: body.scratchDirectory,
+                reasoningEffort: body.reasoningEffort,
               },
               defaultCwd,
               true,
@@ -881,6 +891,7 @@ async function handleHttp(
           : undefined;
         const forked = manager.fork(id, body.anchorUuid, {
           model: body.model,
+          reasoningEffort: body.reasoningEffort,
           branchWorkspaceId: branchSettings?.branchWorkspaceId,
           branch: branchSettings?.branch,
           cwd: branchSettings?.cwd,
@@ -1209,6 +1220,7 @@ function normalizeAgentSettings(
   return {
     provider,
     model: input?.model?.trim() || undefined,
+    reasoningEffort: input?.reasoningEffort?.trim() || undefined,
     branchWorkspaceId: input?.branchWorkspaceId,
     branch: input?.branch,
     cwd: input?.cwd?.trim() || defaultCwd,
@@ -1224,6 +1236,10 @@ function settingsForWorkspaceResolution(
   return {
     provider: currentConfig?.provider,
     model: input?.model === null ? undefined : input?.model ?? currentConfig?.model,
+    reasoningEffort:
+      input?.reasoningEffort === null
+        ? undefined
+        : input?.reasoningEffort ?? currentConfig?.reasoningEffort,
     branchWorkspaceId: input?.branchWorkspaceId ?? currentConfig?.branchWorkspaceId,
     branch: input?.branch ?? currentConfig?.branch,
     cwd: input?.cwd ?? currentConfig?.cwd,

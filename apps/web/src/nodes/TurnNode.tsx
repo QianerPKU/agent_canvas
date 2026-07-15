@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 import {
   CODEX_MODELS,
+  CODEX_REASONING_EFFORTS,
   DEFAULT_CODEX_MODEL,
   isCodexModel,
   type AgentApprovalResponse,
@@ -47,6 +48,7 @@ export interface TurnNodeData {
   agentCwd?: string;
   provider?: AgentProvider;
   model?: string;
+  reasoningEffort?: string;
   providerLocked?: boolean;
   isLatest: boolean;
   windowState?: {
@@ -164,6 +166,7 @@ export function TurnNode({
     agentStatus,
     provider: agentProvider,
     model: agentModel,
+    reasoningEffort: agentReasoningEffort,
     isLatest,
     actions,
   } = data;
@@ -175,6 +178,7 @@ export function TurnNode({
   const [model, setModel] = useState<CodexModel>(
     codexModel(agentModel, codexModels, defaultCodexModel),
   );
+  const [reasoningEffort, setReasoningEffort] = useState(agentReasoningEffort ?? "");
   const [forkBranchName, setForkBranchName] = useState(
     data.agentBranch ?? data.branches?.[0]?.branch ?? "",
   );
@@ -238,6 +242,10 @@ export function TurnNode({
   useEffect(() => {
     setModel(codexModel(agentModel, codexModels, defaultCodexModel));
   }, [agentModel, codexModels, defaultCodexModel]);
+
+  useEffect(() => {
+    setReasoningEffort(agentReasoningEffort ?? "");
+  }, [agentReasoningEffort]);
 
   useEffect(() => {
     if (forkBranches.length === 0) return;
@@ -421,6 +429,15 @@ export function TurnNode({
         <span>
           base <strong>{displayShortSha ?? "(pending)"}</strong>
         </span>
+        {turn.usage?.contextTokens != null && (
+          <span>
+            context{" "}
+            <strong>
+              {formatTokens(turn.usage.contextTokens)}
+              {turn.usage.contextWindow ? ` / ${formatTokens(turn.usage.contextWindow)}` : ""}
+            </strong>
+          </span>
+        )}
       </div>
       {workspaceOpenError && (
         <div className="turn-node__context nodrag" style={{ color: "#dc2626" }}>
@@ -633,12 +650,18 @@ export function TurnNode({
               </div>
             )}
             {agentProvider === "codex" && (
-              <CodexModelSelect
-                ariaLabel="fork model"
-                value={model}
-                models={codexModels}
-                onChange={setModel}
-              />
+              <>
+                <CodexModelSelect
+                  ariaLabel="fork model"
+                  value={model}
+                  models={codexModels}
+                  onChange={setModel}
+                />
+                <ReasoningEffortSelect
+                  value={reasoningEffort}
+                  onChange={setReasoningEffort}
+                />
+              </>
             )}
             {forkError && <span style={{ color: "#dc2626", fontSize: 11 }}>{forkError}</span>}
             <button
@@ -650,6 +673,7 @@ export function TurnNode({
                   turn.anchorUuid!,
                   forkOptionsFor(
                     agentProvider === "codex" ? model : undefined,
+                    agentProvider === "codex" ? reasoningEffort : undefined,
                     selectedForkBranch,
                     forkBranchName,
                   ),
@@ -998,6 +1022,30 @@ function CodexModelSelect({
   );
 }
 
+function ReasoningEffortSelect({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (reasoningEffort: string) => void;
+}): React.ReactElement {
+  return (
+    <select
+      aria-label="fork reasoning effort"
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+      style={selectStyle}
+    >
+      <option value="">默认推理强度</option>
+      {CODEX_REASONING_EFFORTS.map((candidate) => (
+        <option key={candidate} value={candidate}>
+          {candidate}
+        </option>
+      ))}
+    </select>
+  );
+}
+
 function codexModel(
   model: string | undefined,
   models: readonly string[],
@@ -1080,6 +1128,10 @@ function approvalStatusStyle(
 function prettyShort(value: unknown): string {
   const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
   return text && text.length > 1400 ? `${text.slice(0, 1400)}...` : text || "";
+}
+
+function formatTokens(tokens: number): string {
+  return tokens >= 1000 ? `${(tokens / 1000).toFixed(tokens >= 10000 ? 0 : 1)}k` : String(tokens);
 }
 
 const questionPanelStyle: React.CSSProperties = {
@@ -1327,11 +1379,13 @@ function shouldPreferBranchOption(
 
 function forkOptionsFor(
   model: string | undefined,
+  reasoningEffort: string | undefined,
   branch: BranchOption | undefined,
   branchName: string,
 ): Omit<ForkAgentInput, "anchorUuid"> | undefined {
   const options: Omit<ForkAgentInput, "anchorUuid"> = {};
   if (model) options.model = model;
+  if (reasoningEffort?.trim()) options.reasoningEffort = reasoningEffort.trim();
   if (branch) {
     options.branchWorkspaceId = branch.branchWorkspaceId;
     options.branch = branch.branch;

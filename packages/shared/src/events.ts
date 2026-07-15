@@ -35,6 +35,8 @@ export type AgentProvider = "claude" | "codex";
 export const CODEX_MODELS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"] as const;
 export type CodexModel = string;
 export const DEFAULT_CODEX_MODEL: CodexModel = "gpt-5.5";
+export const CODEX_REASONING_EFFORTS = ["low", "medium", "high"] as const;
+export type CodexReasoningEffort = string;
 
 export function isCodexModel(
   model: string | undefined,
@@ -51,9 +53,22 @@ export interface AgentCanvasConfig {
   codexVersion?: string;
 }
 
+export interface CodexUsageSnapshot {
+  tokenUsage?: {
+    lifetimeTokens?: number | null;
+    peakDailyTokens?: number | null;
+    currentStreakDays?: number | null;
+    longestStreakDays?: number | null;
+    longestRunningTurnSec?: number | null;
+  };
+  rateLimits?: unknown;
+  fetchedAt: number;
+}
+
 export interface AgentSettings {
   provider?: AgentProvider;
   model?: string;
+  reasoningEffort?: string;
   /** Branch workspace id；新工作流中由它决定 cwd。 */
   branchWorkspaceId?: string;
   /** 展示用 branch 名称，由后端根据 branchWorkspaceId 填充。 */
@@ -72,6 +87,8 @@ export interface UpdateAgentSettingsInput {
   systemPrompt?: string;
   /** string = switch model for later responses; null = use provider default. */
   model?: string | null;
+  /** string = switch Codex reasoning effort for later responses; null = use Codex default. */
+  reasoningEffort?: string | null;
   branchWorkspaceId?: string;
   branch?: string;
   cwd?: string;
@@ -81,6 +98,7 @@ export interface UpdateAgentSettingsInput {
 export interface ForkAgentInput {
   anchorUuid: string;
   model?: string;
+  reasoningEffort?: string;
   branchWorkspaceId?: string;
   branch?: string;
   cwd?: string;
@@ -91,8 +109,12 @@ export interface ForkAgentInput {
 export interface UsageInfo {
   inputTokens?: number;
   outputTokens?: number;
+  totalTokens?: number;
+  reasoningOutputTokens?: number;
   cacheCreationInputTokens?: number;
   cacheReadInputTokens?: number;
+  contextWindow?: number;
+  contextTokens?: number;
 }
 
 export type CompactTrigger = "manual" | "auto";
@@ -256,6 +278,7 @@ export interface AgentStartConfig {
   branch?: string;
   scratchDirectory?: string;
   model?: string;
+  reasoningEffort?: string;
   /** 当前 agent 私有的系统提示词；由 AgentRunner 按提示词节点方式拼接。 */
   systemPrompt?: string;
   allowedTools?: string[];
