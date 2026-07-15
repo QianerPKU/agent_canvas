@@ -37,7 +37,7 @@ type AgentSettingsDialogProps =
 export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.ReactElement {
   const isCreate = props.mode === "create";
   const agent = props.mode === "edit" ? props.agent : undefined;
-  const [provider, setProvider] = useState<AgentProvider>(agent?.provider ?? "claude");
+  const [provider, setProvider] = useState<AgentProvider>(agent?.provider ?? "codex");
   const [codexModelValue, setCodexModelValue] = useState<CodexModel>(codexModel(agent?.model));
   const [claudeModel, setClaudeModel] = useState(
     agent?.provider === "claude" ? agent.model ?? "" : "",
@@ -92,6 +92,7 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
+    if (creatingBranch) return;
     setSubmitting(true);
     setError("");
     try {
@@ -173,10 +174,7 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
           <Segmented
             value={provider}
             disabled={!isCreate}
-            options={[
-              ["claude", "Claude Code"],
-              ["codex", "Codex"],
-            ]}
+            options={isCreate ? [["codex", "Codex"]] : providerOptionsFor(agent?.provider)}
             onChange={(value) => setProvider(value as AgentProvider)}
           />
         </fieldset>
@@ -279,7 +277,7 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
           <button
             type="submit"
             className="file-dialog__primary"
-            disabled={submitting || (isCreate && !branchName)}
+            disabled={submitting || creatingBranch || (isCreate && !branchName)}
           >
             {isCreate ? "创建" : "保存"}
           </button>
@@ -319,6 +317,12 @@ function Segmented({
 
 function codexModel(model: string | undefined): CodexModel {
   return isCodexModel(model) ? model : DEFAULT_CODEX_MODEL;
+}
+
+function providerOptionsFor(provider: AgentProvider | undefined): Array<[AgentProvider, string]> {
+  return provider === "claude"
+    ? [["claude", "Claude Code"]]
+    : [["codex", "Codex"]];
 }
 
 function selectedModel(

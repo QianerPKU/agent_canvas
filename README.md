@@ -33,6 +33,7 @@ Linux / macOS：
 
 - Node.js 20+ 和 npm
 - Git
+- GitHub CLI（`gh`，用于 Agent Canvas PR 流程授权后创建/合并 GitHub PR）
 - 项目 npm workspace 依赖
 
 可选依赖可以用 `--install-optional` 尝试安装：
@@ -41,7 +42,13 @@ Linux / macOS：
 ./setup-agent-canvas.sh --install-optional
 ```
 
-Codex CLI、Claude Code / Claude CLI、VS Code CLI、GitHub CLI 需要按你的使用场景安装或登录。脚本会检查它们是否存在，并提示下一步；不会自动替你登录账号或写入凭据。
+Windows setup 脚本会尝试安装 GitHub CLI；Linux / macOS 脚本会检查 `gh` 并在缺失时提示你按官方文档安装，避免在未配置 GitHub 官方软件源的系统上盲目执行包管理器安装。脚本不会自动替你登录账号或写入凭据。需要让 agent 在 PR flow 授权后创建/合并 GitHub PR 时，请先执行：
+
+```bash
+gh auth login
+```
+
+Codex CLI、Claude Code / Claude CLI、VS Code CLI 仍按你的使用场景安装或登录。脚本会检查它们是否存在，并提示下一步。
 
 ## 启动
 
@@ -106,6 +113,12 @@ npm run start:app -- --project-root /data/agent-canvas-projects/my-canvas
 
 ## 配置 Claude / Codex
 
+GitHub PR 流程：
+
+- Agent 必须先发起 Agent Canvas PR pipeline，完成审查并收到 `create_pr` / `merge_pr` 授权。
+- 授权后的真实 GitHub PR 创建/合并由 agent 调用 GitHub CLI 完成；`gh` 只是授权后的执行后端，不替代 Agent Canvas PR pipeline。
+- 首次使用前执行 `gh auth login`，并确认当前账号对目标 repo 有创建 PR 的权限。
+
 Claude Code：
 
 - 推荐先在本机 Claude Code / Claude CLI 中登录；Agent Canvas 会复用本机凭据。
@@ -123,7 +136,7 @@ Codex：
 
 1. 打开页面后，新建或打开一个 Canvas 项目。
 2. 连接一个 GitHub repo 或本地 git repo。
-3. 新建 agent，选择 Claude Code / Codex、模型、branch 和私有系统提示词。
+3. 新建 agent，选择 Codex、模型、branch 和私有系统提示词；已有 Claude Code agent 仍可编辑其设置。
 4. 在 agent 节点输入任务并启动。
 5. 运行中可排队下一轮输入，也可用“引导”尽快影响当前轮。
 6. 需要查看该 branch 的真实项目目录时，点击 agent 节点标题栏的文件夹按钮用 VS Code 打开。

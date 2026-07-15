@@ -69,9 +69,9 @@ Set-Location -LiteralPath $Root
 Write-Host "== Agent Canvas dependency setup =="
 Ensure-Node
 Ensure-Command "git" "Git.Git" "Git"
+Ensure-Command "gh" "GitHub.cli" "GitHub CLI"
 
 if ($InstallOptional) {
-  Ensure-Command "gh" "GitHub.cli" "GitHub CLI"
   Ensure-Command "code" "Microsoft.VisualStudioCode" "VS Code CLI"
 }
 
@@ -85,10 +85,10 @@ if (-not $CheckOnly -and -not $SkipNpmInstall) {
 
 Show-OptionalStatus "codex" "Codex CLI" "Install Codex, then run 'codex login'."
 Show-OptionalStatus "claude" "Claude Code / Claude CLI" "Install Claude Code/CLI or set ANTHROPIC_API_KEY."
-Show-OptionalStatus "gh" "GitHub CLI" "Install it if agents should create or merge PRs with gh."
 Show-OptionalStatus "code" "VS Code CLI" "Install it if you want file/workspace open buttons."
 
 Write-Host ""
 Write-Host "Done. Next steps:"
-Write-Host "  1. Authenticate at least one agent backend: codex login, claude login, or ANTHROPIC_API_KEY."
-Write-Host "  2. Start Agent Canvas: npm run start:app"
+Write-Host "  1. Authenticate GitHub CLI for PR flows: gh auth login."
+Write-Host "  2. Authenticate at least one agent backend: codex login, claude login, or ANTHROPIC_API_KEY."
+Write-Host "  3. Start Agent Canvas: npm run start:app"
