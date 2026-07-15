@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { GitBranch, Plus, Settings, X } from "lucide-react";
+import { ExternalLink, GitBranch, LogIn, Plus, RefreshCw, Settings, X } from "lucide-react";
 import {
   CODEX_MODELS,
   DEFAULT_CODEX_MODEL,
@@ -8,10 +8,13 @@ import {
   type AgentSettings,
   type BranchOption,
   type BranchWorkspace,
+  type CodexAuthStatus,
+  type CodexLoginSession,
   type CodexModel,
   type UpdateAgentSettingsInput,
 } from "@agent-canvas/shared";
 import type { AgentView } from "../agentStore.js";
+import { api } from "../api.js";
 
 type AgentSettingsDialogProps =
   | {
@@ -52,6 +55,9 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
   );
   const [systemPrompt, setSystemPrompt] = useState(agent?.systemPrompt ?? "");
   const [error, setError] = useState("");
+  const [codexAuth, setCodexAuth] = useState<CodexAuthStatus | undefined>();
+  const [codexLogin, setCodexLogin] = useState<CodexLoginSession | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [creatingBranch, setCreatingBranch] = useState(false);
   const canChangeBranch = props.mode === "create" || props.canChangeBranch;
@@ -89,6 +95,42 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [props]);
+
+  const refreshCodexAuth = async () => {
+    setAuthBusy(true);
+    try {
+      const next = await api.codexAuthStatus();
+      setCodexAuth(next.status);
+      setCodexLogin(next.login);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (provider !== "codex") return;
+    void refreshCodexAuth();
+  }, [provider]);
+
+  useEffect(() => {
+    if (provider !== "codex" || codexLogin?.state !== "running") return;
+    const timer = window.setInterval(() => void refreshCodexAuth(), 2000);
+    return () => window.clearInterval(timer);
+  }, [provider, codexLogin?.state]);
+
+  const startCodexLogin = async () => {
+    setAuthBusy(true);
+    setError("");
+    try {
+      setCodexLogin(await api.startCodexLogin());
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setAuthBusy(false);
+    }
+  };
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -182,20 +224,29 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
         </fieldset>
 
         {provider === "codex" ? (
-          <label className="file-dialog__field">
-            <span>Codex 模型</span>
-            <select
-              aria-label="Codex 模型"
-              value={codexModelValue}
-              onChange={(event) => setCodexModelValue(event.target.value as CodexModel)}
-            >
-              {CODEX_MODELS.map((candidate) => (
-                <option key={candidate} value={candidate}>
-                  {candidate}
-                </option>
-              ))}
-            </select>
-          </label>
+          <>
+            <label className="file-dialog__field">
+              <span>Codex 模型</span>
+              <select
+                aria-label="Codex 模型"
+                value={codexModelValue}
+                onChange={(event) => setCodexModelValue(event.target.value as CodexModel)}
+              >
+                {CODEX_MODELS.map((candidate) => (
+                  <option key={candidate} value={candidate}>
+                    {candidate}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <CodexLoginPanel
+              status={codexAuth}
+              login={codexLogin}
+              busy={authBusy}
+              onRefresh={() => void refreshCodexAuth()}
+              onStartLogin={() => void startCodexLogin()}
+            />
+          </>
         ) : (
           <label className="file-dialog__field">
             <span>Claude Code 模型</span>
@@ -286,6 +337,61 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
         </footer>
       </form>
     </div>
+  );
+}
+
+function CodexLoginPanel({
+  status,
+  login,
+  busy,
+  onRefresh,
+  onStartLogin,
+}: {
+  status?: CodexAuthStatus;
+  login: CodexLoginSession | null;
+  busy: boolean;
+  onRefresh: () => void;
+  onStartLogin: () => void;
+}): React.ReactElement {
+  const authenticated = status?.state === "authenticated";
+  return (
+    <section className="codex-login-panel">
+      <div>
+        <strong>Codex 登录</strong>
+        <span className={authenticated ? "is-authenticated" : ""}>
+          {authenticated ? "已登录" : status?.state === "unauthenticated" ? "未登录" : "未知"}
+        </span>
+      </div>
+      {status?.message && <p>{status.message}</p>}
+      {login?.state === "running" && (
+        <div className="codex-login-panel__device">
+          {login.loginUrl && (
+            <a href={login.loginUrl} target="_blank" rel="noreferrer">
+              打开登录页面 <ExternalLink size={13} />
+            </a>
+          )}
+          {login.userCode && <code>{login.userCode}</code>}
+          {!login.loginUrl && login.output && <pre>{login.output}</pre>}
+        </div>
+      )}
+      <footer>
+        <button type="button" disabled={busy} onClick={onRefresh}>
+          <RefreshCw size={14} />
+          刷新
+        </button>
+        {!authenticated && (
+          <button
+            type="button"
+            className="file-dialog__primary"
+            disabled={busy}
+            onClick={onStartLogin}
+          >
+            <LogIn size={14} />
+            登录 Codex
+          </button>
+        )}
+      </footer>
+    </section>
   );
 }
 
