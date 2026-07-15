@@ -139,7 +139,7 @@ ensure_gh() {
   if have gh; then
     echo "[ok] GitHub CLI"
   else
-    install_packages gh
+    echo "[required] GitHub CLI was not found. Install it from https://cli.github.com/ and run 'gh auth login' before using Agent Canvas PR merge/create flows."
   fi
 }
 
@@ -179,8 +179,6 @@ if [ "$INSTALL_OPTIONAL" -eq 1 ]; then
   if [ "$(pm)" = "apt" ] || [ "$(pm)" = "dnf" ] || [ "$(pm)" = "pacman" ]; then
     try_install_optional bubblewrap "bubblewrap"
     try_install_optional zenity "zenity"
-  elif [ "$(pm)" = "brew" ]; then
-    try_install_optional gh "GitHub CLI"
   fi
 fi
 

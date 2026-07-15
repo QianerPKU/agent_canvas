@@ -42,7 +42,7 @@ Linux / macOS：
 ./setup-agent-canvas.sh --install-optional
 ```
 
-脚本会安装或检查 GitHub CLI，但不会自动替你登录账号或写入凭据。需要让 agent 直接创建/合并 GitHub PR 时，请先执行：
+Windows setup 脚本会尝试安装 GitHub CLI；Linux / macOS 脚本会检查 `gh` 并在缺失时提示你按官方文档安装，避免在未配置 GitHub 官方软件源的系统上盲目执行包管理器安装。脚本不会自动替你登录账号或写入凭据。需要让 agent 在 PR flow 授权后创建/合并 GitHub PR 时，请先执行：
 
 ```bash
 gh auth login
@@ -115,8 +115,8 @@ npm run start:app -- --project-root /data/agent-canvas-projects/my-canvas
 
 GitHub PR 流程：
 
-- Agent Canvas 的 PR pipeline 负责审查、授权和登记状态。
-- 授权后的真实 GitHub PR 创建/合并由 agent 调用 GitHub CLI 完成，因此需要命令行可执行 `gh`。
+- Agent 必须先发起 Agent Canvas PR pipeline，完成审查并收到 `create_pr` / `merge_pr` 授权。
+- 授权后的真实 GitHub PR 创建/合并由 agent 调用 GitHub CLI 完成；`gh` 只是授权后的执行后端，不替代 Agent Canvas PR pipeline。
 - 首次使用前执行 `gh auth login`，并确认当前账号对目标 repo 有创建 PR 的权限。
 
 Claude Code：
