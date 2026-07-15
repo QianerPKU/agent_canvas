@@ -1548,10 +1548,11 @@ export function ProjectGate({
   const [name, setName] = useState("");
   const [projectRoot, setProjectRoot] = useState("");
   const [busy, setBusy] = useState(false);
+  const [pickingDirectory, setPickingDirectory] = useState(false);
   const [pickError, setPickError] = useState("");
   const create = async () => {
     const trimmed = name.trim();
-    if (!trimmed) return;
+    if (!trimmed || pickingDirectory) return;
     setBusy(true);
     try {
       await onCreate(trimmed, projectRoot);
@@ -1561,11 +1562,14 @@ export function ProjectGate({
   };
   const browse = async () => {
     setPickError("");
+    setPickingDirectory(true);
     try {
       const picked = await api.pickDirectory(projectRoot.trim() || undefined);
       if (picked.path) setProjectRoot(picked.path);
     } catch (reason) {
       setPickError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setPickingDirectory(false);
     }
   };
   return (
@@ -1584,6 +1588,7 @@ export function ProjectGate({
               <button
                 key={project.id}
                 className="project-row"
+                disabled={busy || pickingDirectory}
                 onClick={() => void onOpen(project.id)}
               >
                 <FolderOpen size={18} />
@@ -1605,7 +1610,7 @@ export function ProjectGate({
               placeholder="项目名称"
               onChange={(event) => setName(event.target.value)}
             />
-            <button disabled={busy || !name.trim()} onClick={() => void create()}>
+            <button disabled={busy || pickingDirectory || !name.trim()} onClick={() => void create()}>
               <Plus size={16} />
               新建
             </button>
@@ -1616,7 +1621,7 @@ export function ProjectGate({
                 placeholder="项目文件夹，可留空使用默认位置"
                 onChange={(event) => setProjectRoot(event.target.value)}
               />
-              <button type="button" disabled={busy} onClick={() => void browse()}>
+              <button type="button" disabled={busy || pickingDirectory} onClick={() => void browse()}>
                 <FolderOpen size={16} />
                 浏览
               </button>
@@ -1625,6 +1630,11 @@ export function ProjectGate({
         </section>
         {(error || pickError) && <div className="file-dialog__error">{error ?? pickError}</div>}
       </main>
+      {pickingDirectory && (
+        <div className="project-gate__busy" role="status" aria-live="polite">
+          <span>请选择目录</span>
+        </div>
+      )}
     </div>
   );
 }
