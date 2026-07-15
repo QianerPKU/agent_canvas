@@ -12,7 +12,7 @@ Before a PR flow can be created, the source branch must already include the targ
 
 PR flows reserve both their `sourceBranch` and `targetBranch` while they are `queued` or active. If a new flow shares either branch with an existing queued or active flow, it enters `queued` and does not send review prompts yet.
 
-When a flow closes (`merged`, `cancelled`, `timed_out`, `source_review_failed`, `target_review_failed`, or `blocked`), the manager starts the oldest queued flow whose source and target branches are now free. This preserves FIFO ordering for all flows that share a source or target branch.
+When a flow closes (`merged`, `cancelled`, `timed_out`, `source_review_failed`, `target_review_failed`, or `blocked`), the manager scans queued flows in creation order and starts every candidate whose source and target branches are now free. This preserves FIFO ordering for flows that share a source or target branch without letting an older sync-blocked queued flow stall unrelated ready flows.
 
 If a queued flow fails the branch readiness recheck because its source no longer includes the target branch head, it remains queued with a `failureReason`. After the proposer syncs and pushes the source branch, `POST /api/pr-flows/:id/retry` rechecks readiness and starts source review when the branches are ready.
 

@@ -249,7 +249,7 @@ export class PullRequestFlowManager {
       closedAt: this.now(),
     };
     this.save(next);
-    void this.startNextQueuedFlowAfter(next);
+    void this.startNextQueuedFlowAfter();
     return next;
   }
 
@@ -264,7 +264,7 @@ export class PullRequestFlowManager {
       closedAt: this.now(),
     };
     this.save(next);
-    void this.startNextQueuedFlowAfter(next);
+    void this.startNextQueuedFlowAfter();
     return next;
   }
 
@@ -497,7 +497,7 @@ export class PullRequestFlowManager {
       failureReason: reason,
     };
     this.save(next);
-    void this.startNextQueuedFlowAfter(next);
+    void this.startNextQueuedFlowAfter();
     return next;
   }
 
@@ -544,18 +544,13 @@ export class PullRequestFlowManager {
     );
   }
 
-  private async startNextQueuedFlowAfter(flow: PullRequestFlowSnapshot): Promise<void> {
-    const next = this.list()
-      .filter(
-        (candidate) =>
-          candidate.status === "queued" &&
-          (candidate.sourceBranch === flow.sourceBranch ||
-            candidate.sourceBranch === flow.targetBranch ||
-            candidate.targetBranch === flow.sourceBranch ||
-            candidate.targetBranch === flow.targetBranch),
-      )
-      .sort((a, b) => a.createdAt - b.createdAt)[0];
-    if (next) await this.maybeStartQueuedFlow(next);
+  private async startNextQueuedFlowAfter(): Promise<void> {
+    const queued = this.list()
+      .filter((candidate) => candidate.status === "queued")
+      .sort((a, b) => a.createdAt - b.createdAt);
+    for (const next of queued) {
+      await this.maybeStartQueuedFlow(next);
+    }
   }
 
   private async maybeStartQueuedFlow(next: PullRequestFlowSnapshot): Promise<void> {
@@ -696,7 +691,7 @@ export class PullRequestFlowManager {
         } as PullRequestFlowSnapshot;
         this.save(next);
         this.closeTimer(flowId);
-        void this.startNextQueuedFlowAfter(next);
+        void this.startNextQueuedFlowAfter();
       }, delay),
     );
   }
