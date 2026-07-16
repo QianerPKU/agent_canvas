@@ -1010,6 +1010,7 @@ export default function App(): React.ReactElement {
   const [openSyncFlowId, setOpenSyncFlowId] = useState<string>();
   const [appSettings, setAppSettings] = useState<AgentCanvasSettings>({
     fullPermissionMode: false,
+    workDocumentationEnabled: false,
   });
   const [codexUsage, setCodexUsage] = useState<CodexUsageSnapshot>();
   const [codexUsageError, setCodexUsageError] = useState<string>();
@@ -1048,6 +1049,12 @@ export default function App(): React.ReactElement {
       ...current,
       [id]: position,
     }));
+  }, []);
+
+  const refreshAppSettings = useCallback(async () => {
+    const settings = await api.settings();
+    setAppSettings(settings);
+    return settings;
   }, []);
 
   useEffect(() => {
@@ -1114,7 +1121,10 @@ export default function App(): React.ReactElement {
       try {
         setLayoutProjectId(undefined);
         const nextWorkspace = await api.openCanvasProject(id);
-        const nextLayout = await api.canvasLayout();
+        const [nextLayout] = await Promise.all([
+          api.canvasLayout(),
+          refreshAppSettings(),
+        ]);
         setNodes([]);
         setEdges([]);
         setPendingPlacements({});
@@ -1128,7 +1138,7 @@ export default function App(): React.ReactElement {
         setProjectError(error instanceof Error ? error.message : String(error));
       }
     },
-    [refresh, setEdges, setNodes],
+    [refresh, refreshAppSettings, setEdges, setNodes],
   );
 
   const createProject = useCallback(
@@ -1140,7 +1150,10 @@ export default function App(): React.ReactElement {
           name,
           projectRoot: projectRoot?.trim() || undefined,
         });
-        const nextLayout = await api.canvasLayout();
+        const [nextLayout] = await Promise.all([
+          api.canvasLayout(),
+          refreshAppSettings(),
+        ]);
         setNodes([]);
         setEdges([]);
         setPendingPlacements({});
@@ -1154,7 +1167,7 @@ export default function App(): React.ReactElement {
         setProjectError(error instanceof Error ? error.message : String(error));
       }
     },
-    [refresh, setEdges, setNodes],
+    [refresh, refreshAppSettings, setEdges, setNodes],
   );
 
   const connectRepo = useCallback(
@@ -1779,7 +1792,7 @@ function RepoConnectGate({
   );
 }
 
-function AppSettingsDialog({
+export function AppSettingsDialog({
   settings,
   codexUsage,
   codexUsageError,
@@ -1796,10 +1809,14 @@ function AppSettingsDialog({
 }): React.ReactElement {
   const [busy, setBusy] = useState(false);
   const [usageBusy, setUsageBusy] = useState(false);
-  const toggleFullPermission = async (fullPermissionMode: boolean) => {
+  const [error, setError] = useState("");
+  const updateSetting = async (input: Partial<AgentCanvasSettings>) => {
     setBusy(true);
+    setError("");
     try {
-      await onUpdate({ fullPermissionMode });
+      await onUpdate(input);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
       setBusy(false);
     }
@@ -1829,13 +1846,32 @@ function AppSettingsDialog({
             type="checkbox"
             checked={settings.fullPermissionMode}
             disabled={busy}
-            onChange={(event) => void toggleFullPermission(event.target.checked)}
+            onChange={(event) =>
+              void updateSetting({ fullPermissionMode: event.target.checked })
+            }
           />
           <span>
             <strong>完全权限模式</strong>
             <small>开启后所有授权请求由后端直接允许，不再等待前端审批。</small>
           </span>
         </label>
+        <label className="settings-toggle">
+          <input
+            type="checkbox"
+            checked={settings.workDocumentationEnabled}
+            disabled={busy}
+            onChange={(event) =>
+              void updateSetting({ workDocumentationEnabled: event.target.checked })
+            }
+          />
+          <span>
+            <strong>工作文档维护</strong>
+            <small>
+              开启后 Agent 会实时维护 branch 隔离文档与共享概要；两份固定索引会作为参考文件，且不会进入 Git。
+            </small>
+          </span>
+        </label>
+        {error && <div className="file-dialog__error">{error}</div>}
         <section className="settings-panel">
           <div className="settings-panel__header">
             <strong>Codex 用量</strong>

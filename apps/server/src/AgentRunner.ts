@@ -41,6 +41,7 @@ export interface AgentRunnerDeps {
   resolveFileAccess?: (agentId: string) => AgentFileAccess;
   resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
   fullPermissionMode?: () => boolean;
+  workDocumentationEnabled?: () => boolean;
 }
 
 export interface StartExtra {
@@ -72,6 +73,7 @@ export class AgentRunner {
   private readonly resolveFileAccess?: (agentId: string) => AgentFileAccess;
   private readonly resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
   private readonly fullPermissionMode: () => boolean;
+  private readonly workDocumentationEnabled: () => boolean;
   private readonly listeners = new Set<AgentEventListener>();
 
   private status: AgentStatus = "idle";
@@ -108,6 +110,7 @@ export class AgentRunner {
     this.resolveFileAccess = deps.resolveFileAccess;
     this.resolvePromptAccess = deps.resolvePromptAccess;
     this.fullPermissionMode = deps.fullPermissionMode ?? (() => false);
+    this.workDocumentationEnabled = deps.workDocumentationEnabled ?? (() => false);
     this.createdAt = this.now();
   }
 
@@ -204,6 +207,25 @@ export class AgentRunner {
     ) {
       this.detachIdleSessionForNextStart();
     }
+  }
+
+  refreshPolicyPrompt(
+    pendingPrompt?: AgentPromptReference,
+    clearPendingPromptId?: string,
+  ): void {
+    if (clearPendingPromptId) {
+      this.pendingInjectedPrompts = this.pendingInjectedPrompts.filter(
+        (prompt) => prompt.id !== clearPendingPromptId,
+      );
+    }
+    if (this.status === "idle") return;
+    if (pendingPrompt) {
+      this.pendingInjectedPrompts = [
+        ...this.pendingInjectedPrompts.filter((prompt) => prompt.id !== pendingPrompt.id),
+        pendingPrompt,
+      ];
+    }
+    this.policyPromptInjectionPending = true;
   }
 
   // ---- 生命周期 ----
@@ -667,7 +689,9 @@ export class AgentRunner {
       readablePrompts.unshift({
         id: AGENT_CANVAS_POLICY_PROMPT_ID,
         name: AGENT_CANVAS_POLICY_PROMPT_NAME,
-        content: agentCanvasPolicyPrompt(this.id),
+        content: agentCanvasPolicyPrompt(this.id, {
+          workDocumentationEnabled: this.workDocumentationEnabled(),
+        }),
         kind: "shared",
       });
     }

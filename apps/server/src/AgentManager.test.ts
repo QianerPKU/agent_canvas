@@ -287,6 +287,33 @@ describe("AgentManager fork", () => {
     expect(mgr.appSettings().fullPermissionMode).toBe(true);
   });
 
+  it("persists work documentation settings and defaults legacy state to disabled", () => {
+    const { query } = makeQuery();
+    const manager = new AgentManager({ query });
+    expect(manager.appSettings()).toEqual({
+      fullPermissionMode: false,
+      workDocumentationEnabled: false,
+    });
+
+    manager.updateAppSettings({ workDocumentationEnabled: true });
+    const state = manager.exportState();
+    const restored = new AgentManager({ query });
+    restored.importState(state);
+    expect(restored.appSettings()).toEqual({
+      fullPermissionMode: false,
+      workDocumentationEnabled: true,
+    });
+
+    restored.importState({
+      ...state,
+      appSettings: { fullPermissionMode: true } as typeof state.appSettings,
+    });
+    expect(restored.appSettings()).toEqual({
+      fullPermissionMode: true,
+      workDocumentationEnabled: false,
+    });
+  });
+
   it("currentTurnIndex follows completed result turns", async () => {
     const { query, out } = makeWaitingQuery();
     const mgr = new AgentManager({ query });

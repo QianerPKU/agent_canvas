@@ -10,6 +10,7 @@ import type {
   SdkUserInput,
 } from "./sdk/types.js";
 import { agentCanvasPolicyPrompt } from "./agentCanvasPolicyPrompt.js";
+import { workDocumentationDisabledPrompt } from "./workspaces/workDocumentation.js";
 
 /** 让微任务与队列 resolver 跑完。 */
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -501,6 +502,69 @@ describe("AgentRunner 生命周期", () => {
     await flush();
     expect(readablePromptContents(ctl.inputs.at(-1))).toEqual([
       agentCanvasPolicyPrompt("policy-agent"),
+    ]);
+  });
+
+  it("re-injects documentation policy changes and explicitly revokes disabled rules", async () => {
+    const ctl = makeControllableQuery();
+    let workDocumentationEnabled = false;
+    const runner = new AgentRunner("documentation-policy-agent", {
+      query: ctl.query,
+      workDocumentationEnabled: () => workDocumentationEnabled,
+    });
+
+    runner.start({ prompt: "first", branchWorkspaceId: "branch_1" });
+    await flush();
+    expect(readablePromptContents(ctl.inputs[0])).toEqual([
+      agentCanvasPolicyPrompt("documentation-policy-agent"),
+    ]);
+
+    ctl.emit(SYSTEM_INIT);
+    ctl.emit(resultMsg());
+    await flush();
+    workDocumentationEnabled = true;
+    runner.refreshPolicyPrompt();
+    runner.send("enabled");
+    await flush();
+    expect(readablePromptContents(ctl.inputs.at(-1))).toEqual([
+      agentCanvasPolicyPrompt("documentation-policy-agent", {
+        workDocumentationEnabled: true,
+      }),
+    ]);
+
+    ctl.emit(resultMsg());
+    await flush();
+    workDocumentationEnabled = false;
+    runner.refreshPolicyPrompt({
+      id: "agent-canvas:work-documentation-disabled",
+      name: "Agent Canvas 工作文档维护已关闭",
+      content: workDocumentationDisabledPrompt(),
+      kind: "shared",
+    });
+    workDocumentationEnabled = true;
+    runner.refreshPolicyPrompt(undefined, "agent-canvas:work-documentation-disabled");
+    runner.send("rapidly re-enabled");
+    await flush();
+    expect(readablePromptContents(ctl.inputs.at(-1))).toEqual([
+      agentCanvasPolicyPrompt("documentation-policy-agent", {
+        workDocumentationEnabled: true,
+      }),
+    ]);
+
+    ctl.emit(resultMsg());
+    await flush();
+    workDocumentationEnabled = false;
+    runner.refreshPolicyPrompt({
+      id: "agent-canvas:work-documentation-disabled",
+      name: "Agent Canvas 工作文档维护已关闭",
+      content: workDocumentationDisabledPrompt(),
+      kind: "shared",
+    });
+    runner.send("disabled");
+    await flush();
+    expect(readablePromptContents(ctl.inputs.at(-1))).toEqual([
+      agentCanvasPolicyPrompt("documentation-policy-agent"),
+      workDocumentationDisabledPrompt(),
     ]);
   });
 

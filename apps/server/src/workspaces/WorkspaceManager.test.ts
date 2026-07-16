@@ -1,9 +1,20 @@
 import { describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { WorkspaceManager, type GitRunner } from "./WorkspaceManager.js";
+import { sharedBranchDirectory } from "./workDocumentation.js";
 
 describe("WorkspaceManager", () => {
   it("creates and opens explicit canvas projects", async () => {
@@ -175,9 +186,331 @@ describe("WorkspaceManager", () => {
         path.join(feature.worktreePath, ".git", "info", "exclude"),
         "utf-8",
       );
-      expect(exclude).toContain(".agent-tmp/");
-      expect(exclude).toContain("data/raw/");
-      expect(exclude).toContain("models/weights/");
+      const excludeLines = exclude.split(/\r?\n/u);
+      expect(excludeLines).toContain("/.agent-tmp");
+      expect(excludeLines).toContain("/data/raw");
+      expect(excludeLines).toContain("/models/weights");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("provisions isolated and shared work documentation without overwriting agent content", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-work-docs-"));
+    const source = path.join(root, "source-repo");
+    const projectRoot = path.join(root, "project");
+    await mkdir(source, { recursive: true });
+    let documentationPreflights = 0;
+    const runGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return "https://github.com/acme/work-docs.git";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "worktree" && args[1] === "add") {
+        await mkdir(path.join(String(args[4]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      if (args[0] === "ls-files") documentationPreflights += 1;
+      return "";
+    };
+
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: source,
+        projectRoot,
+        runGit,
+      });
+      const project = await manager.connect({ localPath: source });
+      const main = project.branches[0]!;
+      const feature = await manager.createBranch({ branch: "feature/documentation" });
+
+      expect(
+        manager.accessForAgent(
+          { branchWorkspaceId: feature.id },
+          { workDocumentationEnabled: false },
+        ).readableFiles,
+      ).toEqual([]);
+
+      await Promise.all([
+        manager.prepareAgentWorkspace(
+          "agent_1",
+          { branchWorkspaceId: main.id },
+          { workDocumentationEnabled: true },
+        ),
+        manager.prepareAgentWorkspace(
+          "agent_2",
+          { branchWorkspaceId: feature.id },
+          { workDocumentationEnabled: true },
+        ),
+        manager.prepareWorkDocumentationForAllBranches(),
+      ]);
+
+      const mainIndex = path.join(main.worktreePath, ".agent-docs", "index.md");
+      const featureIndex = path.join(feature.worktreePath, ".agent-docs", "index.md");
+      const mainSharedIndex = path.join(main.worktreePath, ".agent-shared-docs", "index.md");
+      const featureSharedIndex = path.join(
+        feature.worktreePath,
+        ".agent-shared-docs",
+        "index.md",
+      );
+      await expect(readFile(mainIndex, "utf-8")).resolves.toContain("`main`");
+      await expect(readFile(featureIndex, "utf-8")).resolves.toContain(
+        "`feature/documentation`",
+      );
+      expect(await realpath(mainSharedIndex)).toBe(await realpath(featureSharedIndex));
+
+      const sharedIndex = await readFile(featureSharedIndex, "utf-8");
+      expect(sharedIndex.match(/agent-canvas:branch:/gu)).toHaveLength(2);
+      expect(sharedIndex).toContain("feature/documentation");
+
+      await writeFile(featureIndex, "# Agent maintained\n", "utf-8");
+      await manager.prepareWorkDocumentationForAllBranches();
+      await expect(readFile(featureIndex, "utf-8")).resolves.toBe("# Agent maintained\n");
+      expect(documentationPreflights).toBe(2);
+      expect(
+        (await readFile(featureSharedIndex, "utf-8")).match(/agent-canvas:branch:/gu),
+      ).toHaveLength(2);
+
+      const access = manager.accessForAgent(
+        { branchWorkspaceId: feature.id },
+        { workDocumentationEnabled: true },
+      );
+      expect(access.readableFiles).toEqual([
+        expect.objectContaining({
+          name: "branch-work-documentation-index.md",
+          path: featureIndex,
+          previewKind: "markdown",
+        }),
+        expect.objectContaining({
+          name: "shared-work-documentation-index.md",
+          path: featureSharedIndex,
+          previewKind: "markdown",
+        }),
+      ]);
+      expect(access.writableFiles).toEqual([]);
+      expect(access.writableDirectories).not.toContain(path.dirname(featureIndex));
+      expect(access.sandboxWritableDirectories).toContain(path.dirname(featureIndex));
+      const branchMountDirectory = path.join(
+        feature.worktreePath,
+        ".agent-shared-docs",
+        "branches",
+        sharedBranchDirectory(feature.branch),
+      );
+      const branchSourceDirectory = await realpath(branchMountDirectory);
+      expect(access.sandboxWritableDirectories).toContain(branchMountDirectory);
+      expect(access.sandboxWritableDirectories).toContain(branchSourceDirectory);
+      expect(access.sandboxWritableDirectories).not.toContain(
+        path.join(feature.worktreePath, ".agent-shared-docs"),
+      );
+      expect(access.sharedResources).toContainEqual(
+        expect.objectContaining({
+          name: "Agent Canvas 当前 branch 共享概要",
+          mountPath: branchMountDirectory,
+          sourcePath: branchSourceDirectory,
+          access: "readWrite",
+        }),
+      );
+
+      const exclude = await readFile(
+        path.join(feature.worktreePath, ".git", "info", "exclude"),
+        "utf-8",
+      );
+      const excludeLines = exclude.split(/\r?\n/u);
+      expect(excludeLines).toContain("/.agent-docs");
+      expect(excludeLines).toContain("/.agent-shared-docs");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps queued documentation bound to the project that scheduled it", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-doc-project-race-"));
+    const source = path.join(root, "source-repo");
+    const projectsRoot = path.join(root, "projects");
+    await mkdir(source, { recursive: true });
+    let blockDocumentation = false;
+    let signalBlocked!: () => void;
+    let releaseDocumentation!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      signalBlocked = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      releaseDocumentation = resolve;
+    });
+    const runGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return "https://github.com/acme/project-race.git";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      if (args[0] === "ls-files" && blockDocumentation) {
+        blockDocumentation = false;
+        signalBlocked();
+        await released;
+      }
+      return "";
+    };
+
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: source,
+        projectsRoot,
+        autoOpenDefault: false,
+        runGit,
+      });
+      const projectA = await manager.createCanvasProject({ name: "Project A" });
+      const workspaceA = (await manager.connect({ localPath: source })).branches[0]!;
+      blockDocumentation = true;
+      const preparing = manager.prepareAgentWorkspace(
+        "agent_a",
+        { branchWorkspaceId: workspaceA.id },
+        { workDocumentationEnabled: true },
+      );
+      await blocked;
+
+      const projectB = await manager.createCanvasProject({ name: "Project B" });
+      releaseDocumentation();
+      await preparing;
+
+      const sharedTarget = await realpath(
+        path.join(workspaceA.worktreePath, ".agent-shared-docs"),
+      );
+      expect(path.relative(projectA.projectRoot, sharedTarget)).not.toMatch(/^\.\.(?:[\\/]|$)/u);
+      await expect(
+        lstat(path.join(projectB.projectRoot, "shared", "_agent-canvas")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      releaseDocumentation?.();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a shared documentation source mapped outside the project", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-doc-boundary-"));
+    const source = path.join(root, "source-repo");
+    const projectRoot = path.join(root, "project");
+    const outside = path.join(root, "outside");
+    const remoteUrl = "https://github.com/acme/doc-boundary.git";
+    await Promise.all([
+      mkdir(source, { recursive: true }),
+      mkdir(outside, { recursive: true }),
+    ]);
+    const runGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return remoteUrl;
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      return "";
+    };
+
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: source,
+        projectRoot,
+        runGit,
+      });
+      await manager.connect({ localPath: source });
+      const repositoryKey = createHash("sha256")
+        .update(remoteUrl.toLowerCase())
+        .digest("hex")
+        .slice(0, 16);
+      const sharedSource = path.join(
+        projectRoot,
+        "shared",
+        "_agent-canvas",
+        repositoryKey,
+        "work-documentation",
+      );
+      await mkdir(path.dirname(sharedSource), { recursive: true });
+      await symlink(
+        outside,
+        sharedSource,
+        process.platform === "win32" ? "junction" : "dir",
+      );
+
+      await expect(manager.prepareWorkDocumentationForAllBranches()).rejects.toThrow(
+        "工作文档目录包含不安全的映射",
+      );
+      const workspace = (await manager.project()).branches[0]!;
+      await expect(
+        lstat(path.join(workspace.worktreePath, ".agent-docs")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(lstat(path.join(outside, "index.md"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+
+      await rm(sharedSource, { force: true });
+      const conflictingMount = path.join(
+        workspace.worktreePath,
+        ".agent-shared-docs",
+      );
+      await mkdir(conflictingMount, { recursive: true });
+      await expect(manager.prepareWorkDocumentationForAllBranches()).rejects.toThrow(
+        "共享资源挂载点已存在且不是映射",
+      );
+      await expect(
+        lstat(path.join(workspace.worktreePath, ".agent-docs")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to reuse a tracked repository directory for managed documentation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-work-docs-collision-"));
+    const source = path.join(root, "source-repo");
+    const projectRoot = path.join(root, "project");
+    await mkdir(source, { recursive: true });
+    let trackedDocumentation = false;
+    const runGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return "https://github.com/acme/work-docs-collision.git";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      if (args[0] === "ls-files") {
+        return trackedDocumentation ? ".agent-docs/index.md" : "";
+      }
+      return "";
+    };
+
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: source,
+        projectRoot,
+        runGit,
+      });
+      const project = await manager.connect({ localPath: source });
+      const main = project.branches[0]!;
+      const indexPath = path.join(main.worktreePath, ".agent-docs", "index.md");
+      await mkdir(path.dirname(indexPath), { recursive: true });
+      await writeFile(indexPath, "# Repository documentation\n", "utf-8");
+      trackedDocumentation = true;
+
+      await expect(manager.prepareWorkDocumentationForAllBranches()).rejects.toThrow(
+        ".agent-docs/ 或 .agent-shared-docs/ 已包含 Git 跟踪文件",
+      );
+      await expect(readFile(indexPath, "utf-8")).resolves.toBe(
+        "# Repository documentation\n",
+      );
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -294,6 +627,20 @@ describe("WorkspaceManager", () => {
         readFile(path.join(featureB.worktreePath, "feature-only.txt"), "utf-8"),
       ).resolves.toContain("from feature/a");
       const branches = [main, featureA, featureB];
+      await manager.prepareWorkDocumentationForAllBranches();
+
+      for (const branch of branches) {
+        await writeFile(
+          path.join(branch.worktreePath, ".agent-docs", "analysis.md"),
+          `# ${branch.branch} analysis\n`,
+          "utf-8",
+        );
+        await writeFile(
+          path.join(branch.worktreePath, ".agent-shared-docs", `${branch.id}.md`),
+          `# ${branch.branch} shared summary\n`,
+          "utf-8",
+        );
+      }
 
       for (const branch of branches) {
         const mountPath = path.join(branch.worktreePath, "shared", "dataset");
@@ -356,7 +703,10 @@ describe("WorkspaceManager", () => {
           excludePath,
           "utf-8",
         );
-        expect(exclude).toContain("shared/dataset/");
+        const excludeLines = exclude.split(/\r?\n/u);
+        expect(excludeLines).toContain("/shared/dataset");
+        expect(excludeLines).toContain("/.agent-docs");
+        expect(excludeLines).toContain("/.agent-shared-docs");
       }
     } finally {
       await rm(root, { recursive: true, force: true });

@@ -18,15 +18,29 @@ Linux:   ~/.local/share/agent_canvas/projects/index.json
   repos/<repo-id>/repo/          # 默认 branch 的 AppData clone
   worktrees/<repo-id>/<branch>/  # 其他 branch 的 git worktree
   shared/<repo-id>/<resource>/   # 项目级共享资源真实目录
+  shared/_agent-canvas/<repo-hash>/work-documentation/ # 内置跨 branch 工作文档
 ```
 
 新建项目时可传 `projectRoot`，直接把这个 Canvas 项目放进用户指定文件夹。`AGENT_CANVAS_PROJECTS_ROOT` 可覆盖默认项目列表根目录；`AGENT_CANVAS_PROJECT_ROOT` 可覆盖并自动打开单个项目根目录，主要用于测试、调试或固定部署。
 
-## 三类文件
+## 四类文件
 
 - 仓库文件：普通代码、配置、测试、文档等，保存在各 branch workspace 中，默认属于需要 commit 的正式改动。
 - 共享资源：数据集、模型权重等不提交但核心的大文件，真实内容位于 `shared/`，并通过 junction/symlink 映射到每个 branch workspace 的固定相对路径。
 - Agent 临时文件：每个 Agent 使用 `<worktree>/.agent-tmp/<agent-id>/`，该路径写入本地 git exclude，不提交。
+- 内置工作文档：项目设置开启后，branch 详细文档位于 `<worktree>/.agent-docs/`，共享概要通过 `<worktree>/.agent-shared-docs/` 映射到项目级保留目录。两者都写入本地 git exclude，不提交。
+
+## 工作文档维护
+
+- `workDocumentationEnabled` 是随当前 Canvas 项目保存的开关，默认关闭；旧项目缺少该字段时按关闭处理。
+- 后端硬编码两个导航入口：`.agent-docs/index.md` 保存当前 branch 的详细状态、活动记录和文档索引；`.agent-shared-docs/index.md` 由后端维护同一仓库所有 branch 的只读导航条目，并链接由 Agent 实时维护的各 branch 共享概要页。
+- 两个索引只在不存在时初始化，不覆盖 Agent 已维护的内容。WorkspaceManager 会串行执行初始化，并使用原子文件创建避免多个 Agent 同时启动时截断模板。
+- 初始化先执行无副作用的 tracked-path、marker、mount 与路径边界预检，再先安装 Git exclude，最后创建文件；成功的 project/repo/branch 上下文会在进程内缓存，避免 Agent 已获得概要写权后后端重复触碰文档路径。
+- `.agent-docs/` 与内置共享源目录都使用 `.agent-canvas-managed` 标记。启用前会通过 `git ls-files` 检查仓库路径，并拒绝未托管目录、symlink/junction、非普通索引文件或越出项目真实路径边界的共享源，避免复用、覆盖业务文件或扩大写入范围。
+- 开启后，两份索引通过 `AgentFileAccess.readableFiles` 随每次业务输入作为文件引用传给 provider；索引内容不会作为提示词节点全文拼接。`sandboxWritableDirectories` 只开放 branch 隔离文档目录和当前 branch 的共享概要子目录，不开放共享总索引或其他 branch 概要；这些文件不是 `CanvasFileNode`，不会出现在画布文件节点中。
+- `sandboxWritableDirectories` 不会像用户明确授权的文件/提示词写目标那样把 Codex `approvalPolicy` 改为 `never`；文档开关不会顺带取消普通代码修改的审批。
+- `.agent-shared-docs/` 的真实目录使用仓库 remote URL 哈希隔离，避免用户共享资源同名冲突，也避免同一 Canvas 重新连接其他仓库时复用旧概要；Git exclude 使用根锚定且无尾斜杠的条目，POSIX symlink 和 Windows junction 本身都不会进入状态列表。
+- 关闭后，后端移除索引引用和额外写目录，并向已有会话注入一次撤销说明；物理文档会保留，方便以后重新开启。
 
 ## Git 与 GitHub
 

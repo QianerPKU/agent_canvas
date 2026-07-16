@@ -228,6 +228,12 @@ describe("Codex app-server query", () => {
       prompt,
       options: {
         cwd: "C:/repo",
+        fileAccess: {
+          readableFiles: [],
+          writableFiles: [],
+          sandboxWritableDirectories: ["C:/stale-agent-docs"],
+          writableDirectories: [],
+        },
         promptAccess: {
           readablePrompts: [
             { id: "prompt_1", name: "规则", content: "先写测试", kind: "shared" },
@@ -250,6 +256,24 @@ describe("Codex app-server query", () => {
           readableFiles: [
             { name: "next.txt", path: "C:/shared/next.txt", previewKind: "text" },
           ],
+          writableFiles: [],
+          sandboxWritableDirectories: ["C:/agent-docs"],
+          writableDirectories: [],
+        },
+        {
+          readablePrompts: [],
+          writablePrompts: [],
+          writableDirectories: [],
+        },
+      ),
+    );
+    await iterator.next();
+
+    prompt.push(
+      userInput(
+        "关闭工作文档后继续",
+        {
+          readableFiles: [],
           writableFiles: [],
           writableDirectories: [],
         },
@@ -299,7 +323,26 @@ describe("Codex app-server query", () => {
       },
       { type: "mention", name: "next.txt", path: "C:/shared/next.txt" },
     ]);
-    expect(turnStarts[1]?.params?.sandboxPolicy).toBeUndefined();
+    expect(turnStarts[1]?.params?.sandboxPolicy).toEqual({
+      type: "workspaceWrite",
+      writableRoots: [
+        expect.stringMatching(/C:[\\/]repo$/),
+        expect.stringMatching(/C:[\\/]agent-docs$/),
+      ],
+      networkAccess: false,
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false,
+    });
+    expect(turnStarts[1]?.params?.approvalPolicy).toBeUndefined();
+    expect(turnStarts[2]?.params?.input).toEqual([
+      {
+        type: "text",
+        text: "关闭工作文档后继续",
+        text_elements: [],
+      },
+    ]);
+    expect(turnStarts[2]?.params?.sandboxPolicy).toBeUndefined();
+    expect(turnStarts[2]?.params?.approvalPolicy).toBeUndefined();
     await handle.terminate?.();
   });
 

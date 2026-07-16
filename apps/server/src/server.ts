@@ -109,7 +109,9 @@ export function createServer(
   manager.setFileAccessResolver((agentId) =>
     mergeFileAccess(
       fileManager.accessFor(agentId),
-      workspaceManager.accessForAgent(manager.configOf(agentId)),
+      workspaceManager.accessForAgent(manager.configOf(agentId), {
+        workDocumentationEnabled: manager.appSettings().workDocumentationEnabled,
+      }),
     ),
   );
   const promptManager =
@@ -282,9 +284,24 @@ async function handleHttp(
 
   if (method === "PATCH" && path === "/api/settings") {
     const body = await readJson<Partial<AgentCanvasSettings>>(req);
-    const settings = manager.updateAppSettings(body ?? {});
-    canvasState.saveSoon();
-    return sendJson(res, 200, settings);
+    if (
+      (body?.fullPermissionMode !== undefined &&
+        typeof body.fullPermissionMode !== "boolean") ||
+      (body?.workDocumentationEnabled !== undefined &&
+        typeof body.workDocumentationEnabled !== "boolean")
+    ) {
+      return sendJson(res, 400, { error: "设置项必须是 boolean" });
+    }
+    try {
+      if (body?.workDocumentationEnabled) {
+        await workspaceManager.prepareWorkDocumentationForAllBranches();
+      }
+      const settings = manager.updateAppSettings(body ?? {});
+      canvasState.saveSoon();
+      return sendJson(res, 200, settings);
+    } catch (error) {
+      return sendJson(res, 400, { error: errMsg(error) });
+    }
   }
 
   if (method === "GET" && path === "/api/canvas-layout") {
@@ -344,6 +361,9 @@ async function handleHttp(
     const body = await readJson<ConnectGitHubInput>(req);
     try {
       const workspace = await workspaceManager.connect(body ?? {});
+      if (manager.appSettings().workDocumentationEnabled) {
+        await workspaceManager.prepareWorkDocumentationForAllBranches();
+      }
       canvasState.saveSoon();
       return sendJson(res, 200, workspace);
     } catch (error) {
@@ -371,7 +391,11 @@ async function handleHttp(
     const body = await readJson<CreateBranchWorkspaceInput>(req);
     if (!body?.branch) return sendJson(res, 400, { error: "缺少 branch" });
     try {
-      return sendJson(res, 201, { branch: await workspaceManager.createBranch(body) });
+      const branch = await workspaceManager.createBranch(body);
+      if (manager.appSettings().workDocumentationEnabled) {
+        await workspaceManager.prepareWorkDocumentationForAllBranches();
+      }
+      return sendJson(res, 201, { branch });
     } catch (error) {
       return sendJson(res, 400, { error: errMsg(error) });
     }
@@ -880,6 +904,11 @@ async function handleHttp(
               scratchDirectory: resolvedWorkspaceSettings?.scratchDirectory,
             }
           : body ?? {};
+        if (branchChanged && manager.appSettings().workDocumentationEnabled) {
+          await workspaceManager.prepareAgentWorkspace(id, settings, {
+            workDocumentationEnabled: true,
+          });
+        }
         const diff = branchChanged
           ? await workspaceManager.diffBetweenBranches(currentConfig?.branch, settings.branch)
           : undefined;
@@ -908,10 +937,16 @@ async function handleHttp(
     if (method === "POST" && action === "start") {
       const body = await readJson<AgentStartConfig>(req);
       if (!body?.prompt) return sendJson(res, 400, { error: "缺少 prompt" });
-      await workspaceManager.prepareAgentWorkspace(id, {
-        ...manager.configOf(id),
-        ...body,
-      });
+      await workspaceManager.prepareAgentWorkspace(
+        id,
+        {
+          ...manager.configOf(id),
+          ...body,
+        },
+        {
+          workDocumentationEnabled: manager.appSettings().workDocumentationEnabled,
+        },
+      );
       manager.startAgent(id, body); // 若是 fork 产生的 agent，合并其 fork 配置
       return sendJson(res, 202, { ok: true });
     }
@@ -956,6 +991,9 @@ async function handleHttp(
       const body = await readJson<{ text?: string }>(req);
       if (!body?.text) return sendJson(res, 400, { error: "缺少 text" });
       try {
+        await workspaceManager.prepareAgentWorkspace(id, manager.configOf(id), {
+          workDocumentationEnabled: manager.appSettings().workDocumentationEnabled,
+        });
         runner.send(body.text);
       } catch (err) {
         return sendJson(res, 409, { error: errMsg(err) });
@@ -966,6 +1004,9 @@ async function handleHttp(
       const body = await readJson<{ text?: string }>(req);
       if (!body?.text) return sendJson(res, 400, { error: "缺少 text" });
       try {
+        await workspaceManager.prepareAgentWorkspace(id, manager.configOf(id), {
+          workDocumentationEnabled: manager.appSettings().workDocumentationEnabled,
+        });
         await runner.steer(body.text);
       } catch (err) {
         return sendJson(res, 409, { error: errMsg(err) });
@@ -984,6 +1025,9 @@ async function handleHttp(
       const body = await readJson<{ sessionId?: string; text?: string }>(req);
       if (!body?.sessionId || !body?.text)
         return sendJson(res, 400, { error: "缺少 sessionId 或 text" });
+      await workspaceManager.prepareAgentWorkspace(id, manager.configOf(id), {
+        workDocumentationEnabled: manager.appSettings().workDocumentationEnabled,
+      });
       runner.start(
         { ...(runner.snapshot().config ?? { prompt: body.text }), prompt: body.text },
         { resumeSessionId: body.sessionId },
@@ -1131,6 +1175,9 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
       deps.commitManager.importState(state?.commits);
       deps.pullRequestFlowManager.importState(state?.prFlows);
       deps.syncFlowManager.importState(state?.syncFlows);
+      if (deps.manager.appSettings().workDocumentationEnabled) {
+        await deps.workspaceManager.prepareWorkDocumentationForAllBranches();
+      }
       layout = sanitizeCanvasLayout(state?.layout);
     },
     saveNow,
@@ -1415,10 +1462,14 @@ function isPathInside(candidate: string, root: string): boolean {
 }
 
 function mergeFileAccess(...items: AgentFileAccess[]): AgentFileAccess {
+  const sandboxWritableDirectories = [
+    ...new Set(items.flatMap((item) => item.sandboxWritableDirectories ?? [])),
+  ];
   return {
     readableFiles: items.flatMap((item) => item.readableFiles),
     readableDirectories: [...new Set(items.flatMap((item) => item.readableDirectories ?? []))],
     writableFiles: items.flatMap((item) => item.writableFiles),
+    ...(sandboxWritableDirectories.length > 0 ? { sandboxWritableDirectories } : {}),
     writableDirectories: [...new Set(items.flatMap((item) => item.writableDirectories))],
     sharedResources: items.flatMap((item) => item.sharedResources ?? []),
   };

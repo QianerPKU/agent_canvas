@@ -18,6 +18,10 @@ import type {
 import { execFile } from "node:child_process";
 import { AgentRunner } from "./AgentRunner.js";
 import type { QueryFn } from "./sdk/types.js";
+import {
+  WORK_DOCUMENTATION_DISABLED_PROMPT_ID,
+  workDocumentationDisabledPrompt,
+} from "./workspaces/workDocumentation.js";
 
 export type EnvelopeListener = (envelope: AgentEventEnvelope) => void;
 
@@ -60,7 +64,10 @@ export class AgentManager {
   private readonly forkOrigins = new Map<string, ForkOrigin>();
   private readonly forkConfigs = new Map<string, Partial<AgentStartConfig>>();
   private readonly draftConfigs = new Map<string, Partial<AgentStartConfig>>();
-  private readonly appSettingsState: AgentCanvasSettings = { fullPermissionMode: false };
+  private readonly appSettingsState: AgentCanvasSettings = {
+    fullPermissionMode: false,
+    workDocumentationEnabled: false,
+  };
   private readonly query: QueryFn;
   private readonly codexQuery?: QueryFn;
   private readonly defaultCwd: string;
@@ -114,7 +121,9 @@ export class AgentManager {
     this.forkOrigins.clear();
     this.forkConfigs.clear();
     this.draftConfigs.clear();
-    this.appSettingsState.fullPermissionMode = state?.appSettings?.fullPermissionMode ?? false;
+    this.appSettingsState.fullPermissionMode = state?.appSettings?.fullPermissionMode === true;
+    this.appSettingsState.workDocumentationEnabled =
+      state?.appSettings?.workDocumentationEnabled === true;
     this.counter = 0;
 
     const agents = state?.agents ?? [];
@@ -156,6 +165,9 @@ export class AgentManager {
       codexQuery: this.codexQuery,
       now: this.now,
       fullPermissionMode: () => this.appSettingsState.fullPermissionMode,
+      workDocumentationEnabled: () =>
+        this.appSettingsState.workDocumentationEnabled &&
+        !!this.configOf(id)?.branchWorkspaceId,
       resolveFileAccess: (agentId) =>
         this.resolveFileAccess?.(agentId) ?? {
           readableFiles: [],
@@ -293,12 +305,32 @@ export class AgentManager {
 
   updateAppSettings(input: Partial<AgentCanvasSettings>): AgentCanvasSettings {
     const wasFullPermission = this.appSettingsState.fullPermissionMode;
+    const wasWorkDocumentation = this.appSettingsState.workDocumentationEnabled;
     if (input.fullPermissionMode !== undefined) {
       this.appSettingsState.fullPermissionMode = input.fullPermissionMode;
+    }
+    if (input.workDocumentationEnabled !== undefined) {
+      this.appSettingsState.workDocumentationEnabled = input.workDocumentationEnabled;
     }
     if (!wasFullPermission && this.appSettingsState.fullPermissionMode) {
       for (const runner of this.runners.values()) {
         runner.approvePendingApprovals();
+      }
+    }
+    if (wasWorkDocumentation !== this.appSettingsState.workDocumentationEnabled) {
+      const disabledPrompt = this.appSettingsState.workDocumentationEnabled
+        ? undefined
+        : {
+            id: WORK_DOCUMENTATION_DISABLED_PROMPT_ID,
+            name: "Agent Canvas 工作文档维护已关闭",
+            content: workDocumentationDisabledPrompt(),
+            kind: "shared" as const,
+          };
+      for (const [id, runner] of this.runners) {
+        runner.refreshPolicyPrompt(
+          this.configOf(id)?.branchWorkspaceId ? disabledPrompt : undefined,
+          WORK_DOCUMENTATION_DISABLED_PROMPT_ID,
+        );
       }
     }
     return this.appSettings();

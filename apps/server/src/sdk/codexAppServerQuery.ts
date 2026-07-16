@@ -179,7 +179,7 @@ function turnOverrides(
   promptAccess: AgentPromptAccess | undefined,
 ): Record<string, unknown> {
   const params: Record<string, unknown> = {};
-  const writableDirectories = [
+  const approvalExemptWritableDirectories = [
     ...new Set([
       ...(fileAccess?.writableDirectories ?? options?.fileAccess?.writableDirectories ?? []),
       ...(promptAccess?.writableDirectories ??
@@ -187,9 +187,17 @@ function turnOverrides(
         []),
     ]),
   ];
+  const writableDirectories = [
+    ...new Set([
+      ...approvalExemptWritableDirectories,
+      ...(fileAccess
+        ? fileAccess.sandboxWritableDirectories ?? []
+        : options?.fileAccess?.sandboxWritableDirectories ?? []),
+    ]),
+  ];
   const approvalPolicy = approvalPolicyFor(
     options?.permissionMode,
-    writableDirectories.length > 0,
+    approvalExemptWritableDirectories.length > 0,
   );
   if (approvalPolicy) params.approvalPolicy = approvalPolicy;
   if (model) params.model = model;

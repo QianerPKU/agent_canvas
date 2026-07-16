@@ -327,14 +327,39 @@ describe("HTTP server", () => {
 
   it("exposes and updates app settings", async () => {
     const initial = await request(port, "GET", "/api/settings");
-    expect(initial).toEqual({ status: 200, json: { fullPermissionMode: false } });
+    expect(initial).toEqual({
+      status: 200,
+      json: { fullPermissionMode: false, workDocumentationEnabled: false },
+    });
+
+    const invalid = await request(port, "PATCH", "/api/settings", {
+      workDocumentationEnabled: "false",
+    });
+    expect(invalid).toEqual({
+      status: 400,
+      json: { error: "设置项必须是 boolean" },
+    });
 
     const updated = await request(port, "PATCH", "/api/settings", {
       fullPermissionMode: true,
+      workDocumentationEnabled: true,
     });
-    expect(updated).toEqual({ status: 200, json: { fullPermissionMode: true } });
+    expect(updated).toEqual({
+      status: 200,
+      json: { fullPermissionMode: true, workDocumentationEnabled: true },
+    });
+    const mainWorkspace = path.join(projectRoot, "repos", "repo_1", "repo");
+    await expect(
+      readFile(path.join(mainWorkspace, ".agent-docs", "index.md"), "utf-8"),
+    ).resolves.toContain("Branch 工作文档索引");
+    await expect(
+      readFile(path.join(mainWorkspace, ".agent-shared-docs", "index.md"), "utf-8"),
+    ).resolves.toContain("共享 Branch 文档索引");
 
-    await request(port, "PATCH", "/api/settings", { fullPermissionMode: false });
+    await request(port, "PATCH", "/api/settings", {
+      fullPermissionMode: false,
+      workDocumentationEnabled: false,
+    });
   });
 
   it("exposes Codex login status and starts device auth", async () => {
@@ -866,6 +891,7 @@ describe("HTTP server", () => {
     });
     expect(projectA.status).toBe(201);
     await request(port, "POST", "/api/workspace/connect", { localPath: root });
+    await request(port, "PATCH", "/api/settings", { workDocumentationEnabled: true });
 
     const agent = await request(port, "POST", "/api/agents", {
       branch: "main",
@@ -911,7 +937,13 @@ describe("HTTP server", () => {
     );
     expect(persistedState).toMatchObject({
       version: 1,
-      agents: { agents: [expect.objectContaining({ id: agent.json.id })] },
+      agents: {
+        agents: [expect.objectContaining({ id: agent.json.id })],
+        appSettings: {
+          fullPermissionMode: false,
+          workDocumentationEnabled: true,
+        },
+      },
       files: { files: [expect.objectContaining({ id: file.json.file.id })] },
       prompts: { prompts: [expect.objectContaining({ id: prompt.json.prompt.id })] },
       layout: {
@@ -926,11 +958,19 @@ describe("HTTP server", () => {
     });
     expect(projectB.status).toBe(201);
     expect((await request(port, "GET", "/api/agents")).json.agents).toHaveLength(0);
+    expect((await request(port, "GET", "/api/settings")).json).toEqual({
+      fullPermissionMode: false,
+      workDocumentationEnabled: false,
+    });
 
     const reopened = await request(port, "POST", "/api/canvas-projects/open", {
       id: projectA.json.project.id,
     });
     expect(reopened.status).toBe(200);
+    expect((await request(port, "GET", "/api/settings")).json).toEqual({
+      fullPermissionMode: false,
+      workDocumentationEnabled: true,
+    });
 
     const restoredAgents = await request(port, "GET", "/api/agents");
     const restoredFiles = await request(port, "GET", "/api/files");

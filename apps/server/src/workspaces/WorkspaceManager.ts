@@ -5,7 +5,9 @@ import {
   access,
   lstat,
   mkdir,
+  open,
   readFile,
+  realpath,
   rm,
   symlink,
   writeFile,
@@ -29,6 +31,15 @@ import type {
   WorkspaceProject,
 } from "@agent-canvas/shared";
 import type { AgentStartConfig } from "@agent-canvas/shared";
+import {
+  WORK_DOCUMENTATION_PATHS,
+  WORK_DOCUMENTATION_MANAGED_MARKER,
+  ensureSharedBranchIndexEntry,
+  isolatedDocumentationIndex,
+  sharedBranchDirectory,
+  sharedBranchOverview,
+  sharedDocumentationIndex,
+} from "./workDocumentation.js";
 
 export interface WorkspaceManagerOptions {
   defaultSourcePath: string;
@@ -43,6 +54,10 @@ export interface GitRunner {
   (args: string[], options?: { cwd?: string }): Promise<string>;
 }
 
+export interface WorkDocumentationOptions {
+  workDocumentationEnabled?: boolean;
+}
+
 interface WorkspaceState {
   repo?: GitHubConnection;
   branches: BranchWorkspace[];
@@ -51,6 +66,12 @@ interface WorkspaceState {
 
 interface ProjectIndex {
   projects: CanvasProjectSummary[];
+}
+
+interface WorkDocumentationContext {
+  workspace: BranchWorkspace;
+  projectRoot: string;
+  repositoryKey: string;
 }
 
 const DEFAULT_REPO_ID = "repo_1";
@@ -68,6 +89,10 @@ export class WorkspaceManager {
   private stateLoaded = false;
   private branchCounter = 0;
   private resourceCounter = 0;
+  private documentationPrepareChain: Promise<void> = Promise.resolve();
+  private readonly ignoreWriteChains = new Map<string, Promise<void>>();
+  private readonly preparedWorkDocumentation = new Set<string>();
+  private projectGeneration = 0;
 
   constructor(options: WorkspaceManagerOptions) {
     this.defaultSourcePath = path.resolve(options.defaultSourcePath);
@@ -161,6 +186,7 @@ export class WorkspaceManager {
       connectedAt: this.now(),
     });
     this.state = { repo, branches: [], sharedResources: [] };
+    this.resetWorkDocumentationPreparation();
     this.branchCounter = 0;
     this.resourceCounter = 0;
     await this.createBranch({ branch: defaultBranch });
@@ -390,18 +416,50 @@ export class WorkspaceManager {
   async prepareAgentWorkspace(
     agentId: string,
     config: Pick<AgentStartConfig, "cwd" | "branchWorkspaceId"> | undefined,
+    options: WorkDocumentationOptions = {},
   ): Promise<string | undefined> {
     const workspace = this.branchOf(config?.branchWorkspaceId);
+    const documentationContext =
+      workspace && options.workDocumentationEnabled
+        ? this.captureWorkDocumentationContext(workspace)
+        : undefined;
     const cwd = workspace?.worktreePath ?? config?.cwd;
     if (!cwd) return undefined;
     const scratchDirectory = path.join(cwd, ".agent-tmp", agentId);
     await mkdir(scratchDirectory, { recursive: true });
     if (workspace) await this.ensureIgnored(workspace, [".agent-tmp/"]);
+    if (documentationContext) {
+      await this.queueWorkDocumentation(() =>
+        this.ensureWorkDocumentation(documentationContext),
+      );
+    }
     return scratchDirectory;
+  }
+
+  async prepareWorkDocumentationForAllBranches(): Promise<void> {
+    const projectGeneration = this.projectGeneration;
+    await this.ensureProjectOpen();
+    await this.loadStateIfNeeded();
+    if (projectGeneration !== this.projectGeneration) {
+      throw new Error("Canvas 项目已在工作文档初始化期间切换，请重试");
+    }
+    const contexts = this.state.branches.map((workspace) =>
+      this.captureWorkDocumentationContext(workspace),
+    );
+    await this.queueWorkDocumentation(async () => {
+      for (const context of contexts) {
+        await this.ensureWorkDocumentation(context);
+      }
+    });
+  }
+
+  private resetWorkDocumentationPreparation(): void {
+    this.preparedWorkDocumentation.clear();
   }
 
   accessForAgent(
     config: Pick<AgentStartConfig, "branchWorkspaceId"> | undefined,
+    options: WorkDocumentationOptions = {},
   ): AgentFileAccess {
     const workspace = this.branchOf(config?.branchWorkspaceId);
     if (!workspace) {
@@ -422,13 +480,54 @@ export class WorkspaceManager {
       sourcePath: resource.sourcePath,
       access: resource.access,
     }));
+    const documentation = options.workDocumentationEnabled
+      ? this.workDocumentationPaths(this.captureWorkDocumentationContext(workspace))
+      : undefined;
+    if (documentation) {
+      sharedResources.push({
+        name: "Agent Canvas 当前 branch 共享概要",
+        mountPath: documentation.branchMountDirectory,
+        sourcePath: documentation.branchSourceDirectory,
+        access: "readWrite",
+      });
+    }
     return {
-      readableFiles: [],
-      readableDirectories: resources.map((resource) => resource.sourcePath),
+      readableFiles: documentation
+        ? [
+            {
+              name: "branch-work-documentation-index.md",
+              path: documentation.isolatedIndex,
+              previewKind: "markdown",
+            },
+            {
+              name: "shared-work-documentation-index.md",
+              path: documentation.sharedIndex,
+              previewKind: "markdown",
+            },
+          ]
+        : [],
+      readableDirectories: [
+        ...resources.map((resource) => resource.sourcePath),
+        ...(documentation
+          ? [
+              documentation.isolatedDirectory,
+              documentation.sharedMountDirectory,
+            ]
+          : []),
+      ],
       writableFiles: [],
-      writableDirectories: resources
-        .filter((resource) => resource.access === "readWrite")
-        .map((resource) => resource.sourcePath),
+      sandboxWritableDirectories: documentation
+        ? [
+            documentation.isolatedDirectory,
+            documentation.branchSourceDirectory,
+            documentation.branchMountDirectory,
+          ]
+        : [],
+      writableDirectories: [
+        ...resources
+          .filter((resource) => resource.access === "readWrite")
+          .map((resource) => resource.sourcePath),
+      ],
       sharedResources,
     };
   }
@@ -450,6 +549,8 @@ export class WorkspaceManager {
   }
 
   private async openProject(project: CanvasProjectSummary): Promise<void> {
+    this.projectGeneration += 1;
+    this.resetWorkDocumentationPreparation();
     this.currentProject = project;
     this.projectRoot = path.resolve(project.projectRoot);
     this.state = { branches: [], sharedResources: [] };
@@ -580,6 +681,237 @@ export class WorkspaceManager {
     }
   }
 
+  private captureWorkDocumentationContext(
+    workspace: BranchWorkspace,
+  ): WorkDocumentationContext {
+    return {
+      workspace: { ...workspace },
+      projectRoot: this.requireProjectRoot(),
+      repositoryKey: this.workDocumentationRepositoryKey(workspace),
+    };
+  }
+
+  private workDocumentationPaths(context: WorkDocumentationContext) {
+    const { workspace } = context;
+    const isolatedDirectory = path.join(
+      workspace.worktreePath,
+      WORK_DOCUMENTATION_PATHS.isolatedDirectory,
+    );
+    const sharedSourceDirectory = path.join(
+      context.projectRoot,
+      "shared",
+      "_agent-canvas",
+      context.repositoryKey,
+      WORK_DOCUMENTATION_PATHS.sharedSourceDirectory,
+    );
+    const sharedMountDirectory = path.join(
+      workspace.worktreePath,
+      WORK_DOCUMENTATION_PATHS.sharedMountDirectory,
+    );
+    const branchDirectory = sharedBranchDirectory(workspace.branch);
+    const branchSourceDirectory = path.join(
+      sharedSourceDirectory,
+      "branches",
+      branchDirectory,
+    );
+    const branchMountDirectory = path.join(
+      sharedMountDirectory,
+      "branches",
+      branchDirectory,
+    );
+    return {
+      isolatedDirectory,
+      isolatedIndex: path.join(isolatedDirectory, "index.md"),
+      sharedSourceDirectory,
+      sharedMountDirectory,
+      sharedIndex: path.join(sharedMountDirectory, "index.md"),
+      sharedSourceIndex: path.join(sharedSourceDirectory, "index.md"),
+      branchDirectory,
+      branchSourceDirectory,
+      branchMountDirectory,
+      branchOverview: path.join(branchSourceDirectory, "overview.md"),
+    };
+  }
+
+  private async ensureWorkDocumentation(context: WorkDocumentationContext): Promise<void> {
+    const preparationKey = [
+      context.projectRoot,
+      context.repositoryKey,
+      context.workspace.worktreePath,
+      context.workspace.branch,
+    ].join("\u0000");
+    if (this.preparedWorkDocumentation.has(preparationKey)) return;
+
+    const { workspace } = context;
+    const documentation = this.workDocumentationPaths(context);
+    await this.preflightWorkDocumentation(context, documentation);
+    await this.ensureIgnored(workspace, [
+      WORK_DOCUMENTATION_PATHS.isolatedDirectory,
+      WORK_DOCUMENTATION_PATHS.sharedMountDirectory,
+    ]);
+
+    await ensureDirectoryWithinRoot(
+      workspace.worktreePath,
+      documentation.isolatedDirectory,
+      { allowRootMapping: true },
+    );
+    const isolatedMarker = path.join(
+      documentation.isolatedDirectory,
+      WORK_DOCUMENTATION_MANAGED_MARKER,
+    );
+    await ensureFile(
+      isolatedMarker,
+      "Agent Canvas managed work documentation. Do not commit or remove this marker.\n",
+    );
+    await assertRegularFile(
+      isolatedMarker,
+      `${WORK_DOCUMENTATION_PATHS.isolatedDirectory}/ 缺少有效的 Agent Canvas 管理标记`,
+    );
+
+    await ensureDirectoryWithinRoot(
+      context.projectRoot,
+      documentation.sharedSourceDirectory,
+      { allowRootMapping: true },
+    );
+    const sharedMarker = path.join(
+      documentation.sharedSourceDirectory,
+      WORK_DOCUMENTATION_MANAGED_MARKER,
+    );
+    await ensureFile(
+      sharedMarker,
+      "Agent Canvas managed shared work documentation. Do not commit or remove this marker.\n",
+    );
+    await assertRegularFile(
+      sharedMarker,
+      `${WORK_DOCUMENTATION_PATHS.sharedMountDirectory}/ 缺少有效的 Agent Canvas 管理标记`,
+    );
+    await ensureDirectoryWithinRoot(
+      documentation.sharedSourceDirectory,
+      documentation.branchSourceDirectory,
+    );
+    await ensureFile(
+      documentation.isolatedIndex,
+      isolatedDocumentationIndex(workspace.branch),
+    );
+    await ensureFile(documentation.sharedSourceIndex, sharedDocumentationIndex());
+    await ensureFile(documentation.branchOverview, sharedBranchOverview(workspace.branch));
+    await assertRegularFile(
+      documentation.isolatedIndex,
+      `${WORK_DOCUMENTATION_PATHS.isolatedIndex} 必须是普通文件`,
+    );
+    await assertRegularFile(
+      documentation.sharedSourceIndex,
+      `${WORK_DOCUMENTATION_PATHS.sharedIndex} 必须是普通文件`,
+    );
+    await assertRegularFile(
+      documentation.branchOverview,
+      "共享 branch 概要必须是普通文件",
+    );
+    await ensureLink(documentation.sharedSourceDirectory, documentation.sharedMountDirectory);
+
+    const sharedIndex = await readRegularFile(documentation.sharedSourceIndex);
+    const nextSharedIndex = ensureSharedBranchIndexEntry(
+      sharedIndex,
+      workspace.branch,
+      documentation.branchDirectory,
+    );
+    if (nextSharedIndex !== sharedIndex) {
+      await writeRegularFile(documentation.sharedSourceIndex, nextSharedIndex);
+    }
+    this.preparedWorkDocumentation.add(preparationKey);
+  }
+
+  private async preflightWorkDocumentation(
+    context: WorkDocumentationContext,
+    documentation: ReturnType<WorkspaceManager["workDocumentationPaths"]>,
+  ): Promise<void> {
+    const { workspace } = context;
+    const trackedDocumentation = await this.runGit(
+      [
+        "ls-files",
+        "--",
+        WORK_DOCUMENTATION_PATHS.isolatedDirectory,
+        WORK_DOCUMENTATION_PATHS.sharedMountDirectory,
+      ],
+      { cwd: workspace.worktreePath },
+    );
+    if (trackedDocumentation.trim()) {
+      throw new Error(
+        `${WORK_DOCUMENTATION_PATHS.isolatedDirectory}/ 或 ${WORK_DOCUMENTATION_PATHS.sharedMountDirectory}/ 已包含 Git 跟踪文件，无法启用工作文档维护`,
+      );
+    }
+
+    const isolatedMarker = path.join(
+      documentation.isolatedDirectory,
+      WORK_DOCUMENTATION_MANAGED_MARKER,
+    );
+    const isolatedStat = await lstatIfExists(documentation.isolatedDirectory);
+    if (isolatedStat) {
+      if (!isolatedStat.isDirectory() || isolatedStat.isSymbolicLink()) {
+        throw new Error(
+          `${WORK_DOCUMENTATION_PATHS.isolatedDirectory}/ 已存在且不是 Agent Canvas 管理的文档目录`,
+        );
+      }
+      await assertRegularFile(
+        isolatedMarker,
+        `${WORK_DOCUMENTATION_PATHS.isolatedDirectory}/ 缺少有效的 Agent Canvas 管理标记`,
+      );
+      await assertRegularFileIfExists(
+        documentation.isolatedIndex,
+        `${WORK_DOCUMENTATION_PATHS.isolatedIndex} 必须是普通文件`,
+      );
+    }
+
+    const sharedSourceStat = await lstatIfExists(documentation.sharedSourceDirectory);
+    await ensureDirectoryWithinRoot(
+      context.projectRoot,
+      documentation.sharedSourceDirectory,
+      { allowRootMapping: true, createMissing: false },
+    );
+    if (sharedSourceStat) {
+      const sharedMarker = path.join(
+        documentation.sharedSourceDirectory,
+        WORK_DOCUMENTATION_MANAGED_MARKER,
+      );
+      await assertRegularFile(
+        sharedMarker,
+        `${WORK_DOCUMENTATION_PATHS.sharedMountDirectory}/ 缺少有效的 Agent Canvas 管理标记`,
+      );
+      await assertRegularFileIfExists(
+        documentation.sharedSourceIndex,
+        `${WORK_DOCUMENTATION_PATHS.sharedIndex} 必须是普通文件`,
+      );
+      await ensureDirectoryWithinRoot(
+        documentation.sharedSourceDirectory,
+        documentation.branchSourceDirectory,
+        { createMissing: false },
+      );
+      await assertRegularFileIfExists(
+        documentation.branchOverview,
+        "共享 branch 概要必须是普通文件",
+      );
+    }
+    await assertLinkCanPointTo(
+      documentation.sharedSourceDirectory,
+      documentation.sharedMountDirectory,
+    );
+  }
+
+  private workDocumentationRepositoryKey(workspace: BranchWorkspace): string {
+    const repo = this.state.repo?.id === workspace.repoId ? this.state.repo : undefined;
+    const identity = repo?.remoteUrl || workspace.repoId;
+    return createHash("sha256").update(identity.toLowerCase()).digest("hex").slice(0, 16);
+  }
+
+  private async queueWorkDocumentation<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.documentationPrepareChain.then(task, task);
+    this.documentationPrepareChain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return await result;
+  }
+
   private async applyResource(
     workspace: BranchWorkspace,
     resource: SharedResourceMount,
@@ -593,7 +925,26 @@ export class WorkspaceManager {
   private async ensureIgnored(workspace: BranchWorkspace, patterns: string[]): Promise<void> {
     const excludePath = await gitPath(this.runGit, workspace.worktreePath, "info/exclude");
     const normalized = patterns.map((pattern) => normalizeIgnorePattern(pattern));
-    await appendUniqueLines(excludePath, normalized);
+    const key = process.platform === "win32"
+      ? path.resolve(excludePath).toLowerCase()
+      : path.resolve(excludePath);
+    const previous = this.ignoreWriteChains.get(key) ?? Promise.resolve();
+    const result = previous.then(
+      () => appendUniqueLines(excludePath, normalized),
+      () => appendUniqueLines(excludePath, normalized),
+    );
+    const settled = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.ignoreWriteChains.set(key, settled);
+    try {
+      await result;
+    } finally {
+      if (this.ignoreWriteChains.get(key) === settled) {
+        this.ignoreWriteChains.delete(key);
+      }
+    }
   }
 
   private async currentBranch(cwd: string): Promise<string | undefined> {
@@ -669,13 +1020,149 @@ async function gitPath(runGit: GitRunner, cwd: string, key: string): Promise<str
 }
 
 async function ensureLink(sourcePath: string, mountPath: string): Promise<void> {
-  if (await exists(mountPath)) {
-    const stat = await lstat(mountPath);
-    if (stat.isSymbolicLink()) return;
+  const existing = await lstatIfExists(mountPath);
+  if (existing) {
+    const stat = existing;
+    if (stat.isSymbolicLink()) {
+      const [currentTarget, expectedTarget] = await Promise.all([
+        realpath(mountPath),
+        realpath(sourcePath),
+      ]);
+      if (sameFileSystemPath(currentTarget, expectedTarget)) return;
+      throw new Error(
+        `共享资源挂载点已映射到其他目录: ${mountPath} -> ${currentTarget}`,
+      );
+    }
     throw new Error(`共享资源挂载点已存在且不是映射: ${mountPath}`);
   }
   const type = process.platform === "win32" ? "junction" : "dir";
   await symlink(path.resolve(sourcePath), mountPath, type);
+}
+
+async function assertLinkCanPointTo(sourcePath: string, mountPath: string): Promise<void> {
+  const mountStat = await lstatIfExists(mountPath);
+  if (!mountStat) return;
+  if (!mountStat.isSymbolicLink()) {
+    throw new Error(`共享资源挂载点已存在且不是映射: ${mountPath}`);
+  }
+  const sourceStat = await lstatIfExists(sourcePath);
+  if (!sourceStat) {
+    throw new Error(`共享资源挂载点已存在，但目标文档目录不存在: ${mountPath}`);
+  }
+  const [currentTarget, expectedTarget] = await Promise.all([
+    realpath(mountPath),
+    realpath(sourcePath),
+  ]);
+  if (!sameFileSystemPath(currentTarget, expectedTarget)) {
+    throw new Error(
+      `共享资源挂载点已映射到其他目录: ${mountPath} -> ${currentTarget}`,
+    );
+  }
+}
+
+function sameFileSystemPath(left: string, right: string): boolean {
+  const normalizedLeft = path.resolve(left);
+  const normalizedRight = path.resolve(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+async function ensureFile(filePath: string, content: string): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  try {
+    await writeFile(filePath, content, { encoding: "utf-8", flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+}
+
+async function ensureDirectoryWithinRoot(
+  root: string,
+  target: string,
+  options: { allowRootMapping?: boolean; createMissing?: boolean } = {},
+): Promise<void> {
+  const createMissing = options.createMissing !== false;
+  const resolvedRoot = path.resolve(root);
+  const resolvedTarget = path.resolve(target);
+  if (!isPathInside(resolvedTarget, resolvedRoot)) {
+    throw new Error(`工作文档目录越出项目边界: ${resolvedTarget}`);
+  }
+  if (createMissing) await mkdir(resolvedRoot, { recursive: true });
+  const rootStat = await lstat(resolvedRoot);
+  if (
+    (!rootStat.isDirectory() && !rootStat.isSymbolicLink()) ||
+    (!options.allowRootMapping && rootStat.isSymbolicLink())
+  ) {
+    throw new Error(`工作文档根目录不是安全的普通目录: ${resolvedRoot}`);
+  }
+  const relative = path.relative(resolvedRoot, resolvedTarget);
+  let current = resolvedRoot;
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    const next = path.join(current, segment);
+    const stat = await lstatIfExists(next);
+    if (!stat) {
+      if (!createMissing) break;
+      await mkdir(next);
+      current = next;
+      continue;
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error(`工作文档目录包含不安全的映射或非目录路径: ${next}`);
+    }
+    current = next;
+  }
+  const [realRoot, realCurrent] = await Promise.all([
+    realpath(resolvedRoot),
+    realpath(current),
+  ]);
+  if (!isPathInside(realCurrent, realRoot)) {
+    throw new Error(`工作文档目录越出项目真实路径边界: ${realCurrent}`);
+  }
+}
+
+async function assertRegularFile(filePath: string, message: string): Promise<void> {
+  const stat = await lstatIfExists(filePath);
+  if (!stat?.isFile() || stat.isSymbolicLink()) throw new Error(message);
+}
+
+async function assertRegularFileIfExists(filePath: string, message: string): Promise<void> {
+  const stat = await lstatIfExists(filePath);
+  if (stat && (!stat.isFile() || stat.isSymbolicLink())) throw new Error(message);
+}
+
+async function readRegularFile(filePath: string): Promise<string> {
+  const noFollow = process.platform === "win32" ? 0 : constants.O_NOFOLLOW;
+  const handle = await open(filePath, constants.O_RDONLY | noFollow);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error(`工作文档索引必须是普通文件: ${filePath}`);
+    return await handle.readFile({ encoding: "utf-8" });
+  } finally {
+    await handle.close();
+  }
+}
+
+async function writeRegularFile(filePath: string, content: string): Promise<void> {
+  const noFollow = process.platform === "win32" ? 0 : constants.O_NOFOLLOW;
+  const handle = await open(filePath, constants.O_WRONLY | noFollow);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error(`工作文档索引必须是普通文件: ${filePath}`);
+    await handle.truncate(0);
+    await handle.writeFile(content, { encoding: "utf-8" });
+  } finally {
+    await handle.close();
+  }
+}
+
+async function lstatIfExists(filePath: string) {
+  try {
+    return await lstat(filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
 }
 
 async function appendUniqueLines(filePath: string, lines: string[]): Promise<void> {
@@ -758,8 +1245,16 @@ function normalizeRelativePath(value: string): string {
 }
 
 function normalizeIgnorePattern(value: string): string {
-  const normalized = value.replace(/\\/gu, "/").replace(/^\/+/u, "");
-  return normalized.endsWith("/") ? normalized : `${normalized}/`;
+  const normalized = value
+    .replace(/\\/gu, "/")
+    .replace(/^\/+/u, "")
+    .replace(/\/+$/u, "");
+  return `/${normalized}`;
+}
+
+function isPathInside(candidate: string, root: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
 function safePathPart(value: string): string {
