@@ -10,6 +10,7 @@ import {
 import { GitCommitHorizontal, Minimize2 } from "lucide-react";
 import type { AgentCommitSnapshot } from "@agent-canvas/shared";
 import { COMMIT_NODE_DIMENSIONS } from "../nodeDimensions.js";
+import { commitDisplayText } from "../displayText.js";
 
 export interface CommitNodeData {
   commit: AgentCommitSnapshot;
@@ -57,6 +58,7 @@ export function CommitNode({ id, data }: NodeProps<CommitNodeType>): React.React
   const reactFlow = useReactFlow<CommitNodeType>();
   const updateNodeInternals = useUpdateNodeInternals();
   const minimized = data.windowState?.minimized === true;
+  const display = commitDisplayText(commit);
 
   const toggleMinimized = (event: React.MouseEvent) => {
     event.stopPropagation();
@@ -111,7 +113,7 @@ export function CommitNode({ id, data }: NodeProps<CommitNodeType>): React.React
         </button>
       </header>
       <div className="commit-node__body nodrag">
-        <p>{commit.summary}</p>
+        <p>{display.summary}</p>
         <small>
           {commit.branch ?? "unknown branch"} · {commit.files.length} files · {commit.agentId}
         </small>

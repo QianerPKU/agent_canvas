@@ -9,6 +9,7 @@ import {
 } from "@xyflow/react";
 import { GitPullRequest, Minimize2 } from "lucide-react";
 import type { PullRequestFlowSnapshot } from "@agent-canvas/shared";
+import { flowDisplayText } from "../displayText.js";
 import { PULL_REQUEST_NODE_DIMENSIONS } from "../nodeDimensions.js";
 
 export interface PullRequestNodeData {
@@ -63,6 +64,7 @@ export function PullRequestNode({
   const updateNodeInternals = useUpdateNodeInternals();
   const minimized = data.windowState?.minimized === true;
   const meta = statusMeta(flow.status);
+  const display = flowDisplayText(flow);
 
   const toggleMinimized = (event: React.MouseEvent) => {
     event.stopPropagation();
@@ -108,7 +110,7 @@ export function PullRequestNode({
       <PullRequestHandle />
       <header className="pr-node__header drag-handle">
         <GitPullRequest size={16} />
-        <strong>{flow.title || flow.id}</strong>
+        <strong>{display.title}</strong>
         <button
           className="icon-button nodrag"
           title="最小化 PR 节点"
@@ -119,7 +121,7 @@ export function PullRequestNode({
       </header>
       <div className="pr-node__body nodrag">
         <span style={{ color: meta.color }}>{meta.label}</span>
-        <p>{flow.summary}</p>
+        <p>{display.summary}</p>
         <small>
           {flow.sourceBranch} → {flow.targetBranch} · {flow.files.length} files
         </small>

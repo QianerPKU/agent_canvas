@@ -81,4 +81,34 @@ describe("PullRequestNode", () => {
     fireEvent.click(screen.getByText("merge feature a"));
     expect(onOpenDetails).toHaveBeenCalledWith("pr_flow_1");
   });
+
+  it("uses PR metadata when the submitted flow text is encoding-damaged", () => {
+    render(
+      <ReactFlowProvider>
+        <PullRequestNode
+          {...({
+            id: "pr:pr_flow_1",
+            data: {
+              flow: flow({
+                title: "????????",
+                summary: "????????????",
+                pr: {
+                  title: "修复节点乱码",
+                  summary: "确保 PR 节点正常显示中文",
+                  files: [],
+                  fileChanges: [],
+                  createdAt: 3,
+                },
+              }),
+              onOpenDetails: vi.fn(),
+            },
+          } as unknown as NodeProps<PullRequestNodeType>)}
+        />
+      </ReactFlowProvider>,
+    );
+
+    expect(screen.getByText("修复节点乱码")).toBeTruthy();
+    expect(screen.getByText("确保 PR 节点正常显示中文")).toBeTruthy();
+    expect(screen.queryByText("????????????")).toBeNull();
+  });
 });
