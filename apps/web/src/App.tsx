@@ -25,7 +25,11 @@ import {
   X,
 } from "lucide-react";
 import { api } from "./api.js";
-import { CODEX_MODELS, DEFAULT_CODEX_MODEL } from "@agent-canvas/shared";
+import {
+  CODEX_MODELS,
+  CODEX_REASONING_EFFORTS,
+  DEFAULT_CODEX_MODEL,
+} from "@agent-canvas/shared";
 import type {
   AgentCanvasSettings,
   AgentCanvasConfig,
@@ -623,6 +627,8 @@ export function buildNodes(
   branches: BranchOption[] = [],
   codexModels: readonly string[] = CODEX_MODELS,
   defaultCodexModel: string = DEFAULT_CODEX_MODEL,
+  codexReasoningEfforts: readonly string[] = CODEX_REASONING_EFFORTS,
+  codexModelCapabilities: AgentCanvasConfig["codexModelCapabilities"] = [],
   onCreateBranch?: (branch: string, baseBranch?: string) => Promise<BranchWorkspace>,
 ): CanvasNode[] {
   const layout = computeLayout(agents);
@@ -670,6 +676,8 @@ export function buildNodes(
         branches,
         codexModels,
         defaultCodexModel,
+        codexReasoningEfforts,
+        codexModelCapabilities,
         onCreateBranch,
         actions,
       };
@@ -1010,6 +1018,8 @@ export default function App(): React.ReactElement {
     projectRoot: "",
     codexModels: [...CODEX_MODELS],
     defaultCodexModel: DEFAULT_CODEX_MODEL,
+    codexReasoningEfforts: [...CODEX_REASONING_EFFORTS],
+    codexModelCapabilities: [],
   });
   const [agentSettingsTarget, setAgentSettingsTarget] = useState<AgentSettingsTarget>();
   const [projects, setProjects] = useState<CanvasProjectSummary[]>([]);
@@ -1214,6 +1224,8 @@ export default function App(): React.ReactElement {
         branches,
         serverConfig.codexModels,
         serverConfig.defaultCodexModel,
+        serverConfig.codexReasoningEfforts,
+        serverConfig.codexModelCapabilities,
         createBranch,
       ),
     );
@@ -1241,6 +1253,8 @@ export default function App(): React.ReactElement {
     branches,
     serverConfig.codexModels,
     serverConfig.defaultCodexModel,
+    serverConfig.codexReasoningEfforts,
+    serverConfig.codexModelCapabilities,
     createBranch,
     openHistory,
     openAgentSettings,
@@ -1471,6 +1485,8 @@ export default function App(): React.ReactElement {
           branches={branches}
           codexModels={serverConfig.codexModels}
           defaultCodexModel={serverConfig.defaultCodexModel}
+          codexReasoningEfforts={serverConfig.codexReasoningEfforts}
+          codexModelCapabilities={serverConfig.codexModelCapabilities}
           onCreateBranch={createBranch}
           onCreate={async (settings) => {
             const id = await actions.create(settings);
@@ -1487,6 +1503,8 @@ export default function App(): React.ReactElement {
           branches={branches}
           codexModels={serverConfig.codexModels}
           defaultCodexModel={serverConfig.defaultCodexModel}
+          codexReasoningEfforts={serverConfig.codexReasoningEfforts}
+          codexModelCapabilities={serverConfig.codexModelCapabilities}
           canChangeBranch={
             settingsAgent.status === "idle" || settingsAgent.status === "waiting_input"
           }

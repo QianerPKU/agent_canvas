@@ -34,6 +34,7 @@ import {
   type AgentStatus,
   type BranchOption,
   type BranchWorkspace,
+  type CodexModelCapability,
   type CodexModel,
   type ForkAgentInput,
 } from "@agent-canvas/shared";
@@ -61,6 +62,8 @@ export interface TurnNodeData {
   branches?: BranchOption[];
   codexModels?: readonly string[];
   defaultCodexModel?: string;
+  codexReasoningEfforts?: readonly string[];
+  codexModelCapabilities?: readonly CodexModelCapability[];
   onCreateBranch?: (branch: string, baseBranch?: string) => Promise<BranchWorkspace>;
   actions: AgentActions;
   [key: string]: unknown;
@@ -174,11 +177,20 @@ export function TurnNode({
   const updateNodeInternals = useUpdateNodeInternals();
   const codexModels = data.codexModels?.length ? data.codexModels : CODEX_MODELS;
   const defaultCodexModel = data.defaultCodexModel ?? DEFAULT_CODEX_MODEL;
+  const codexReasoningEfforts = data.codexReasoningEfforts?.length
+    ? data.codexReasoningEfforts
+    : CODEX_REASONING_EFFORTS;
+  const codexModelCapabilities = data.codexModelCapabilities ?? [];
   const [text, setText] = useState("");
   const [model, setModel] = useState<CodexModel>(
     codexModel(agentModel, codexModels, defaultCodexModel),
   );
   const [reasoningEffort, setReasoningEffort] = useState(agentReasoningEffort ?? "");
+  const reasoningEffortOptions = reasoningEffortsForModel(
+    model,
+    codexModelCapabilities,
+    codexReasoningEfforts,
+  );
   const [forkBranchName, setForkBranchName] = useState(
     data.agentBranch ?? data.branches?.[0]?.branch ?? "",
   );
@@ -242,6 +254,12 @@ export function TurnNode({
   useEffect(() => {
     setModel(codexModel(agentModel, codexModels, defaultCodexModel));
   }, [agentModel, codexModels, defaultCodexModel]);
+
+  useEffect(() => {
+    if (reasoningEffort && !reasoningEffortOptions.includes(reasoningEffort)) {
+      setReasoningEffort("");
+    }
+  }, [reasoningEffort, reasoningEffortOptions]);
 
   useEffect(() => {
     setReasoningEffort(agentReasoningEffort ?? "");
@@ -659,6 +677,7 @@ export function TurnNode({
                 />
                 <ReasoningEffortSelect
                   value={reasoningEffort}
+                  options={reasoningEffortOptions}
                   onChange={setReasoningEffort}
                 />
               </>
@@ -1024,9 +1043,11 @@ function CodexModelSelect({
 
 function ReasoningEffortSelect({
   value,
+  options,
   onChange,
 }: {
   value: string;
+  options: readonly string[];
   onChange: (reasoningEffort: string) => void;
 }): React.ReactElement {
   return (
@@ -1037,7 +1058,7 @@ function ReasoningEffortSelect({
       style={selectStyle}
     >
       <option value="">默认推理强度</option>
-      {CODEX_REASONING_EFFORTS.map((candidate) => (
+      {options.map((candidate) => (
         <option key={candidate} value={candidate}>
           {candidate}
         </option>
@@ -1394,4 +1415,13 @@ function forkOptionsFor(
     options.branch = branchName;
   }
   return Object.keys(options).length > 0 ? options : undefined;
+}
+
+function reasoningEffortsForModel(
+  model: string,
+  capabilities: readonly CodexModelCapability[],
+  fallback: readonly string[],
+): readonly string[] {
+  const capability = capabilities.find((candidate) => candidate.model === model);
+  return capability?.reasoningEfforts.length ? capability.reasoningEfforts : fallback;
 }

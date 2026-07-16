@@ -35,8 +35,15 @@ export type AgentProvider = "claude" | "codex";
 export const CODEX_MODELS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"] as const;
 export type CodexModel = string;
 export const DEFAULT_CODEX_MODEL: CodexModel = "gpt-5.5";
-export const CODEX_REASONING_EFFORTS = ["low", "medium", "high"] as const;
+export const CODEX_REASONING_EFFORTS = ["low", "medium", "high", "xhigh"] as const;
 export type CodexReasoningEffort = string;
+
+export interface CodexModelCapability {
+  model: string;
+  displayName?: string;
+  reasoningEfforts: string[];
+  defaultReasoningEffort?: string;
+}
 
 export function isCodexModel(
   model: string | undefined,
@@ -50,6 +57,8 @@ export interface AgentCanvasConfig {
   projectRoot: string;
   codexModels: string[];
   defaultCodexModel: string;
+  codexReasoningEfforts: string[];
+  codexModelCapabilities?: CodexModelCapability[];
   codexVersion?: string;
 }
 

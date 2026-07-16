@@ -62,6 +62,11 @@ export interface CreateServerResult {
   codexAuthManager: CodexAuthManager;
 }
 
+type CodexModelDetectionInput =
+  | Promise<CodexModelDetection>
+  | CodexModelDetection
+  | (() => Promise<CodexModelDetection> | CodexModelDetection);
+
 export interface CreateServerOptions {
   defaultCwd?: string;
   openFile?: (filePath: string) => Promise<void>;
@@ -72,7 +77,7 @@ export interface CreateServerOptions {
   syncFlowManager?: SyncFlowManager;
   commitManager?: CommitManager;
   codexAuthManager?: CodexAuthManager;
-  codexModelDetection?: Promise<CodexModelDetection> | CodexModelDetection;
+  codexModelDetection?: CodexModelDetectionInput;
 }
 
 interface CanvasStateController {
@@ -95,7 +100,7 @@ export function createServer(
   options: CreateServerOptions = {},
 ): CreateServerResult {
   const defaultCwd = options.defaultCwd ?? process.cwd();
-  const codexModels = Promise.resolve(options.codexModelDetection ?? detectCodexModels());
+  const codexModels = codexModelDetectionSource(options.codexModelDetection);
   fileManager ??= new FileManager({
     workspaceRoot: defaultCwd,
   });
@@ -237,7 +242,7 @@ async function handleHttp(
   commitManager: CommitManager,
   codexAuthManager: CodexAuthManager,
   defaultCwd: string,
-  codexModels: Promise<CodexModelDetection>,
+  codexModels: () => Promise<CodexModelDetection>,
   openFile: (filePath: string) => Promise<void>,
   pickDirectory: PickDirectory,
   canvasState: CanvasStateController,
@@ -1034,16 +1039,26 @@ function errMsg(err: unknown): string {
 async function serverConfig(
   defaultCwd: string,
   workspaceManager: WorkspaceManager,
-  codexModels: Promise<CodexModelDetection>,
+  codexModels: () => Promise<CodexModelDetection>,
 ): Promise<AgentCanvasConfig> {
-  const detected = await codexModels;
+  const detected = await codexModels();
   return {
     defaultCwd,
     projectRoot: workspaceManager.root(),
     codexModels: detected.models,
     defaultCodexModel: detected.defaultModel,
+    codexReasoningEfforts: detected.reasoningEfforts,
+    codexModelCapabilities: detected.modelCapabilities,
     codexVersion: detected.version,
   };
+}
+
+function codexModelDetectionSource(
+  input: CodexModelDetectionInput | undefined,
+): () => Promise<CodexModelDetection> {
+  if (typeof input === "function") return () => Promise.resolve(input());
+  if (input !== undefined) return () => Promise.resolve(input);
+  return () => detectCodexModels();
 }
 
 interface CanvasStateControllerDeps {

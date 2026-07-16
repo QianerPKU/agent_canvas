@@ -1,4 +1,5 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
+import type { Readable } from "node:stream";
 import type { CodexAuthStatus, CodexLoginSession } from "@agent-canvas/shared";
 
 export interface CodexAuthManagerDeps {
@@ -78,7 +79,7 @@ class LoginProcess {
   private readonly command: string;
   private readonly spawnFn: typeof spawn;
   private readonly now: () => number;
-  private proc?: ChildProcessWithoutNullStreams;
+  private proc?: ChildProcessByStdio<null, Readable, Readable>;
   private state: CodexLoginSession["state"] = "running";
   private startedAt: number;
   private updatedAt: number;
@@ -97,18 +98,19 @@ class LoginProcess {
   }
 
   start(): void {
-    this.proc = this.spawnFn(this.command, ["login", "--device-auth"], {
+    const proc = this.spawnFn(this.command, ["login", "--device-auth"], {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
-    this.proc.stdout.on("data", (chunk: Buffer) => this.append(chunk.toString("utf-8")));
-    this.proc.stderr.on("data", (chunk: Buffer) => this.append(chunk.toString("utf-8")));
-    this.proc.once("error", (error) => {
+    this.proc = proc;
+    proc.stdout.on("data", (chunk: Buffer) => this.append(chunk.toString("utf-8")));
+    proc.stderr.on("data", (chunk: Buffer) => this.append(chunk.toString("utf-8")));
+    proc.once("error", (error) => {
       this.state = "failed";
       this.message = error.message;
       this.touch();
     });
-    this.proc.once("exit", (code, signal) => {
+    proc.once("exit", (code, signal) => {
       if (this.state === "cancelled") return;
       this.state = code === 0 ? "completed" : "failed";
       this.message =

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   CODEX_MODELS,
+  CODEX_REASONING_EFFORTS,
   DEFAULT_CODEX_MODEL,
   isCodexModel,
   isTerminalStatus,
@@ -69,6 +70,7 @@ describe("Codex models", () => {
   it("包含当前可选模型并以 gpt-5.5 为默认值", () => {
     expect(CODEX_MODELS).toEqual(["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]);
     expect(DEFAULT_CODEX_MODEL).toBe("gpt-5.5");
+    expect(CODEX_REASONING_EFFORTS).toEqual(["low", "medium", "high", "xhigh"]);
     expect(isCodexModel("gpt-5.4-mini")).toBe(true);
     expect(isCodexModel("claude-opus-4-8")).toBe(false);
   });

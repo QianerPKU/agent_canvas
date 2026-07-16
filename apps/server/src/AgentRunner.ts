@@ -169,9 +169,8 @@ export class AgentRunner {
         | "branch"
         | "cwd"
         | "scratchDirectory"
-        | "reasoningEffort"
       >
-    > & { model?: string | null },
+    > & { model?: string | null; reasoningEffort?: string | null },
     pendingPrompt?: AgentPromptReference,
   ): void {
     this.config = applySettings(this.config ?? { prompt: "" }, settings);
@@ -242,6 +241,7 @@ export class AgentRunner {
     const options: QueryOptions = {
       cwd: config.cwd,
       model: config.model,
+      reasoningEffort: config.reasoningEffort,
       allowedTools: config.allowedTools,
       permissionMode: config.permissionMode,
       maxTurns: config.maxTurns,
@@ -769,13 +769,12 @@ function applySettings(
     Pick<
       AgentStartConfig,
       | "systemPrompt"
-      | "branchWorkspaceId"
-      | "branch"
-      | "cwd"
-      | "scratchDirectory"
-      | "reasoningEffort"
-    >
-  > & { model?: string | null },
+        | "branchWorkspaceId"
+        | "branch"
+        | "cwd"
+        | "scratchDirectory"
+      >
+    > & { model?: string | null; reasoningEffort?: string | null },
 ): AgentStartConfig {
   const next: AgentStartConfig = { ...config };
   for (const [key, value] of Object.entries(settings) as Array<
