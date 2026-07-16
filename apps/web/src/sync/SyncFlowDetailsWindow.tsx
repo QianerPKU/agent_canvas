@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { GitBranch, GitCommitHorizontal, X } from "lucide-react";
 import type { SyncFlowSnapshot } from "@agent-canvas/shared";
+import { flowDisplayText, readableCanvasText } from "../displayText.js";
 import { syncStatusMeta } from "./SyncFlowNode.js";
 
 export function SyncFlowDetailsWindow({
@@ -12,6 +13,7 @@ export function SyncFlowDetailsWindow({
 }): React.ReactElement {
   const meta = syncStatusMeta(flow.status);
   const Icon = flow.kind === "cherry_pick" ? GitCommitHorizontal : GitBranch;
+  const display = flowDisplayText(flow);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -37,7 +39,7 @@ export function SyncFlowDetailsWindow({
         <header className="history-window__header">
           <div>
             <strong>
-              <Icon size={15} /> {flow.title || flow.id}
+              <Icon size={15} /> {display.title}
             </strong>
             <span>
               {flow.kind === "cherry_pick" ? flow.commitSha : flow.sourceBranch} -&gt;{" "}
@@ -50,7 +52,7 @@ export function SyncFlowDetailsWindow({
         </header>
         <div className="pr-details-window__body">
           <section className="commit-details-window__summary">
-            <h2>{flow.summary}</h2>
+            <h2>{display.summary}</h2>
             <dl>
               <dt>status</dt>
               <dd style={{ color: meta.color }}>{meta.label}</dd>
@@ -67,7 +69,7 @@ export function SyncFlowDetailsWindow({
               <dt>strategy</dt>
               <dd>{flow.strategy ?? "(none)"}</dd>
               <dt>reason</dt>
-              <dd>{flow.reason}</dd>
+              <dd>{readableCanvasText(flow.reason, "(unavailable)")}</dd>
               <dt>failure</dt>
               <dd>{flow.failureReason ?? "(none)"}</dd>
             </dl>
@@ -114,7 +116,7 @@ export function SyncFlowDetailsWindow({
             <section className="commit-details-window__files">
               <h3>Applied</h3>
               <div className="pr-flow-row">
-                <p>{flow.applied.summary}</p>
+                <p>{readableCanvasText(flow.applied.summary, display.summary)}</p>
                 <small>
                   {flow.applied.commitSha ?? "(no commit)"} -{" "}
                   {flow.applied.reportedByAgentId ?? flow.proposerAgentId}

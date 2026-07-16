@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { GitPullRequest, X } from "lucide-react";
 import type { PullRequestFlowSnapshot } from "@agent-canvas/shared";
+import { flowDisplayText } from "../displayText.js";
 import { statusMeta } from "./PullRequestNode.js";
 
 export function PullRequestDetailsWindow({
@@ -11,6 +12,7 @@ export function PullRequestDetailsWindow({
   onClose: () => void;
 }): React.ReactElement {
   const meta = statusMeta(flow.status);
+  const display = flowDisplayText(flow);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -36,7 +38,7 @@ export function PullRequestDetailsWindow({
         <header className="history-window__header">
           <div>
             <strong>
-              <GitPullRequest size={15} /> {flow.title || flow.id}
+              <GitPullRequest size={15} /> {display.title}
             </strong>
             <span>{flow.sourceBranch} → {flow.targetBranch}</span>
           </div>
@@ -46,7 +48,7 @@ export function PullRequestDetailsWindow({
         </header>
         <div className="pr-details-window__body">
           <section className="commit-details-window__summary">
-            <h2>{flow.summary}</h2>
+            <h2>{display.summary}</h2>
             <dl>
               <dt>状态</dt>
               <dd style={{ color: meta.color }}>{meta.label}</dd>

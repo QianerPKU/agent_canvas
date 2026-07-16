@@ -40,6 +40,7 @@ import {
 } from "@agent-canvas/shared";
 import type { OutputLine, Turn, TurnStatus } from "../agentStore.js";
 import type { AgentActions } from "../useAgentCanvas.js";
+import { TURN_NODE_DIMENSIONS } from "../nodeDimensions.js";
 
 export interface TurnNodeData {
   agentId: string;
@@ -75,8 +76,8 @@ export function toggleTurnNodeWindow(node: TurnNodeType): Partial<TurnNodeType> 
   const state = node.data.windowState;
   if (state?.minimized) {
     return {
-      width: state.restoreWidth ?? 360,
-      height: state.restoreHeight ?? 300,
+      width: state.restoreWidth ?? TURN_NODE_DIMENSIONS.width,
+      height: state.restoreHeight ?? TURN_NODE_DIMENSIONS.height,
       data: {
         ...node.data,
         windowState: { ...state, minimized: false },
@@ -84,14 +85,16 @@ export function toggleTurnNodeWindow(node: TurnNodeType): Partial<TurnNodeType> 
     };
   }
   return {
-    width: 68,
-    height: 48,
+    width: TURN_NODE_DIMENSIONS.minimizedWidth,
+    height: TURN_NODE_DIMENSIONS.minimizedHeight,
     data: {
       ...node.data,
       windowState: {
         minimized: true,
-        restoreWidth: node.width ?? node.measured?.width ?? 360,
-        restoreHeight: node.height ?? node.measured?.height ?? 300,
+        restoreWidth:
+          node.width ?? node.measured?.width ?? TURN_NODE_DIMENSIONS.width,
+        restoreHeight:
+          node.height ?? node.measured?.height ?? TURN_NODE_DIMENSIONS.height,
       },
     },
   };
