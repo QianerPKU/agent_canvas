@@ -42,7 +42,10 @@ import { readCodexUsage } from "./codexUsage.js";
 import { CommitManager } from "./commits/CommitManager.js";
 import { pickDirectory as defaultPickDirectory, type PickDirectory } from "./files/DirectoryPicker.js";
 import { FileManager } from "./files/FileManager.js";
-import { openFileInVscode } from "./files/VscodeFileOpener.js";
+import {
+  openFileInVscode,
+  type OpenInVscodeOptions,
+} from "./files/VscodeFileOpener.js";
 import { PromptManager } from "./prompts/PromptManager.js";
 import { PullRequestFlowManager } from "./pullRequests/PullRequestFlowManager.js";
 import { CodexAuthManager } from "./sdk/CodexAuthManager.js";
@@ -69,7 +72,7 @@ type CodexModelDetectionInput =
 
 export interface CreateServerOptions {
   defaultCwd?: string;
-  openFile?: (filePath: string) => Promise<void>;
+  openFile?: (filePath: string, options?: OpenInVscodeOptions) => Promise<void>;
   pickDirectory?: PickDirectory;
   promptManager?: PromptManager;
   workspaceManager?: WorkspaceManager;
@@ -243,7 +246,7 @@ async function handleHttp(
   codexAuthManager: CodexAuthManager,
   defaultCwd: string,
   codexModels: () => Promise<CodexModelDetection>,
-  openFile: (filePath: string) => Promise<void>,
+  openFile: (filePath: string, options?: OpenInVscodeOptions) => Promise<void>,
   pickDirectory: PickDirectory,
   canvasState: CanvasStateController,
   broadcastHello: () => void,
@@ -680,7 +683,7 @@ async function handleHttp(
     }
     if (method === "POST" && action === "open") {
       try {
-        await openFile(fileManager.get(id)!.path);
+        await openFile(fileManager.get(id)!.path, { windowMode: "reuse" });
         return sendJson(res, 202, { ok: true });
       } catch (error) {
         return sendJson(res, 500, { error: errMsg(error) });
@@ -899,7 +902,7 @@ async function handleHttp(
       const cwd = manager.configOf(id)?.cwd?.trim();
       if (!cwd) return sendJson(res, 400, { error: "该 agent 尚未绑定 branch 工作目录" });
       try {
-        await openFile(cwd);
+        await openFile(cwd, { windowMode: "new" });
         return sendJson(res, 202, { ok: true });
       } catch (error) {
         return sendJson(res, 400, { error: errMsg(error) });

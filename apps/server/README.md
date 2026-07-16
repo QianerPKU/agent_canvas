@@ -54,7 +54,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 - **完整历史**：`AgentRunner` 把每次 start/send/steer/compact 输入记录为 `user_input`；Claude thinking block 与 Codex reasoning delta/summary 统一映射为 `thinking`。`GET /api/agents/:id/history` 因而可回放用户输入、思考、答复、工具调用/结果与轮次结果。
 - **commit 上报**：Agent Canvas 不替 agent 执行 `git commit`，但内置工作区规则要求每次 commit 成功后调用 `POST /api/agents/:id/commits`。后端用该 agent 的 branch workspace 读取 commit hash、message、文件列表和 diff，并记录当时的 `sourceTurnIndex`，让前端 commit 节点始终连回触发它的那一轮对话。
 - **结果汇报**：agent 可以调用 `POST /api/agents/:id/report-result` 把 Markdown/CSV/图片等结果复制成隔离文件节点。记录会带来源 agent 与 `sourceTurnIndex`，前端把它放到对应对话轮旁边并保留连线。
-- **VS Code 工作区入口**：`POST /api/agents/:id/open-workspace` 会用 VS Code CLI 打开该 agent 当前配置中的 branch worktree 目录，供前端节点标题栏的文件夹按钮调用。
+- **VS Code 工作区入口**：`POST /api/agents/:id/open-workspace` 会用 VS Code CLI 在新窗口打开该 agent 当前配置中的 branch worktree 目录，供前端节点标题栏的文件夹按钮调用，不会替换用户已有的工作区窗口。
 
 ## Canvas Project State
 
@@ -177,7 +177,7 @@ npm run smoke --workspace apps/server
 - `src/files/FileManager.ts` 管理节点元数据、真实文件、共享权限和普通读写连线。
 - 文件节点固定使用用户本地数据目录中的隔离存储，并让每个文件节点独占目录；不再创建到 Agent/branch 工作目录中。
 - `GET/POST /api/files` 列出/创建；`PATCH /api/files/:id` 重命名或更新共享开关；`content/raw` 子路径提供预览与原始内容。
-- `POST /api/files/:id/open` 使用 VS Code CLI 打开真实文件，`POST /api/agents/:id/open-workspace` 复用同一 opener 打开 agent branch worktree 目录，并等待 CLI 返回实际退出状态。Windows 会检查标准安装位置和 PATH 中的 `code.cmd`；自定义位置可设置 `AGENT_CANVAS_VSCODE_PATH` 为 `code.cmd` 完整路径，也可传 `Code.exe` 并自动解析同目录下的 `bin\code.cmd`。
+- `POST /api/files/:id/open` 使用 VS Code CLI 在当前窗口打开真实文件，`POST /api/agents/:id/open-workspace` 通过同一 opener 的新窗口模式打开 agent branch worktree 目录，并等待 CLI 返回实际退出状态。Windows 会检查标准安装位置和 PATH 中的 `code.cmd`；自定义位置可设置 `AGENT_CANVAS_VSCODE_PATH` 为 `code.cmd` 完整路径，也可传 `Code.exe` 并自动解析同目录下的 `bin\code.cmd`。
 - `GET/POST /api/file-connections` 与 `DELETE /api/file-connections/:id` 管理普通节点连线。
 - Codex 使用 app-server 原生 `mention/localImage` 和 `workspaceWrite.writableRoots`。
 - Claude 使用 `@绝对路径`、`additionalDirectories`，并通过 `applyFlagSettings()` 在流式会话下一轮动态刷新写目录。

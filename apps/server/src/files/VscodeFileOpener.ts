@@ -2,7 +2,13 @@ import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process"
 import { access } from "node:fs/promises";
 import path from "node:path";
 
-export interface VscodeFileOpenerOptions {
+export type VscodeWindowMode = "reuse" | "new";
+
+export interface OpenInVscodeOptions {
+  windowMode?: VscodeWindowMode;
+}
+
+export interface VscodeFileOpenerOptions extends OpenInVscodeOptions {
   command?: string;
   platform?: NodeJS.Platform;
   comSpec?: string;
@@ -26,6 +32,7 @@ export async function openFileInVscode(
     options.platform ?? process.platform,
     options.comSpec ?? process.env.ComSpec,
     options.env ?? process.env,
+    options.windowMode ?? "reuse",
   );
   await new Promise<void>((resolve, reject) => {
     const child = spawnFn(launch.command, launch.args, launch.options);
@@ -102,11 +109,13 @@ function vscodeLaunch(
   platform: NodeJS.Platform,
   comSpec: string | undefined,
   env: NodeJS.ProcessEnv,
+  windowMode: VscodeWindowMode,
 ): { command: string; args: string[]; options: SpawnOptions } {
+  const windowFlag = windowMode === "new" ? "--new-window" : "--reuse-window";
   if (platform !== "win32") {
     return {
       command: vscodeCommand,
-      args: ["--reuse-window", filePath],
+      args: [windowFlag, filePath],
       options: {
         stdio: ["ignore", "ignore", "pipe"],
       },
@@ -123,7 +132,7 @@ function vscodeLaunch(
       "/s",
       "/v:off",
       "/c",
-      `call "%${cliVariable}%" --reuse-window "%${fileVariable}%"`,
+      `call "%${cliVariable}%" ${windowFlag} "%${fileVariable}%"`,
     ],
     options: {
       stdio: ["ignore", "ignore", "pipe"],
