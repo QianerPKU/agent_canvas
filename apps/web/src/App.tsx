@@ -22,6 +22,7 @@ import {
   MousePointer2,
   Plus,
   Settings,
+  Trash2,
   X,
 } from "lucide-react";
 import { api } from "./api.js";
@@ -1109,11 +1110,11 @@ export default function App(): React.ReactElement {
   }, []);
 
   const openProject = useCallback(
-    async (id: string) => {
+    async (id?: string, projectRoot?: string) => {
       setProjectError(undefined);
       try {
         setLayoutProjectId(undefined);
-        const nextWorkspace = await api.openCanvasProject(id);
+        const nextWorkspace = await api.openCanvasProject({ id, projectRoot });
         const nextLayout = await api.canvasLayout();
         setNodes([]);
         setEdges([]);
@@ -1130,6 +1131,16 @@ export default function App(): React.ReactElement {
     },
     [refresh, setEdges, setNodes],
   );
+
+  const deleteProject = useCallback(async (id: string) => {
+    setProjectError(undefined);
+    try {
+      await api.deleteCanvasProject(id);
+      setProjects(await api.listCanvasProjects());
+    } catch (error) {
+      setProjectError(error instanceof Error ? error.message : String(error));
+    }
+  }, []);
 
   const createProject = useCallback(
     async (name: string, projectRoot?: string) => {
@@ -1351,8 +1362,10 @@ export default function App(): React.ReactElement {
         connected={connected}
         projects={projects}
         error={projectError}
-        onOpen={openProject}
+        onOpen={(id) => openProject(id)}
+        onLoad={(projectRoot) => openProject(undefined, projectRoot)}
         onCreate={createProject}
+        onDelete={deleteProject}
       />
     );
   }
@@ -1601,16 +1614,21 @@ export function ProjectGate({
   projects,
   error,
   onOpen,
+  onLoad,
   onCreate,
+  onDelete,
 }: {
   connected: boolean;
   projects: CanvasProjectSummary[];
   error?: string;
   onOpen: (id: string) => Promise<void>;
+  onLoad: (projectRoot: string) => Promise<void>;
   onCreate: (name: string, projectRoot?: string) => Promise<void>;
+  onDelete: (id: string) => Promise<void>;
 }): React.ReactElement {
   const [name, setName] = useState("");
   const [projectRoot, setProjectRoot] = useState("");
+  const [loadRoot, setLoadRoot] = useState("");
   const [busy, setBusy] = useState(false);
   const [pickingDirectory, setPickingDirectory] = useState(false);
   const [pickError, setPickError] = useState("");
@@ -1624,12 +1642,37 @@ export function ProjectGate({
       setBusy(false);
     }
   };
-  const browse = async () => {
+  const load = async () => {
+    const root = loadRoot.trim();
+    if (!root || pickingDirectory) return;
+    setBusy(true);
+    try {
+      await onLoad(root);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const remove = async (project: CanvasProjectSummary) => {
+    const confirmed = window.confirm(
+      `确定永久删除项目“${project.name}”及其目录中的全部数据吗？\n\n${project.projectRoot}`,
+    );
+    if (!confirmed) return;
+    setBusy(true);
+    try {
+      await onDelete(project.id);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const browse = async (
+    initialDirectory: string,
+    setDirectory: (directory: string) => void,
+  ) => {
     setPickError("");
     setPickingDirectory(true);
     try {
-      const picked = await api.pickDirectory(projectRoot.trim() || undefined);
-      if (picked.path) setProjectRoot(picked.path);
+      const picked = await api.pickDirectory(initialDirectory.trim() || undefined);
+      if (picked.path) setDirectory(picked.path);
     } catch (reason) {
       setPickError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -1649,20 +1692,57 @@ export function ProjectGate({
           <h1>打开 Canvas 项目</h1>
           <div className="project-list">
             {projects.map((project) => (
-              <button
-                key={project.id}
-                className="project-row"
-                disabled={busy || pickingDirectory}
-                onClick={() => void onOpen(project.id)}
-              >
-                <FolderOpen size={18} />
-                <span>
-                  <strong>{project.name}</strong>
-                  <small>{project.projectRoot}</small>
-                </span>
-              </button>
+              <div key={project.id} className="project-row">
+                <button
+                  className="project-row__open"
+                  disabled={busy || pickingDirectory}
+                  onClick={() => void onOpen(project.id)}
+                >
+                  <FolderOpen size={18} />
+                  <span>
+                    <strong>{project.name}</strong>
+                    <small>{project.projectRoot}</small>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  className="project-row__delete"
+                  aria-label={`删除项目 ${project.name}`}
+                  title="永久删除项目"
+                  disabled={busy || pickingDirectory}
+                  onClick={() => void remove(project)}
+                >
+                  <Trash2 size={16} />
+                </button>
+              </div>
             ))}
             {projects.length === 0 && <p className="project-empty">暂无项目</p>}
+          </div>
+        </section>
+        <section className="project-gate__section">
+          <h2>从文件夹加载项目</h2>
+          <div className="project-load">
+            <input
+              aria-label="要加载的 Canvas 项目文件夹"
+              value={loadRoot}
+              placeholder="选择包含 workspace.json 的项目文件夹"
+              onChange={(event) => setLoadRoot(event.target.value)}
+            />
+            <button
+              type="button"
+              disabled={busy || pickingDirectory}
+              onClick={() => void browse(loadRoot, setLoadRoot)}
+            >
+              <FolderOpen size={16} />
+              浏览
+            </button>
+            <button
+              type="button"
+              disabled={busy || pickingDirectory || !loadRoot.trim()}
+              onClick={() => void load()}
+            >
+              加载
+            </button>
           </div>
         </section>
         <section className="project-gate__section">
@@ -1685,7 +1765,11 @@ export function ProjectGate({
                 placeholder="项目文件夹，可留空使用默认位置"
                 onChange={(event) => setProjectRoot(event.target.value)}
               />
-              <button type="button" disabled={busy || pickingDirectory} onClick={() => void browse()}>
+              <button
+                type="button"
+                disabled={busy || pickingDirectory}
+                onClick={() => void browse(projectRoot, setProjectRoot)}
+              >
                 <FolderOpen size={16} />
                 浏览
               </button>

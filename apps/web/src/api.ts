@@ -30,6 +30,7 @@ import type {
   FileConnectionAccess,
   ForkAgentInput,
   ForkOrigin,
+  OpenCanvasProjectInput,
   PullRequestCreatedInput,
   PullRequestFlowSnapshot,
   PromptConnectionAccess,
@@ -79,11 +80,15 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
-  openCanvasProject: (id: string) =>
+  openCanvasProject: (input: OpenCanvasProjectInput | string) =>
     call<{ workspace: WorkspaceProject }>("/canvas-projects/open", {
       method: "POST",
-      body: JSON.stringify({ id }),
+      body: JSON.stringify(typeof input === "string" ? { id: input } : input),
     }).then((r) => r.workspace),
+  deleteCanvasProject: (id: string) =>
+    call<{ project: CanvasProjectSummary }>(`/canvas-projects/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }).then((r) => r.project),
   workspace: () => call<WorkspaceProject>("/workspace"),
   connectWorkspace: (input: ConnectGitHubInput) =>
     call<WorkspaceProject>("/workspace/connect", {

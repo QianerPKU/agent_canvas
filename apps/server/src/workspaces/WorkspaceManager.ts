@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { constants } from "node:fs";
+import { constants, type Dirent } from "node:fs";
 import {
   access,
   lstat,
   mkdir,
+  readdir,
   readFile,
   rm,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -44,6 +46,7 @@ export interface GitRunner {
 }
 
 interface WorkspaceState {
+  project?: CanvasProjectSummary;
   repo?: GitHubConnection;
   branches: BranchWorkspace[];
   sharedResources: SharedResourceMount[];
@@ -94,14 +97,35 @@ export class WorkspaceManager {
 
   async listCanvasProjects(): Promise<CanvasProjectSummary[]> {
     const index = await this.readProjectIndex();
-    const projects = [...index.projects];
-    if (
-      this.currentProject &&
-      !projects.some((project) => project.id === this.currentProject?.id)
-    ) {
-      projects.unshift(this.currentProject);
+    const byRoot = new Map<string, CanvasProjectSummary>();
+    for (const indexed of index.projects) {
+      try {
+        const project = await this.readProjectSummary(indexed.projectRoot, indexed);
+        byRoot.set(normalizedRootKey(project.projectRoot), project);
+      } catch {
+        // Stale and invalid index entries are omitted. A valid custom project can be loaded by path.
+      }
     }
-    return projects.sort((a, b) => (b.openedAt ?? b.createdAt) - (a.openedAt ?? a.createdAt));
+    for (const discovered of await this.discoverProjects()) {
+      const key = normalizedRootKey(discovered.projectRoot);
+      if (!byRoot.has(key)) byRoot.set(key, discovered);
+    }
+    if (this.currentProject) {
+      let current = this.currentProject;
+      try {
+        current = await this.readProjectSummary(current.projectRoot);
+        this.currentProject = current;
+      } catch {
+        // A configured project root may be intentionally empty until its first save.
+      }
+      const key = normalizedRootKey(current.projectRoot);
+      byRoot.set(key, { ...byRoot.get(key), ...current });
+    }
+    const projects = uniqueProjectIds([...byRoot.values()]).sort(
+      (a, b) => (b.openedAt ?? b.createdAt) - (a.openedAt ?? a.createdAt),
+    );
+    await this.writeProjectIndex(projects);
+    return projects;
   }
 
   async createCanvasProject(input: CreateCanvasProjectInput): Promise<CanvasProjectSummary> {
@@ -111,6 +135,9 @@ export class WorkspaceManager {
       ? projectIdFromExplicitRoot(explicitRoot)
       : `${safePathPart(name)}-${this.now().toString(36)}`;
     const projectRoot = explicitRoot ?? path.join(this.projectsRoot, id);
+    if (isPathWithin(this.projectsRoot, projectRoot)) {
+      throw new Error("项目文件夹不能包含项目列表根目录");
+    }
     const project: CanvasProjectSummary = {
       id,
       name,
@@ -118,21 +145,64 @@ export class WorkspaceManager {
       createdAt: this.now(),
       openedAt: this.now(),
     };
+    await this.ensureProjectRootAvailable(projectRoot);
     await mkdir(projectRoot, { recursive: true });
-    await this.upsertProject(project);
-    await this.openProject(project);
+    this.selectProject(project, { branches: [], sharedResources: [] });
     await this.saveState();
     return project;
   }
 
   async openCanvasProject(input: OpenCanvasProjectInput): Promise<WorkspaceProject> {
-    const index = await this.readProjectIndex();
-    const project = index.projects.find((candidate) => candidate.id === input.id);
-    if (!project) throw new Error(`未知 canvas 项目: ${input.id}`);
+    const projectRoot = normalizeOptionalProjectRoot(input.projectRoot);
+    const projects = await this.listCanvasProjects();
+    const indexed = input.id
+      ? projects.find((candidate) => candidate.id === input.id)
+      : undefined;
+    if (!indexed && !projectRoot) {
+      throw new Error(input.id ? `未知 canvas 项目: ${input.id}` : "缺少项目 id 或项目文件夹");
+    }
+    if (
+      indexed &&
+      projectRoot &&
+      normalizedRootKey(indexed.projectRoot) !== normalizedRootKey(projectRoot)
+    ) {
+      throw new Error("项目 id 与项目文件夹不匹配");
+    }
+    const project = await this.readProjectSummary(projectRoot ?? indexed!.projectRoot, indexed);
     const opened = { ...project, openedAt: this.now() };
-    await this.upsertProject(opened);
     await this.openProject(opened);
+    this.currentProject = { ...this.currentProject!, openedAt: opened.openedAt };
+    await this.saveState();
     return this.snapshot();
+  }
+
+  async deleteCanvasProject(id: string): Promise<CanvasProjectSummary> {
+    const project = (await this.listCanvasProjects()).find((candidate) => candidate.id === id);
+    if (!project) throw new Error(`未知 canvas 项目: ${id}`);
+    const projectRoot = path.resolve(project.projectRoot);
+    await this.readProjectSummary(projectRoot, project);
+    if (isPathWithin(this.projectsRoot, projectRoot)) {
+      throw new Error("不能删除包含项目列表根目录的文件夹");
+    }
+    if (path.parse(projectRoot).root === projectRoot) throw new Error("不能删除文件系统根目录");
+    await rm(projectRoot, { recursive: true, force: false });
+    const index = await this.readProjectIndex();
+    await this.writeProjectIndex(
+      index.projects.filter(
+        (candidate) =>
+          candidate.id !== id &&
+          normalizedRootKey(candidate.projectRoot) !== normalizedRootKey(projectRoot),
+      ),
+    );
+    if (normalizedRootKey(this.currentProject?.projectRoot ?? "") === normalizedRootKey(projectRoot)) {
+      this.projectRoot = undefined;
+      this.currentProject = undefined;
+      this.state = { branches: [], sharedResources: [] };
+      this.stateLoaded = false;
+      this.branchCounter = 0;
+      this.resourceCounter = 0;
+    }
+    return project;
   }
 
   async project(): Promise<WorkspaceProject> {
@@ -450,14 +520,19 @@ export class WorkspaceManager {
   }
 
   private async openProject(project: CanvasProjectSummary): Promise<void> {
-    this.currentProject = project;
-    this.projectRoot = path.resolve(project.projectRoot);
-    this.state = { branches: [], sharedResources: [] };
-    this.stateLoaded = false;
-    this.branchCounter = 0;
-    this.resourceCounter = 0;
-    await mkdir(this.projectRoot, { recursive: true });
+    this.selectProject(project);
     await this.loadStateIfNeeded();
+  }
+
+  private selectProject(project: CanvasProjectSummary, state?: WorkspaceState): void {
+    this.currentProject = { ...project, projectRoot: path.resolve(project.projectRoot) };
+    this.projectRoot = this.currentProject.projectRoot;
+    this.state = state ?? { branches: [], sharedResources: [] };
+    this.stateLoaded = state !== undefined;
+    this.branchCounter = maxNumericSuffix(this.state.branches.map((branch) => branch.id));
+    this.resourceCounter = maxNumericSuffix(
+      this.state.sharedResources.map((resource) => resource.id),
+    );
   }
 
   private async ensureProjectOpen(): Promise<void> {
@@ -472,11 +547,19 @@ export class WorkspaceManager {
 
   private async loadStateIfNeeded(): Promise<void> {
     if (this.stateLoaded) return;
-    this.stateLoaded = true;
     const statePath = this.statePath();
     try {
       const parsed = JSON.parse(await readFile(statePath, "utf-8")) as WorkspaceState;
+      if (!isRecord(parsed)) throw new Error("workspace.json 格式不合法");
+      if (parsed.project && this.currentProject) {
+        this.currentProject = projectSummaryFromValue(
+          parsed.project,
+          this.requireProjectRoot(),
+          this.currentProject,
+        );
+      }
       this.state = {
+        project: this.currentProject,
         repo: parsed.repo,
         branches: Array.isArray(parsed.branches) ? parsed.branches : [],
         sharedResources: Array.isArray(parsed.sharedResources) ? parsed.sharedResources : [],
@@ -485,21 +568,26 @@ export class WorkspaceManager {
       this.resourceCounter = maxNumericSuffix(
         this.state.sharedResources.map((resource) => resource.id),
       );
-    } catch {
-      this.state = { branches: [], sharedResources: [] };
+      this.stateLoaded = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      this.state = { project: this.currentProject, branches: [], sharedResources: [] };
       this.branchCounter = 0;
       this.resourceCounter = 0;
+      this.stateLoaded = true;
     }
   }
 
   private async saveState(): Promise<void> {
     const statePath = this.statePath();
+    this.state.project = this.currentProject;
     await mkdir(path.dirname(statePath), { recursive: true });
     await writeFile(
       statePath,
       `${JSON.stringify(this.state, undefined, 2)}\n`,
       "utf-8",
     );
+    if (this.currentProject) await this.upsertProject(this.currentProject);
   }
 
   private statePath(): string {
@@ -625,14 +713,90 @@ export class WorkspaceManager {
     const index = await this.readProjectIndex();
     const projects = [
       project,
-      ...index.projects.filter((candidate) => candidate.id !== project.id),
+      ...index.projects.filter(
+        (candidate) =>
+          candidate.id !== project.id &&
+          normalizedRootKey(candidate.projectRoot) !== normalizedRootKey(project.projectRoot),
+      ),
     ];
+    await this.writeProjectIndex(projects);
+  }
+
+  private async writeProjectIndex(projects: CanvasProjectSummary[]): Promise<void> {
     await mkdir(this.projectsRoot, { recursive: true });
     await writeFile(
       this.projectIndexPath(),
       `${JSON.stringify({ projects }, undefined, 2)}\n`,
       "utf-8",
     );
+  }
+
+  private async discoverProjects(): Promise<CanvasProjectSummary[]> {
+    let entries: Dirent[];
+    try {
+      entries = await readdir(this.projectsRoot, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    const projects = await Promise.all(
+      entries
+        .filter((entry) => entry.isDirectory())
+        .map(async (entry) => {
+          try {
+            return await this.readProjectSummary(path.join(this.projectsRoot, entry.name));
+          } catch {
+            return undefined;
+          }
+        }),
+    );
+    return projects.filter((project): project is CanvasProjectSummary => !!project);
+  }
+
+  private async readProjectSummary(
+    projectRoot: string,
+    fallback?: CanvasProjectSummary,
+  ): Promise<CanvasProjectSummary> {
+    const resolvedRoot = path.resolve(projectRoot);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await readFile(path.join(resolvedRoot, WORKSPACE_STATE_FILE), "utf-8"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new Error(`所选文件夹不是 Canvas 项目: ${resolvedRoot}`);
+      }
+      throw new Error(`无法读取 Canvas 项目 ${resolvedRoot}: ${errorMessage(error)}`);
+    }
+    if (!isRecord(parsed)) throw new Error(`Canvas 项目配置格式不合法: ${resolvedRoot}`);
+    const fileStat = await stat(path.join(resolvedRoot, WORKSPACE_STATE_FILE));
+    const project = projectSummaryFromValue(
+      parsed.project,
+      resolvedRoot,
+      fallback ?? {
+        id: projectIdFromExplicitRoot(resolvedRoot),
+        name: path.basename(resolvedRoot),
+        projectRoot: resolvedRoot,
+        createdAt: fileStat.birthtimeMs || fileStat.mtimeMs || this.now(),
+      },
+    );
+    return fallback && normalizedRootKey(fallback.projectRoot) === normalizedRootKey(resolvedRoot)
+      ? { ...project, id: fallback.id }
+      : project;
+  }
+
+  private async ensureProjectRootAvailable(projectRoot: string): Promise<void> {
+    let entries: string[];
+    try {
+      entries = await readdir(projectRoot);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    if (entries.length === 0) return;
+    if (entries.includes(WORKSPACE_STATE_FILE)) {
+      throw new Error(`文件夹中已有 Canvas 项目，请使用“加载项目”: ${projectRoot}`);
+    }
+    throw new Error(`项目文件夹必须为空: ${projectRoot}`);
   }
 
   private projectIndexPath(): string {
@@ -782,6 +946,69 @@ function projectIdFromExplicitRoot(root: string): string {
   const name = safePathPart(path.basename(root));
   const hash = createHash("sha256").update(path.resolve(root).toLowerCase()).digest("hex").slice(0, 12);
   return name ? `${name}-${hash}` : hash;
+}
+
+function projectSummaryFromValue(
+  value: unknown,
+  projectRoot: string,
+  fallback: CanvasProjectSummary,
+): CanvasProjectSummary {
+  const record = isRecord(value) ? value : {};
+  const id = nonEmptyString(record.id) ?? fallback.id;
+  const name = nonEmptyString(record.name) ?? fallback.name;
+  const createdAt = finiteTimestamp(record.createdAt) ?? fallback.createdAt;
+  const openedAt = finiteTimestamp(record.openedAt) ?? fallback.openedAt;
+  return {
+    id,
+    name,
+    projectRoot: path.resolve(projectRoot),
+    createdAt,
+    ...(openedAt === undefined ? {} : { openedAt }),
+  };
+}
+
+function uniqueProjectIds(projects: CanvasProjectSummary[]): CanvasProjectSummary[] {
+  const rootsById = new Map<string, string>();
+  return projects.map((project) => {
+    const rootKey = normalizedRootKey(project.projectRoot);
+    const existingRoot = rootsById.get(project.id);
+    if (!existingRoot || existingRoot === rootKey) {
+      rootsById.set(project.id, rootKey);
+      return project;
+    }
+    const id = projectIdFromExplicitRoot(project.projectRoot);
+    rootsById.set(id, rootKey);
+    return { ...project, id };
+  });
+}
+
+function normalizedRootKey(root: string): string {
+  const resolved = path.resolve(root);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function isPathWithin(candidate: string, parent: string): boolean {
+  const relative = path.relative(path.resolve(parent), path.resolve(candidate));
+  return (
+    relative === "" ||
+    (!path.isAbsolute(relative) && !relative.startsWith(`..${path.sep}`) && relative !== "..")
+  );
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function finiteTimestamp(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function defaultProjectRoot(defaultSourcePath: string): string {

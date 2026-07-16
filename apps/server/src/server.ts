@@ -320,13 +320,29 @@ async function handleHttp(
 
   if (method === "POST" && path === "/api/canvas-projects/open") {
     const body = await readJson<OpenCanvasProjectInput>(req);
-    if (!body?.id) return sendJson(res, 400, { error: "缺少项目 id" });
+    if (!body?.id && !body?.projectRoot?.trim()) {
+      return sendJson(res, 400, { error: "缺少项目 id 或项目文件夹" });
+    }
     try {
       await canvasState.saveNow();
       const workspace = await workspaceManager.openCanvasProject(body);
       await canvasState.loadProjectState();
       broadcastHello();
       return sendJson(res, 200, { workspace });
+    } catch (error) {
+      return sendJson(res, 404, { error: errMsg(error) });
+    }
+  }
+
+  const canvasProjectMatch = path.match(/^\/api\/canvas-projects\/([^/]+)$/u);
+  if (method === "DELETE" && canvasProjectMatch) {
+    try {
+      await canvasState.saveNow();
+      const project = await workspaceManager.deleteCanvasProject(
+        decodeURIComponent(canvasProjectMatch[1]!),
+      );
+      broadcastHello();
+      return sendJson(res, 200, { project });
     } catch (error) {
       return sendJson(res, 404, { error: errMsg(error) });
     }

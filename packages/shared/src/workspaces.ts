@@ -14,7 +14,10 @@ export interface CreateCanvasProjectInput {
 }
 
 export interface OpenCanvasProjectInput {
-  id: string;
+  /** Open a project already registered in the project index. */
+  id?: string;
+  /** Open and register a project directly from its on-disk directory. */
+  projectRoot?: string;
 }
 
 export interface GitHubConnection {

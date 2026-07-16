@@ -11,7 +11,7 @@ Windows: %LOCALAPPDATA%/agent_canvas/projects/index.json
 Linux:   ~/.local/share/agent_canvas/projects/index.json
 
 <projects-root>/<project-id>/
-  workspace.json                 # 当前 repo/branch/shared resource 状态
+  workspace.json                 # 项目元数据及当前 repo/branch/shared resource 状态
   canvas-state.json              # 当前画布节点、agent histories、commit/PR/sync 和布局状态
   files/                         # 当前 canvas 项目的文件节点隔离目录
   prompts/                       # 当前 canvas 项目的提示词节点载体
@@ -20,7 +20,7 @@ Linux:   ~/.local/share/agent_canvas/projects/index.json
   shared/<repo-id>/<resource>/   # 项目级共享资源真实目录
 ```
 
-新建项目时可传 `projectRoot`，直接把这个 Canvas 项目放进用户指定文件夹。`AGENT_CANVAS_PROJECTS_ROOT` 可覆盖默认项目列表根目录；`AGENT_CANVAS_PROJECT_ROOT` 可覆盖并自动打开单个项目根目录，主要用于测试、调试或固定部署。
+新建项目时可传 `projectRoot`，直接把这个 Canvas 项目放进用户指定文件夹。项目文件夹必须为空，避免覆盖已有数据。项目自身的名称、id 和创建/打开时间保存在 `workspace.json`；默认项目根目录会扫描其中的项目以修复丢失的索引，自定义位置的项目则可通过项目文件夹手动加载并重新登记。`AGENT_CANVAS_PROJECTS_ROOT` 可覆盖默认项目列表根目录；`AGENT_CANVAS_PROJECT_ROOT` 可覆盖并自动打开单个项目根目录，主要用于测试、调试或固定部署。
 
 ## 三类文件
 
@@ -30,7 +30,7 @@ Linux:   ~/.local/share/agent_canvas/projects/index.json
 
 ## Git 与 GitHub
 
-- `GET/POST /api/canvas-projects` 管理 canvas 项目；`POST /api/canvas-projects` 支持 `projectRoot` 自定义项目文件夹；`POST /api/canvas-projects/open` 打开已有项目。打开项目不会自动连接 GitHub repo。
+- `GET/POST /api/canvas-projects` 管理 canvas 项目；`POST /api/canvas-projects` 支持 `projectRoot` 自定义项目文件夹；`POST /api/canvas-projects/open` 可按已登记 id 或任意项目文件夹打开项目；`DELETE /api/canvas-projects/:id` 会永久删除项目目录。打开项目不会自动连接 GitHub repo。
 - `POST /api/workspace/connect` 使用远端 URL 或本地路径 clone 到 AppData 项目目录。
 - 默认 branch 直接使用 AppData clone；其他 branch 不会在连接时全部拉取。只有创建 Agent 或切换 Agent branch 选中了某个尚未创建 workspace 的 branch 时，才会 `fetch` 该 branch 并执行 `git worktree add -B <branch> <path> <startPoint>`。
 - `POST /api/workspace/branches` 支持 `baseBranch`。当目标 branch 不是已有远端 branch 时，新 worktree 会优先从 `origin/<baseBranch>` 创建；如果该远端 ref 不存在，则退回本地已有的 `<baseBranch>`。

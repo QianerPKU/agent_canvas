@@ -842,7 +842,7 @@ describe("HTTP server", () => {
     expect(connections.json.connections).toContainEqual(connection.json.connection);
   });
 
-  it("canvas project REST 支持自定义项目文件夹", async () => {
+  it("canvas project REST 支持从自定义文件夹加载和删除项目", async () => {
     const customProjectRoot = path.join(root, "custom-project-root");
     const created = await request(port, "POST", "/api/canvas-projects", {
       name: "custom-root",
@@ -858,6 +858,23 @@ describe("HTTP server", () => {
     await expect(readFile(path.join(customProjectRoot, "workspace.json"), "utf-8")).resolves.toContain(
       '"branches": []',
     );
+
+    const loaded = await request(port, "POST", "/api/canvas-projects/open", {
+      projectRoot: customProjectRoot,
+    });
+    expect(loaded.status).toBe(200);
+    expect(loaded.json.workspace.canvasProject.id).toBe(created.json.project.id);
+
+    const deleted = await request(
+      port,
+      "DELETE",
+      `/api/canvas-projects/${encodeURIComponent(created.json.project.id)}`,
+    );
+    expect(deleted.status).toBe(200);
+    expect(deleted.json.project.id).toBe(created.json.project.id);
+    await expect(readFile(path.join(customProjectRoot, "workspace.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 
   it("canvas project 保存并恢复节点快照和布局", async () => {
