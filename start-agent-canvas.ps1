@@ -72,7 +72,7 @@ if (-not (Test-Path (Join-Path $Root "node_modules"))) {
 $escapedRoot = Escape-PowerShellSingleQuotedString $Root
 $escapedProjectsRoot = Escape-PowerShellSingleQuotedString $ProjectsRoot
 $escapedProjectRoot = Escape-PowerShellSingleQuotedString $ProjectRoot
-$projectEnvCommand = ""
+$projectEnvCommand = "`$env:AGENT_CANVAS_ALLOWED_ORIGINS='http://127.0.0.1:$WebPort,http://localhost:$WebPort'; "
 if ($ProjectsRoot.Trim().Length -gt 0) {
   $projectEnvCommand += "`$env:AGENT_CANVAS_PROJECTS_ROOT='$escapedProjectsRoot'; "
 }

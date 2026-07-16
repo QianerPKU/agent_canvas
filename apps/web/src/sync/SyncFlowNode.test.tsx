@@ -79,4 +79,24 @@ describe("SyncFlowNode", () => {
     fireEvent.click(screen.getByText("apply focused fix"));
     expect(onOpenDetails).toHaveBeenCalledWith("sync_flow_1");
   });
+
+  it("falls back to the source and target when flow text is encoding-damaged", () => {
+    render(
+      <ReactFlowProvider>
+        <SyncFlowNode
+          {...({
+            id: "sync:sync_flow_1",
+            data: {
+              flow: flow({ title: "????????", summary: "????????????" }),
+              onOpenDetails: vi.fn(),
+            },
+          } as unknown as NodeProps<SyncFlowNodeType>)}
+        />
+      </ReactFlowProvider>,
+    );
+
+    expect(screen.getByText("sync_flow_1")).toBeTruthy();
+    expect(screen.getByText("main → feature/a")).toBeTruthy();
+    expect(screen.queryByText("????????????")).toBeNull();
+  });
 });

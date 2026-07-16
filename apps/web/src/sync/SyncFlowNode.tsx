@@ -9,6 +9,8 @@ import {
 } from "@xyflow/react";
 import { GitBranch, GitCommitHorizontal, Minimize2 } from "lucide-react";
 import type { SyncFlowSnapshot } from "@agent-canvas/shared";
+import { flowDisplayText } from "../displayText.js";
+import { SYNC_FLOW_NODE_DIMENSIONS } from "../nodeDimensions.js";
 
 export interface SyncFlowNodeData {
   flow: SyncFlowSnapshot;
@@ -27,8 +29,8 @@ export function toggleSyncFlowNodeWindow(node: SyncFlowNodeType): Partial<SyncFl
   const state = node.data.windowState;
   if (state?.minimized) {
     return {
-      width: state.restoreWidth ?? 280,
-      height: state.restoreHeight ?? 180,
+      width: state.restoreWidth ?? SYNC_FLOW_NODE_DIMENSIONS.width,
+      height: state.restoreHeight ?? SYNC_FLOW_NODE_DIMENSIONS.height,
       data: {
         ...node.data,
         windowState: { ...state, minimized: false },
@@ -36,14 +38,16 @@ export function toggleSyncFlowNodeWindow(node: SyncFlowNodeType): Partial<SyncFl
     };
   }
   return {
-    width: 76,
-    height: 50,
+    width: SYNC_FLOW_NODE_DIMENSIONS.minimizedWidth,
+    height: SYNC_FLOW_NODE_DIMENSIONS.minimizedHeight,
     data: {
       ...node.data,
       windowState: {
         minimized: true,
-        restoreWidth: node.width ?? node.measured?.width ?? 280,
-        restoreHeight: node.height ?? node.measured?.height ?? 180,
+        restoreWidth:
+          node.width ?? node.measured?.width ?? SYNC_FLOW_NODE_DIMENSIONS.width,
+        restoreHeight:
+          node.height ?? node.measured?.height ?? SYNC_FLOW_NODE_DIMENSIONS.height,
       },
     },
   };
@@ -56,6 +60,7 @@ export function SyncFlowNode({ id, data }: NodeProps<SyncFlowNodeType>): React.R
   const minimized = data.windowState?.minimized === true;
   const meta = syncStatusMeta(flow.status);
   const Icon = flow.kind === "cherry_pick" ? GitCommitHorizontal : GitBranch;
+  const display = flowDisplayText(flow);
 
   const toggleMinimized = (event: React.MouseEvent) => {
     event.stopPropagation();
@@ -101,7 +106,7 @@ export function SyncFlowNode({ id, data }: NodeProps<SyncFlowNodeType>): React.R
       <SyncFlowHandle />
       <header className="sync-node__header drag-handle">
         <Icon size={16} />
-        <strong>{flow.title || flow.id}</strong>
+        <strong>{display.title}</strong>
         <button
           className="icon-button nodrag"
           title="Minimize sync node"
@@ -112,7 +117,7 @@ export function SyncFlowNode({ id, data }: NodeProps<SyncFlowNodeType>): React.R
       </header>
       <div className="sync-node__body nodrag">
         <span style={{ color: meta.color }}>{meta.label}</span>
-        <p>{flow.summary}</p>
+        <p>{display.summary}</p>
         <small>
           {flow.sourceBranch ?? flow.commitSha ?? "commit"} -&gt; {flow.targetBranch} -{" "}
           {flow.files.length} files

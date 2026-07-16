@@ -8,6 +8,7 @@ import type {
   SyncFlowSnapshot,
 } from "@agent-canvas/shared";
 import type { AgentMap } from "../agentStore.js";
+import { flowDisplayText } from "../displayText.js";
 import type { SyncFlowActions } from "../useAgentCanvas.js";
 import { syncStatusMeta } from "./SyncFlowNode.js";
 
@@ -271,6 +272,7 @@ function SyncFlowRow({
 }): React.ReactElement {
   const [busy, setBusy] = useState(false);
   const meta = syncStatusMeta(flow.status);
+  const display = flowDisplayText(flow);
 
   const recordApplied = async () => {
     const input: SyncFlowAppliedInput = {
@@ -289,14 +291,14 @@ function SyncFlowRow({
   return (
     <article className="pr-flow-row">
       <header>
-        <strong>{flow.title || flow.id}</strong>
+        <strong>{display.title}</strong>
         <span style={{ color: meta.color }}>{meta.label}</span>
       </header>
       <div className="pr-flow-row__meta">
         {flow.kind} - {flow.sourceBranch ?? flow.commitSha ?? "source"} -&gt;{" "}
         {flow.targetBranch}
       </div>
-      <p>{flow.summary}</p>
+      <p>{display.summary}</p>
       {flow.reviewRequest?.responses.map((response) => (
         <div key={response.agentId} className="pr-flow-row__review">
           <strong>{response.agentId}</strong>

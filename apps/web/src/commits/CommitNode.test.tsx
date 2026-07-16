@@ -74,4 +74,26 @@ describe("CommitNode", () => {
     fireEvent.click(screen.getByText("add app"));
     expect(onOpenDetails).toHaveBeenCalledWith("commit_1");
   });
+
+  it("falls back to the Git subject when a reported summary is encoding-damaged", () => {
+    render(
+      <ReactFlowProvider>
+        <CommitNode
+          {...({
+            id: "commit:commit_1",
+            data: {
+              commit: commit({
+                subject: "fix: 修复中文提交节点",
+                summary: "????????????",
+              }),
+              onOpenDetails: vi.fn(),
+            },
+          } as unknown as NodeProps<CommitNodeType>)}
+        />
+      </ReactFlowProvider>,
+    );
+
+    expect(screen.getByText("fix: 修复中文提交节点")).toBeTruthy();
+    expect(screen.queryByText("????????????")).toBeNull();
+  });
 });

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { ChevronRight, GitCommitHorizontal, X } from "lucide-react";
 import type { AgentCommitSnapshot, CommitChangedFile } from "@agent-canvas/shared";
 import { parseUnifiedDiff, type ParsedDiffLine } from "./diff.js";
+import { commitDisplayText } from "../displayText.js";
 
 export function CommitDetailsWindow({
   commit,
@@ -11,6 +12,7 @@ export function CommitDetailsWindow({
   onClose: () => void;
 }): React.ReactElement {
   const [openFiles, setOpenFiles] = useState<Set<string>>(() => new Set());
+  const display = commitDisplayText(commit);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -47,7 +49,7 @@ export function CommitDetailsWindow({
             <strong>
               <GitCommitHorizontal size={15} /> {commit.shortSha}
             </strong>
-            <span title={commit.commitSha}>{commit.subject}</span>
+            <span title={commit.commitSha}>{display.subject}</span>
           </div>
           <button className="icon-button" title="关闭 commit 详情" onClick={onClose}>
             <X size={17} />
@@ -56,7 +58,7 @@ export function CommitDetailsWindow({
 
         <div className="commit-details-window__body">
           <section className="commit-details-window__summary">
-            <h2>{commit.summary}</h2>
+            <h2>{display.summary}</h2>
             <dl>
               <dt>完整 hash</dt>
               <dd>{commit.commitSha}</dd>

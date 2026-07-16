@@ -9,6 +9,7 @@ import { AgentManager } from "./AgentManager.js";
 import { CommitManager } from "./commits/CommitManager.js";
 import { createServer } from "./server.js";
 import { FileManager } from "./files/FileManager.js";
+import type { OpenInVscodeOptions } from "./files/VscodeFileOpener.js";
 import { PromptManager } from "./prompts/PromptManager.js";
 import { CodexAuthManager } from "./sdk/CodexAuthManager.js";
 import { SyncFlowManager, type SyncFlowAgentHost } from "./sync/SyncFlowManager.js";
@@ -142,6 +143,7 @@ function request(
   method: string,
   path: string,
   body?: unknown,
+  extraHeaders: Record<string, string> = {},
 ): Promise<Resp> {
   return new Promise((resolve, reject) => {
     const data = body !== undefined ? JSON.stringify(body) : undefined;
@@ -151,9 +153,12 @@ function request(
         port,
         method,
         path,
-        headers: data
-          ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) }
-          : {},
+        headers: {
+          ...extraHeaders,
+          ...(data
+            ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) }
+            : {}),
+        },
       },
       (res) => {
         const chunks: Buffer[] = [];
@@ -177,7 +182,9 @@ describe("HTTP server", () => {
   let projectRoot = "";
   let syncHost: FakeSyncHost;
   let syncFlowManager: SyncFlowManager;
-  const openFile = vi.fn<(filePath: string) => Promise<void>>().mockResolvedValue(undefined);
+  const openFile = vi
+    .fn<(filePath: string, options?: OpenInVscodeOptions) => Promise<void>>()
+    .mockResolvedValue(undefined);
   const pickDirectory = vi
     .fn<(initialDirectory?: string) => Promise<string | undefined>>()
     .mockResolvedValue("C:\\picked");
@@ -472,7 +479,9 @@ describe("HTTP server", () => {
     const opened = await request(port, "POST", `/api/agents/${created.json.id}/open-workspace`);
 
     expect(opened).toEqual({ status: 202, json: { ok: true } });
-    expect(openFile).toHaveBeenCalledWith(feature.json.branch.worktreePath);
+    expect(openFile).toHaveBeenCalledWith(feature.json.branch.worktreePath, {
+      windowMode: "new",
+    });
   });
 
   it("creates agents with settings and updates private system prompt", async () => {
@@ -806,7 +815,9 @@ describe("HTTP server", () => {
       `/api/files/${created.json.file.id}/open`,
     );
     expect(opened).toEqual({ status: 202, json: { ok: true } });
-    expect(openFile).toHaveBeenCalledWith(updated.json.file.path);
+    expect(openFile).toHaveBeenCalledWith(updated.json.file.path, {
+      windowMode: "reuse",
+    });
 
     const connection = await request(port, "POST", "/api/file-connections", {
       fileId: created.json.file.id,
@@ -867,7 +878,7 @@ describe("HTTP server", () => {
     expect(connections.json.connections).toContainEqual(connection.json.connection);
   });
 
-  it("canvas project REST 支持自定义项目文件夹", async () => {
+  it("canvas project REST 支持从自定义文件夹加载和删除项目", async () => {
     const customProjectRoot = path.join(root, "custom-project-root");
     const created = await request(port, "POST", "/api/canvas-projects", {
       name: "custom-root",
@@ -881,8 +892,75 @@ describe("HTTP server", () => {
     });
     expect(created.json.workspace.projectRoot).toBe(customProjectRoot);
     await expect(readFile(path.join(customProjectRoot, "workspace.json"), "utf-8")).resolves.toContain(
-      '"branches": []',
+      '"schema": "agent-canvas/workspace"',
     );
+
+    const loaded = await request(port, "POST", "/api/canvas-projects/open", {
+      projectRoot: customProjectRoot,
+    }, {
+      Origin: "http://127.0.0.1:5317",
+      "Sec-Fetch-Site": "same-origin",
+    });
+    expect(loaded.status).toBe(200);
+    expect(loaded.json.workspace.canvasProject.id).toBe(created.json.project.id);
+
+    const missingIntent = await request(
+      port,
+      "DELETE",
+      `/api/canvas-projects/${encodeURIComponent(created.json.project.id)}`,
+    );
+    expect(missingIntent.status).toBe(403);
+
+    const crossOrigin = await request(
+      port,
+      "DELETE",
+      `/api/canvas-projects/${encodeURIComponent(created.json.project.id)}`,
+      undefined,
+      {
+        Origin: "https://attacker.example",
+        "Sec-Fetch-Site": "cross-site",
+        "X-Agent-Canvas-Intent": "delete-project",
+      },
+    );
+    expect(crossOrigin.status).toBe(403);
+    await expect(readFile(path.join(customProjectRoot, "workspace.json"), "utf-8")).resolves.toContain(
+      '"schema": "agent-canvas/workspace"',
+    );
+
+    await request(port, "POST", "/api/workspace/connect", { localPath: root });
+    const activeAgent = await request(port, "POST", "/api/agents", { branch: "main" });
+    expect(activeAgent.status).toBe(201);
+
+    const activeDelete = await request(
+      port,
+      "DELETE",
+      `/api/canvas-projects/${encodeURIComponent(created.json.project.id)}`,
+      undefined,
+      { "X-Agent-Canvas-Intent": "delete-project" },
+    );
+    expect(activeDelete.status).toBe(409);
+    expect(activeDelete.json.error).toContain("活动 agent");
+    await request(port, "POST", `/api/agents/${activeAgent.json.id}/terminate`);
+
+    const deleted = await request(
+      port,
+      "DELETE",
+      `/api/canvas-projects/${encodeURIComponent(created.json.project.id)}`,
+      undefined,
+      { "X-Agent-Canvas-Intent": "delete-project" },
+    );
+    expect(deleted.status).toBe(200);
+    expect(deleted.json.project.id).toBe(created.json.project.id);
+    expect((await request(port, "GET", "/api/agents")).json.agents).toEqual([]);
+    expect((await request(port, "GET", "/api/files")).json.files).toEqual([]);
+    expect((await request(port, "GET", "/api/prompts")).json.prompts).toEqual([]);
+    expect((await request(port, "GET", "/api/commits")).json.commits).toEqual([]);
+    expect((await request(port, "GET", "/api/pr-flows")).json.flows).toEqual([]);
+    expect((await request(port, "GET", "/api/sync-flows")).json.flows).toEqual([]);
+    expect((await request(port, "GET", "/api/canvas-layout")).json.nodes).toEqual([]);
+    await expect(readFile(path.join(customProjectRoot, "workspace.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 
   it("canvas project 保存并恢复节点快照和布局", async () => {

@@ -23,6 +23,16 @@ describe("agentCanvasPolicyPrompt", () => {
     expect(prompt).toContain('"targetBranch": "main"');
     expect(prompt).toContain('"files": ["src/example.ts"]');
     expect(prompt).toContain('proposerAgentId = "agent_42"');
+    const powershellRequests = prompt
+      .split("\n")
+      .filter((line) => line.startsWith("Invoke-RestMethod"));
+    expect(powershellRequests).toHaveLength(5);
+    expect(
+      powershellRequests.every((line) =>
+        line.includes('-ContentType "application/json; charset=utf-8"'),
+      ),
+    ).toBe(true);
+    expect(prompt).toContain("PowerShell 5.1 会在请求发出前把中文替换成问号");
     expect(prompt).toContain('curl -sS -X POST "http://127.0.0.1:4317/api/pr-flows"');
     expect(prompt).toContain("create_pr authorization");
     expect(prompt).toContain("merge_pr authorization");

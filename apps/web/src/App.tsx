@@ -22,6 +22,7 @@ import {
   MousePointer2,
   Plus,
   Settings,
+  Trash2,
   X,
 } from "lucide-react";
 import { api } from "./api.js";
@@ -74,6 +75,14 @@ import { SyncFlowDialog } from "./sync/SyncFlowDialog.js";
 import { SyncFlowNode, type SyncFlowNodeType } from "./sync/SyncFlowNode.js";
 import { SyncFlowDetailsWindow } from "./sync/SyncFlowDetailsWindow.js";
 import type { PromptActions } from "./useAgentCanvas.js";
+import {
+  COMMIT_NODE_DIMENSIONS,
+  FILE_NODE_DIMENSIONS,
+  PROMPT_NODE_DIMENSIONS,
+  PULL_REQUEST_NODE_DIMENSIONS,
+  SYNC_FLOW_NODE_DIMENSIONS,
+  TURN_NODE_DIMENSIONS,
+} from "./nodeDimensions.js";
 
 const nodeTypes = {
   turn: TurnNode,
@@ -86,19 +95,20 @@ const nodeTypes = {
 
 const COL_W = 760;
 const ROW_H = 360;
-const FILE_ROW_H = 280;
-const DEFAULT_NODE_WIDTH = 360;
-const DEFAULT_NODE_HEIGHT = 300;
-const FILE_NODE_WIDTH = 280;
-const FILE_NODE_HEIGHT = 240;
-const PROMPT_NODE_WIDTH = 300;
-const PROMPT_NODE_HEIGHT = 260;
-const COMMIT_NODE_WIDTH = 270;
-const COMMIT_NODE_HEIGHT = 170;
-const PR_NODE_WIDTH = 290;
-const PR_NODE_HEIGHT = 180;
-const SYNC_NODE_WIDTH = 290;
-const SYNC_NODE_HEIGHT = 180;
+const DEFAULT_NODE_WIDTH = TURN_NODE_DIMENSIONS.width;
+const DEFAULT_NODE_HEIGHT = TURN_NODE_DIMENSIONS.height;
+const FILE_NODE_WIDTH = FILE_NODE_DIMENSIONS.width;
+const FILE_NODE_HEIGHT = FILE_NODE_DIMENSIONS.height;
+const PROMPT_NODE_WIDTH = PROMPT_NODE_DIMENSIONS.width;
+const PROMPT_NODE_HEIGHT = PROMPT_NODE_DIMENSIONS.height;
+const COMMIT_NODE_WIDTH = COMMIT_NODE_DIMENSIONS.width;
+const COMMIT_NODE_HEIGHT = COMMIT_NODE_DIMENSIONS.height;
+const PR_NODE_WIDTH = PULL_REQUEST_NODE_DIMENSIONS.width;
+const PR_NODE_HEIGHT = PULL_REQUEST_NODE_DIMENSIONS.height;
+const SYNC_NODE_WIDTH = SYNC_FLOW_NODE_DIMENSIONS.width;
+const SYNC_NODE_HEIGHT = SYNC_FLOW_NODE_DIMENSIONS.height;
+const FILE_ROW_H = FILE_NODE_HEIGHT + 20;
+const PROMPT_ROW_H = PROMPT_NODE_HEIGHT + 20;
 type CanvasTool = "select" | "hand";
 
 export function canvasInteractionForTool(tool: CanvasTool): {
@@ -116,7 +126,6 @@ const X0 = 40;
 const Y0 = 40;
 const NODE_GAP = 36;
 const TURN_VERTICAL_GAP = 24;
-const DERIVED_NODE_GAP = 24;
 
 type CanvasNode =
   | TurnNodeType
@@ -129,7 +138,6 @@ type AgentSettingsTarget =
   | { mode: "create" }
   | { mode: "edit"; agentId: string };
 type NodePosition = { x: number; y: number };
-type NodeRect = NodePosition & { width: number; height: number };
 type NodePlacementOverrides = Record<string, NodePosition>;
 
 function nodeId(agentId: string, turnIndex: number): string {
@@ -182,14 +190,6 @@ function nodeHeight(node: CanvasNode): number {
   return node.height ?? node.measured?.height ?? fallbackSize(node).height;
 }
 
-function nodeRect(node: CanvasNode): NodeRect {
-  return {
-    ...node.position,
-    width: nodeWidth(node),
-    height: nodeHeight(node),
-  };
-}
-
 function nodeWindowState(node: CanvasNode): CanvasNodeLayout["windowState"] {
   switch (node.type) {
     case "turn":
@@ -213,6 +213,23 @@ export function centeredNodePosition(
     x: center.x - width / 2,
     y: center.y - height / 2,
   };
+}
+
+export function centeredNodePositionInViewport(
+  bounds: Pick<DOMRect, "left" | "top" | "width" | "height">,
+  screenToFlowPosition: (position: NodePosition) => NodePosition,
+  width: number,
+  height: number,
+): NodePosition {
+  const center = screenToFlowPosition({
+    x: bounds.left + bounds.width / 2,
+    y: bounds.top + bounds.height / 2,
+  });
+  return centeredNodePosition(center, width, height);
+}
+
+function positionsMatch(left: NodePosition, right: NodePosition): boolean {
+  return left.x === right.x && left.y === right.y;
 }
 
 export function canvasLayoutFromNodes(
@@ -246,45 +263,12 @@ function storedLayoutFor(
   return layout.type === undefined || layout.type === type ? layout : undefined;
 }
 
-function intersects(a: NodeRect, b: NodeRect): boolean {
-  return (
-    a.x < b.x + b.width + DERIVED_NODE_GAP &&
-    a.x + a.width + DERIVED_NODE_GAP > b.x &&
-    a.y < b.y + b.height + DERIVED_NODE_GAP &&
-    a.y + a.height + DERIVED_NODE_GAP > b.y
-  );
-}
-
-function isFree(position: NodePosition, width: number, height: number, occupied: NodeRect[]): boolean {
-  const candidate = { ...position, width, height };
-  return !occupied.some((rect) => intersects(candidate, rect));
-}
-
-function findFreePosition(
-  preferred: NodePosition,
-  width: number,
-  height: number,
-  occupied: NodeRect[],
-): NodePosition {
-  for (let column = 0; column < 8; column++) {
-    for (let row = 0; row < 10; row++) {
-      const candidate = {
-        x: preferred.x + column * (width + NODE_GAP),
-        y: preferred.y + row * (height + NODE_GAP),
-      };
-      if (isFree(candidate, width, height, occupied)) return candidate;
-    }
-  }
-  return preferred;
-}
-
 function turnPosition(
   id: string,
   viewId: string,
   index: number,
   layout: Record<string, NodePosition>,
   placed: Map<string, CanvasNode>,
-  occupied: NodeRect[],
 ): NodePosition {
   if (index === 0) return layout[id] ?? { x: X0, y: Y0 };
   const previous = placed.get(nodeId(viewId, index - 1));
@@ -293,17 +277,14 @@ function turnPosition(
     x: previous.position.x,
     y: previous.position.y + nodeHeight(previous) + TURN_VERTICAL_GAP,
   };
-  return findFreePosition(preferred, DEFAULT_NODE_WIDTH, DEFAULT_NODE_HEIGHT, occupied);
+  return preferred;
 }
 
 function anchoredSidePosition(
   source: CanvasNode | undefined,
   fallback: NodePosition,
-  width: number,
-  height: number,
-  occupied: NodeRect[],
 ): NodePosition {
-  if (!source) return findFreePosition(fallback, width, height, occupied);
+  if (!source) return fallback;
   const sourceWidth =
     source.type === "turn"
       ? Math.max(
@@ -312,15 +293,10 @@ function anchoredSidePosition(
           DEFAULT_NODE_WIDTH,
         )
       : nodeWidth(source);
-  return findFreePosition(
-    {
-      x: source.position.x + sourceWidth + NODE_GAP,
-      y: source.position.y,
-    },
-    width,
-    height,
-    occupied,
-  );
+  return {
+    x: source.position.x + sourceWidth + NODE_GAP,
+    y: source.position.y,
+  };
 }
 
 function autoTurnWindowState(
@@ -341,11 +317,15 @@ function autoTurnWindowState(
 }
 
 function turnWidth(windowState: TurnNodeType["data"]["windowState"]): number {
-  return windowState?.minimized ? 68 : DEFAULT_NODE_WIDTH;
+  return windowState?.minimized
+    ? TURN_NODE_DIMENSIONS.minimizedWidth
+    : DEFAULT_NODE_WIDTH;
 }
 
 function turnHeight(windowState: TurnNodeType["data"]["windowState"]): number {
-  return windowState?.minimized ? 48 : DEFAULT_NODE_HEIGHT;
+  return windowState?.minimized
+    ? TURN_NODE_DIMENSIONS.minimizedHeight
+    : DEFAULT_NODE_HEIGHT;
 }
 
 function anchorIndex(agents: AgentMap, parentId: string, anchorUuid: string): number {
@@ -636,17 +616,16 @@ export function buildNodes(
   const savedById = layoutById(savedLayout);
   const result: CanvasNode[] = [];
   const placed = new Map<string, CanvasNode>();
-  const occupied: NodeRect[] = [];
   const pushNode = (node: CanvasNode) => {
     result.push(node);
     placed.set(node.id, node);
-    occupied.push(nodeRect(node));
   };
 
   for (const view of Object.values(agents)) {
     view.turns.forEach((turn, index) => {
       const id = nodeId(view.id, index);
-      const placement = placementOverrides[id];
+      const placement =
+        index === 0 && !view.forkOrigin ? placementOverrides[id] : undefined;
       const existing = byId.get(id);
       const existingTurn = existing?.type === "turn" ? existing : undefined;
       const stored = storedLayoutFor(savedById, id, "turn");
@@ -684,16 +663,13 @@ export function buildNodes(
       if (existingTurn) {
         pushNode({
           ...existingTurn,
-          position: placement
-            ? findFreePosition(
-                placement,
-                nodeWidth(existingTurn),
-                nodeHeight(existingTurn),
-                occupied,
-              )
-            : existingTurn.position,
-          width: windowState?.minimized ? 68 : existingTurn.width,
-          height: windowState?.minimized ? 48 : existingTurn.height,
+          position: placement ?? existingTurn.position,
+          width: windowState?.minimized
+            ? TURN_NODE_DIMENSIONS.minimizedWidth
+            : existingTurn.width,
+          height: windowState?.minimized
+            ? TURN_NODE_DIMENSIONS.minimizedHeight
+            : existingTurn.height,
           data,
         });
       } else {
@@ -719,24 +695,12 @@ export function buildNodes(
             ? anchoredSidePosition(
                 forkAnchorNode,
                 layout[id] ?? { x: X0, y: Y0 },
-                width,
-                height,
-                occupied,
               )
-            : turnPosition(id, view.id, index, layout, placed, occupied);
-        const positionedAt =
-          index === 0 && placement
-            ? findFreePosition(
-                placement,
-                width,
-                height,
-                occupied,
-              )
-            : fallbackPosition;
+            : turnPosition(id, view.id, index, layout, placed);
         pushNode({
           id,
           type: "turn",
-          position: stored?.position ?? positionedAt,
+          position: placement ?? stored?.position ?? fallbackPosition,
           width,
           height,
           dragHandle: ".drag-handle",
@@ -749,7 +713,7 @@ export function buildNodes(
   const fileX = X0 + Math.max(Object.keys(agents).length, 1) * COL_W;
   files.forEach((file, index) => {
     const id = fileNodeId(file.id);
-    const placement = placementOverrides[id];
+    const placement = file.origin ? undefined : placementOverrides[id];
     const existing = byId.get(id);
     const existingFile = existing?.type === "file" ? existing : undefined;
     const stored = storedLayoutFor(savedById, id, "file");
@@ -770,44 +734,29 @@ export function buildNodes(
       existingFile
         ? {
             ...existingFile,
-            position: placement
-              ? findFreePosition(
-                  placement,
-                  nodeWidth(existingFile),
-                  nodeHeight(existingFile),
-                  occupied,
-                )
-              : existingFile.position,
+            position: placement ?? existingFile.position,
             data,
           }
         : {
             id,
             type: "file",
             position:
+              placement ??
               stored?.position ??
-              (placement
-                ? findFreePosition(
-                    placement,
-                    FILE_NODE_WIDTH,
-                    FILE_NODE_HEIGHT,
-                    occupied,
-                  )
-                : sourceNode
-                  ? anchoredSidePosition(
-                      sourceNode,
-                      { x: fileX, y: Y0 + index * FILE_ROW_H },
-                      FILE_NODE_WIDTH,
-                      FILE_NODE_HEIGHT,
-                      occupied,
-                    )
-                  : findFreePosition(
-                      { x: fileX, y: Y0 + index * FILE_ROW_H },
-                      FILE_NODE_WIDTH,
-                      FILE_NODE_HEIGHT,
-                      occupied,
-                    )),
-            width: stored?.width ?? (windowState?.minimized ? 68 : FILE_NODE_WIDTH),
-            height: stored?.height ?? (windowState?.minimized ? 48 : FILE_NODE_HEIGHT),
+              anchoredSidePosition(sourceNode, {
+                x: fileX,
+                y: Y0 + index * FILE_ROW_H,
+              }),
+            width:
+              stored?.width ??
+              (windowState?.minimized
+                ? FILE_NODE_DIMENSIONS.minimizedWidth
+                : FILE_NODE_WIDTH),
+            height:
+              stored?.height ??
+              (windowState?.minimized
+                ? FILE_NODE_DIMENSIONS.minimizedHeight
+                : FILE_NODE_HEIGHT),
             dragHandle: ".drag-handle",
             data,
           },
@@ -831,29 +780,24 @@ export function buildNodes(
       existingPrompt
         ? {
             ...existingPrompt,
-            position: placement
-              ? findFreePosition(
-                  placement,
-                  nodeWidth(existingPrompt),
-                  nodeHeight(existingPrompt),
-                  occupied,
-                )
-              : existingPrompt.position,
+            position: placement ?? existingPrompt.position,
             data,
           }
         : {
             id,
             type: "prompt",
             position:
-              stored?.position ??
-              findFreePosition(
-                placement ?? { x: promptX, y: Y0 + index * FILE_ROW_H },
-                PROMPT_NODE_WIDTH,
-                PROMPT_NODE_HEIGHT,
-                occupied,
-              ),
-            width: stored?.width ?? (windowState?.minimized ? 68 : PROMPT_NODE_WIDTH),
-            height: stored?.height ?? (windowState?.minimized ? 48 : PROMPT_NODE_HEIGHT),
+              placement ?? stored?.position ?? { x: promptX, y: Y0 + index * PROMPT_ROW_H },
+            width:
+              stored?.width ??
+              (windowState?.minimized
+                ? PROMPT_NODE_DIMENSIONS.minimizedWidth
+                : PROMPT_NODE_WIDTH),
+            height:
+              stored?.height ??
+              (windowState?.minimized
+                ? PROMPT_NODE_DIMENSIONS.minimizedHeight
+                : PROMPT_NODE_HEIGHT),
             dragHandle: ".drag-handle",
             data,
           },
@@ -884,12 +828,17 @@ export function buildNodes(
               anchoredSidePosition(
                 source ? placed.get(source) ?? byId.get(source) : undefined,
                 { x: commitX, y: Y0 + index * 210 },
-                COMMIT_NODE_WIDTH,
-                COMMIT_NODE_HEIGHT,
-                occupied,
               ),
-            width: stored?.width ?? (windowState?.minimized ? 76 : COMMIT_NODE_WIDTH),
-            height: stored?.height ?? (windowState?.minimized ? 48 : COMMIT_NODE_HEIGHT),
+            width:
+              stored?.width ??
+              (windowState?.minimized
+                ? COMMIT_NODE_DIMENSIONS.minimizedWidth
+                : COMMIT_NODE_WIDTH),
+            height:
+              stored?.height ??
+              (windowState?.minimized
+                ? COMMIT_NODE_DIMENSIONS.minimizedHeight
+                : COMMIT_NODE_HEIGHT),
             dragHandle: ".drag-handle",
             data,
           },
@@ -920,12 +869,17 @@ export function buildNodes(
               anchoredSidePosition(
                 source ? placed.get(source) ?? byId.get(source) : undefined,
                 { x: prX, y: Y0 + index * 220 },
-                PR_NODE_WIDTH,
-                PR_NODE_HEIGHT,
-                occupied,
               ),
-            width: stored?.width ?? (windowState?.minimized ? 76 : PR_NODE_WIDTH),
-            height: stored?.height ?? (windowState?.minimized ? 48 : PR_NODE_HEIGHT),
+            width:
+              stored?.width ??
+              (windowState?.minimized
+                ? PULL_REQUEST_NODE_DIMENSIONS.minimizedWidth
+                : PR_NODE_WIDTH),
+            height:
+              stored?.height ??
+              (windowState?.minimized
+                ? PULL_REQUEST_NODE_DIMENSIONS.minimizedHeight
+                : PR_NODE_HEIGHT),
             dragHandle: ".drag-handle",
             data,
           },
@@ -956,12 +910,17 @@ export function buildNodes(
               anchoredSidePosition(
                 source ? placed.get(source) ?? byId.get(source) : undefined,
                 { x: syncX, y: Y0 + index * 220 },
-                SYNC_NODE_WIDTH,
-                SYNC_NODE_HEIGHT,
-                occupied,
               ),
-            width: stored?.width ?? (windowState?.minimized ? 76 : SYNC_NODE_WIDTH),
-            height: stored?.height ?? (windowState?.minimized ? 48 : SYNC_NODE_HEIGHT),
+            width:
+              stored?.width ??
+              (windowState?.minimized
+                ? SYNC_FLOW_NODE_DIMENSIONS.minimizedWidth
+                : SYNC_NODE_WIDTH),
+            height:
+              stored?.height ??
+              (windowState?.minimized
+                ? SYNC_FLOW_NODE_DIMENSIONS.minimizedHeight
+                : SYNC_NODE_HEIGHT),
             dragHandle: ".drag-handle",
             data,
           },
@@ -1036,15 +995,20 @@ export default function App(): React.ReactElement {
   const settingsAgent =
     agentSettingsTarget?.mode === "edit" ? agents[agentSettingsTarget.agentId] : undefined;
 
-  const rememberNodePlacement = useCallback((id: string, width: number, height: number) => {
+  const captureViewportPlacement = useCallback((width: number, height: number) => {
     const flow = flowRef.current;
     const bounds = canvasWrapRef.current?.getBoundingClientRect();
-    if (!flow || !bounds) return;
-    const center = flow.screenToFlowPosition({
-      x: bounds.left + bounds.width / 2,
-      y: bounds.top + bounds.height / 2,
-    });
-    const position = centeredNodePosition(center, width, height);
+    if (!flow || !bounds) return undefined;
+    return centeredNodePositionInViewport(
+      bounds,
+      (position) => flow.screenToFlowPosition(position),
+      width,
+      height,
+    );
+  }, []);
+
+  const rememberNodePlacement = useCallback((id: string, position?: NodePosition) => {
+    if (!position) return;
     setPendingPlacements((current) => ({
       ...current,
       [id]: position,
@@ -1116,11 +1080,15 @@ export default function App(): React.ReactElement {
   }, []);
 
   const openProject = useCallback(
-    async (id: string) => {
+    async (id?: string, projectRoot?: string, trustedExternalResourcePaths?: string[]) => {
       setProjectError(undefined);
       try {
         setLayoutProjectId(undefined);
-        const nextWorkspace = await api.openCanvasProject(id);
+        const nextWorkspace = await api.openCanvasProject({
+          id,
+          projectRoot,
+          trustedExternalResourcePaths,
+        });
         const [nextLayout] = await Promise.all([
           api.canvasLayout(),
           refreshAppSettings(),
@@ -1140,6 +1108,38 @@ export default function App(): React.ReactElement {
     },
     [refresh, refreshAppSettings, setEdges, setNodes],
   );
+
+  const loadProject = useCallback(
+    async (projectRoot: string) => {
+      setProjectError(undefined);
+      try {
+        const inspection = await api.inspectCanvasProject(projectRoot);
+        const externalPaths = inspection.externalSharedResources.map(
+          (resource) => resource.sourcePath,
+        );
+        if (externalPaths.length > 0) {
+          const approved = window.confirm(
+            `该项目引用了项目目录外的共享资源。是否授权加载以下路径？\n\n${externalPaths.join("\n")}`,
+          );
+          if (!approved) return;
+        }
+        await openProject(undefined, projectRoot, externalPaths);
+      } catch (error) {
+        setProjectError(error instanceof Error ? error.message : String(error));
+      }
+    },
+    [openProject],
+  );
+
+  const deleteProject = useCallback(async (id: string) => {
+    setProjectError(undefined);
+    try {
+      await api.deleteCanvasProject(id);
+      setProjects(await api.listCanvasProjects());
+    } catch (error) {
+      setProjectError(error instanceof Error ? error.message : String(error));
+    }
+  }, []);
 
   const createProject = useCallback(
     async (name: string, projectRoot?: string) => {
@@ -1280,11 +1280,18 @@ export default function App(): React.ReactElement {
 
   useEffect(() => {
     if (Object.keys(pendingPlacements).length === 0) return;
+    const appliedNodes = nodes.filter((node) => {
+      const placement = pendingPlacements[node.id];
+      return placement ? positionsMatch(node.position, placement) : false;
+    });
+    if (appliedNodes.length === 0) return;
+
     setPendingPlacements((current) => {
       let changed = false;
       const next = { ...current };
-      for (const node of nodes) {
-        if (next[node.id]) {
+      for (const node of appliedNodes) {
+        const placement = next[node.id];
+        if (placement && positionsMatch(node.position, placement)) {
           delete next[node.id];
           changed = true;
         }
@@ -1364,8 +1371,10 @@ export default function App(): React.ReactElement {
         connected={connected}
         projects={projects}
         error={projectError}
-        onOpen={openProject}
+        onOpen={(id) => openProject(id)}
+        onLoad={loadProject}
         onCreate={createProject}
+        onDelete={deleteProject}
       />
     );
   }
@@ -1486,8 +1495,9 @@ export default function App(): React.ReactElement {
       {creatingFile && (
         <CreateFileDialog
           onCreate={async (input) => {
+            const placement = captureViewportPlacement(FILE_NODE_WIDTH, FILE_NODE_HEIGHT);
             const file = await fileActions.create(input);
-            rememberNodePlacement(fileNodeId(file.id), FILE_NODE_WIDTH, FILE_NODE_HEIGHT);
+            rememberNodePlacement(fileNodeId(file.id), placement);
           }}
           onClose={() => setCreatingFile(false)}
         />
@@ -1502,8 +1512,12 @@ export default function App(): React.ReactElement {
           codexModelCapabilities={serverConfig.codexModelCapabilities}
           onCreateBranch={createBranch}
           onCreate={async (settings) => {
+            const placement = captureViewportPlacement(
+              DEFAULT_NODE_WIDTH,
+              DEFAULT_NODE_HEIGHT,
+            );
             const id = await actions.create(settings);
-            rememberNodePlacement(nodeId(id, 0), DEFAULT_NODE_WIDTH, DEFAULT_NODE_HEIGHT);
+            rememberNodePlacement(nodeId(id, 0), placement);
             await refreshBranchOptions();
           }}
           onClose={() => setAgentSettingsTarget(undefined)}
@@ -1529,8 +1543,12 @@ export default function App(): React.ReactElement {
       {creatingPrompt && (
         <CreatePromptDialog
           onCreate={async (input) => {
+            const placement = captureViewportPlacement(
+              PROMPT_NODE_WIDTH,
+              PROMPT_NODE_HEIGHT,
+            );
             const prompt = await promptActions.create(input);
-            rememberNodePlacement(promptNodeId(prompt.id), PROMPT_NODE_WIDTH, PROMPT_NODE_HEIGHT);
+            rememberNodePlacement(promptNodeId(prompt.id), placement);
           }}
           onClose={() => setCreatingPrompt(false)}
         />
@@ -1614,35 +1632,62 @@ export function ProjectGate({
   projects,
   error,
   onOpen,
+  onLoad,
   onCreate,
+  onDelete,
 }: {
   connected: boolean;
   projects: CanvasProjectSummary[];
   error?: string;
   onOpen: (id: string) => Promise<void>;
+  onLoad: (projectRoot: string) => Promise<void>;
   onCreate: (name: string, projectRoot?: string) => Promise<void>;
+  onDelete: (id: string) => Promise<void>;
 }): React.ReactElement {
   const [name, setName] = useState("");
   const [projectRoot, setProjectRoot] = useState("");
+  const [loadRoot, setLoadRoot] = useState("");
   const [busy, setBusy] = useState(false);
   const [pickingDirectory, setPickingDirectory] = useState(false);
   const [pickError, setPickError] = useState("");
-  const create = async () => {
-    const trimmed = name.trim();
-    if (!trimmed || pickingDirectory) return;
+  const operationRef = useRef(false);
+  const runExclusive = async (operation: () => Promise<void>) => {
+    if (operationRef.current) return;
+    operationRef.current = true;
     setBusy(true);
     try {
-      await onCreate(trimmed, projectRoot);
+      await operation();
     } finally {
+      operationRef.current = false;
       setBusy(false);
     }
   };
-  const browse = async () => {
+  const create = async () => {
+    const trimmed = name.trim();
+    if (!trimmed || pickingDirectory) return;
+    await runExclusive(() => onCreate(trimmed, projectRoot));
+  };
+  const load = async () => {
+    const root = loadRoot.trim();
+    if (!root || pickingDirectory) return;
+    await runExclusive(() => onLoad(root));
+  };
+  const remove = async (project: CanvasProjectSummary) => {
+    const confirmed = window.confirm(
+      `确定永久删除项目“${project.name}”及其目录中的全部数据吗？\n\n${project.projectRoot}`,
+    );
+    if (!confirmed) return;
+    await runExclusive(() => onDelete(project.id));
+  };
+  const browse = async (
+    initialDirectory: string,
+    setDirectory: (directory: string) => void,
+  ) => {
     setPickError("");
     setPickingDirectory(true);
     try {
-      const picked = await api.pickDirectory(projectRoot.trim() || undefined);
-      if (picked.path) setProjectRoot(picked.path);
+      const picked = await api.pickDirectory(initialDirectory.trim() || undefined);
+      if (picked.path) setDirectory(picked.path);
     } catch (reason) {
       setPickError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -1662,20 +1707,57 @@ export function ProjectGate({
           <h1>打开 Canvas 项目</h1>
           <div className="project-list">
             {projects.map((project) => (
-              <button
-                key={project.id}
-                className="project-row"
-                disabled={busy || pickingDirectory}
-                onClick={() => void onOpen(project.id)}
-              >
-                <FolderOpen size={18} />
-                <span>
-                  <strong>{project.name}</strong>
-                  <small>{project.projectRoot}</small>
-                </span>
-              </button>
+              <div key={project.id} className="project-row">
+                <button
+                  className="project-row__open"
+                  disabled={busy || pickingDirectory}
+                  onClick={() => void runExclusive(() => onOpen(project.id))}
+                >
+                  <FolderOpen size={18} />
+                  <span>
+                    <strong>{project.name}</strong>
+                    <small>{project.projectRoot}</small>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  className="project-row__delete"
+                  aria-label={`删除项目 ${project.name}`}
+                  title="永久删除项目"
+                  disabled={busy || pickingDirectory}
+                  onClick={() => void remove(project)}
+                >
+                  <Trash2 size={16} />
+                </button>
+              </div>
             ))}
             {projects.length === 0 && <p className="project-empty">暂无项目</p>}
+          </div>
+        </section>
+        <section className="project-gate__section">
+          <h2>从文件夹加载项目</h2>
+          <div className="project-load">
+            <input
+              aria-label="要加载的 Canvas 项目文件夹"
+              value={loadRoot}
+              placeholder="选择包含 workspace.json 的项目文件夹"
+              onChange={(event) => setLoadRoot(event.target.value)}
+            />
+            <button
+              type="button"
+              disabled={busy || pickingDirectory}
+              onClick={() => void browse(loadRoot, setLoadRoot)}
+            >
+              <FolderOpen size={16} />
+              浏览
+            </button>
+            <button
+              type="button"
+              disabled={busy || pickingDirectory || !loadRoot.trim()}
+              onClick={() => void load()}
+            >
+              加载
+            </button>
           </div>
         </section>
         <section className="project-gate__section">
@@ -1698,7 +1780,11 @@ export function ProjectGate({
                 placeholder="项目文件夹，可留空使用默认位置"
                 onChange={(event) => setProjectRoot(event.target.value)}
               />
-              <button type="button" disabled={busy || pickingDirectory} onClick={() => void browse()}>
+              <button
+                type="button"
+                disabled={busy || pickingDirectory}
+                onClick={() => void browse(projectRoot, setProjectRoot)}
+              >
                 <FolderOpen size={16} />
                 浏览
               </button>

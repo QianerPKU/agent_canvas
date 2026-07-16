@@ -7,6 +7,7 @@ import type {
   PullRequestFlowSnapshot,
 } from "@agent-canvas/shared";
 import type { AgentMap } from "../agentStore.js";
+import { flowDisplayText } from "../displayText.js";
 import type { PullRequestActions } from "../useAgentCanvas.js";
 
 export interface PullRequestDialogProps {
@@ -165,6 +166,7 @@ function PullRequestFlowRow({
   const [prUrl, setPrUrl] = useState(flow.pr?.prUrl ?? "");
   const [prNumber, setPrNumber] = useState(flow.pr?.prNumber?.toString() ?? "");
   const [busy, setBusy] = useState(false);
+  const display = flowDisplayText(flow);
 
   const recordCreated = async () => {
     const input: PullRequestCreatedInput = {
@@ -182,13 +184,13 @@ function PullRequestFlowRow({
   return (
     <article className="pr-flow-row">
       <header>
-        <strong>{flow.title || flow.id}</strong>
+        <strong>{display.title}</strong>
         <span>{statusLabel(flow.status)}</span>
       </header>
       <div className="pr-flow-row__meta">
         {flow.sourceBranch} → {flow.targetBranch}
       </div>
-      <p>{flow.summary}</p>
+      <p>{display.summary}</p>
       {flow.reviewRequests.at(-1)?.responses.map((response) => (
         <div key={`${response.stage}:${response.agentId}`} className="pr-flow-row__review">
           <strong>{response.agentId}</strong>

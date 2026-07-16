@@ -45,6 +45,7 @@
 - PR 节点来自 `prFlows`，同样使用 flow 的 `sourceTurnIndex` 连接到发起 PR pipeline 的原始对话轮。节点显示当前状态，点击可看完整流程、审查结果和变更文件。
 - Sync 节点来自 `syncFlows`，使用 flow 的 `sourceTurnIndex` 连接到发起同步 pipeline 的原始对话轮。节点显示 cherry-pick / pull 状态，点击可看 summary、reason、文件范围、审查意见和 applied 结果。
 - 项目打开/新建后，`useAgentCanvas.refresh()` 会重新拉取当前项目的 agents/files/prompts/commits/PR/sync 快照；WebSocket `hello.histories` 用来恢复多轮 agent 对话节点。
+- 项目打开页既展示已登记和默认目录下自动发现的项目，也支持选择任意有效 `workspace.json` 项目文件夹进行加载和重新登记；加载前会检查外部共享资源并要求逐路径授权。打开、加载、新建和删除共享一个同步操作锁，操作完成前所有项目动作均禁用。删除项目前会展示路径并二次确认，实际安全边界由后端同源校验、删除意图头和活动 agent 检查保证。
 - React Flow 节点布局通过 `GET/PATCH /api/canvas-layout` 保存到当前 canvas 项目的 `canvas-state.json`。前端会 debounce 保存每个节点的位置、尺寸和最小化状态；项目切换期间暂停保存，避免空布局覆盖旧项目。
 - 左侧 canvas toolbar 提供选择工具和手型工具。选择工具下左键拖拽框选多个节点，选中后可一起拖动；手型工具下左键拖动画布。鼠标中键在两种工具下都保持拖动画布。
 - 新建 / fork 后后端不发事件，前端**乐观插入**节点（fork 带 `forkOrigin` 以画连线）。

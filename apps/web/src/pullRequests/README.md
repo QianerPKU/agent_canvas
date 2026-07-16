@@ -13,7 +13,7 @@
 
 `useAgentCanvas` 在 WebSocket `hello` 帧中读取 `prFlows`，并通过 `pr_flow` 帧实时更新流程列表。REST 返回值也会立即 upsert 到本地状态，避免等待下一条 WS。
 
-画布 PR 节点使用后端记录的 `sourceTurnIndex` 连回发起 flow 的对话轮，因此 agent 进入下一轮后，旧对话节点成为历史节点，PR 连线仍保留在原始轮次上。新 PR 节点会优先出现在源对话轮右侧，并避让已有节点。
+画布 PR 节点使用后端记录的 `sourceTurnIndex` 连回发起 flow 的对话轮，因此 agent 进入下一轮后，旧对话节点成为历史节点，PR 连线仍保留在原始轮次上。新 PR 节点固定出现在源对话轮右侧；允许与其他派生节点重叠，不做位置避让。
 
 ## 测试
 
