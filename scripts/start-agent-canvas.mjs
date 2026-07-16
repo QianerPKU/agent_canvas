@@ -19,6 +19,7 @@ if (!Number.isInteger(webPort) || webPort <= 0) {
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 const baseEnv = {
   ...process.env,
+  AGENT_CANVAS_ALLOWED_ORIGINS: `http://127.0.0.1:${webPort},http://localhost:${webPort}`,
   ...(options.projectsRoot ? { AGENT_CANVAS_PROJECTS_ROOT: options.projectsRoot } : {}),
   ...(options.projectRoot ? { AGENT_CANVAS_PROJECT_ROOT: options.projectRoot } : {}),
 };

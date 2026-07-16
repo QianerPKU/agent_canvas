@@ -1110,11 +1110,15 @@ export default function App(): React.ReactElement {
   }, []);
 
   const openProject = useCallback(
-    async (id?: string, projectRoot?: string) => {
+    async (id?: string, projectRoot?: string, trustedExternalResourcePaths?: string[]) => {
       setProjectError(undefined);
       try {
         setLayoutProjectId(undefined);
-        const nextWorkspace = await api.openCanvasProject({ id, projectRoot });
+        const nextWorkspace = await api.openCanvasProject({
+          id,
+          projectRoot,
+          trustedExternalResourcePaths,
+        });
         const nextLayout = await api.canvasLayout();
         setNodes([]);
         setEdges([]);
@@ -1130,6 +1134,28 @@ export default function App(): React.ReactElement {
       }
     },
     [refresh, setEdges, setNodes],
+  );
+
+  const loadProject = useCallback(
+    async (projectRoot: string) => {
+      setProjectError(undefined);
+      try {
+        const inspection = await api.inspectCanvasProject(projectRoot);
+        const externalPaths = inspection.externalSharedResources.map(
+          (resource) => resource.sourcePath,
+        );
+        if (externalPaths.length > 0) {
+          const approved = window.confirm(
+            `该项目引用了项目目录外的共享资源。是否授权加载以下路径？\n\n${externalPaths.join("\n")}`,
+          );
+          if (!approved) return;
+        }
+        await openProject(undefined, projectRoot, externalPaths);
+      } catch (error) {
+        setProjectError(error instanceof Error ? error.message : String(error));
+      }
+    },
+    [openProject],
   );
 
   const deleteProject = useCallback(async (id: string) => {
@@ -1363,7 +1389,7 @@ export default function App(): React.ReactElement {
         projects={projects}
         error={projectError}
         onOpen={(id) => openProject(id)}
-        onLoad={(projectRoot) => openProject(undefined, projectRoot)}
+        onLoad={loadProject}
         onCreate={createProject}
         onDelete={deleteProject}
       />
@@ -1632,37 +1658,34 @@ export function ProjectGate({
   const [busy, setBusy] = useState(false);
   const [pickingDirectory, setPickingDirectory] = useState(false);
   const [pickError, setPickError] = useState("");
+  const operationRef = useRef(false);
+  const runExclusive = async (operation: () => Promise<void>) => {
+    if (operationRef.current) return;
+    operationRef.current = true;
+    setBusy(true);
+    try {
+      await operation();
+    } finally {
+      operationRef.current = false;
+      setBusy(false);
+    }
+  };
   const create = async () => {
     const trimmed = name.trim();
     if (!trimmed || pickingDirectory) return;
-    setBusy(true);
-    try {
-      await onCreate(trimmed, projectRoot);
-    } finally {
-      setBusy(false);
-    }
+    await runExclusive(() => onCreate(trimmed, projectRoot));
   };
   const load = async () => {
     const root = loadRoot.trim();
     if (!root || pickingDirectory) return;
-    setBusy(true);
-    try {
-      await onLoad(root);
-    } finally {
-      setBusy(false);
-    }
+    await runExclusive(() => onLoad(root));
   };
   const remove = async (project: CanvasProjectSummary) => {
     const confirmed = window.confirm(
       `确定永久删除项目“${project.name}”及其目录中的全部数据吗？\n\n${project.projectRoot}`,
     );
     if (!confirmed) return;
-    setBusy(true);
-    try {
-      await onDelete(project.id);
-    } finally {
-      setBusy(false);
-    }
+    await runExclusive(() => onDelete(project.id));
   };
   const browse = async (
     initialDirectory: string,
@@ -1696,7 +1719,7 @@ export function ProjectGate({
                 <button
                   className="project-row__open"
                   disabled={busy || pickingDirectory}
-                  onClick={() => void onOpen(project.id)}
+                  onClick={() => void runExclusive(() => onOpen(project.id))}
                 >
                   <FolderOpen size={18} />
                   <span>

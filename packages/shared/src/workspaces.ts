@@ -18,6 +18,15 @@ export interface OpenCanvasProjectInput {
   id?: string;
   /** Open and register a project directly from its on-disk directory. */
   projectRoot?: string;
+  /** External shared-resource paths explicitly approved while importing this project. */
+  trustedExternalResourcePaths?: string[];
+}
+
+export interface CanvasProjectInspection {
+  project: CanvasProjectSummary;
+  externalSharedResources: Array<
+    Pick<SharedResourceMount, "id" | "name" | "sourcePath" | "access">
+  >;
 }
 
 export interface GitHubConnection {
