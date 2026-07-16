@@ -9,6 +9,7 @@ import { AgentManager } from "./AgentManager.js";
 import { CommitManager } from "./commits/CommitManager.js";
 import { createServer } from "./server.js";
 import { FileManager } from "./files/FileManager.js";
+import type { OpenInVscodeOptions } from "./files/VscodeFileOpener.js";
 import { PromptManager } from "./prompts/PromptManager.js";
 import { CodexAuthManager } from "./sdk/CodexAuthManager.js";
 import { SyncFlowManager, type SyncFlowAgentHost } from "./sync/SyncFlowManager.js";
@@ -177,7 +178,9 @@ describe("HTTP server", () => {
   let projectRoot = "";
   let syncHost: FakeSyncHost;
   let syncFlowManager: SyncFlowManager;
-  const openFile = vi.fn<(filePath: string) => Promise<void>>().mockResolvedValue(undefined);
+  const openFile = vi
+    .fn<(filePath: string, options?: OpenInVscodeOptions) => Promise<void>>()
+    .mockResolvedValue(undefined);
   const pickDirectory = vi
     .fn<(initialDirectory?: string) => Promise<string | undefined>>()
     .mockResolvedValue("C:\\picked");
@@ -447,7 +450,9 @@ describe("HTTP server", () => {
     const opened = await request(port, "POST", `/api/agents/${created.json.id}/open-workspace`);
 
     expect(opened).toEqual({ status: 202, json: { ok: true } });
-    expect(openFile).toHaveBeenCalledWith(feature.json.branch.worktreePath);
+    expect(openFile).toHaveBeenCalledWith(feature.json.branch.worktreePath, {
+      windowMode: "new",
+    });
   });
 
   it("creates agents with settings and updates private system prompt", async () => {
@@ -781,7 +786,9 @@ describe("HTTP server", () => {
       `/api/files/${created.json.file.id}/open`,
     );
     expect(opened).toEqual({ status: 202, json: { ok: true } });
-    expect(openFile).toHaveBeenCalledWith(updated.json.file.path);
+    expect(openFile).toHaveBeenCalledWith(updated.json.file.path, {
+      windowMode: "reuse",
+    });
 
     const connection = await request(port, "POST", "/api/file-connections", {
       fileId: created.json.file.id,

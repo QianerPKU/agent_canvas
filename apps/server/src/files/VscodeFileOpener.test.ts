@@ -42,6 +42,59 @@ describe("openFileInVscode", () => {
     );
   });
 
+  it("Windows 在新窗口打开工作区且不替换现有窗口", async () => {
+    const child = new EventEmitter() as ChildProcess;
+    child.stderr = new PassThrough();
+    const spawnFn = vi.fn(() => {
+      queueMicrotask(() => child.emit("close", 0, null));
+      return child;
+    });
+
+    await openFileInVscode("C:/workspaces/agent-4", {
+      command: "C:/VSCode/bin/code.cmd",
+      platform: "win32",
+      comSpec: "C:/Windows/System32/cmd.exe",
+      env: {},
+      spawnFn,
+      windowMode: "new",
+    });
+
+    expect(spawnFn).toHaveBeenCalledWith(
+      "C:/Windows/System32/cmd.exe",
+      [
+        "/d",
+        "/s",
+        "/v:off",
+        "/c",
+        'call "%AGENT_CANVAS_VSCODE_CLI%" --new-window "%AGENT_CANVAS_FILE_TO_OPEN%"',
+      ],
+      expect.any(Object),
+    );
+  });
+
+  it("非 Windows 在新窗口打开工作区", async () => {
+    const child = new EventEmitter() as ChildProcess;
+    child.stderr = new PassThrough();
+    const spawnFn = vi.fn(() => {
+      queueMicrotask(() => child.emit("close", 0, null));
+      return child;
+    });
+
+    await openFileInVscode("/workspaces/agent-4", {
+      command: "code",
+      platform: "linux",
+      env: {},
+      spawnFn,
+      windowMode: "new",
+    });
+
+    expect(spawnFn).toHaveBeenCalledWith(
+      "code",
+      ["--new-window", "/workspaces/agent-4"],
+      expect.objectContaining({ stdio: ["ignore", "ignore", "pipe"] }),
+    );
+  });
+
   it("VS Code CLI 失败时返回实际错误", async () => {
     const child = new EventEmitter() as ChildProcess;
     child.stderr = new PassThrough();
