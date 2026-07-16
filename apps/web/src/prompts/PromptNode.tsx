@@ -11,6 +11,7 @@ import {
 import { Check, MessageSquareText, Minimize2, Pencil, X } from "lucide-react";
 import type { CanvasPromptNode } from "@agent-canvas/shared";
 import type { PromptActions } from "../useAgentCanvas.js";
+import { PROMPT_NODE_DIMENSIONS } from "../nodeDimensions.js";
 
 export interface PromptNodeData {
   prompt: CanvasPromptNode;
@@ -29,8 +30,8 @@ export function togglePromptNodeWindow(node: PromptNodeType): Partial<PromptNode
   const state = node.data.windowState;
   if (state?.minimized) {
     return {
-      width: state.restoreWidth ?? 300,
-      height: state.restoreHeight ?? 260,
+      width: state.restoreWidth ?? PROMPT_NODE_DIMENSIONS.width,
+      height: state.restoreHeight ?? PROMPT_NODE_DIMENSIONS.height,
       data: {
         ...node.data,
         windowState: { ...state, minimized: false },
@@ -38,14 +39,16 @@ export function togglePromptNodeWindow(node: PromptNodeType): Partial<PromptNode
     };
   }
   return {
-    width: 68,
-    height: 48,
+    width: PROMPT_NODE_DIMENSIONS.minimizedWidth,
+    height: PROMPT_NODE_DIMENSIONS.minimizedHeight,
     data: {
       ...node.data,
       windowState: {
         minimized: true,
-        restoreWidth: node.width ?? node.measured?.width ?? 300,
-        restoreHeight: node.height ?? node.measured?.height ?? 260,
+        restoreWidth:
+          node.width ?? node.measured?.width ?? PROMPT_NODE_DIMENSIONS.width,
+        restoreHeight:
+          node.height ?? node.measured?.height ?? PROMPT_NODE_DIMENSIONS.height,
       },
     },
   };

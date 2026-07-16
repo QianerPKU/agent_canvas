@@ -12,6 +12,7 @@ import { Check, ExternalLink, Eye, File, FileText, Image, Minimize2, Pencil, X }
 import type { AgentResultReportKind, CanvasFileNode } from "@agent-canvas/shared";
 import { api } from "../api.js";
 import type { FileActions } from "../useAgentCanvas.js";
+import { FILE_NODE_DIMENSIONS } from "../nodeDimensions.js";
 
 export interface FileNodeData {
   file: CanvasFileNode;
@@ -32,8 +33,8 @@ export function toggleFileNodeWindow(node: FileNodeType): Partial<FileNodeType> 
   const state = node.data.windowState;
   if (state?.minimized) {
     return {
-      width: state.restoreWidth ?? 280,
-      height: state.restoreHeight ?? 240,
+      width: state.restoreWidth ?? FILE_NODE_DIMENSIONS.width,
+      height: state.restoreHeight ?? FILE_NODE_DIMENSIONS.height,
       data: {
         ...node.data,
         windowState: { ...state, minimized: false },
@@ -41,14 +42,16 @@ export function toggleFileNodeWindow(node: FileNodeType): Partial<FileNodeType> 
     };
   }
   return {
-    width: 68,
-    height: 48,
+    width: FILE_NODE_DIMENSIONS.minimizedWidth,
+    height: FILE_NODE_DIMENSIONS.minimizedHeight,
     data: {
       ...node.data,
       windowState: {
         minimized: true,
-        restoreWidth: node.width ?? node.measured?.width ?? 280,
-        restoreHeight: node.height ?? node.measured?.height ?? 240,
+        restoreWidth:
+          node.width ?? node.measured?.width ?? FILE_NODE_DIMENSIONS.width,
+        restoreHeight:
+          node.height ?? node.measured?.height ?? FILE_NODE_DIMENSIONS.height,
       },
     },
   };

@@ -35,6 +35,7 @@ export function agentCanvasPolicyPrompt(agentId: string): string {
 - 触发条件满足时，必须真实调用对应 API；不要只在自然语言里声明自己已经调用。
 - 调用后以后端返回的 flow id 或记录为准，不要猜测 id。
 - 如果必要参数不明确，先向用户确认；如果参数已经明确，可以直接调用。
+- Windows PowerShell 发送 JSON 时必须保留示例中的 charset=utf-8 参数；否则 PowerShell 5.1 会在请求发出前把中文替换成问号。
 - 回报完成事件时，只输出指定 JSON 对象，不要在同一条消息里附加解释文字。
 
 ### tool: agent_canvas.create_pr_flow
@@ -70,7 +71,7 @@ export function agentCanvasPolicyPrompt(agentId: string): string {
 
 PowerShell 示例：
 ~~~powershell
-Invoke-RestMethod -Method Post -Uri "${apiBase}/pr-flows" -ContentType "application/json" -Body (@{
+Invoke-RestMethod -Method Post -Uri "${apiBase}/pr-flows" -ContentType "application/json; charset=utf-8" -Body (@{
   proposerAgentId = "${agentId}"
   targetBranch = "main"
   title = "简短 PR 标题"
@@ -159,7 +160,7 @@ curl -sS -X POST "${apiBase}/pr-flows" \\
 
 PowerShell cherry-pick 示例：
 ~~~powershell
-Invoke-RestMethod -Method Post -Uri "${apiBase}/sync-flows" -ContentType "application/json" -Body (@{
+Invoke-RestMethod -Method Post -Uri "${apiBase}/sync-flows" -ContentType "application/json; charset=utf-8" -Body (@{
   kind = "cherry_pick"
   proposerAgentId = "${agentId}"
   sourceBranch = "feature/source"
@@ -187,7 +188,7 @@ curl -sS -X POST "${apiBase}/sync-flows" \\
 
 PowerShell branch pull 示例：
 ~~~powershell
-Invoke-RestMethod -Method Post -Uri "${apiBase}/sync-flows" -ContentType "application/json" -Body (@{
+Invoke-RestMethod -Method Post -Uri "${apiBase}/sync-flows" -ContentType "application/json; charset=utf-8" -Body (@{
   kind = "branch_pull"
   proposerAgentId = "${agentId}"
   sourceBranch = "main"
@@ -256,7 +257,7 @@ curl -sS -X POST "${apiBase}/sync-flows" \\
 
 PowerShell 示例：
 ~~~powershell
-Invoke-RestMethod -Method Post -Uri "${apiBase}/agents/${agentId}/commits" -ContentType "application/json" -Body (@{
+Invoke-RestMethod -Method Post -Uri "${apiBase}/agents/${agentId}/commits" -ContentType "application/json; charset=utf-8" -Body (@{
   commit = "HEAD"
   summary = "这次 commit 的一句话概括"
 } | ConvertTo-Json -Depth 4)
@@ -313,7 +314,7 @@ curl -sS -X POST "${apiBase}/agents/${agentId}/commits" \\
 
 PowerShell sourcePath 示例：
 ~~~powershell
-Invoke-RestMethod -Method Post -Uri "${apiBase}/agents/${agentId}/report-result" -ContentType "application/json" -Body (@{
+Invoke-RestMethod -Method Post -Uri "${apiBase}/agents/${agentId}/report-result" -ContentType "application/json; charset=utf-8" -Body (@{
   name = "accuracy-curve"
   extension = "png"
   resultKind = "image"
