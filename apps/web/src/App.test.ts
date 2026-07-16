@@ -6,6 +6,7 @@ import {
   canvasInteractionForTool,
   canvasLayoutFromNodes,
   centeredNodePosition,
+  centeredNodePositionInViewport,
   computeCommitEdges,
   computeFileEdges,
   computeLayout,
@@ -72,12 +73,12 @@ describe("computeFileEdges", () => {
     const second = nodes.find((node) => node.id === "agent_1#1");
 
     expect(first).toMatchObject({
-      width: 360,
-      height: 300,
+      width: 400,
+      height: 320,
       data: { windowState: undefined },
     });
     expect(second?.position.x).toBe(first?.position.x);
-    expect(second?.position.y).toBe((first?.position.y ?? 0) + 324);
+    expect(second?.position.y).toBe((first?.position.y ?? 0) + 344);
   });
 
   it("auto-minimizes turns only after they are older than the latest two turns", () => {
@@ -124,20 +125,20 @@ describe("computeFileEdges", () => {
       data: { windowState: { minimized: true } },
     });
     expect(second).toMatchObject({
-      width: 360,
-      height: 300,
+      width: 400,
+      height: 320,
       data: { windowState: undefined },
     });
     expect(third).toMatchObject({
-      width: 360,
-      height: 300,
+      width: 400,
+      height: 320,
       data: { windowState: undefined },
     });
     expect(second?.position.y).toBe((first?.position.y ?? 0) + 72);
-    expect(third?.position.y).toBe((second?.position.y ?? 0) + 324);
+    expect(third?.position.y).toBe((second?.position.y ?? 0) + 344);
   });
 
-  it("commit 节点创建在源对话轮右侧，并避让同源 commit", () => {
+  it("places same-source commits at one fixed relative position and allows overlap", () => {
     const agents: AgentMap = {
       agent_1: {
         id: "agent_1",
@@ -197,9 +198,12 @@ describe("computeFileEdges", () => {
     const commit1 = nodes.find((node) => node.id === "commit:commit_1");
     const commit2 = nodes.find((node) => node.id === "commit:commit_2");
 
-    expect(commit1?.position.x).toBeGreaterThan(source?.position.x ?? 0);
-    expect(commit1?.position.y).toBe(source?.position.y);
-    expect(commit2?.position).not.toEqual(commit1?.position);
+    const expected = {
+      x: (source?.position.x ?? 0) + (source?.width ?? 0) + 36,
+      y: source?.position.y,
+    };
+    expect(commit1?.position).toEqual(expected);
+    expect(commit2?.position).toEqual(expected);
   });
 
   it("forked agent root node starts beside its parent anchor turn", () => {
@@ -245,8 +249,10 @@ describe("computeFileEdges", () => {
     const parent = nodes.find((node) => node.id === "agent_1#0");
     const forked = nodes.find((node) => node.id === "agent_2#0");
 
-    expect(forked?.position.x).toBeGreaterThan(parent?.position.x ?? 0);
-    expect(forked?.position.y).toBe(parent?.position.y);
+    expect(forked?.position).toEqual({
+      x: (parent?.position.x ?? 0) + (parent?.width ?? 0) + 36,
+      y: parent?.position.y,
+    });
   });
 
   it("agent result files are placed beside and connected to the source turn", () => {
@@ -306,8 +312,10 @@ describe("computeFileEdges", () => {
 
     const source = nodes.find((node) => node.id === "agent_1#0");
     const file = nodes.find((node) => node.id === "file:file_1");
-    expect(file?.position.x).toBeGreaterThan(source?.position.x ?? 0);
-    expect(file?.position.y).toBe(source?.position.y);
+    expect(file?.position).toEqual({
+      x: (source?.position.x ?? 0) + (source?.width ?? 0) + 36,
+      y: source?.position.y,
+    });
 
     expect(computeResultFileEdges(agents, [resultFile])[0]).toMatchObject({
       source: "agent_1#0",
@@ -399,7 +407,26 @@ describe("computeFileEdges", () => {
     });
   });
 
-  it("buildNodes uses viewport placement overrides for newly created root nodes", () => {
+  it("converts the visible viewport center into a centered flow position", () => {
+    let receivedScreenPosition: { x: number; y: number } | undefined;
+    const position = centeredNodePositionInViewport(
+      { left: 100, top: 50, width: 1000, height: 600 },
+      (screenPosition) => {
+        receivedScreenPosition = screenPosition;
+        return {
+          x: (screenPosition.x - 100) / 2,
+          y: (screenPosition.y - 50) / 2,
+        };
+      },
+      400,
+      320,
+    );
+
+    expect(receivedScreenPosition).toEqual({ x: 600, y: 350 });
+    expect(position).toEqual({ x: 50, y: -10 });
+  });
+
+  it("centers newly created root nodes at one fixed point and allows overlap", () => {
     const agents: AgentMap = {
       agent_1: {
         id: "agent_1",
@@ -407,6 +434,12 @@ describe("computeFileEdges", () => {
         turns: [{ index: 0, status: "idle", lines: [] }],
         lastSeq: 0,
       },
+    };
+    const center = { x: 1200, y: 800 };
+    const placements = {
+      "agent_1#0": centeredNodePosition(center, 400, 320),
+      "file:file_1": centeredNodePosition(center, 320, 260),
+      "prompt:prompt_1": centeredNodePosition(center, 340, 280),
     };
 
     const nodes = buildNodes(
@@ -455,25 +488,130 @@ describe("computeFileEdges", () => {
       () => undefined,
       () => undefined,
       [],
-      {
-        "agent_1#0": { x: 1000, y: 800 },
-        "file:file_1": { x: 1500, y: 850 },
-        "prompt:prompt_1": { x: 1900, y: 900 },
-      },
+      placements,
     );
 
-    expect(nodes.find((node) => node.id === "agent_1#0")?.position).toEqual({
-      x: 1000,
-      y: 800,
+    expect(nodes.find((node) => node.id === "agent_1#0")).toMatchObject({
+      position: placements["agent_1#0"],
+      width: 400,
+      height: 320,
     });
-    expect(nodes.find((node) => node.id === "file:file_1")?.position).toEqual({
-      x: 1500,
-      y: 850,
+    expect(nodes.find((node) => node.id === "file:file_1")).toMatchObject({
+      position: placements["file:file_1"],
+      width: 320,
+      height: 260,
     });
-    expect(nodes.find((node) => node.id === "prompt:prompt_1")?.position).toEqual({
-      x: 1900,
-      y: 900,
+    expect(nodes.find((node) => node.id === "prompt:prompt_1")).toMatchObject({
+      position: placements["prompt:prompt_1"],
+      width: 340,
+      height: 280,
     });
+    for (const node of nodes) {
+      expect(node.position.x + (node.width ?? 0) / 2).toBe(center.x);
+      expect(node.position.y + (node.height ?? 0) / 2).toBe(center.y);
+    }
+  });
+
+  it("applies a late placement override exactly after a root node already exists", () => {
+    const agents: AgentMap = {
+      agent_1: {
+        id: "agent_1",
+        status: "idle",
+        turns: [{ index: 0, status: "idle", lines: [] }],
+        lastSeq: 0,
+      },
+    };
+    const file = {
+      id: "file_1",
+      name: "brief",
+      filename: "brief.md",
+      extension: "md",
+      path: "/tmp/brief.md",
+      storage: "isolated" as const,
+      kind: "normal" as const,
+      sharedRead: false,
+      sharedWrite: false,
+      previewKind: "markdown" as const,
+      mimeType: "text/markdown",
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    const build = (
+      current: ReturnType<typeof buildNodes> = [],
+      placements: Record<string, { x: number; y: number }> = {},
+    ) =>
+      buildNodes(
+        agents,
+        [file],
+        [],
+        [],
+        [],
+        [],
+        {} as AgentActions,
+        {} as FileActions,
+        {} as PromptActions,
+        current,
+        () => undefined,
+        () => undefined,
+        () => undefined,
+        () => undefined,
+        () => undefined,
+        () => undefined,
+        () => undefined,
+        [],
+        placements,
+      );
+
+    const initial = build();
+    const agent = initial.find((node) => node.id === "agent_1#0");
+    const initialFile = initial.find((node) => node.id === "file:file_1");
+    expect(agent).toBeDefined();
+    expect(initialFile).toBeDefined();
+    expect(initialFile?.position).not.toEqual(agent?.position);
+    const placement = agent!.position;
+    const rebuilt = build(initial, { "file:file_1": placement });
+
+    expect(rebuilt.find((node) => node.id === "file:file_1")?.position).toEqual(
+      placement,
+    );
+  });
+
+  it("keeps a fixed gap between enlarged prompt fallback positions", () => {
+    const prompts = ["one", "two"].map((id, index) => ({
+      id,
+      name: id,
+      content: `prompt ${index + 1}`,
+      kind: "normal" as const,
+      sharedRead: false,
+      sharedWrite: false,
+      createdAt: index + 1,
+      updatedAt: index + 1,
+    }));
+    const nodes = buildNodes(
+      {},
+      [],
+      prompts,
+      [],
+      [],
+      [],
+      {} as AgentActions,
+      {} as FileActions,
+      {} as PromptActions,
+      [],
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+      () => undefined,
+    );
+    const first = nodes.find((node) => node.id === "prompt:one");
+    const second = nodes.find((node) => node.id === "prompt:two");
+
+    expect(first).toMatchObject({ width: 340, height: 280 });
+    expect(second?.position.x).toBe(first?.position.x);
+    expect((second?.position.y ?? 0) - (first?.position.y ?? 0)).toBe(300);
   });
 
   it("canvasLayoutFromNodes 序列化节点布局和窗口状态", () => {

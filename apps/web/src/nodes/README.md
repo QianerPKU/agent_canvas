@@ -5,10 +5,10 @@
 - The tail of each conversation chain keeps the latest turn and the immediately previous completed
   turn expanded by default. Older completed turns auto-minimize once; if the user changes a node's
   minimized state manually, later refreshes respect that choice.
-- New turns are positioned under the previous turn's actual canvas position. When an older turn has
-  auto-minimized, the following turn sits directly under the small node with a compact gap.
-- New root nodes created from the toolbar, including agent, file, and prompt nodes, start from the
-  current viewport center instead of the global canvas origin.
+- New turns use a deterministic position directly under the previous turn. New and derived nodes do
+  not move to avoid collisions, so their anchor-relative positions stay fixed even when nodes overlap.
+- New root nodes created from the toolbar, including agent, file, and prompt nodes, lock the current
+  viewport center before creation starts and remain visually centered when creation finishes.
 - Newly forked agent root nodes start beside the parent turn that was used as the fork anchor, unless
   the user already saved or manually placed that node.
 - Derived nodes such as result file, commit, PR, and sync nodes use the source turn as their anchor, so historical

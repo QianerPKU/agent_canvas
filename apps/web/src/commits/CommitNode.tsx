@@ -9,6 +9,7 @@ import {
 } from "@xyflow/react";
 import { GitCommitHorizontal, Minimize2 } from "lucide-react";
 import type { AgentCommitSnapshot } from "@agent-canvas/shared";
+import { COMMIT_NODE_DIMENSIONS } from "../nodeDimensions.js";
 
 export interface CommitNodeData {
   commit: AgentCommitSnapshot;
@@ -27,8 +28,8 @@ export function toggleCommitNodeWindow(node: CommitNodeType): Partial<CommitNode
   const state = node.data.windowState;
   if (state?.minimized) {
     return {
-      width: state.restoreWidth ?? 260,
-      height: state.restoreHeight ?? 170,
+      width: state.restoreWidth ?? COMMIT_NODE_DIMENSIONS.width,
+      height: state.restoreHeight ?? COMMIT_NODE_DIMENSIONS.height,
       data: {
         ...node.data,
         windowState: { ...state, minimized: false },
@@ -36,14 +37,16 @@ export function toggleCommitNodeWindow(node: CommitNodeType): Partial<CommitNode
     };
   }
   return {
-    width: 76,
-    height: 50,
+    width: COMMIT_NODE_DIMENSIONS.minimizedWidth,
+    height: COMMIT_NODE_DIMENSIONS.minimizedHeight,
     data: {
       ...node.data,
       windowState: {
         minimized: true,
-        restoreWidth: node.width ?? node.measured?.width ?? 260,
-        restoreHeight: node.height ?? node.measured?.height ?? 170,
+        restoreWidth:
+          node.width ?? node.measured?.width ?? COMMIT_NODE_DIMENSIONS.width,
+        restoreHeight:
+          node.height ?? node.measured?.height ?? COMMIT_NODE_DIMENSIONS.height,
       },
     },
   };

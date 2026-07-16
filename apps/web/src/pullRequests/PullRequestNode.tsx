@@ -9,6 +9,7 @@ import {
 } from "@xyflow/react";
 import { GitPullRequest, Minimize2 } from "lucide-react";
 import type { PullRequestFlowSnapshot } from "@agent-canvas/shared";
+import { PULL_REQUEST_NODE_DIMENSIONS } from "../nodeDimensions.js";
 
 export interface PullRequestNodeData {
   flow: PullRequestFlowSnapshot;
@@ -29,8 +30,8 @@ export function togglePullRequestNodeWindow(
   const state = node.data.windowState;
   if (state?.minimized) {
     return {
-      width: state.restoreWidth ?? 280,
-      height: state.restoreHeight ?? 180,
+      width: state.restoreWidth ?? PULL_REQUEST_NODE_DIMENSIONS.width,
+      height: state.restoreHeight ?? PULL_REQUEST_NODE_DIMENSIONS.height,
       data: {
         ...node.data,
         windowState: { ...state, minimized: false },
@@ -38,14 +39,16 @@ export function togglePullRequestNodeWindow(
     };
   }
   return {
-    width: 76,
-    height: 50,
+    width: PULL_REQUEST_NODE_DIMENSIONS.minimizedWidth,
+    height: PULL_REQUEST_NODE_DIMENSIONS.minimizedHeight,
     data: {
       ...node.data,
       windowState: {
         minimized: true,
-        restoreWidth: node.width ?? node.measured?.width ?? 280,
-        restoreHeight: node.height ?? node.measured?.height ?? 180,
+        restoreWidth:
+          node.width ?? node.measured?.width ?? PULL_REQUEST_NODE_DIMENSIONS.width,
+        restoreHeight:
+          node.height ?? node.measured?.height ?? PULL_REQUEST_NODE_DIMENSIONS.height,
       },
     },
   };
