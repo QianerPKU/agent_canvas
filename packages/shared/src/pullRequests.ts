@@ -64,6 +64,7 @@ export interface PullRequestReviewRequest {
   retryCounts: Record<string, number>;
   responses: PullRequestReviewResponse[];
   requestedAt: number;
+  requestedAfterSeqs?: Record<string, number>;
   deadlineAt: number;
 }
 

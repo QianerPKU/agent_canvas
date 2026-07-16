@@ -80,6 +80,21 @@ describe("SyncFlowNode", () => {
     expect(onOpenDetails).toHaveBeenCalledWith("sync_flow_1");
   });
 
+  it("shows when a sync review is waiting for its branch queue", () => {
+    render(
+      <ReactFlowProvider>
+        <SyncFlowNode
+          {...({
+            id: "sync:sync_flow_1",
+            data: { flow: flow({ status: "queued" }), onOpenDetails: vi.fn() },
+          } as unknown as NodeProps<SyncFlowNodeType>)}
+        />
+      </ReactFlowProvider>,
+    );
+
+    expect(screen.getByText("waiting for branch review")).toBeTruthy();
+  });
+
   it("falls back to the source and target when flow text is encoding-damaged", () => {
     render(
       <ReactFlowProvider>

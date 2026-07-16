@@ -10,14 +10,35 @@ request, running agents receive a steer message, waiting agents receive a normal
 is retried once, and a 10 minute timeout closes stale flows. The manager only grants permission; the
 proposer agent still performs the actual git commands and reports completion.
 
+## Shared Branch Review Queue
+
+Sync and PR reviews use one shared queue keyed by the branch being reviewed. Every sync review uses
+its `targetBranch` (the proposer's current branch); its `sourceBranch`, when present, does not occupy
+a review slot. A PR source review uses its `sourceBranch`, and a PR target review uses its
+`targetBranch`. Consequently, pulling into a branch is serialized with a PR source or target review
+for that same branch.
+
+Only one review may run on a branch at a time. Reviews for the same branch start in FIFO order, while
+reviews for different branches may run in parallel. A queued sync flow has no active review request
+or review deadline, so queue waiting time does not count toward its 10 minute review timeout. The
+deadline starts when the review actually begins.
+
+Approval, rejection, timeout, or cancellation releases the target-branch slot and immediately lets
+the next eligible review start. Approval releases the slot when apply authorization is issued; the
+queue does not wait for the proposer to finish the git operation or report `applied`.
+
+When persisted canvas state is restored, the server rebuilds the shared queue and active branch
+ownership before starting queued reviews. Active review timers are restored from their saved
+deadlines; an already-expired review times out and releases its branch during recovery.
+
 ## Review Contract
 
 Reviewers must return one JSON object with `agentCanvasSyncReview: true`, `flowId`, `decision`,
 `summary`, `risks`, `filesReviewed`, and `requiredChanges`. Any `reject`, `needs_changes`, or
 `blocked` decision closes the flow as `review_failed`.
 
-When all reviewers approve, the proposer receives apply authorization. After it performs the real
-git operation, it reports:
+When all reviewers approve, the target-branch review slot is released and the proposer receives
+apply authorization. After it performs the real git operation, it reports:
 
 ```json
 {

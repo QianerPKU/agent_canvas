@@ -263,15 +263,53 @@ describe("PullRequestFlowManager", () => {
     ).rejects.toThrow("must include origin/main");
   });
 
-  it("queues PR flows that target the same branch and starts them in order", async () => {
+  it("starts the next source review as soon as the previous source review finishes", async () => {
     let now = 6000;
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/shared", "waiting_input");
+    const manager = new PullRequestFlowManager({ host, now: () => now });
+
+    const first = await manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "main",
+      summary: "First PR",
+      files: ["src/a.ts"],
+    });
+    const second = await manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "release",
+      summary: "Second PR",
+      files: ["src/b.ts"],
+    });
+
+    expect(first.status).toBe("source_review_collecting");
+    expect(second).toMatchObject({ status: "queued", currentStage: "source_preflight" });
+    expect(second.reviewRequests).toHaveLength(0);
+    expect(proposer.sent).toHaveLength(1);
+    expect(proposer.steered).toHaveLength(0);
+
+    now += 1;
+    proposer.setStatus("waiting_input");
+    host.assistant("agent_1", reviewJson(first, "source_preflight", "approve"), now);
+    await manager.handleAgentEvent(host.result("agent_1", now));
+    await flush();
+
+    expect(manager.get(first.id)?.status).toBe("create_pr_authorized");
+    expect(manager.get(second.id)?.status).toBe("source_review_collecting");
+    expect(manager.get(second.id)?.reviewRequests).toHaveLength(1);
+    expect(proposer.steered).toHaveLength(1);
+    expect(proposer.steered[0]).toContain(`flowId: ${second.id}`);
+  });
+
+  it("runs source reviews on different branches in parallel and queues their target reviews", async () => {
+    let now = 6250;
     const host = new FakeHost();
     const proposerA = host.addAgent("agent_a", "feature/a", "waiting_input");
     const proposerB = host.addAgent("agent_b", "feature/b", "waiting_input");
     const targetReviewer = host.addAgent("agent_main", "main", "waiting_input");
     const manager = new PullRequestFlowManager({ host, now: () => now });
 
-    let first = await manager.create({
+    const first = await manager.create({
       proposerAgentId: "agent_a",
       targetBranch: "main",
       summary: "First PR",
@@ -285,286 +323,246 @@ describe("PullRequestFlowManager", () => {
     });
 
     expect(first.status).toBe("source_review_collecting");
-    expect(second.status).toBe("queued");
-    expect(proposerA.sent).toHaveLength(1);
-    expect(proposerB.sent).toHaveLength(0);
+    expect(second.status).toBe("source_review_collecting");
 
     now += 1;
     proposerA.setStatus("waiting_input");
     host.assistant("agent_a", reviewJson(first, "source_preflight", "approve"), now);
     await manager.handleAgentEvent(host.result("agent_a", now));
-
-    first = manager.get(first.id)!;
-    expect(first.status).toBe("create_pr_authorized");
-
     now += 1;
-    proposerA.setStatus("waiting_input");
-    host.assistant(
-      "agent_a",
-      JSON.stringify({ agentCanvasPrEvent: "pr_created", flowId: first.id, prNumber: 1 }),
-      now,
-    );
-    await manager.handleAgentEvent(host.result("agent_a", now));
+    proposerB.setStatus("waiting_input");
+    host.assistant("agent_b", reviewJson(second, "source_preflight", "approve"), now);
+    await manager.handleAgentEvent(host.result("agent_b", now));
 
-    first = manager.get(first.id)!;
-    expect(first.status).toBe("target_review_collecting");
+    await manager.recordPrCreated(first.id, { prNumber: 1 });
+    await manager.recordPrCreated(second.id, { prNumber: 2 });
+
+    expect(manager.get(first.id)?.status).toBe("target_review_collecting");
+    expect(manager.get(second.id)).toMatchObject({ status: "queued", currentStage: "target_merge" });
+    expect(targetReviewer.sent).toHaveLength(1);
 
     now += 1;
     targetReviewer.setStatus("waiting_input");
-    host.assistant("agent_main", reviewJson(first, "target_merge", "approve"), now);
+    host.assistant("agent_main", reviewJson(manager.get(first.id)!, "target_merge", "approve"), now);
     await manager.handleAgentEvent(host.result("agent_main", now));
-
-    first = manager.get(first.id)!;
-    expect(first.status).toBe("merge_authorized");
-
-    manager.recordMerged(first.id);
     await flush();
 
-    const startedSecond = manager.get(second.id)!;
-    expect(startedSecond.status).toBe("source_review_collecting");
-    expect(proposerB.sent).toHaveLength(1);
-    expect(proposerB.sent[0]).toContain(`flowId: ${second.id}`);
+    expect(manager.get(first.id)?.status).toBe("merge_authorized");
+    expect(manager.get(second.id)?.status).toBe("target_review_collecting");
+    expect(targetReviewer.sent).toHaveLength(2);
+    expect(targetReviewer.sent[1]).toContain(`flowId: ${second.id}`);
   });
 
-  it("rechecks queued PR branch readiness before starting source review", async () => {
+  it("rechecks branch readiness when a queued source review starts", async () => {
     let now = 6500;
     let ready = true;
     const host = new FakeHost();
-    const proposerA = host.addAgent("agent_a", "feature/a", "waiting_input");
-    const proposerB = host.addAgent("agent_b", "feature/b", "waiting_input");
-    const targetReviewer = host.addAgent("agent_main", "main", "waiting_input");
+    const proposer = host.addAgent("agent_1", "feature/shared", "waiting_input");
     const manager = new PullRequestFlowManager({
       host,
       now: () => now,
       ensureBranchesReady: async ({ sourceBranch, targetBranch }) => {
-        if (!ready && sourceBranch === "feature/b") {
+        if (!ready) {
           throw new Error(`source branch ${sourceBranch} must include origin/${targetBranch}`);
         }
       },
     });
 
-    let first = await manager.create({
-      proposerAgentId: "agent_a",
+    const first = await manager.create({
+      proposerAgentId: "agent_1",
       targetBranch: "main",
       summary: "First PR",
       files: ["src/a.ts"],
     });
     const second = await manager.create({
-      proposerAgentId: "agent_b",
-      targetBranch: "main",
+      proposerAgentId: "agent_1",
+      targetBranch: "release",
       summary: "Second PR",
       files: ["src/b.ts"],
     });
     expect(second.status).toBe("queued");
 
-    now += 1;
-    proposerA.setStatus("waiting_input");
-    host.assistant("agent_a", reviewJson(first, "source_preflight", "approve"), now);
-    await manager.handleAgentEvent(host.result("agent_a", now));
-
-    first = manager.get(first.id)!;
-    now += 1;
-    proposerA.setStatus("waiting_input");
-    host.assistant(
-      "agent_a",
-      JSON.stringify({ agentCanvasPrEvent: "pr_created", flowId: first.id, prNumber: 1 }),
-      now,
-    );
-    await manager.handleAgentEvent(host.result("agent_a", now));
-
-    first = manager.get(first.id)!;
-    now += 1;
-    targetReviewer.setStatus("waiting_input");
-    host.assistant("agent_main", reviewJson(first, "target_merge", "approve"), now);
-    await manager.handleAgentEvent(host.result("agent_main", now));
-
     ready = false;
-    manager.recordMerged(first.id);
+    now += 1;
+    proposer.setStatus("waiting_input");
+    host.assistant("agent_1", reviewJson(first, "source_preflight", "approve"), now);
+    await manager.handleAgentEvent(host.result("agent_1", now));
     await flush();
 
-    const stillQueued = manager.get(second.id)!;
-    expect(stillQueued.status).toBe("queued");
-    expect(stillQueued.failureReason).toContain("waiting for branch sync");
-    expect(proposerB.sent).toHaveLength(0);
+    expect(manager.get(second.id)).toMatchObject({
+      status: "queued",
+      currentStage: "source_preflight",
+    });
+    expect(manager.get(second.id)?.failureReason).toContain("waiting for branch sync");
 
     ready = true;
-    proposerB.setStatus("waiting_input");
+    proposer.setStatus("waiting_input");
     const retried = await manager.retryQueued(second.id);
 
     expect(retried.status).toBe("source_review_collecting");
     expect(retried.failureReason).toBeUndefined();
-    expect(proposerB.sent).toHaveLength(1);
-    expect(proposerB.sent[0]).toContain(`flowId: ${second.id}`);
   });
 
-  it("continues draining independent queued flows when an older queued flow still needs sync", async () => {
-    let now = 6750;
-    let staleReady = true;
+  it("keeps FIFO order for multiple source reviews on the same branch", async () => {
+    let now = 7000;
     const host = new FakeHost();
-    const activeProposer = host.addAgent("agent_active", "feature/c", "waiting_input");
-    const staleProposer = host.addAgent("agent_stale", "feature/b", "waiting_input");
-    const releaseReviewer = host.addAgent("agent_release", "release", "waiting_input");
-    const manager = new PullRequestFlowManager({
+    const proposer = host.addAgent("agent_1", "feature/shared", "waiting_input");
+    const manager = new PullRequestFlowManager({ host, now: () => now });
+
+    const first = await manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "main",
+      summary: "First PR",
+      files: ["src/a.ts"],
+    });
+    const second = await manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "release",
+      summary: "Second PR",
+      files: ["src/b.ts"],
+    });
+    const third = await manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "develop",
+      summary: "Third PR",
+      files: ["src/c.ts"],
+    });
+
+    expect(second.status).toBe("queued");
+    expect(third.status).toBe("queued");
+
+    now += 1;
+    proposer.setStatus("waiting_input");
+    host.assistant("agent_1", reviewJson(first, "source_preflight", "approve"), now);
+    await manager.handleAgentEvent(host.result("agent_1", now));
+    await flush();
+
+    expect(manager.get(second.id)?.status).toBe("source_review_collecting");
+    expect(manager.get(third.id)?.status).toBe("queued");
+
+    now += 1;
+    proposer.setStatus("waiting_input");
+    host.assistant("agent_1", reviewJson(manager.get(second.id)!, "source_preflight", "approve"), now);
+    await manager.handleAgentEvent(host.result("agent_1", now));
+    await flush();
+
+    expect(manager.get(third.id)?.status).toBe("source_review_collecting");
+    expect(manager.get(third.id)?.reviewRequests).toHaveLength(1);
+  });
+
+  it("starts a restored queued review when its persisted predecessor is already closed", async () => {
+    let now = 7500;
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/shared", "waiting_input");
+    const manager = new PullRequestFlowManager({ host, now: () => now });
+
+    const first = await manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "main",
+      summary: "Persisted predecessor",
+      files: ["src/a.ts"],
+    });
+    const second = await manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "release",
+      summary: "Persisted queued review",
+      files: ["src/b.ts"],
+    });
+    const restored = manager.exportState().map((flow) =>
+      flow.id === first.id
+        ? {
+            ...flow,
+            status: "cancelled" as const,
+            currentStage: undefined,
+            closedAt: now,
+          }
+        : flow,
+    );
+
+    proposer.sent.length = 0;
+    proposer.steered.length = 0;
+    proposer.setStatus("waiting_input");
+    manager.importState(restored);
+    await flush();
+
+    expect(manager.get(second.id)?.status).toBe("source_review_collecting");
+    expect(proposer.sent).toHaveLength(1);
+    expect(proposer.sent[0]).toContain(`flowId: ${second.id}`);
+  });
+
+  it("restores an active review deadline and releases it on timeout", async () => {
+    vi.useFakeTimers();
+    let now = 8000;
+    const host = new FakeHost();
+    host.addAgent("agent_1", "feature/a", "waiting_input");
+    const original = new PullRequestFlowManager({
       host,
       now: () => now,
-      ensureBranchesReady: async ({ sourceBranch, targetBranch }) => {
-        if (!staleReady && sourceBranch === "feature/b") {
-          throw new Error(`source branch ${sourceBranch} must include origin/${targetBranch}`);
-        }
+      reviewTimeoutMs: 10,
+    });
+    const flow = await original.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "main",
+      summary: "Restored timeout",
+      files: ["src/timeout.ts"],
+    });
+    const persisted = original.exportState();
+    original.cancel(flow.id);
+
+    const restored = new PullRequestFlowManager({
+      host,
+      now: () => now,
+      reviewTimeoutMs: 10,
+    });
+    restored.importState(persisted);
+    now += 11;
+    vi.advanceTimersByTime(11);
+
+    expect(restored.get(flow.id)?.status).toBe("timed_out");
+  });
+
+  it("does not let an in-flight review start mutate a newly imported project", async () => {
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/shared", "waiting_input");
+    let readinessChecks = 0;
+    let releaseStaleCheck!: () => void;
+    const staleCheck = new Promise<void>((resolve) => {
+      releaseStaleCheck = resolve;
+    });
+    const manager = new PullRequestFlowManager({
+      host,
+      ensureBranchesReady: async () => {
+        readinessChecks += 1;
+        if (readinessChecks === 2) await staleCheck;
       },
     });
 
-    let active = await manager.create({
-      proposerAgentId: "agent_active",
-      targetBranch: "release",
-      summary: "Active PR",
-      files: ["src/active.ts"],
-    });
-    const staleQueued = await manager.create({
-      proposerAgentId: "agent_stale",
-      targetBranch: "release",
-      summary: "Stale queued PR",
-      files: ["src/stale.ts"],
-    });
-
-    expect(staleQueued.status).toBe("queued");
-
-    now += 1;
-    activeProposer.setStatus("waiting_input");
-    host.assistant("agent_active", reviewJson(active, "source_preflight", "approve"), now);
-    await manager.handleAgentEvent(host.result("agent_active", now));
-
-    active = manager.get(active.id)!;
-    const readyProposer = host.addAgent("agent_ready", "feature/c", "waiting_input");
-    const readyQueued = await manager.create({
-      proposerAgentId: "agent_ready",
+    const staleCreate = manager.create({
+      proposerAgentId: "agent_1",
       targetBranch: "main",
-      summary: "Ready queued PR",
-      files: ["src/ready.ts"],
+      summary: "Old project review",
+      files: ["src/old.ts"],
     });
-    expect(readyQueued.status).toBe("queued");
+    for (let attempt = 0; attempt < 10 && readinessChecks < 2; attempt += 1) {
+      await Promise.resolve();
+    }
+    expect(readinessChecks).toBe(2);
 
-    now += 1;
-    activeProposer.setStatus("waiting_input");
-    host.assistant(
-      "agent_active",
-      JSON.stringify({ agentCanvasPrEvent: "pr_created", flowId: active.id, prNumber: 4 }),
-      now,
-    );
-    await manager.handleAgentEvent(host.result("agent_active", now));
-
-    active = manager.get(active.id)!;
-    now += 1;
-    releaseReviewer.setStatus("waiting_input");
-    host.assistant("agent_release", reviewJson(active, "target_merge", "approve"), now);
-    await manager.handleAgentEvent(host.result("agent_release", now));
-
-    staleReady = false;
-    manager.recordMerged(active.id);
-    await flush();
-
-    const stale = manager.get(staleQueued.id)!;
-    const ready = manager.get(readyQueued.id)!;
-    expect(stale.status).toBe("queued");
-    expect(stale.failureReason).toContain("waiting for branch sync");
-    expect(staleProposer.sent).toHaveLength(0);
-    expect(ready.status).toBe("source_review_collecting");
-    expect(readyProposer.sent).toHaveLength(1);
-    expect(readyProposer.sent[0]).toContain(`flowId: ${readyQueued.id}`);
-  });
-
-  it("treats queued flows as branch reservations so later flows cannot skip them", async () => {
-    let now = 7000;
-    const host = new FakeHost();
-    const activeProposer = host.addAgent("agent_active", "feature/a", "waiting_input");
-    const queuedProposer = host.addAgent("agent_queued", "feature/b", "waiting_input");
-    const laterProposer = host.addAgent("agent_later", "feature/b", "waiting_input");
-    const mainReviewer = host.addAgent("agent_main", "main", "waiting_input");
-    const releaseReviewer = host.addAgent("agent_release", "release", "waiting_input");
-    const manager = new PullRequestFlowManager({ host, now: () => now });
-
-    const active = await manager.create({
-      proposerAgentId: "agent_active",
+    manager.importState([]);
+    proposer.setStatus("waiting_input");
+    const fresh = await manager.create({
+      proposerAgentId: "agent_1",
       targetBranch: "release",
-      summary: "Active release PR",
-      files: ["src/a.ts"],
+      summary: "New project review",
+      files: ["src/new.ts"],
     });
-    const olderQueued = await manager.create({
-      proposerAgentId: "agent_queued",
-      targetBranch: "release",
-      summary: "Older queued release PR",
-      files: ["src/b.ts"],
-    });
-    const laterQueued = await manager.create({
-      proposerAgentId: "agent_later",
-      targetBranch: "main",
-      summary: "Later main PR",
-      files: ["src/c.ts"],
-    });
-    laterProposer.setStatus("idle");
+    expect(fresh.id).toBe("pr_flow_1");
+    expect(fresh.status).toBe("source_review_collecting");
 
-    expect(active.status).toBe("source_review_collecting");
-    expect(olderQueued.status).toBe("queued");
-    expect(laterQueued.status).toBe("queued");
-    expect(queuedProposer.sent).toHaveLength(0);
-    expect(laterProposer.sent).toHaveLength(0);
-
-    now += 1;
-    activeProposer.setStatus("waiting_input");
-    host.assistant("agent_active", reviewJson(active, "source_preflight", "approve"), now);
-    await manager.handleAgentEvent(host.result("agent_active", now));
-
-    now += 1;
-    activeProposer.setStatus("waiting_input");
-    host.assistant(
-      "agent_active",
-      JSON.stringify({ agentCanvasPrEvent: "pr_created", flowId: active.id, prNumber: 2 }),
-      now,
-    );
-    await manager.handleAgentEvent(host.result("agent_active", now));
-
-    now += 1;
-    releaseReviewer.setStatus("waiting_input");
-    host.assistant("agent_release", reviewJson(manager.get(active.id)!, "target_merge", "approve"), now);
-    await manager.handleAgentEvent(host.result("agent_release", now));
-    manager.recordMerged(active.id);
-    await flush();
-
-    expect(manager.get(olderQueued.id)?.status).toBe("source_review_collecting");
-    expect(manager.get(laterQueued.id)?.status).toBe("queued");
-    expect(queuedProposer.sent).toHaveLength(1);
-    expect(laterProposer.sent).toHaveLength(0);
-
-    now += 1;
-    queuedProposer.setStatus("waiting_input");
-    host.assistant("agent_queued", reviewJson(manager.get(olderQueued.id)!, "source_preflight", "approve"), now);
-    await manager.handleAgentEvent(host.result("agent_queued", now));
-
-    now += 1;
-    queuedProposer.setStatus("waiting_input");
-    host.assistant(
-      "agent_queued",
-      JSON.stringify({ agentCanvasPrEvent: "pr_created", flowId: olderQueued.id, prNumber: 3 }),
-      now,
-    );
-    await manager.handleAgentEvent(host.result("agent_queued", now));
-    expect(manager.get(olderQueued.id)?.status).toBe("target_review_collecting");
-
-    now += 1;
-    releaseReviewer.setStatus("waiting_input");
-    host.assistant(
-      "agent_release",
-      reviewJson(manager.get(olderQueued.id)!, "target_merge", "approve"),
-      now,
-    );
-    await manager.handleAgentEvent(host.result("agent_release", now));
-    expect(manager.get(olderQueued.id)?.status).toBe("merge_authorized");
-    laterProposer.setStatus("waiting_input");
-    manager.recordMerged(olderQueued.id);
-    await flush();
-
-    expect(manager.get(laterQueued.id)?.status).toBe("source_review_collecting");
-    expect(mainReviewer.sent).toHaveLength(0);
+    releaseStaleCheck();
+    await expect(staleCreate).rejects.toThrow("state changed");
+    expect(manager.get(fresh.id)?.summary).toBe("New project review");
+    expect(manager.get(fresh.id)?.status).toBe("source_review_collecting");
   });
 
   it("resolves changed files when a flow is created without explicit files", async () => {

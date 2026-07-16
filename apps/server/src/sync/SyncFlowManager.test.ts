@@ -216,6 +216,79 @@ describe("SyncFlowManager", () => {
     expect(proposer.sent.at(-1)).toContain("Do not apply this sync flow");
   });
 
+  it("queues reviews for the same current branch and starts the next after authorization", async () => {
+    let now = 3500;
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/current", "waiting_input");
+    const manager = new SyncFlowManager({ host, now: () => now });
+
+    const first = await manager.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_1",
+      sourceBranch: "main",
+      summary: "First pull",
+      reason: "Need the first update",
+      files: ["src/first.ts"],
+    });
+    const second = await manager.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_1",
+      sourceBranch: "release",
+      summary: "Second pull",
+      reason: "Need the second update",
+      files: ["src/second.ts"],
+    });
+
+    expect(first.status).toBe("review_collecting");
+    expect(second.status).toBe("queued");
+    expect(second.reviewRequest).toBeUndefined();
+    expect(proposer.sent).toHaveLength(1);
+    expect(proposer.steered).toHaveLength(0);
+
+    now += 1;
+    proposer.setStatus("waiting_input");
+    host.assistant("agent_1", reviewJson(first, "approve"), now);
+    await manager.handleAgentEvent(host.result("agent_1", now));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(manager.get(first.id)?.status).toBe("apply_authorized");
+    expect(manager.get(second.id)?.status).toBe("review_collecting");
+    expect(manager.get(second.id)?.reviewRequest).toBeDefined();
+    expect(proposer.steered).toHaveLength(1);
+    expect(proposer.steered[0]).toContain(`flowId: ${second.id}`);
+  });
+
+  it("releases the branch queue when an active sync review is cancelled", async () => {
+    const host = new FakeHost();
+    host.addAgent("agent_1", "feature/current", "waiting_input");
+    const manager = new SyncFlowManager({ host });
+
+    const first = await manager.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_1",
+      sourceBranch: "main",
+      summary: "Cancelled pull",
+      reason: "Exercise queue cancellation",
+      files: ["src/first.ts"],
+    });
+    const second = await manager.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_1",
+      sourceBranch: "release",
+      summary: "Pull after cancellation",
+      reason: "Must start after the branch slot is released",
+      files: ["src/second.ts"],
+    });
+    expect(second.status).toBe("queued");
+
+    manager.cancel(first.id);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(manager.get(first.id)?.status).toBe("cancelled");
+    expect(manager.get(second.id)?.status).toBe("review_collecting");
+  });
+
   it("times out when reviewers do not all respond", async () => {
     vi.useFakeTimers();
     let now = 0;

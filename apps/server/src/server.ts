@@ -48,6 +48,7 @@ import {
 } from "./files/VscodeFileOpener.js";
 import { PromptManager } from "./prompts/PromptManager.js";
 import { PullRequestFlowManager } from "./pullRequests/PullRequestFlowManager.js";
+import { BranchReviewQueue } from "./reviews/BranchReviewQueue.js";
 import { CodexAuthManager } from "./sdk/CodexAuthManager.js";
 import { SyncFlowManager } from "./sync/SyncFlowManager.js";
 import { WorkspaceManager } from "./workspaces/WorkspaceManager.js";
@@ -78,6 +79,7 @@ export interface CreateServerOptions {
   workspaceManager?: WorkspaceManager;
   pullRequestFlowManager?: PullRequestFlowManager;
   syncFlowManager?: SyncFlowManager;
+  reviewQueue?: BranchReviewQueue;
   commitManager?: CommitManager;
   codexAuthManager?: CodexAuthManager;
   codexModelDetection?: CodexModelDetectionInput;
@@ -120,10 +122,20 @@ export function createServer(
     new PromptManager({
       workspaceRoot: defaultCwd,
     });
+  const injectedReviewQueues = [
+    options.reviewQueue,
+    options.pullRequestFlowManager?.getReviewQueue(),
+    options.syncFlowManager?.getReviewQueue(),
+  ].filter((queue): queue is BranchReviewQueue => queue !== undefined);
+  const reviewQueue = injectedReviewQueues[0] ?? new BranchReviewQueue();
+  if (injectedReviewQueues.some((queue) => queue !== reviewQueue)) {
+    throw new Error("PR and sync flow managers must share the same branch review queue");
+  }
   const pullRequestFlowManager =
     options.pullRequestFlowManager ??
     new PullRequestFlowManager({
       host: manager,
+      reviewQueue,
       ensureBranchesReady: async ({ sourceBranch, targetBranch }) =>
         await workspaceManager.ensurePullRequestBranchesReady(sourceBranch, targetBranch),
       resolveChangedFiles: async ({ sourceBranch, targetBranch }) =>
@@ -133,6 +145,7 @@ export function createServer(
     options.syncFlowManager ??
     new SyncFlowManager({
       host: manager,
+      reviewQueue,
       resolveChangedFiles: async ({ kind, sourceBranch, targetBranch, commitSha }) => {
         if (kind === "cherry_pick") {
           return await workspaceManager.changedFilesForCommit(commitSha, sourceBranch);
@@ -148,6 +161,7 @@ export function createServer(
     fileManager,
     promptManager,
     workspaceManager,
+    reviewQueue,
     pullRequestFlowManager,
     syncFlowManager,
     commitManager,
@@ -1069,6 +1083,7 @@ interface CanvasStateControllerDeps {
   fileManager: FileManager;
   promptManager: PromptManager;
   workspaceManager: WorkspaceManager;
+  reviewQueue: BranchReviewQueue;
   pullRequestFlowManager: PullRequestFlowManager;
   syncFlowManager: SyncFlowManager;
   commitManager: CommitManager;
@@ -1130,10 +1145,11 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
       const state = await readCanvasProjectState(path.join(project.projectRoot, CANVAS_STATE_FILE));
       deps.manager.importState(state?.agents);
       deps.fileManager.importState(state?.files);
-      await deps.promptManager.importState(state?.prompts);
       deps.commitManager.importState(state?.commits);
+      deps.reviewQueue.clear();
       deps.pullRequestFlowManager.importState(state?.prFlows);
       deps.syncFlowManager.importState(state?.syncFlows);
+      await deps.promptManager.importState(state?.prompts);
       layout = sanitizeCanvasLayout(state?.layout);
     },
     saveNow,
