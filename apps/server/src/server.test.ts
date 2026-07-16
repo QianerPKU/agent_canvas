@@ -1,9 +1,11 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import http from "node:http";
+import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import WebSocket, { type RawData } from "ws";
 import type { AgentEventEnvelope, AgentSnapshot } from "@agent-canvas/shared";
 import { AgentManager } from "./AgentManager.js";
 import { CommitManager } from "./commits/CommitManager.js";
@@ -11,6 +13,7 @@ import { createServer } from "./server.js";
 import { FileManager } from "./files/FileManager.js";
 import type { OpenInVscodeOptions } from "./files/VscodeFileOpener.js";
 import { PromptManager } from "./prompts/PromptManager.js";
+import type { PullRequestFlowManager } from "./pullRequests/PullRequestFlowManager.js";
 import { CodexAuthManager } from "./sdk/CodexAuthManager.js";
 import { SyncFlowManager, type SyncFlowAgentHost } from "./sync/SyncFlowManager.js";
 import type { QueryFn } from "./sdk/types.js";
@@ -138,7 +141,53 @@ class FakeCodexAuthManager extends CodexAuthManager {
   }
 }
 
-function request(
+let requestWorkspaceContext:
+  | { canvasProjectId: string; revision: number }
+  | undefined;
+
+async function request(
+  port: number,
+  method: string,
+  path: string,
+  body?: unknown,
+  extraHeaders: Record<string, string> = {},
+): Promise<Resp> {
+  if (
+    requiresTestProjectContext(method, path) &&
+    !extraHeaders["X-Agent-Canvas-Project-Id"] &&
+    !requestWorkspaceContext
+  ) {
+    await request(port, "GET", "/api/workspace");
+  }
+  const projectHeaders: Record<string, string> =
+    requiresTestProjectContext(method, path) &&
+    !extraHeaders["X-Agent-Canvas-Project-Id"] &&
+    requestWorkspaceContext
+      ? {
+          "X-Agent-Canvas-Project-Id": requestWorkspaceContext.canvasProjectId,
+          "X-Agent-Canvas-Project-Revision": String(requestWorkspaceContext.revision),
+        }
+      : {};
+  const response = await rawRequest(port, method, path, body, {
+    ...projectHeaders,
+    ...extraHeaders,
+  });
+  updateTestWorkspaceContext(response.json);
+  if (method === "DELETE" && response.status >= 200 && response.status < 300) {
+    const deletedProject = new URL(path, "http://localhost").pathname.match(
+      /^\/api\/canvas-projects\/([^/]+)$/u,
+    );
+    if (
+      deletedProject &&
+      requestWorkspaceContext?.canvasProjectId === decodeURIComponent(deletedProject[1]!)
+    ) {
+      requestWorkspaceContext = undefined;
+    }
+  }
+  return response;
+}
+
+function rawRequest(
   port: number,
   method: string,
   path: string,
@@ -175,13 +224,100 @@ function request(
   });
 }
 
+function requiresTestProjectContext(method: string, requestPath: string): boolean {
+  if (["GET", "HEAD", "OPTIONS"].includes(method)) return false;
+  const pathname = new URL(requestPath, "http://localhost").pathname;
+  return pathname.startsWith("/api/");
+}
+
+function updateTestWorkspaceContext(payload: any): void {
+  const workspace = payload?.workspace?.canvasProject ? payload.workspace : payload;
+  const canvasProjectId = workspace?.canvasProject?.id;
+  const revision = workspace?.revision;
+  if (typeof canvasProjectId === "string" && Number.isSafeInteger(revision)) {
+    requestWorkspaceContext = { canvasProjectId, revision };
+  }
+}
+
+async function patchAppSettings(
+  port: number,
+  settings: Record<string, unknown>,
+): Promise<Resp> {
+  const workspace = await request(port, "GET", "/api/workspace");
+  return await request(port, "PATCH", "/api/settings", {
+    ...settings,
+    canvasProjectId: workspace.json.canvasProject.id,
+  });
+}
+
+function streamingRequest(
+  port: number,
+  method: string,
+  requestPath: string,
+  includeProjectContext = true,
+): { req: http.ClientRequest; response: Promise<Resp> } {
+  let req!: http.ClientRequest;
+  const projectHeaders: Record<string, string> = {};
+  if (
+    includeProjectContext &&
+    requiresTestProjectContext(method, requestPath) &&
+    requestWorkspaceContext
+  ) {
+    projectHeaders["X-Agent-Canvas-Project-Id"] = requestWorkspaceContext.canvasProjectId;
+    projectHeaders["X-Agent-Canvas-Project-Revision"] = String(
+      requestWorkspaceContext.revision,
+    );
+  }
+  const response = new Promise<Resp>((resolve, reject) => {
+    req = http.request(
+      {
+        host: "127.0.0.1",
+        port,
+        method,
+        path: requestPath,
+        headers: {
+          "Content-Type": "application/json",
+          ...projectHeaders,
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf-8");
+          resolve({ status: res.statusCode ?? 0, json: text ? JSON.parse(text) : undefined });
+        });
+      },
+    );
+    req.on("error", reject);
+  });
+  return { req, response };
+}
+
+function nextWebSocketFrame(socket: WebSocket, type: string): Promise<any> {
+  return new Promise((resolve) => {
+    const onMessage = (payload: RawData) => {
+      const frame = JSON.parse(String(payload));
+      if (frame.type !== type) return;
+      socket.off("message", onMessage);
+      resolve(frame);
+    };
+    socket.on("message", onMessage);
+  });
+}
+
 describe("HTTP server", () => {
   let server: http.Server;
+  let manager: AgentManager;
   let port = 0;
   let root = "";
   let projectRoot = "";
   let trackedWorkDocumentationCwd: string | undefined;
+  let beforeNextProjectStatePromptImport: (() => Promise<void>) | undefined;
+  let resolveTurnContextForTest: () => Promise<{ baseCommitSha?: string }> = async () => ({});
+  let workspaceManager: WorkspaceManager;
   let syncHost: FakeSyncHost;
+  let pullRequestFlowManager: PullRequestFlowManager;
   let syncFlowManager: SyncFlowManager;
   const openFile = vi
     .fn<(filePath: string, options?: OpenInVscodeOptions) => Promise<void>>()
@@ -191,7 +327,10 @@ describe("HTTP server", () => {
     .mockResolvedValue("C:\\picked");
 
   beforeAll(async () => {
-    const manager = new AgentManager({ query: emptyQuery });
+    manager = new AgentManager({
+      query: emptyQuery,
+      resolveTurnContext: async () => await resolveTurnContextForTest(),
+    });
     root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-server-"));
     projectRoot = path.join(root, "project");
     const runGit: GitRunner = async (args, options) => {
@@ -219,7 +358,7 @@ describe("HTTP server", () => {
       }
       return "";
     };
-    const workspaceManager = new WorkspaceManager({
+    workspaceManager = new WorkspaceManager({
       defaultSourcePath: root,
       projectRoot,
       runGit,
@@ -233,9 +372,16 @@ describe("HTTP server", () => {
       workspaceRoot: root,
       promptRoot: path.join(root, "prompts"),
     });
+    const importPromptState = promptManager.importState.bind(promptManager);
+    vi.spyOn(promptManager, "importState").mockImplementation(async (state) => {
+      const beforeImport = beforeNextProjectStatePromptImport;
+      beforeNextProjectStatePromptImport = undefined;
+      if (beforeImport) await beforeImport();
+      await importPromptState(state);
+    });
     syncHost = new FakeSyncHost();
     syncFlowManager = new SyncFlowManager({ host: syncHost });
-    ({ httpServer: server } = createServer(manager, fileManager, {
+    ({ httpServer: server, pullRequestFlowManager } = createServer(manager, fileManager, {
       defaultCwd: root,
       openFile,
       pickDirectory,
@@ -348,7 +494,7 @@ describe("HTTP server", () => {
       json: { fullPermissionMode: false, workDocumentationEnabled: false },
     });
 
-    const invalid = await request(port, "PATCH", "/api/settings", {
+    const invalid = await patchAppSettings(port, {
       workDocumentationEnabled: "false",
     });
     expect(invalid).toEqual({
@@ -356,7 +502,7 @@ describe("HTTP server", () => {
       json: { error: "设置项必须是 boolean" },
     });
 
-    const updated = await request(port, "PATCH", "/api/settings", {
+    const updated = await patchAppSettings(port, {
       fullPermissionMode: true,
       workDocumentationEnabled: true,
     });
@@ -372,7 +518,7 @@ describe("HTTP server", () => {
       readFile(path.join(mainWorkspace, ".agent-shared-docs", "index.md"), "utf-8"),
     ).resolves.toContain("共享 Branch 文档索引");
 
-    await request(port, "PATCH", "/api/settings", {
+    await patchAppSettings(port, {
       fullPermissionMode: false,
       workDocumentationEnabled: false,
     });
@@ -380,7 +526,7 @@ describe("HTTP server", () => {
 
   it("reports work-documentation failures as partial success after workspace mutations", async () => {
     const mainWorkspace = path.join(projectRoot, "repos", "repo_1", "repo");
-    const enabled = await request(port, "PATCH", "/api/settings", {
+    const enabled = await patchAppSettings(port, {
       workDocumentationEnabled: true,
     });
     expect(enabled.status).toBe(200);
@@ -404,7 +550,7 @@ describe("HTTP server", () => {
 
     trackedWorkDocumentationCwd = undefined;
     expect(
-      (await request(port, "PATCH", "/api/settings", { workDocumentationEnabled: true }))
+      (await patchAppSettings(port, { workDocumentationEnabled: true }))
         .status,
     ).toBe(200);
 
@@ -434,7 +580,7 @@ describe("HTTP server", () => {
 
     trackedWorkDocumentationCwd = undefined;
     expect(
-      (await request(port, "PATCH", "/api/settings", { workDocumentationEnabled: false }))
+      (await patchAppSettings(port, { workDocumentationEnabled: false }))
         .status,
     ).toBe(200);
   });
@@ -769,6 +915,27 @@ describe("HTTP server", () => {
     ).toBe(true);
   });
 
+  it("keeps tokenless agent flow callbacks compatible with project revision enforcement", async () => {
+    const created = await rawRequest(port, "POST", "/api/sync-flows", {
+      kind: "cherry_pick",
+      proposerAgentId: "agent_sync",
+      sourceBranch: "main",
+      commitSha: "abcdef123456",
+      summary: "Agent protocol compatibility",
+      reason: "Agent callbacks do not receive browser workspace revision headers",
+      files: ["src/compatibility.ts"],
+    });
+
+    expect(created.status).toBe(201);
+    const cancelled = await rawRequest(
+      port,
+      "POST",
+      `/api/sync-flows/${created.json.flow.id}/cancel`,
+    );
+    expect(cancelled.status).toBe(200);
+    expect(cancelled.json.flow.status).toBe("cancelled");
+  });
+
   it("history 记录用户输入", async () => {
     const c = await request(port, "POST", "/api/agents");
     await request(port, "POST", `/api/agents/${c.json.id}/start`, { prompt: "保留这条输入" });
@@ -948,7 +1115,60 @@ describe("HTTP server", () => {
     expect(connections.json.connections).toContainEqual(connection.json.connection);
   });
 
+  it("broadcasts authoritative workspace revisions to every connected client", async () => {
+    await manager.clear();
+    const created = await request(port, "POST", "/api/canvas-projects", {
+      name: "workspace-broadcasts",
+    });
+    expect(created.status).toBe(201);
+    const socketA = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const socketB = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const initialFrames = [
+      nextWebSocketFrame(socketA, "hello"),
+      nextWebSocketFrame(socketA, "workspace"),
+      nextWebSocketFrame(socketB, "hello"),
+      nextWebSocketFrame(socketB, "workspace"),
+    ];
+    await Promise.all([once(socketA, "open"), once(socketB, "open")]);
+    await Promise.all(initialFrames);
+
+    const connectedFrames = [
+      nextWebSocketFrame(socketA, "workspace"),
+      nextWebSocketFrame(socketB, "workspace"),
+    ];
+    const connected = await request(port, "POST", "/api/workspace/connect", {
+      localPath: root,
+    });
+    expect(connected.status).toBe(200);
+    const [connectedA, connectedB] = await Promise.all(connectedFrames);
+    for (const frame of [connectedA, connectedB]) {
+      expect(frame.workspace).toMatchObject({
+        canvasProject: { id: created.json.project.id },
+        revision: connected.json.revision,
+        repo: { defaultBranch: "main" },
+      });
+    }
+
+    const branchFrames = [
+      nextWebSocketFrame(socketA, "workspace"),
+      nextWebSocketFrame(socketB, "workspace"),
+    ];
+    const branch = await request(port, "POST", "/api/workspace/branches", {
+      branch: "feature/broadcast-to-peers",
+    });
+    expect(branch.status).toBe(201);
+    const [branchA, branchB] = await Promise.all(branchFrames);
+    for (const frame of [branchA, branchB]) {
+      expect(frame.workspace.branches).toContainEqual(
+        expect.objectContaining({ branch: "feature/broadcast-to-peers" }),
+      );
+    }
+    socketA.close();
+    socketB.close();
+  });
+
   it("canvas project REST 支持从自定义文件夹加载和删除项目", async () => {
+    await manager.clear();
     const customProjectRoot = path.join(root, "custom-project-root");
     const created = await request(port, "POST", "/api/canvas-projects", {
       name: "custom-root",
@@ -1001,6 +1221,17 @@ describe("HTTP server", () => {
     const activeAgent = await request(port, "POST", "/api/agents", { branch: "main" });
     expect(activeAgent.status).toBe(201);
 
+    const activeCreate = await request(port, "POST", "/api/canvas-projects", {
+      name: "blocked-by-active-agent",
+    });
+    expect(activeCreate.status).toBe(409);
+    expect(activeCreate.json.error).toContain("活动 agent");
+    const activeOpen = await request(port, "POST", "/api/canvas-projects/open", {
+      id: created.json.project.id,
+    });
+    expect(activeOpen.status).toBe(409);
+    expect(activeOpen.json.error).toContain("活动 agent");
+
     const activeDelete = await request(
       port,
       "DELETE",
@@ -1011,6 +1242,45 @@ describe("HTTP server", () => {
     expect(activeDelete.status).toBe(409);
     expect(activeDelete.json.error).toContain("活动 agent");
     await request(port, "POST", `/api/agents/${activeAgent.json.id}/terminate`);
+
+    const activeFlow = await request(port, "POST", "/api/sync-flows", {
+      kind: "cherry_pick",
+      proposerAgentId: "agent_sync",
+      sourceBranch: "main",
+      commitSha: "feedface1234",
+      summary: "Keep this project active while review is pending",
+      reason: "Regression coverage for project switching",
+      files: ["src/project-flow.ts"],
+    });
+    expect(activeFlow.status).toBe(201);
+    const flowCreate = await request(port, "POST", "/api/canvas-projects", {
+      name: "blocked-by-active-flow",
+    });
+    expect(flowCreate.status).toBe(409);
+    expect(flowCreate.json.error).toContain("流程");
+    const flowOpen = await request(port, "POST", "/api/canvas-projects/open", {
+      id: created.json.project.id,
+    });
+    expect(flowOpen.status).toBe(409);
+    expect(flowOpen.json.error).toContain("流程");
+    const flowDelete = await request(
+      port,
+      "DELETE",
+      `/api/canvas-projects/${encodeURIComponent(created.json.project.id)}`,
+      undefined,
+      { "X-Agent-Canvas-Intent": "delete-project" },
+    );
+    expect(flowDelete.status).toBe(409);
+    expect(flowDelete.json.error).toContain("流程");
+    expect(
+      (
+        await request(
+          port,
+          "POST",
+          `/api/sync-flows/${encodeURIComponent(activeFlow.json.flow.id)}/cancel`,
+        )
+      ).status,
+    ).toBe(200);
 
     const deleted = await request(
       port,
@@ -1033,13 +1303,220 @@ describe("HTTP server", () => {
     });
   });
 
+  it("keeps the current in-memory state intact when deleting its project fails", async () => {
+    const created = await request(port, "POST", "/api/canvas-projects", {
+      name: "delete-rollback",
+    });
+    const file = await request(port, "POST", "/api/files", {
+      name: "must-survive-delete-failure",
+      extension: "txt",
+      kind: "normal",
+    });
+    expect(file.status).toBe(201);
+    const workspacePath = path.join(created.json.project.projectRoot, "workspace.json");
+    const validWorkspace = await readFile(workspacePath, "utf-8");
+    await writeFile(workspacePath, "not valid json", "utf-8");
+
+    const failed = await request(
+      port,
+      "DELETE",
+      `/api/canvas-projects/${encodeURIComponent(created.json.project.id)}`,
+      undefined,
+      { "X-Agent-Canvas-Intent": "delete-project" },
+    );
+    expect(failed.status).toBe(404);
+    expect((await request(port, "GET", "/api/files")).json.files).toContainEqual(
+      expect.objectContaining({ id: file.json.file.id }),
+    );
+    expect((await request(port, "GET", "/api/workspace")).json.canvasProject.id).toBe(
+      created.json.project.id,
+    );
+
+    await writeFile(workspacePath, validWorkspace, "utf-8");
+    const deleted = await request(
+      port,
+      "DELETE",
+      `/api/canvas-projects/${encodeURIComponent(created.json.project.id)}`,
+      undefined,
+      { "X-Agent-Canvas-Intent": "delete-project" },
+    );
+    expect(deleted.status).toBe(200);
+  });
+
+  it("rolls back a failed project open and broadcasts the restored workspace", async () => {
+    const projectA = await request(port, "POST", "/api/canvas-projects", {
+      name: "open-rollback-a",
+    });
+    await request(port, "POST", "/api/files", {
+      name: "file-from-a",
+      extension: "txt",
+      kind: "normal",
+    });
+    const projectB = await request(port, "POST", "/api/canvas-projects", {
+      name: "open-rollback-b",
+    });
+    const fileB = await request(port, "POST", "/api/files", {
+      name: "file-from-b",
+      extension: "txt",
+      kind: "normal",
+    });
+
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const initialHello = nextWebSocketFrame(socket, "hello");
+    const initialWorkspace = nextWebSocketFrame(socket, "workspace");
+    await once(socket, "open");
+    await initialHello;
+    await initialWorkspace;
+    const restoredWorkspace = nextWebSocketFrame(socket, "workspace");
+    beforeNextProjectStatePromptImport = async () => {
+      throw new Error("injected prompt import failure");
+    };
+
+    const failed = await request(port, "POST", "/api/canvas-projects/open", {
+      id: projectA.json.project.id,
+    });
+    expect(failed.status).toBe(404);
+    expect(failed.json.error).toContain("injected prompt import failure");
+    await expect(restoredWorkspace).resolves.toMatchObject({
+      type: "workspace",
+      workspace: { canvasProject: { id: projectB.json.project.id } },
+    });
+    expect((await request(port, "GET", "/api/workspace")).json.canvasProject.id).toBe(
+      projectB.json.project.id,
+    );
+    expect((await request(port, "GET", "/api/files")).json.files).toEqual([
+      expect.objectContaining({ id: fileB.json.file.id, name: "file-from-b" }),
+    ]);
+    socket.close();
+
+    await request(
+      port,
+      "DELETE",
+      `/api/canvas-projects/${encodeURIComponent(projectA.json.project.id)}`,
+      undefined,
+      { "X-Agent-Canvas-Intent": "delete-project" },
+    );
+    await request(
+      port,
+      "DELETE",
+      `/api/canvas-projects/${encodeURIComponent(projectB.json.project.id)}`,
+      undefined,
+      { "X-Agent-Canvas-Intent": "delete-project" },
+    );
+  });
+
+  it("clears a failed project open when there is no previous project", async () => {
+    const target = await request(port, "POST", "/api/canvas-projects", {
+      name: "open-without-previous-target",
+    });
+    const disposable = await request(port, "POST", "/api/canvas-projects", {
+      name: "open-without-previous-disposable",
+    });
+    expect(target.status).toBe(201);
+    expect(disposable.status).toBe(201);
+    await writeFile(
+      path.join(target.json.project.projectRoot, "canvas-state.json"),
+      "not valid json",
+      "utf-8",
+    );
+    const deleted = await request(
+      port,
+      "DELETE",
+      `/api/canvas-projects/${encodeURIComponent(disposable.json.project.id)}`,
+      undefined,
+      { "X-Agent-Canvas-Intent": "delete-project" },
+    );
+    expect(deleted.status).toBe(200);
+
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const initialHello = nextWebSocketFrame(socket, "hello");
+    const initialWorkspace = nextWebSocketFrame(socket, "workspace");
+    await once(socket, "open");
+    await initialHello;
+    await initialWorkspace;
+    const clearedWorkspace = nextWebSocketFrame(socket, "workspace");
+    const clearedHello = nextWebSocketFrame(socket, "hello");
+
+    const failed = await request(port, "POST", "/api/canvas-projects/open", {
+      id: target.json.project.id,
+    });
+    expect(failed.status).toBe(404);
+    expect(failed.json.error).toContain("JSON");
+    await expect(clearedWorkspace).resolves.toMatchObject({
+      type: "workspace",
+      workDocumentation: { ready: true },
+    });
+    expect((await clearedWorkspace).workspace).toBeUndefined();
+    await expect(clearedHello).resolves.toMatchObject({
+      type: "hello",
+      agents: [],
+    });
+    expect((await request(port, "GET", "/api/workspace")).status).toBe(409);
+    expect((await request(port, "GET", "/api/files")).json.files).toEqual([]);
+    socket.close();
+  });
+
+  it("removes a failed project creation and restores the previous workspace", async () => {
+    const previous = await request(port, "POST", "/api/canvas-projects", {
+      name: "create-rollback-previous",
+    });
+    const preservedFile = await request(port, "POST", "/api/files", {
+      name: "preserved-across-create-failure",
+      extension: "txt",
+      kind: "normal",
+    });
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const initialHello = nextWebSocketFrame(socket, "hello");
+    const initialWorkspace = nextWebSocketFrame(socket, "workspace");
+    await once(socket, "open");
+    await initialHello;
+    await initialWorkspace;
+    const restoredWorkspace = nextWebSocketFrame(socket, "workspace");
+    beforeNextProjectStatePromptImport = async () => {
+      throw new Error("injected create import failure");
+    };
+
+    const failed = await request(port, "POST", "/api/canvas-projects", {
+      name: "create-rollback-failed",
+    });
+    expect(failed.status).toBe(400);
+    expect(failed.json.error).toContain("injected create import failure");
+    await expect(restoredWorkspace).resolves.toMatchObject({
+      type: "workspace",
+      workspace: { canvasProject: { id: previous.json.project.id } },
+    });
+    expect((await request(port, "GET", "/api/workspace")).json.canvasProject.id).toBe(
+      previous.json.project.id,
+    );
+    expect((await request(port, "GET", "/api/files")).json.files).toEqual([
+      expect.objectContaining({ id: preservedFile.json.file.id }),
+    ]);
+    expect(
+      (await request(port, "GET", "/api/canvas-projects")).json.projects.some(
+        (project: { name: string }) => project.name === "create-rollback-failed",
+      ),
+    ).toBe(false);
+    socket.close();
+
+    await request(
+      port,
+      "DELETE",
+      `/api/canvas-projects/${encodeURIComponent(previous.json.project.id)}`,
+      undefined,
+      { "X-Agent-Canvas-Intent": "delete-project" },
+    );
+  });
+
   it("canvas project 保存并恢复节点快照和布局", async () => {
     const projectA = await request(port, "POST", "/api/canvas-projects", {
       name: "persist-a",
     });
     expect(projectA.status).toBe(201);
-    await request(port, "POST", "/api/workspace/connect", { localPath: root });
-    await request(port, "PATCH", "/api/settings", { workDocumentationEnabled: true });
+    const connectedA = await request(port, "POST", "/api/workspace/connect", {
+      localPath: root,
+    });
+    const mainWorkspace = connectedA.json.branches[0].worktreePath as string;
+    await patchAppSettings(port, { workDocumentationEnabled: true });
 
     const agent = await request(port, "POST", "/api/agents", {
       branch: "main",
@@ -1060,6 +1537,7 @@ describe("HTTP server", () => {
     expect(prompt.status).toBe(201);
 
     const layout = await request(port, "PATCH", "/api/canvas-layout", {
+      canvasProjectId: projectA.json.project.id,
       nodes: [
         {
           id: `${agent.json.id}#0`,
@@ -1101,6 +1579,8 @@ describe("HTTP server", () => {
       },
     });
 
+    await request(port, "POST", `/api/agents/${agent.json.id}/terminate`);
+
     const projectB = await request(port, "POST", "/api/canvas-projects", {
       name: "persist-b",
     });
@@ -1111,10 +1591,58 @@ describe("HTTP server", () => {
       workDocumentationEnabled: false,
     });
 
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const initialHello = once(socket, "message");
+    await once(socket, "open");
+    await initialHello;
+    const broadcastWorkspace = nextWebSocketFrame(socket, "workspace");
+    const broadcastHello = nextWebSocketFrame(socket, "hello");
+    trackedWorkDocumentationCwd = mainWorkspace;
     const reopened = await request(port, "POST", "/api/canvas-projects/open", {
       id: projectA.json.project.id,
     });
-    expect(reopened.status).toBe(200);
+    trackedWorkDocumentationCwd = undefined;
+    expect(reopened.status).toBe(207);
+    expect(reopened.json).toMatchObject({
+      workspace: {
+        canvasProject: { id: projectA.json.project.id },
+        branches: [{ branch: "main", worktreePath: mainWorkspace }],
+      },
+      partialSuccess: true,
+      workDocumentation: {
+        ready: false,
+        error: expect.stringContaining("Git"),
+      },
+    });
+    await expect(broadcastWorkspace).resolves.toMatchObject({
+      type: "workspace",
+      workspace: { canvasProject: { id: projectA.json.project.id } },
+      partialSuccess: true,
+      workDocumentation: { ready: false },
+    });
+    await expect(broadcastHello).resolves.toMatchObject({
+      type: "hello",
+      agents: [expect.objectContaining({ id: agent.json.id })],
+    });
+    socket.close();
+    const lateSocket = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const lateHello = nextWebSocketFrame(lateSocket, "hello");
+    const lateWorkspace = nextWebSocketFrame(lateSocket, "workspace");
+    await once(lateSocket, "open");
+    await expect(lateHello).resolves.toMatchObject({
+      type: "hello",
+      agents: [expect.objectContaining({ id: agent.json.id })],
+    });
+    await expect(lateWorkspace).resolves.toMatchObject({
+      type: "workspace",
+      workspace: { canvasProject: { id: projectA.json.project.id } },
+      partialSuccess: true,
+      workDocumentation: { ready: false },
+    });
+    lateSocket.close();
+    expect((await request(port, "GET", "/api/workspace")).json.canvasProject.id).toBe(
+      projectA.json.project.id,
+    );
     expect((await request(port, "GET", "/api/settings")).json).toEqual({
       fullPermissionMode: false,
       workDocumentationEnabled: true,
@@ -1138,6 +1666,657 @@ describe("HTTP server", () => {
       expect.objectContaining({ id: prompt.json.prompt.id, content: "saved prompt" }),
     ]);
     expect(restoredLayout.json.nodes).toEqual(layout.json.nodes);
+  });
+
+  it("publishes the authoritative workspace and hello before activating overdue imported flows", async () => {
+    const target = await request(port, "POST", "/api/canvas-projects", {
+      name: "overdue-flow-target",
+    });
+    const source = await request(port, "POST", "/api/canvas-projects", {
+      name: "overdue-flow-source",
+    });
+    expect(target.status).toBe(201);
+    expect(source.status).toBe(201);
+
+    const statePath = path.join(target.json.project.projectRoot, "canvas-state.json");
+    const state = JSON.parse(await readFile(statePath, "utf-8"));
+    state.prFlows = [
+      {
+        id: "pr_flow_1",
+        proposerAgentId: "agent_old",
+        sourceBranch: "feature/old",
+        targetBranch: "main",
+        summary: "Expired imported PR",
+        files: ["src/old-pr.ts"],
+        fileChanges: [{ status: "M", path: "src/old-pr.ts" }],
+        status: "source_review_collecting",
+        createdAt: 1,
+        updatedAt: 1,
+        currentStage: "source_preflight",
+        deadlineAt: 1,
+        reviewRequests: [],
+      },
+    ];
+    state.syncFlows = [
+      {
+        id: "sync_flow_1",
+        kind: "cherry_pick",
+        proposerAgentId: "agent_old",
+        targetBranch: "feature/old",
+        commitSha: "abcdef123456",
+        summary: "Expired imported sync",
+        reason: "Exercise activation ordering",
+        files: ["src/old-sync.ts"],
+        fileChanges: [{ status: "M", path: "src/old-sync.ts" }],
+        status: "review_collecting",
+        createdAt: 1,
+        updatedAt: 1,
+        deadlineAt: 1,
+      },
+    ];
+    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf-8");
+
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const initialHello = nextWebSocketFrame(socket, "hello");
+    const initialWorkspace = nextWebSocketFrame(socket, "workspace");
+    await once(socket, "open");
+    await initialHello;
+    await initialWorkspace;
+    const frames: any[] = [];
+    socket.on("message", (payload: RawData) => {
+      frames.push(JSON.parse(String(payload)));
+    });
+
+    const opened = await request(port, "POST", "/api/canvas-projects/open", {
+      id: target.json.project.id,
+    });
+    expect(opened.status).toBe(200);
+    await vi.waitFor(() => {
+      expect(frames.some((frame) => frame.type === "pr_flow")).toBe(true);
+      expect(frames.some((frame) => frame.type === "sync_flow")).toBe(true);
+    });
+
+    const workspaceIndex = frames.findIndex(
+      (frame) =>
+        frame.type === "workspace" &&
+        frame.workspace?.canvasProject?.id === target.json.project.id,
+    );
+    const helloIndex = frames.findIndex(
+      (frame, index) => index > workspaceIndex && frame.type === "hello",
+    );
+    const prFlowIndex = frames.findIndex((frame) => frame.type === "pr_flow");
+    const syncFlowIndex = frames.findIndex((frame) => frame.type === "sync_flow");
+    expect(workspaceIndex).toBeGreaterThanOrEqual(0);
+    expect(helloIndex).toBeGreaterThan(workspaceIndex);
+    expect(prFlowIndex).toBeGreaterThan(helloIndex);
+    expect(syncFlowIndex).toBeGreaterThan(helloIndex);
+    expect(frames[helloIndex]).toMatchObject({
+      prFlows: [{ id: "pr_flow_1", status: "source_review_collecting" }],
+      syncFlows: [{ id: "sync_flow_1", status: "review_collecting" }],
+    });
+    expect(frames[prFlowIndex]).toMatchObject({
+      type: "pr_flow",
+      flow: { id: "pr_flow_1", status: "timed_out" },
+    });
+    expect(frames[syncFlowIndex]).toMatchObject({
+      type: "sync_flow",
+      flow: { id: "sync_flow_1", status: "timed_out" },
+    });
+    socket.close();
+  });
+
+  it("rejects a delayed canvas layout save from a previous project", async () => {
+    const projectA = await request(port, "POST", "/api/canvas-projects", {
+      name: "layout-owner-a",
+    });
+    const projectB = await request(port, "POST", "/api/canvas-projects", {
+      name: "layout-owner-b",
+    });
+    expect(projectA.status, JSON.stringify(projectA.json)).toBe(201);
+    expect(projectB.status).toBe(201);
+
+    const missingOwner = await request(port, "PATCH", "/api/canvas-layout", {
+      nodes: [],
+    });
+    expect(missingOwner.status).toBe(409);
+
+    const staleSave = await request(port, "PATCH", "/api/canvas-layout", {
+      canvasProjectId: projectA.json.project.id,
+      nodes: [
+        {
+          id: "stale-node",
+          type: "file",
+          position: { x: 10, y: 20 },
+        },
+      ],
+    });
+    expect(staleSave.status).toBe(409);
+    expect(staleSave.json.error).toContain("项目已切换");
+    expect((await request(port, "GET", "/api/canvas-layout")).json.nodes).toEqual([]);
+  });
+
+  it("rejects delayed permission settings from a previous project", async () => {
+    const projectA = await request(port, "POST", "/api/canvas-projects", {
+      name: "settings-owner-a",
+    });
+    const projectB = await request(port, "POST", "/api/canvas-projects", {
+      name: "settings-owner-b",
+    });
+    expect(projectA.status, JSON.stringify(projectA.json)).toBe(201);
+    expect(projectB.status).toBe(201);
+
+    const missingOwner = await request(port, "PATCH", "/api/settings", {
+      fullPermissionMode: true,
+    });
+    expect(missingOwner.status).toBe(409);
+
+    const staleSettings = await request(port, "PATCH", "/api/settings", {
+      canvasProjectId: projectA.json.project.id,
+      fullPermissionMode: true,
+      workDocumentationEnabled: true,
+    });
+    expect(staleSettings.status).toBe(409);
+    expect(staleSettings.json.error).toContain("项目已切换");
+    expect((await request(port, "GET", "/api/settings")).json).toEqual({
+      fullPermissionMode: false,
+      workDocumentationEnabled: false,
+    });
+  });
+
+  it("rejects stale project-version headers on project-local mutations", async () => {
+    const projectA = await request(port, "POST", "/api/canvas-projects", {
+      name: "mutation-token-a",
+    });
+    const projectB = await request(port, "POST", "/api/canvas-projects", {
+      name: "mutation-token-b",
+    });
+    expect(projectA.status).toBe(201);
+    expect(projectB.status).toBe(201);
+    const staleHeaders = {
+      "X-Agent-Canvas-Project-Id": projectA.json.project.id,
+      "X-Agent-Canvas-Project-Revision": String(projectA.json.workspace.revision),
+    };
+
+    const staleConnect = await request(
+      port,
+      "POST",
+      "/api/workspace/connect",
+      { localPath: root },
+      staleHeaders,
+    );
+    expect(staleConnect.status).toBe(409);
+    const staleFile = await request(
+      port,
+      "POST",
+      "/api/files",
+      { name: "must-not-land-in-b", extension: "txt", kind: "normal" },
+      staleHeaders,
+    );
+    expect(staleFile.status).toBe(409);
+    const missingToken = await rawRequest(port, "POST", "/api/files", {
+      name: "missing-token",
+      extension: "txt",
+      kind: "normal",
+    });
+    expect(missingToken.status).toBe(409);
+
+    const current = await request(port, "GET", "/api/workspace");
+    expect(current.json.canvasProject.id).toBe(projectB.json.project.id);
+    expect(current.json.repo).toBeUndefined();
+    expect(current.json.branches).toEqual([]);
+    expect((await request(port, "GET", "/api/files")).json.files).toEqual([]);
+  });
+
+  it("rejects stale revisions after an A-to-B-to-A project cycle", async () => {
+    const firstA = await request(port, "POST", "/api/canvas-projects", {
+      name: "revision-aba-a",
+    });
+    const projectB = await request(port, "POST", "/api/canvas-projects", {
+      name: "revision-aba-b",
+    });
+    const reopenedA = await request(port, "POST", "/api/canvas-projects/open", {
+      id: firstA.json.project.id,
+    });
+    expect(firstA.status).toBe(201);
+    expect(projectB.status).toBe(201);
+    expect(reopenedA.status).toBe(200);
+    expect(reopenedA.json.workspace.revision).not.toBe(firstA.json.workspace.revision);
+    const staleHeaders = {
+      "X-Agent-Canvas-Project-Id": firstA.json.project.id,
+      "X-Agent-Canvas-Project-Revision": String(firstA.json.workspace.revision),
+    };
+
+    const staleSettings = await request(
+      port,
+      "PATCH",
+      "/api/settings",
+      {
+        canvasProjectId: firstA.json.project.id,
+        fullPermissionMode: true,
+      },
+      staleHeaders,
+    );
+    expect(staleSettings.status).toBe(409);
+    expect(
+      await request(
+        port,
+        "POST",
+        "/api/files",
+        { name: "stale-aba", extension: "txt", kind: "normal" },
+        staleHeaders,
+      ),
+    ).toMatchObject({ status: 409 });
+    expect(
+      await request(port, "POST", "/api/agents", { branch: "main" }, staleHeaders),
+    ).toMatchObject({ status: 409 });
+    expect(
+      await request(
+        port,
+        "POST",
+        "/api/pr-flows",
+        {
+          proposerAgentId: "agent_1",
+          targetBranch: "main",
+          summary: "must not use an old project revision",
+          files: ["src/stale.ts"],
+        },
+        staleHeaders,
+      ),
+    ).toMatchObject({ status: 409 });
+
+    expect((await request(port, "GET", "/api/settings")).json.fullPermissionMode).toBe(false);
+    expect((await request(port, "GET", "/api/agents")).json.agents).toEqual([]);
+    expect((await request(port, "GET", "/api/pr-flows")).json.flows).toEqual([]);
+    const validFile = await request(port, "POST", "/api/files", {
+      name: "current-aba",
+      extension: "txt",
+      kind: "normal",
+    });
+    expect(validFile.status).toBe(201);
+  });
+
+  it("sends an atomic hello and workspace snapshot to a socket connected mid-project import", async () => {
+    const projectA = await request(port, "POST", "/api/canvas-projects", {
+      name: "socket-snapshot-a",
+    });
+    const projectB = await request(port, "POST", "/api/canvas-projects", {
+      name: "socket-snapshot-b",
+    });
+    expect(projectA.status, JSON.stringify(projectA.json)).toBe(201);
+    expect(projectB.status, JSON.stringify(projectB.json)).toBe(201);
+
+    const oldProjectRunner = manager.create();
+    await manager.startAgent(oldProjectRunner.id, { prompt: "old project agent" });
+    await vi.waitFor(() => {
+      expect(manager.snapshot(oldProjectRunner.id)?.status).toBe("done");
+    });
+
+    let markImportStarted!: () => void;
+    let releaseImport!: () => void;
+    const importStarted = new Promise<void>((resolve) => {
+      markImportStarted = resolve;
+    });
+    const importRelease = new Promise<void>((resolve) => {
+      releaseImport = resolve;
+    });
+    const originalImport = manager.importState.bind(manager);
+    const importSpy = vi.spyOn(manager, "importState").mockImplementationOnce(async (state) => {
+      markImportStarted();
+      await importRelease;
+      await originalImport(state);
+    });
+    let socket: WebSocket | undefined;
+    try {
+      const opening = request(port, "POST", "/api/canvas-projects/open", {
+        id: projectA.json.project.id,
+      });
+      await importStarted;
+
+      const frames: any[] = [];
+      socket = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      socket.on("message", (payload: RawData) => frames.push(JSON.parse(String(payload))));
+      await once(socket, "open");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(frames).toEqual([]);
+
+      releaseImport();
+      await expect(opening).resolves.toMatchObject({ status: 200 });
+      await vi.waitFor(() => expect(frames.length).toBeGreaterThanOrEqual(2));
+      expect(frames[0]).toMatchObject({ type: "hello" });
+      expect(frames[0].agents).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ id: oldProjectRunner.id })]),
+      );
+      expect(frames[1]).toMatchObject({
+        type: "workspace",
+        workspace: { canvasProject: { id: projectA.json.project.id } },
+      });
+    } finally {
+      releaseImport();
+      importSpy.mockRestore();
+      socket?.close();
+    }
+  });
+
+  it("serializes concurrent project opens through state load and authoritative broadcasts", async () => {
+    const projectA = await request(port, "POST", "/api/canvas-projects", {
+      name: "concurrent-open-a",
+    });
+    const projectB = await request(port, "POST", "/api/canvas-projects", {
+      name: "concurrent-open-b",
+    });
+    expect(projectA.status).toBe(201);
+    expect(projectB.status).toBe(201);
+
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const initialHello = nextWebSocketFrame(socket, "hello");
+    const initialWorkspace = nextWebSocketFrame(socket, "workspace");
+    await once(socket, "open");
+    await initialHello;
+    await initialWorkspace;
+
+    let markImportStarted!: () => void;
+    let releaseImport!: () => void;
+    const importStarted = new Promise<void>((resolve) => {
+      markImportStarted = resolve;
+    });
+    const importRelease = new Promise<void>((resolve) => {
+      releaseImport = resolve;
+    });
+    beforeNextProjectStatePromptImport = async () => {
+      markImportStarted();
+      await importRelease;
+    };
+
+    const broadcastProjectIds: string[] = [];
+    socket.on("message", (payload: RawData) => {
+      const frame = JSON.parse(String(payload));
+      if (frame.type === "workspace") {
+        broadcastProjectIds.push(frame.workspace.canvasProject.id);
+      }
+    });
+    const responseOrder: string[] = [];
+    const openA = request(port, "POST", "/api/canvas-projects/open", {
+      id: projectA.json.project.id,
+    }).then((response) => {
+      responseOrder.push(response.json.workspace.canvasProject.id);
+      return response;
+    });
+    await importStarted;
+
+    let fileFinished = false;
+    const fileDuringOpen = request(port, "POST", "/api/files", {
+      name: "created-after-open-transaction",
+      extension: "txt",
+      kind: "normal",
+    }).then((response) => {
+      fileFinished = true;
+      return response;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    let refreshFinished = false;
+    const filesDuringOpen = request(port, "GET", "/api/files").then((response) => {
+      refreshFinished = true;
+      return response;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    let connectFinished = false;
+    const connectA = request(port, "POST", "/api/workspace/connect", {
+      localPath: root,
+    }).then((response) => {
+      connectFinished = true;
+      return response;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    let branchFinished = false;
+    const createBranchA = request(port, "POST", "/api/workspace/branches", {
+      branch: "feature/concurrent-open-transaction",
+    }).then((response) => {
+      branchFinished = true;
+      return response;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    let openBFinished = false;
+    const openB = request(port, "POST", "/api/canvas-projects/open", {
+      id: projectB.json.project.id,
+    }).then((response) => {
+      openBFinished = true;
+      if (response.status === 200) {
+        responseOrder.push(response.json.workspace.canvasProject.id);
+      }
+      return response;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(fileFinished).toBe(false);
+    expect(refreshFinished).toBe(false);
+    expect(connectFinished).toBe(false);
+    expect(branchFinished).toBe(false);
+    expect(openBFinished).toBe(false);
+
+    releaseImport();
+    const [responseA, createdFile, listedFiles, connectedA, branchA, responseB] = await Promise.all([
+      openA,
+      fileDuringOpen,
+      filesDuringOpen,
+      connectA,
+      createBranchA,
+      openB,
+    ]);
+    expect(responseA.status).toBe(200);
+    expect(createdFile.status).toBe(409);
+    expect(listedFiles.json.files).toEqual([]);
+    expect(connectedA.status).toBe(409);
+    expect(branchA.status).toBe(409);
+    expect(responseB.status).toBe(409);
+    expect(responseOrder).toEqual([projectA.json.project.id]);
+    await vi.waitFor(() => {
+      expect(broadcastProjectIds).toEqual([projectA.json.project.id]);
+    });
+    expect((await request(port, "GET", "/api/workspace")).json.canvasProject.id).toBe(
+      projectA.json.project.id,
+    );
+    socket.close();
+  });
+
+  it("does not let a slow project request body jump ahead of terminal agent events", async () => {
+    const current = await request(port, "GET", "/api/workspace");
+    const slowOpen = streamingRequest(port, "POST", "/api/canvas-projects/open");
+    slowOpen.req.write('{"id":"');
+
+    const runner = manager.create();
+    await manager.startAgent(runner.id, { prompt: "finish before project open" });
+    await vi.waitFor(() => {
+      expect(manager.snapshot(runner.id)?.status).toBe("done");
+    });
+    // This project-scoped read sits behind the force-enqueued derived event and proves it
+    // completed while the trusted POST body was still streaming outside the transaction gate.
+    expect((await request(port, "GET", "/api/agents")).status).toBe(200);
+
+    slowOpen.req.end(`${current.json.canvasProject.id}"}`);
+    await expect(slowOpen.response).resolves.toMatchObject({
+      status: 200,
+      json: { workspace: { canvasProject: { id: current.json.canvasProject.id } } },
+    });
+  });
+
+  it("invalidates delayed turn context before an asynchronous project open", async () => {
+    await manager.clear();
+    await vi.waitFor(() => {
+      expect(pullRequestFlowManager.hasPendingOperations()).toBe(false);
+      expect(syncFlowManager.hasPendingOperations()).toBe(false);
+    });
+    await request(port, "GET", "/api/workspace");
+    const projectB = await request(port, "POST", "/api/canvas-projects", {
+      name: "turn-context-target-b",
+    });
+    expect(projectB.status, JSON.stringify(projectB.json)).toBe(201);
+    const currentB = await request(port, "GET", "/api/workspace");
+    expect(currentB.json).toMatchObject({
+      canvasProject: { id: projectB.json.project.id },
+      revision: projectB.json.workspace.revision,
+    });
+    const projectA = await request(port, "POST", "/api/canvas-projects", {
+      name: "turn-context-origin-a",
+    });
+    expect(projectA.status, JSON.stringify(projectA.json)).toBe(201);
+
+    let markContextRequested!: () => void;
+    let releaseContext!: (metadata: { baseCommitSha?: string }) => void;
+    const contextRequested = new Promise<void>((resolve) => {
+      markContextRequested = resolve;
+    });
+    const delayedContext = new Promise<{ baseCommitSha?: string }>((resolve) => {
+      releaseContext = resolve;
+    });
+    resolveTurnContextForTest = async () => {
+      markContextRequested();
+      return await delayedContext;
+    };
+    const observedTurnContexts: AgentEventEnvelope[] = [];
+    const unsubscribe = manager.onEvent((envelope) => {
+      if (envelope.event.kind === "turn_context") observedTurnContexts.push(envelope);
+    });
+
+    let markProjectSelected!: () => void;
+    let releaseProjectOpen!: () => void;
+    const projectSelected = new Promise<void>((resolve) => {
+      markProjectSelected = resolve;
+    });
+    const projectOpenRelease = new Promise<void>((resolve) => {
+      releaseProjectOpen = resolve;
+    });
+    const originalOpen = workspaceManager.openCanvasProject.bind(workspaceManager);
+    const openSpy = vi.spyOn(workspaceManager, "openCanvasProject").mockImplementationOnce(
+      async (input) => {
+        const opened = await originalOpen(input);
+        markProjectSelected();
+        await projectOpenRelease;
+        return opened;
+      },
+    );
+
+    try {
+      const runner = manager.create();
+      await manager.startAgent(runner.id, { prompt: "resolve context later" });
+      await contextRequested;
+      await vi.waitFor(() => {
+        expect(manager.snapshot(runner.id)?.status).toBe("done");
+      });
+
+      const opening = request(port, "POST", "/api/canvas-projects/open", {
+        id: projectB.json.project.id,
+      });
+      await projectSelected;
+      releaseContext({ baseCommitSha: "abcdef1234567890" });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(observedTurnContexts).toEqual([]);
+
+      releaseProjectOpen();
+      await expect(opening).resolves.toMatchObject({
+        status: 200,
+        json: { workspace: { canvasProject: { id: projectB.json.project.id } } },
+      });
+    } finally {
+      releaseProjectOpen();
+      releaseContext({});
+      openSpy.mockRestore();
+      unsubscribe();
+      resolveTurnContextForTest = async () => ({});
+    }
+  });
+
+  it("rejects a slow mutation after its originating project has changed", async () => {
+    await vi.waitFor(() => {
+      expect(pullRequestFlowManager.hasPendingOperations()).toBe(false);
+      expect(syncFlowManager.hasPendingOperations()).toBe(false);
+    });
+    await request(port, "GET", "/api/workspace");
+    const projectB = await request(port, "POST", "/api/canvas-projects", {
+      name: "slow-request-target-b",
+    });
+    expect(projectB.status, JSON.stringify(projectB.json)).toBe(201);
+    const currentB = await request(port, "GET", "/api/workspace");
+    expect(currentB.json).toMatchObject({
+      canvasProject: { id: projectB.json.project.id },
+      revision: projectB.json.workspace.revision,
+    });
+    const projectA = await request(port, "POST", "/api/canvas-projects", {
+      name: "slow-request-origin-a",
+    });
+    expect(projectA.status, JSON.stringify(projectA.json)).toBe(201);
+
+    const slowFile = streamingRequest(port, "POST", "/api/files");
+    slowFile.req.write('{"name":"stale');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const openedB = await request(port, "POST", "/api/canvas-projects/open", {
+      id: projectB.json.project.id,
+    });
+    expect(openedB.status).toBe(200);
+    slowFile.req.end('-file","extension":"txt","kind":"normal"}');
+
+    await expect(slowFile.response).resolves.toMatchObject({
+      status: 409,
+      json: { error: expect.stringContaining("项目已切换") },
+    });
+    expect((await request(port, "GET", "/api/files")).json.files).toEqual([]);
+    expect((await request(port, "GET", "/api/workspace")).json.canvasProject.id).toBe(
+      projectB.json.project.id,
+    );
+  });
+
+  it("rejects a tokenless agent callback after an A-to-B-to-A project cycle", async () => {
+    await manager.clear();
+    await vi.waitFor(() => {
+      expect(pullRequestFlowManager.hasPendingOperations()).toBe(false);
+      expect(syncFlowManager.hasPendingOperations()).toBe(false);
+    });
+    const projectA = await request(port, "POST", "/api/canvas-projects", {
+      name: "slow-agent-callback-a",
+    });
+    const projectB = await request(port, "POST", "/api/canvas-projects", {
+      name: "slow-agent-callback-b",
+    });
+    expect(projectA.status, JSON.stringify(projectA.json)).toBe(201);
+    expect(projectB.status, JSON.stringify(projectB.json)).toBe(201);
+    expect(
+      await request(port, "POST", "/api/canvas-projects/open", {
+        id: projectA.json.project.id,
+      }),
+    ).toMatchObject({ status: 200 });
+
+    const runner = manager.create();
+    await manager.startAgent(runner.id, { prompt: "finish before callback" });
+    await vi.waitFor(() => {
+      expect(manager.snapshot(runner.id)?.status).toBe("done");
+    });
+    const slowReport = streamingRequest(
+      port,
+      "POST",
+      `/api/agents/${runner.id}/report-result`,
+      false,
+    );
+    slowReport.req.write(
+      '{"name":"stale-callback","extension":"txt","resultKind":"document","content":"',
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(
+      await request(port, "POST", "/api/canvas-projects/open", {
+        id: projectB.json.project.id,
+      }),
+    ).toMatchObject({ status: 200 });
+    expect(
+      await request(port, "POST", "/api/canvas-projects/open", {
+        id: projectA.json.project.id,
+      }),
+    ).toMatchObject({ status: 200 });
+    slowReport.req.end('must not land"}');
+
+    await expect(slowReport.response).resolves.toMatchObject({
+      status: 409,
+      json: { error: expect.any(String) },
+    });
+    expect((await request(port, "GET", "/api/files")).json.files).toEqual([]);
   });
 });
 

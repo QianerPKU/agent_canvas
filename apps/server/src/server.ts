@@ -1,4 +1,5 @@
 import http from "node:http";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -54,6 +55,7 @@ import { SyncFlowManager } from "./sync/SyncFlowManager.js";
 import {
   WorkspaceManager,
   WorkspaceProjectChangedError,
+  type WorkspaceProjectRevision,
 } from "./workspaces/WorkspaceManager.js";
 
 export interface CreateServerResult {
@@ -91,13 +93,28 @@ export interface CreateServerOptions {
 interface CanvasStateController {
   getLayout(): CanvasLayoutSnapshot;
   setLayout(layout: Partial<CanvasLayoutSnapshot>): Promise<CanvasLayoutSnapshot>;
-  loadProjectState(): Promise<void>;
+  loadProjectState(): Promise<WorkDocumentationLoadStatus>;
+  activateImportedFlowState(): void;
   unloadProjectState(): Promise<void>;
+  runProjectTransaction<T>(
+    operation: () => Promise<T>,
+    options?: { saveCurrent?: boolean; forceEnqueue?: boolean },
+  ): Promise<T>;
+  currentWorkspaceFrame(): Promise<Extract<ServerFrame, { type: "workspace" }>>;
+  recordWorkDocumentationStatus(status: WorkDocumentationLoadStatus): void;
+  beginDerivedAgentEvent(): () => void;
+  hasPendingDerivedAgentEvents(): boolean;
   saveNow(): Promise<void>;
   saveSoon(): void;
 }
 
+interface WorkDocumentationLoadStatus {
+  ready: boolean;
+  error?: string;
+}
+
 const CANVAS_STATE_FILE = "canvas-state.json";
+const requestJsonBodies = new WeakMap<http.IncomingMessage, Promise<unknown | undefined>>();
 
 /**
  * 组装 HTTP（REST 命令）+ WebSocket（事件广播）服务。
@@ -123,11 +140,6 @@ export function createServer(
       }),
     ),
   );
-  manager.setFileAccessPreparer(async (agentId) => {
-    await workspaceManager.prepareAgentWorkspace(agentId, manager.configOf(agentId), {
-      workDocumentationEnabled: manager.appSettings().workDocumentationEnabled,
-    });
-  });
   const promptManager =
     options.promptManager ??
     new PromptManager({
@@ -166,27 +178,65 @@ export function createServer(
     syncFlowManager,
     commitManager,
   });
+  manager.setFileAccessPreparer((agentId) =>
+    canvasState.runProjectTransaction(async () => {
+      await workspaceManager.prepareAgentWorkspace(agentId, manager.configOf(agentId), {
+        workDocumentationEnabled: manager.appSettings().workDocumentationEnabled,
+      });
+    }),
+  );
   const httpServer = http.createServer((req, res) => {
-    handleHttp(
-      req,
-      res,
-      manager,
-      fileManager,
-      promptManager,
-      workspaceManager,
-      pullRequestFlowManager,
-      syncFlowManager,
-      commitManager,
-      codexAuthManager,
-      defaultCwd,
-      codexModels,
-      options.openFile ?? openFileInVscode,
-      options.pickDirectory ?? defaultPickDirectory,
-      canvasState,
-      broadcastHello,
-      broadcastFrame,
-      allowedOrigins,
-    ).catch((err) => {
+    const projectScoped = isProjectScopedHttpRequest(req);
+    let expectedProjectRevision: WorkspaceProjectRevision | undefined;
+    if (projectScoped) {
+      try {
+        expectedProjectRevision = workspaceManager.captureProjectRevision();
+      } catch {
+        expectedProjectRevision = undefined;
+      }
+    }
+    const expectedNoProject = projectScoped && !expectedProjectRevision;
+    const operation = async () => {
+      if (projectScoped) {
+        try {
+          if (expectedProjectRevision) {
+            workspaceManager.assertProjectRevision(expectedProjectRevision);
+          } else if (expectedNoProject && workspaceManager.currentProjectId()) {
+            throw new WorkspaceProjectChangedError();
+          }
+        } catch (error) {
+          return sendJson(res, workspaceErrorStatus(error), {
+            error: "请求所属项目已切换；已拒绝迟到的项目操作",
+          });
+        }
+      }
+      return await handleHttp(
+        req,
+        res,
+        manager,
+        fileManager,
+        promptManager,
+        workspaceManager,
+        pullRequestFlowManager,
+        syncFlowManager,
+        commitManager,
+        codexAuthManager,
+        defaultCwd,
+        codexModels,
+        options.openFile ?? openFileInVscode,
+        options.pickDirectory ?? defaultPickDirectory,
+        canvasState,
+        broadcastHello,
+        broadcastFrame,
+        allowedOrigins,
+      );
+    };
+    const invoke = () =>
+      projectScoped ? canvasState.runProjectTransaction(operation) : operation();
+    const result = shouldPreloadProjectRequestBody(req, allowedOrigins)
+      ? preloadRequestJsonBody(req).then(invoke)
+      : invoke();
+    result.catch((err) => {
       sendJson(res, 500, { error: errMsg(err) });
     });
   });
@@ -199,10 +249,11 @@ export function createServer(
       done(trusted, trusted ? undefined : 403, trusted ? undefined : "Forbidden origin");
     },
   });
+  const initializingClients = new WeakSet<WebSocket>();
   const broadcastFrame = (frame: ServerFrame): void => {
     const data = JSON.stringify(frame);
     for (const client of wss.clients) {
-      if (client.readyState === client.OPEN) client.send(data);
+      if (!initializingClients.has(client) && client.readyState === client.OPEN) client.send(data);
     }
   };
   const helloFrame = (): ServerFrame => ({
@@ -215,15 +266,49 @@ export function createServer(
   });
   const broadcastHello = (): void => broadcastFrame(helloFrame());
   wss.on("connection", (ws: WebSocket) => {
-    send(ws, helloFrame());
+    initializingClients.add(ws);
+    // Initial project-scoped snapshots must come from one serialized state. Otherwise a
+    // connection racing a project import can observe a half-imported hello and a workspace
+    // frame from the project selected later in the same transaction.
+    void canvasState
+      .runProjectTransaction(
+        async () => {
+          const workspace = await canvasState.currentWorkspaceFrame();
+          const hello = helloFrame();
+          send(ws, hello);
+          send(ws, workspace);
+        },
+        { forceEnqueue: true },
+      )
+      .then(
+        () => initializingClients.delete(ws),
+        () => {
+          initializingClients.delete(ws);
+          ws.close();
+        },
+      );
   });
 
   // 把 manager 的事件广播到所有 WS 客户端
   manager.onEvent((envelope) => {
-    void pullRequestFlowManager.handleAgentEvent(envelope);
-    void syncFlowManager.handleAgentEvent(envelope);
-    broadcastFrame({ type: "event", envelope });
-    canvasState.saveSoon();
+    // Agent completion can asynchronously advance PR/sync flows. Keep that derived mutation
+    // ordered with project switches so a late old-project result cannot update newly imported
+    // flow state. Calls are enqueued in listener order.
+    const finishDerivedEvent = canvasState.beginDerivedAgentEvent();
+    void canvasState
+      .runProjectTransaction(
+        async () => {
+          broadcastFrame({ type: "event", envelope });
+          await Promise.all([
+            pullRequestFlowManager.handleAgentEvent(envelope),
+            syncFlowManager.handleAgentEvent(envelope),
+          ]);
+          canvasState.saveSoon();
+        },
+        { forceEnqueue: true },
+      )
+      .catch(() => undefined)
+      .finally(finishDerivedEvent);
   });
 
   pullRequestFlowManager.onFlow((flow) => {
@@ -288,8 +373,39 @@ async function handleHttp(
   const url = new URL(req.url ?? "/", "http://localhost");
   const path = url.pathname;
   const method = req.method ?? "GET";
+  const hasLiveProjectWork = (): boolean =>
+    manager.list().some((agent) => !isTerminalStatus(agent.status)) ||
+    canvasState.hasPendingDerivedAgentEvents() ||
+    pullRequestFlowManager.hasOpenFlows() ||
+    pullRequestFlowManager.hasPendingOperations() ||
+    syncFlowManager.hasOpenFlows() ||
+    syncFlowManager.hasPendingOperations();
   if (method !== "GET" && method !== "HEAD" && !isTrustedBrowserRequest(req, allowedOrigins)) {
     return sendJson(res, 403, { error: "forbidden origin" });
+  }
+  if (requiresExpectedProjectMutation(req)) {
+    const expectedProjectId = singleHeader(req.headers["x-agent-canvas-project-id"]);
+    const expectedRevisionText = singleHeader(
+      req.headers["x-agent-canvas-project-revision"],
+    );
+    const expectedRevision = Number(expectedRevisionText);
+    let currentRevision: WorkspaceProjectRevision | undefined;
+    try {
+      currentRevision = workspaceManager.captureProjectRevision();
+    } catch {
+      currentRevision = undefined;
+    }
+    if (
+      !expectedProjectId ||
+      !expectedRevisionText ||
+      !Number.isSafeInteger(expectedRevision) ||
+      currentRevision?.projectId !== expectedProjectId ||
+      currentRevision.generation !== expectedRevision
+    ) {
+      return sendJson(res, 409, {
+        error: "请求所属项目版本已切换；已拒绝迟到的项目写入",
+      });
+    }
   }
 
   if (method === "GET" && path === "/api/health") {
@@ -313,7 +429,17 @@ async function handleHttp(
   }
 
   if (method === "PATCH" && path === "/api/settings") {
-    const body = await readJson<Partial<AgentCanvasSettings>>(req);
+    const body = await readJson<
+      Partial<AgentCanvasSettings> & { canvasProjectId?: string }
+    >(req);
+    if (
+      !body?.canvasProjectId ||
+      body.canvasProjectId !== workspaceManager.currentProjectId()
+    ) {
+      return sendJson(res, 409, {
+        error: "设置所属项目已切换；已拒绝迟到的权限设置",
+      });
+    }
     if (
       (body?.fullPermissionMode !== undefined &&
         typeof body.fullPermissionMode !== "boolean") ||
@@ -323,14 +449,22 @@ async function handleHttp(
       return sendJson(res, 400, { error: "设置项必须是 boolean" });
     }
     try {
-      if (body?.workDocumentationEnabled) {
-        const revision = workspaceManager.captureProjectRevision();
-        await workspaceManager.prepareWorkDocumentationForAllBranches(revision);
-        workspaceManager.assertProjectRevision(revision);
-      }
-      const settings = manager.updateAppSettings(body ?? {});
-      canvasState.saveSoon();
-      return sendJson(res, 200, settings);
+      return await canvasState.runProjectTransaction(async () => {
+        if (body?.workDocumentationEnabled) {
+          const revision = workspaceManager.captureProjectRevision();
+          await workspaceManager.prepareWorkDocumentationForAllBranches(revision);
+          workspaceManager.assertProjectRevision(revision);
+        }
+        const settings = manager.updateAppSettings({
+          fullPermissionMode: body.fullPermissionMode,
+          workDocumentationEnabled: body.workDocumentationEnabled,
+        });
+        if (body?.workDocumentationEnabled !== undefined) {
+          canvasState.recordWorkDocumentationStatus({ ready: true });
+        }
+        canvasState.saveSoon();
+        return sendJson(res, 200, settings);
+      });
     } catch (error) {
       return sendJson(res, workspaceErrorStatus(error), { error: errMsg(error) });
     }
@@ -341,8 +475,18 @@ async function handleHttp(
   }
 
   if (method === "PATCH" && path === "/api/canvas-layout") {
-    const body = await readJson<Partial<CanvasLayoutSnapshot>>(req);
+    const body = await readJson<
+      Partial<CanvasLayoutSnapshot> & { canvasProjectId?: string }
+    >(req);
     try {
+      if (
+        !body?.canvasProjectId ||
+        body.canvasProjectId !== workspaceManager.currentProjectId()
+      ) {
+        return sendJson(res, 409, {
+          error: "画布布局所属项目已切换；已拒绝迟到的布局保存",
+        });
+      }
       return sendJson(res, 200, await canvasState.setLayout(body ?? {}));
     } catch (error) {
       return sendJson(res, 400, { error: errMsg(error) });
@@ -350,18 +494,78 @@ async function handleHttp(
   }
 
   if (method === "GET" && path === "/api/canvas-projects") {
-    return sendJson(res, 200, { projects: await workspaceManager.listCanvasProjects() });
+    return await canvasState.runProjectTransaction(async () =>
+      sendJson(res, 200, { projects: await workspaceManager.listCanvasProjects() }),
+    );
   }
 
   if (method === "POST" && path === "/api/canvas-projects") {
     const body = await readJson<CreateCanvasProjectInput>(req);
     if (!body?.name) return sendJson(res, 400, { error: "缺少项目名称" });
+    if (hasLiveProjectWork()) {
+      return sendJson(res, 409, {
+        error: "当前项目仍有活动 agent 或流程；请先结束全部工作后再切换项目",
+      });
+    }
+    manager.invalidatePendingTurnContexts();
     try {
-      await canvasState.saveNow();
-      const project = await workspaceManager.createCanvasProject(body);
-      await canvasState.loadProjectState();
-      broadcastHello();
-      return sendJson(res, 201, { project, workspace: await workspaceManager.project() });
+      const created = await canvasState.runProjectTransaction(async () => {
+        const previousWorkspace = await workspaceManager.project().catch(() => undefined);
+        let project: Awaited<ReturnType<WorkspaceManager["createCanvasProject"]>> | undefined;
+        try {
+          project = await workspaceManager.createCanvasProject(body);
+          const workDocumentation = await canvasState.loadProjectState();
+          const workspace = await workspaceManager.project();
+          broadcastFrame({ type: "workspace", workspace, workDocumentation });
+          broadcastHello();
+          canvasState.activateImportedFlowState();
+          return { project, workspace };
+        } catch (createError) {
+          const rollbackErrors: unknown[] = [];
+          if (project) {
+            try {
+              await workspaceManager.deleteCanvasProject(project.id);
+            } catch (error) {
+              rollbackErrors.push(error);
+            }
+          }
+          try {
+            if (previousWorkspace?.canvasProject) {
+              await workspaceManager.openCanvasProject({
+                id: previousWorkspace.canvasProject.id,
+                projectRoot: previousWorkspace.projectRoot,
+              });
+              const workDocumentation = await canvasState.loadProjectState();
+              const workspace = await workspaceManager.project();
+              broadcastFrame({
+                type: "workspace",
+                workspace,
+                partialSuccess: !workDocumentation.ready || undefined,
+                workDocumentation,
+              });
+            } else {
+              await workspaceManager.closeCanvasProject();
+              await canvasState.unloadProjectState();
+              broadcastFrame({
+                type: "workspace",
+                workDocumentation: { ready: true },
+              });
+            }
+            broadcastHello();
+            canvasState.activateImportedFlowState();
+          } catch (error) {
+            rollbackErrors.push(error);
+          }
+          if (rollbackErrors.length > 0) {
+            throw new Error(
+              `创建项目失败，且恢复原项目失败：${errMsg(createError)}；${rollbackErrors.map(errMsg).join("；")}`,
+              { cause: createError },
+            );
+          }
+          throw createError;
+        }
+      }, { saveCurrent: true });
+      return sendJson(res, 201, created);
     } catch (error) {
       return sendJson(res, 400, { error: errMsg(error) });
     }
@@ -372,12 +576,78 @@ async function handleHttp(
     if (!body?.id && !body?.projectRoot?.trim()) {
       return sendJson(res, 400, { error: "缺少项目 id 或项目文件夹" });
     }
+    if (hasLiveProjectWork()) {
+      return sendJson(res, 409, {
+        error: "当前项目仍有活动 agent 或流程；请先结束全部工作后再切换项目",
+      });
+    }
+    manager.invalidatePendingTurnContexts();
     try {
-      await canvasState.saveNow();
-      const workspace = await workspaceManager.openCanvasProject(body);
-      await canvasState.loadProjectState();
-      broadcastHello();
-      return sendJson(res, 200, { workspace });
+      const opened = await canvasState.runProjectTransaction(async () => {
+        const previousWorkspace = await workspaceManager.project().catch(() => undefined);
+        try {
+          const workspace = await workspaceManager.openCanvasProject(body);
+          const workDocumentation = await canvasState.loadProjectState();
+          broadcastFrame({
+            type: "workspace",
+            workspace,
+            partialSuccess: !workDocumentation.ready || undefined,
+            workDocumentation,
+          });
+          broadcastHello();
+          canvasState.activateImportedFlowState();
+          return { workspace, workDocumentation };
+        } catch (openError) {
+          if (!previousWorkspace?.canvasProject) {
+            try {
+              await workspaceManager.closeCanvasProject();
+              await canvasState.unloadProjectState();
+              broadcastFrame({
+                type: "workspace",
+                workDocumentation: { ready: true },
+              });
+              broadcastHello();
+              canvasState.activateImportedFlowState();
+            } catch (rollbackError) {
+              throw new Error(
+                `打开项目失败，且清理失败项目状态失败：${errMsg(openError)}；${errMsg(rollbackError)}`,
+                { cause: openError },
+              );
+            }
+            throw openError;
+          }
+          try {
+            await workspaceManager.openCanvasProject({
+              id: previousWorkspace.canvasProject.id,
+              projectRoot: previousWorkspace.projectRoot,
+            });
+            const workDocumentation = await canvasState.loadProjectState();
+            const workspace = await workspaceManager.project();
+            broadcastFrame({
+              type: "workspace",
+              workspace,
+              partialSuccess: !workDocumentation.ready || undefined,
+              workDocumentation,
+            });
+            broadcastHello();
+            canvasState.activateImportedFlowState();
+          } catch (rollbackError) {
+            throw new Error(
+              `打开项目失败，且恢复原项目失败：${errMsg(openError)}；${errMsg(rollbackError)}`,
+              { cause: openError },
+            );
+          }
+          throw openError;
+        }
+      }, { saveCurrent: true });
+      if (!opened.workDocumentation.ready) {
+        return sendJson(res, 207, {
+          workspace: opened.workspace,
+          partialSuccess: true,
+          workDocumentation: opened.workDocumentation,
+        });
+      }
+      return sendJson(res, 200, { workspace: opened.workspace });
     } catch (error) {
       return sendJson(res, 404, { error: errMsg(error) });
     }
@@ -404,19 +674,24 @@ async function handleHttp(
     try {
       const projectId = decodeURIComponent(canvasProjectMatch[1]!);
       const deletingCurrentProject = workspaceManager.currentProjectId() === projectId;
-      if (
-        deletingCurrentProject &&
-        manager.list().some((agent) => !isTerminalStatus(agent.status))
-      ) {
+      if (deletingCurrentProject && hasLiveProjectWork()) {
         return sendJson(res, 409, {
-          error: "当前项目仍有活动 agent；请先终止全部 agent 后再删除",
+          error: "当前项目仍有活动 agent 或流程；请先结束全部工作后再删除",
         });
       }
-      await canvasState.saveNow();
-      if (deletingCurrentProject) await canvasState.unloadProjectState();
-      const project = await workspaceManager.deleteCanvasProject(projectId);
-      broadcastHello();
-      return sendJson(res, 200, { project });
+      if (deletingCurrentProject) manager.invalidatePendingTurnContexts();
+      return await canvasState.runProjectTransaction(async () => {
+        const project = await workspaceManager.deleteCanvasProject(projectId);
+        if (deletingCurrentProject) {
+          await canvasState.unloadProjectState();
+          broadcastFrame({
+            type: "workspace",
+            workDocumentation: { ready: true },
+          });
+        }
+        broadcastHello();
+        return sendJson(res, 200, { project });
+      }, { saveCurrent: true });
     } catch (error) {
       return sendJson(res, 404, { error: errMsg(error) });
     }
@@ -424,7 +699,9 @@ async function handleHttp(
 
   if (method === "GET" && path === "/api/workspace") {
     try {
-      return sendJson(res, 200, await workspaceManager.project());
+      return await canvasState.runProjectTransaction(async () =>
+        sendJson(res, 200, await workspaceManager.project()),
+      );
     } catch (error) {
       return sendJson(res, 409, { error: errMsg(error) });
     }
@@ -432,34 +709,51 @@ async function handleHttp(
 
   if (method === "POST" && path === "/api/workspace/connect") {
     const body = await readJson<ConnectGitHubInput>(req);
-    let connected: Awaited<ReturnType<WorkspaceManager["connectWithProjectRevision"]>>;
-    try {
-      connected = await workspaceManager.connectWithProjectRevision(body ?? {});
-    } catch (error) {
-      return sendJson(res, 400, { error: errMsg(error) });
-    }
-    if (manager.appSettings().workDocumentationEnabled) {
+    return await canvasState.runProjectTransaction(async () => {
+      let connected: Awaited<ReturnType<WorkspaceManager["connectWithProjectRevision"]>>;
       try {
-        await workspaceManager.prepareWorkDocumentationForAllBranches(connected.revision);
-        workspaceManager.assertProjectRevision(connected.revision);
+        connected = await workspaceManager.connectWithProjectRevision(body ?? {});
       } catch (error) {
-        // The repository connection is already persisted; removing it here could discard
-        // work created by another request, so expose the documentation failure explicitly.
-        canvasState.saveSoon();
-        return sendJson(res, 207, {
-          ...connected.workspace,
-          partialSuccess: true,
-          workDocumentation: { ready: false, error: errMsg(error) },
-        });
+        return sendJson(res, 400, { error: errMsg(error) });
       }
-    }
-    canvasState.saveSoon();
-    return sendJson(res, 200, connected.workspace);
+      if (manager.appSettings().workDocumentationEnabled) {
+        try {
+          await workspaceManager.prepareWorkDocumentationForAllBranches(connected.revision);
+          workspaceManager.assertProjectRevision(connected.revision);
+        } catch (error) {
+          // The repository connection is already persisted; removing it here could discard
+          // work created by another request, so expose the documentation failure explicitly.
+          canvasState.saveSoon();
+          canvasState.recordWorkDocumentationStatus({ ready: false, error: errMsg(error) });
+          broadcastFrame({
+            type: "workspace",
+            workspace: connected.workspace,
+            partialSuccess: true,
+            workDocumentation: { ready: false, error: errMsg(error) },
+          });
+          return sendJson(res, 207, {
+            ...connected.workspace,
+            partialSuccess: true,
+            workDocumentation: { ready: false, error: errMsg(error) },
+          });
+        }
+      }
+      canvasState.recordWorkDocumentationStatus({ ready: true });
+      canvasState.saveSoon();
+      broadcastFrame({
+        type: "workspace",
+        workspace: connected.workspace,
+        workDocumentation: { ready: true },
+      });
+      return sendJson(res, 200, connected.workspace);
+    });
   }
 
   if (method === "GET" && path === "/api/workspace/branches") {
     try {
-      return sendJson(res, 200, { branches: await workspaceManager.listBranches() });
+      return await canvasState.runProjectTransaction(async () =>
+        sendJson(res, 200, { branches: await workspaceManager.listBranches() }),
+      );
     } catch (error) {
       return sendJson(res, 409, { error: errMsg(error) });
     }
@@ -467,7 +761,9 @@ async function handleHttp(
 
   if (method === "GET" && path === "/api/workspace/branch-options") {
     try {
-      return sendJson(res, 200, { branches: await workspaceManager.listBranchOptions() });
+      return await canvasState.runProjectTransaction(async () =>
+        sendJson(res, 200, { branches: await workspaceManager.listBranchOptions() }),
+      );
     } catch (error) {
       return sendJson(res, 409, { error: errMsg(error) });
     }
@@ -475,35 +771,53 @@ async function handleHttp(
 
   if (method === "POST" && path === "/api/workspace/branches") {
     const body = await readJson<CreateBranchWorkspaceInput>(req);
+    // Validation stays outside the transaction; all project-dependent mutation work is inside.
     if (!body?.branch) return sendJson(res, 400, { error: "缺少 branch" });
-    let created: Awaited<ReturnType<WorkspaceManager["createBranchWithProjectRevision"]>>;
-    try {
-      created = await workspaceManager.createBranchWithProjectRevision(body);
-    } catch (error) {
-      return sendJson(res, 400, { error: errMsg(error) });
-    }
-    if (manager.appSettings().workDocumentationEnabled) {
+    return await canvasState.runProjectTransaction(async () => {
+      let created: Awaited<ReturnType<WorkspaceManager["createBranchWithProjectRevision"]>>;
       try {
-        await workspaceManager.prepareWorkDocumentationForAllBranches(created.revision);
-        workspaceManager.assertProjectRevision(created.revision);
+        created = await workspaceManager.createBranchWithProjectRevision(body);
       } catch (error) {
-        // The git worktree is already persisted. Do not delete it as compensation because
-        // another process may have started using it before documentation preparation failed.
-        return sendJson(res, 207, {
-          branch: created.branch,
-          partialSuccess: true,
-          workDocumentation: { ready: false, error: errMsg(error) },
-        });
+        return sendJson(res, 400, { error: errMsg(error) });
       }
-    }
-    return sendJson(res, 201, { branch: created.branch });
+      if (manager.appSettings().workDocumentationEnabled) {
+        try {
+          await workspaceManager.prepareWorkDocumentationForAllBranches(created.revision);
+          workspaceManager.assertProjectRevision(created.revision);
+        } catch (error) {
+          // The git worktree is already persisted. Do not delete it as compensation because
+          // another process may have started using it before documentation preparation failed.
+          canvasState.recordWorkDocumentationStatus({ ready: false, error: errMsg(error) });
+          broadcastFrame({
+            type: "workspace",
+            workspace: await workspaceManager.project(),
+            partialSuccess: true,
+            workDocumentation: { ready: false, error: errMsg(error) },
+          });
+          return sendJson(res, 207, {
+            branch: created.branch,
+            partialSuccess: true,
+            workDocumentation: { ready: false, error: errMsg(error) },
+          });
+        }
+      }
+      canvasState.recordWorkDocumentationStatus({ ready: true });
+      broadcastFrame({
+        type: "workspace",
+        workspace: await workspaceManager.project(),
+        workDocumentation: { ready: true },
+      });
+      return sendJson(res, 201, { branch: created.branch });
+    });
   }
 
   if (method === "GET" && path === "/api/workspace/shared-resources") {
     try {
-      return sendJson(res, 200, {
-        resources: (await workspaceManager.project()).sharedResources,
-      });
+      return await canvasState.runProjectTransaction(async () =>
+        sendJson(res, 200, {
+          resources: (await workspaceManager.project()).sharedResources,
+        }),
+      );
     } catch (error) {
       return sendJson(res, 409, { error: errMsg(error) });
     }
@@ -514,13 +828,18 @@ async function handleHttp(
     if (!body?.name || !body.mountPath) {
       return sendJson(res, 400, { error: "缺少共享资源名称或挂载路径" });
     }
-    try {
-      return sendJson(res, 201, {
-        resource: await workspaceManager.createSharedResource(body),
-      });
-    } catch (error) {
-      return sendJson(res, 400, { error: errMsg(error) });
-    }
+    return await canvasState.runProjectTransaction(async () => {
+      try {
+        const resource = await workspaceManager.createSharedResource(body);
+        broadcastFrame({
+          type: "workspace",
+          workspace: await workspaceManager.project(),
+        });
+        return sendJson(res, 201, { resource });
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
+    });
   }
 
   if (method === "POST" && path === "/api/directories/pick") {
@@ -685,17 +1004,19 @@ async function handleHttp(
 
   if (method === "POST" && path === "/api/agents") {
     const body = await readJson<CreateAgentInput>(req);
-    try {
-      const settings = normalizeAgentSettings(
-        await resolveAgentWorkspaceSettings(workspaceManager, body, defaultCwd, true),
-        defaultCwd,
-      );
-      const runner = manager.create(settings);
-      canvasState.saveSoon();
-      return sendJson(res, 201, { id: runner.id });
-    } catch (error) {
-      return sendJson(res, 400, { error: errMsg(error) });
-    }
+    return await canvasState.runProjectTransaction(async () => {
+      try {
+        const settings = normalizeAgentSettings(
+          await resolveAgentWorkspaceSettings(workspaceManager, body, defaultCwd, true),
+          defaultCwd,
+        );
+        const runner = manager.create(settings);
+        canvasState.saveSoon();
+        return sendJson(res, 201, { id: runner.id });
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
+    });
   }
 
   if (method === "GET" && path === "/api/files") {
@@ -981,43 +1302,45 @@ async function handleHttp(
     }
     if (method === "PATCH" && action === "settings") {
       const body = await readJson<UpdateAgentSettingsInput>(req);
-      try {
-        const currentConfig = manager.configOf(id);
-        const branchChanged =
-          body?.branchWorkspaceId !== undefined || body?.branch !== undefined;
-        const resolvedWorkspaceSettings = branchChanged
-          ? await resolveAgentWorkspaceSettings(
-              workspaceManager,
-              settingsForWorkspaceResolution(currentConfig, body),
-              defaultCwd,
-              true,
-            )
-          : undefined;
-        const settings = branchChanged
-          ? {
-              ...(body ?? {}),
-              branchWorkspaceId: resolvedWorkspaceSettings?.branchWorkspaceId,
-              branch: resolvedWorkspaceSettings?.branch,
-              cwd: resolvedWorkspaceSettings?.cwd,
-              scratchDirectory: resolvedWorkspaceSettings?.scratchDirectory,
-            }
-          : body ?? {};
-        if (branchChanged && manager.appSettings().workDocumentationEnabled) {
-          await workspaceManager.prepareAgentWorkspace(id, settings, {
-            workDocumentationEnabled: true,
+      return await canvasState.runProjectTransaction(async () => {
+        try {
+          const currentConfig = manager.configOf(id);
+          const branchChanged =
+            body?.branchWorkspaceId !== undefined || body?.branch !== undefined;
+          const resolvedWorkspaceSettings = branchChanged
+            ? await resolveAgentWorkspaceSettings(
+                workspaceManager,
+                settingsForWorkspaceResolution(currentConfig, body),
+                defaultCwd,
+                true,
+              )
+            : undefined;
+          const settings = branchChanged
+            ? {
+                ...(body ?? {}),
+                branchWorkspaceId: resolvedWorkspaceSettings?.branchWorkspaceId,
+                branch: resolvedWorkspaceSettings?.branch,
+                cwd: resolvedWorkspaceSettings?.cwd,
+                scratchDirectory: resolvedWorkspaceSettings?.scratchDirectory,
+              }
+            : body ?? {};
+          if (branchChanged && manager.appSettings().workDocumentationEnabled) {
+            await workspaceManager.prepareAgentWorkspace(id, settings, {
+              workDocumentationEnabled: true,
+            });
+          }
+          const diff = branchChanged
+            ? await workspaceManager.diffBetweenBranches(currentConfig?.branch, settings.branch)
+            : undefined;
+          const snapshot = manager.updateSettings(id, settings, {
+            branchSwitchPrompt: branchChanged ? branchSwitchPrompt(diff) : undefined,
           });
+          canvasState.saveSoon();
+          return sendJson(res, 200, snapshot);
+        } catch (error) {
+          return sendJson(res, 400, { error: errMsg(error) });
         }
-        const diff = branchChanged
-          ? await workspaceManager.diffBetweenBranches(currentConfig?.branch, settings.branch)
-          : undefined;
-        const snapshot = manager.updateSettings(id, settings, {
-          branchSwitchPrompt: branchChanged ? branchSwitchPrompt(diff) : undefined,
-        });
-        canvasState.saveSoon();
-        return sendJson(res, 200, snapshot);
-      } catch (error) {
-        return sendJson(res, 400, { error: errMsg(error) });
-      }
+      });
     }
     if (method === "GET" && action === "history") {
       return sendJson(res, 200, { events: manager.historyOf(id) });
@@ -1045,7 +1368,7 @@ async function handleHttp(
           workDocumentationEnabled: manager.appSettings().workDocumentationEnabled,
         },
       );
-      manager.startAgent(id, body); // 若是 fork 产生的 agent，合并其 fork 配置
+      await manager.startAgent(id, body); // 若是 fork 产生的 agent，合并其 fork 配置
       return sendJson(res, 202, { ok: true });
     }
     if (method === "POST" && action === "fork") {
@@ -1092,7 +1415,7 @@ async function handleHttp(
         await workspaceManager.prepareAgentWorkspace(id, manager.configOf(id), {
           workDocumentationEnabled: manager.appSettings().workDocumentationEnabled,
         });
-        runner.send(body.text);
+        await runner.send(body.text);
       } catch (err) {
         return sendJson(res, 409, { error: errMsg(err) });
       }
@@ -1113,7 +1436,7 @@ async function handleHttp(
     }
     if (method === "POST" && action === "compact") {
       try {
-        runner.compact();
+        await runner.compact();
       } catch (err) {
         return sendJson(res, 409, { error: errMsg(err) });
       }
@@ -1126,7 +1449,7 @@ async function handleHttp(
       await workspaceManager.prepareAgentWorkspace(id, manager.configOf(id), {
         workDocumentationEnabled: manager.appSettings().workDocumentationEnabled,
       });
-      runner.start(
+      await runner.start(
         { ...(runner.snapshot().config ?? { prompt: body.text }), prompt: body.text },
         { resumeSessionId: body.sessionId },
       );
@@ -1158,7 +1481,10 @@ function setCors(
     res.setHeader("Vary", "Origin");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,X-Agent-Canvas-Intent");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type,X-Agent-Canvas-Intent,X-Agent-Canvas-Project-Id,X-Agent-Canvas-Project-Revision",
+  );
 }
 
 function resolveAllowedOrigins(configured: string[] | undefined): Set<string> {
@@ -1202,6 +1528,78 @@ function isTrustedOrigin(origin: string | undefined, allowedOrigins: Set<string>
   }
 }
 
+function isProjectScopedHttpRequest(req: http.IncomingMessage): boolean {
+  if (req.method === "OPTIONS") return false;
+  const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+  if (!pathname.startsWith("/api/")) return false;
+  return !(
+    pathname === "/api/health" ||
+    pathname === "/api/config" ||
+    pathname === "/api/codex/usage" ||
+    pathname === "/api/canvas-projects/inspect" ||
+    pathname === "/api/directories/pick" ||
+    pathname === "/api/codex-auth/status" ||
+    pathname === "/api/codex-auth/login" ||
+    pathname === "/api/codex-auth/login/cancel"
+  );
+}
+
+function requiresExpectedProjectMutation(req: http.IncomingMessage): boolean {
+  const method = req.method ?? "GET";
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") return false;
+  const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+  if (!isProjectScopedHttpRequest(req)) return false;
+  if (
+    req.headers["x-agent-canvas-project-id"] !== undefined ||
+    req.headers["x-agent-canvas-project-revision"] !== undefined
+  ) {
+    return true;
+  }
+  if (
+    /^\/api\/agents\/[^/]+\/(?:commits|report-result)$/u.test(pathname) ||
+    pathname === "/api/pr-flows" ||
+    /^\/api\/pr-flows\/[^/]+(?:\/[^/]+)?$/u.test(pathname) ||
+    pathname === "/api/sync-flows" ||
+    /^\/api\/sync-flows\/[^/]+(?:\/[^/]+)?$/u.test(pathname)
+  ) {
+    return false;
+  }
+  return (
+    pathname === "/api/settings" ||
+    pathname === "/api/canvas-layout" ||
+    pathname === "/api/workspace/connect" ||
+    /^\/api\/workspace\/(?:branches|shared-resources)(?:\/[^/]+)?$/u.test(pathname) ||
+    pathname === "/api/agents" ||
+    /^\/api\/agents\/[^/]+(?:\/[^/]+(?:\/[^/]+)?)?$/u.test(pathname) ||
+    pathname === "/api/files" ||
+    /^\/api\/files\/[^/]+$/u.test(pathname) ||
+    pathname === "/api/prompts" ||
+    /^\/api\/prompts\/[^/]+$/u.test(pathname) ||
+    pathname === "/api/file-connections" ||
+    /^\/api\/file-connections\/[^/]+$/u.test(pathname) ||
+    pathname === "/api/prompt-connections" ||
+    /^\/api\/prompt-connections\/[^/]+$/u.test(pathname)
+  );
+}
+
+function singleHeader(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function shouldPreloadProjectRequestBody(
+  req: http.IncomingMessage,
+  allowedOrigins: Set<string>,
+): boolean {
+  const method = req.method ?? "GET";
+  return (
+    method !== "GET" &&
+    method !== "HEAD" &&
+    method !== "OPTIONS" &&
+    isProjectScopedHttpRequest(req) &&
+    isTrustedBrowserRequest(req, allowedOrigins)
+  );
+}
+
 function isLoopbackHost(hostname: string): boolean {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
 }
@@ -1212,12 +1610,24 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
   res.end(data);
 }
 
+function preloadRequestJsonBody(req: http.IncomingMessage): Promise<unknown | undefined> {
+  const existing = requestJsonBodies.get(req);
+  if (existing) return existing;
+  const pending = readJsonBody(req);
+  requestJsonBodies.set(req, pending);
+  return pending;
+}
+
 async function readJson<T>(req: http.IncomingMessage): Promise<T | undefined> {
+  return (await preloadRequestJsonBody(req)) as T | undefined;
+}
+
+async function readJsonBody(req: http.IncomingMessage): Promise<unknown | undefined> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
   if (chunks.length === 0) return undefined;
   try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf-8")) as T;
+    return JSON.parse(Buffer.concat(chunks).toString("utf-8")) as unknown;
   } catch {
     return undefined;
   }
@@ -1273,7 +1683,25 @@ interface CanvasStateControllerDeps {
 function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasStateController {
   let layout = emptyCanvasLayout();
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
-  let saveChain: Promise<void> = Promise.resolve();
+  let projectOperationChain: Promise<void> = Promise.resolve();
+  let workDocumentationStatus: WorkDocumentationLoadStatus = { ready: true };
+  let pendingDerivedAgentEvents = 0;
+  const projectOperationContext = new AsyncLocalStorage<{ active: boolean }>();
+
+  const clearSaveTimer = (): void => {
+    if (!saveTimer) return;
+    clearTimeout(saveTimer);
+    saveTimer = undefined;
+  };
+
+  const enqueueProjectOperation = <T>(operation: () => Promise<T>): Promise<T> => {
+    const result = projectOperationChain.then(operation, operation);
+    projectOperationChain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  };
 
   const applyProjectStorageRoots = (projectRoot: string): void => {
     deps.fileManager.setIsolatedRoot(path.join(projectRoot, "files"));
@@ -1304,43 +1732,75 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
     await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf-8");
   };
 
-  const saveNow = async (): Promise<void> => {
-    if (saveTimer) {
-      clearTimeout(saveTimer);
-      saveTimer = undefined;
-    }
-    saveChain = saveChain.then(saveCurrentProject, saveCurrentProject);
-    await saveChain;
+  const runProjectTransaction = <T>(
+    operation: () => Promise<T>,
+    options: { saveCurrent?: boolean; forceEnqueue?: boolean } = {},
+  ): Promise<T> => {
+    const execute = async (): Promise<T> => {
+      if (options.saveCurrent) {
+        clearSaveTimer();
+        await saveCurrentProject();
+      }
+      return await operation();
+    };
+    if (projectOperationContext.getStore()?.active && !options.forceEnqueue) return execute();
+    return enqueueProjectOperation(() => {
+      const context = { active: true };
+      return projectOperationContext.run(context, async () => {
+        try {
+          return await execute();
+        } finally {
+          // Async resources (notably saveSoon timers) inherit the storage object. Marking the
+          // transaction inactive makes those later callbacks enqueue instead of bypassing it.
+          context.active = false;
+        }
+      });
+    });
   };
+
+  const saveNow = (): Promise<void> =>
+    runProjectTransaction(async () => {
+      clearSaveTimer();
+      await saveCurrentProject();
+    });
 
   return {
     getLayout: () => layout,
-    setLayout: async (nextLayout) => {
-      layout = sanitizeCanvasLayout(nextLayout);
-      await saveNow();
-      return layout;
-    },
+    setLayout: (nextLayout) =>
+      runProjectTransaction(async () => {
+        clearSaveTimer();
+        layout = sanitizeCanvasLayout(nextLayout);
+        await saveCurrentProject();
+        return layout;
+      }),
     loadProjectState: async () => {
       const project = await deps.workspaceManager.project();
       applyProjectStorageRoots(project.projectRoot);
       const state = await readCanvasProjectState(path.join(project.projectRoot, CANVAS_STATE_FILE));
-      deps.manager.importState(state?.agents);
+      await deps.manager.importState(state?.agents);
       deps.fileManager.importState(state?.files);
       await deps.promptManager.importState(state?.prompts);
       deps.commitManager.importState(state?.commits);
-      deps.pullRequestFlowManager.importState(state?.prFlows);
-      deps.syncFlowManager.importState(state?.syncFlows);
-      if (deps.manager.appSettings().workDocumentationEnabled) {
-        await deps.workspaceManager.prepareWorkDocumentationForAllBranches();
-      }
+      deps.pullRequestFlowManager.importState(state?.prFlows, { deferActivation: true });
+      deps.syncFlowManager.importState(state?.syncFlows, { deferActivation: true });
       layout = sanitizeCanvasLayout(state?.layout);
+      if (deps.manager.appSettings().workDocumentationEnabled) {
+        try {
+          await deps.workspaceManager.prepareWorkDocumentationForAllBranches();
+        } catch (error) {
+          workDocumentationStatus = { ready: false, error: errMsg(error) };
+          return workDocumentationStatus;
+        }
+      }
+      workDocumentationStatus = { ready: true };
+      return workDocumentationStatus;
+    },
+    activateImportedFlowState: () => {
+      deps.pullRequestFlowManager.activateImportedState();
+      deps.syncFlowManager.activateImportedState();
     },
     unloadProjectState: async () => {
-      if (saveTimer) {
-        clearTimeout(saveTimer);
-        saveTimer = undefined;
-      }
-      await saveChain;
+      clearSaveTimer();
       await deps.manager.clear();
       deps.fileManager.importState(undefined);
       await deps.promptManager.importState(undefined);
@@ -1348,14 +1808,48 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
       deps.pullRequestFlowManager.importState(undefined);
       deps.syncFlowManager.importState(undefined);
       layout = emptyCanvasLayout();
+      workDocumentationStatus = { ready: true };
       applyProjectStorageRoots(path.join(deps.workspaceManager.projectListRoot(), ".inactive"));
     },
+    runProjectTransaction,
+    currentWorkspaceFrame: () =>
+      runProjectTransaction(async () => {
+        try {
+          return {
+            type: "workspace",
+            workspace: await deps.workspaceManager.project(),
+            partialSuccess: !workDocumentationStatus.ready || undefined,
+            workDocumentation: workDocumentationStatus,
+          };
+        } catch {
+          return {
+            type: "workspace",
+            workDocumentation: workDocumentationStatus,
+          };
+        }
+      }),
+    recordWorkDocumentationStatus: (status) => {
+      workDocumentationStatus = status;
+    },
+    beginDerivedAgentEvent: () => {
+      pendingDerivedAgentEvents += 1;
+      let finished = false;
+      return () => {
+        if (finished) return;
+        finished = true;
+        pendingDerivedAgentEvents -= 1;
+      };
+    },
+    hasPendingDerivedAgentEvents: () => pendingDerivedAgentEvents > 0,
     saveNow,
     saveSoon: () => {
       if (saveTimer) clearTimeout(saveTimer);
       saveTimer = setTimeout(() => {
         saveTimer = undefined;
-        void saveNow();
+        // A timer created inside an AsyncLocalStorage transaction inherits its context. Always
+        // enter through the physical queue here so a long-running outer operation cannot be
+        // bypassed when the debounce expires.
+        void enqueueProjectOperation(saveCurrentProject);
       }, 100);
     },
   };

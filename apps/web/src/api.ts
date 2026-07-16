@@ -55,11 +55,25 @@ export interface WorkDocumentationMutationStatus {
 
 export type WorkspaceConnectionResult = WorkspaceProject & WorkDocumentationMutationStatus;
 export type BranchCreationResult = BranchWorkspace & WorkDocumentationMutationStatus;
+export type CanvasProjectOpenResult = WorkspaceProject & WorkDocumentationMutationStatus;
+
+let activeWorkspaceContext:
+  | { canvasProjectId: string; revision: number }
+  | undefined;
 
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers);
+  if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  if (activeWorkspaceContext) {
+    headers.set("X-Agent-Canvas-Project-Id", activeWorkspaceContext.canvasProjectId);
+    headers.set(
+      "X-Agent-Canvas-Project-Revision",
+      String(activeWorkspaceContext.revision),
+    );
+  }
   const res = await fetch(BASE + path, {
-    headers: { "Content-Type": "application/json" },
     ...init,
+    headers,
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -70,20 +84,37 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  setWorkspaceContext: (workspace?: WorkspaceProject) => {
+    const canvasProjectId = workspace?.canvasProject?.id?.trim();
+    const revision = workspace?.revision;
+    const nextContext =
+      canvasProjectId && Number.isSafeInteger(revision) && (revision ?? -1) >= 0
+        ? { canvasProjectId, revision: revision! }
+        : undefined;
+    if (
+      nextContext &&
+      activeWorkspaceContext &&
+      nextContext.canvasProjectId === activeWorkspaceContext.canvasProjectId &&
+      nextContext.revision < activeWorkspaceContext.revision
+    ) {
+      return;
+    }
+    activeWorkspaceContext = nextContext;
+  },
   list: () => call<{ agents: AgentSnapshot[] }>("/agents").then((r) => r.agents),
   canvasLayout: () => call<CanvasLayoutSnapshot>("/canvas-layout"),
-  saveCanvasLayout: (input: CanvasLayoutSnapshot) =>
+  saveCanvasLayout: (input: CanvasLayoutSnapshot, canvasProjectId?: string) =>
     call<CanvasLayoutSnapshot>("/canvas-layout", {
       method: "PATCH",
-      body: JSON.stringify(input),
+      body: JSON.stringify({ ...input, canvasProjectId }),
     }),
   config: () => call<AgentCanvasConfig>("/config"),
   codexUsage: () => call<CodexUsageSnapshot>("/codex/usage"),
   settings: () => call<AgentCanvasSettings>("/settings"),
-  updateSettings: (input: Partial<AgentCanvasSettings>) =>
+  updateSettings: (input: Partial<AgentCanvasSettings>, canvasProjectId: string) =>
     call<AgentCanvasSettings>("/settings", {
       method: "PATCH",
-      body: JSON.stringify(input),
+      body: JSON.stringify({ ...input, canvasProjectId }),
     }),
   listCanvasProjects: () =>
     call<{ projects: CanvasProjectSummary[] }>("/canvas-projects").then((r) => r.projects),
@@ -93,10 +124,14 @@ export const api = {
       body: JSON.stringify(input),
     }),
   openCanvasProject: (input: OpenCanvasProjectInput | string) =>
-    call<{ workspace: WorkspaceProject }>("/canvas-projects/open", {
+    call<{ workspace: WorkspaceProject } & WorkDocumentationMutationStatus>("/canvas-projects/open", {
       method: "POST",
       body: JSON.stringify(typeof input === "string" ? { id: input } : input),
-    }).then((r) => r.workspace),
+    }).then((result): CanvasProjectOpenResult => ({
+      ...result.workspace,
+      partialSuccess: result.partialSuccess,
+      workDocumentation: result.workDocumentation,
+    })),
   inspectCanvasProject: (projectRoot: string) =>
     call<{ inspection: CanvasProjectInspection }>("/canvas-projects/inspect", {
       method: "POST",

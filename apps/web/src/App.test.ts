@@ -1,9 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentMap } from "./agentStore.js";
 import type { AgentActions, FileActions, PromptActions } from "./useAgentCanvas.js";
 import {
+  adoptDeletedCurrentProject,
+  adoptOpenedProject,
   buildNodes,
   canvasInteractionForTool,
+  canvasLayoutAutosaveReady,
   canvasLayoutFromNodes,
   centeredNodePosition,
   centeredNodePositionInViewport,
@@ -14,10 +17,47 @@ import {
   computePullRequestEdges,
   computeResultFileEdges,
   computeSyncFlowEdges,
+  isCurrentWorkspaceUpdate,
   isSameBranchWorkspace,
+  ownsProjectOperation,
+  resolveCurrentProjectOpenStep,
   workDocumentationMutationWarning,
 } from "./App.js";
 import { SelectionMode } from "@xyflow/react";
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe("canvas layout autosave readiness", () => {
+  it("stays closed beyond the debounce while the target layout and refresh are deferred", async () => {
+    vi.useFakeTimers();
+    let resolveTarget!: () => void;
+    let readyProjectId: string | undefined;
+    const targetLayoutAndRefresh = new Promise<void>((resolve) => {
+      resolveTarget = resolve;
+    }).then(() => {
+      readyProjectId = "project_q";
+    });
+    let autosaved = false;
+
+    setTimeout(() => {
+      autosaved = canvasLayoutAutosaveReady(
+        "project_q",
+        "project_q",
+        readyProjectId,
+      );
+    }, 400);
+    await vi.advanceTimersByTimeAsync(401);
+
+    expect(autosaved).toBe(false);
+    resolveTarget();
+    await targetLayoutAndRefresh;
+    expect(
+      canvasLayoutAutosaveReady("project_q", "project_q", readyProjectId),
+    ).toBe(true);
+  });
+});
 
 describe("canvasInteractionForTool", () => {
   it("select tool enables drag selection while keeping middle mouse panning", () => {
@@ -49,6 +89,187 @@ describe("workDocumentationMutationWarning", () => {
 
   it("does not warn for a complete operation", () => {
     expect(workDocumentationMutationWarning({})).toBeUndefined();
+  });
+});
+
+describe("adoptOpenedProject", () => {
+  it("synchronously adopts the target project and its documentation warning", () => {
+    const updates: string[] = [];
+    const target = {
+      projectRoot: "/projects/target",
+      canvasProject: {
+        id: "project_target",
+        name: "target",
+        projectRoot: "/projects/target",
+        createdAt: 1,
+      },
+      branches: [],
+      sharedResources: [],
+      partialSuccess: true,
+      workDocumentation: { ready: false, error: "unsafe documentation link" },
+    };
+
+    adoptOpenedProject(target, {
+      setWorkspace: (workspace) => updates.push(`workspace:${workspace.canvasProject?.id}`),
+      setLayoutProjectId: (projectId) => updates.push(`layout:${projectId}`),
+      setProjectError: (error) => updates.push(`warning:${error}`),
+    });
+
+    expect(updates.slice(0, 2)).toEqual([
+      "workspace:project_target",
+      "layout:project_target",
+    ]);
+    expect(updates[2]).toContain("unsafe documentation link");
+  });
+});
+
+describe("resolveCurrentProjectOpenStep", () => {
+  it("drops a deferred old-project result after a newer invocation takes ownership", async () => {
+    let resolveOld!: (value: string) => void;
+    let current = true;
+    const oldResult = new Promise<string>((resolve) => {
+      resolveOld = resolve;
+    });
+    const guarded = resolveCurrentProjectOpenStep(oldResult, () => current);
+
+    current = false;
+    resolveOld("old-project-layout");
+
+    await expect(guarded).resolves.toBeUndefined();
+  });
+});
+
+describe("project operation ownership", () => {
+  const ownership = { token: 4, workspaceEventGeneration: 10 };
+
+  it("keeps the current open response when its own workspace frame arrived first", () => {
+    expect(
+      ownsProjectOperation(
+        ownership,
+        4,
+        11,
+        "project:target",
+        "project:target",
+      ),
+    ).toBe(true);
+  });
+
+  it("drops a late response after a different project or newer local operation takes ownership", () => {
+    expect(
+      ownsProjectOperation(
+        ownership,
+        4,
+        11,
+        "project:newer",
+        "project:target",
+      ),
+    ).toBe(false);
+    expect(
+      ownsProjectOperation(
+        ownership,
+        5,
+        10,
+        "project:target",
+        "project:target",
+      ),
+    ).toBe(false);
+    expect(
+      ownsProjectOperation(
+        ownership,
+        4,
+        11,
+        "project:target@2",
+      ),
+    ).toBe(false);
+  });
+
+  it("drops a late response from an older revision of the same project", () => {
+    expect(
+      ownsProjectOperation(
+        ownership,
+        4,
+        11,
+        "project:target@2",
+        "project:target@1",
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("workspace update ownership", () => {
+  it("drops an older same-project effect after the hook has accepted a newer frame", () => {
+    expect(
+      isCurrentWorkspaceUpdate(
+        {
+          canvasProject: {
+            id: "project_a",
+            name: "A",
+            projectRoot: "/projects/a",
+            createdAt: 1,
+          },
+          revision: 1,
+          projectRoot: "/projects/a",
+          branches: [],
+          sharedResources: [],
+        },
+        "project:project_a@2",
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("adoptDeletedCurrentProject", () => {
+  it("clears the active project from the REST result even without a workspace frame", () => {
+    const updates: string[] = [];
+    const cleared = adoptDeletedCurrentProject(
+      "project_current",
+      {
+        projectRoot: "/projects/current",
+        canvasProject: {
+          id: "project_current",
+          name: "current",
+          projectRoot: "/projects/current",
+          createdAt: 1,
+        },
+        branches: [],
+        sharedResources: [],
+      },
+      {
+        setWorkspace: (workspace) => updates.push(`workspace:${workspace ? "set" : "empty"}`),
+        setLayoutProjectId: (projectId) => updates.push(`layout:${projectId ?? "empty"}`),
+        setProjectError: (error) => updates.push(`error:${error ?? "empty"}`),
+      },
+    );
+
+    expect(cleared).toBe(true);
+    expect(updates).toEqual(["workspace:empty", "layout:empty", "error:empty"]);
+  });
+
+  it("does not clear another active project", () => {
+    const setWorkspace = () => {
+      throw new Error("must not clear");
+    };
+    expect(
+      adoptDeletedCurrentProject(
+        "project_other",
+        {
+          projectRoot: "/projects/current",
+          canvasProject: {
+            id: "project_current",
+            name: "current",
+            projectRoot: "/projects/current",
+            createdAt: 1,
+          },
+          branches: [],
+          sharedResources: [],
+        },
+        {
+          setWorkspace,
+          setLayoutProjectId: setWorkspace,
+          setProjectError: setWorkspace,
+        },
+      ),
+    ).toBe(false);
   });
 });
 

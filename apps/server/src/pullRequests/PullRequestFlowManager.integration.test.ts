@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentSettings, BranchWorkspace } from "@agent-canvas/shared";
@@ -24,6 +24,7 @@ describe("PullRequestFlowManager integration", () => {
     const source = path.join(root, "source-repo");
     const remote = path.join(root, "remote.git");
     const projectRoot = path.join(root, "project");
+    const documentationMounts: string[] = [];
 
     try {
       await createTempRepo(source, remote);
@@ -40,6 +41,11 @@ describe("PullRequestFlowManager integration", () => {
       if (!main) throw new Error("expected main branch workspace");
       const sourceBranch = await workspaceManager.createBranch({ branch: "feature/pr-flow" });
       const otherBranch = await workspaceManager.createBranch({ branch: "feature/other" });
+      documentationMounts.push(
+        path.join(main.worktreePath, ".agent-shared-docs"),
+        path.join(sourceBranch.worktreePath, ".agent-shared-docs"),
+        path.join(otherBranch.worktreePath, ".agent-shared-docs"),
+      );
 
       const query = makeQueryHub();
       let now = 1_000;
@@ -52,6 +58,18 @@ describe("PullRequestFlowManager integration", () => {
           branch: config?.branch,
           cwd: config?.cwd,
         }),
+      });
+      agentManager.setFileAccessResolver((agentId) =>
+        workspaceManager.accessForAgent(agentManager.configOf(agentId), {
+          workDocumentationEnabled: true,
+        }),
+      );
+      agentManager.setFileAccessPreparer(async (agentId) => {
+        await workspaceManager.prepareAgentWorkspace(
+          agentId,
+          agentManager.configOf(agentId),
+          { workDocumentationEnabled: true },
+        );
       });
       const prManager = new PullRequestFlowManager({
         host: agentManager,
@@ -104,6 +122,11 @@ describe("PullRequestFlowManager integration", () => {
       await approve(prManager, query, sourceRunning, flow.id, "source_preflight");
 
       await waitUntil(() => prManager.get(flow.id)?.status === "create_pr_authorized");
+      await waitUntil(() =>
+        inputText(proposer.session.inputs.at(-1)).includes(
+          "authorized to prepare and create the PR",
+        ),
+      );
       expect(inputText(proposer.session.inputs.at(-1))).toContain(
         "authorized to prepare and create the PR",
       );
@@ -142,6 +165,9 @@ describe("PullRequestFlowManager integration", () => {
       await approve(prManager, query, targetRunning, flow.id, "target_merge");
 
       await waitUntil(() => prManager.get(flow.id)?.status === "merge_authorized");
+      await waitUntil(() =>
+        inputText(proposer.session.inputs.at(-1)).includes("authorized to merge the PR"),
+      );
       expect(inputText(proposer.session.inputs.at(-1))).toContain(
         "authorized to merge the PR",
       );
@@ -157,7 +183,38 @@ describe("PullRequestFlowManager integration", () => {
         prNumber: 42,
         prUrl: "local://pull/42",
       });
+
+      // Keep one source agent running so the next PR review exercises native steer,
+      // while the other source agents exercise direct waiting-input send.
+      await agentManager.get(sourceRunning.id)?.send("keep this source agent running");
+      const proposerInputCount = proposer.session.inputs.length;
+      const waitingInputCount = sourceWaiting.session.inputs.length;
+      const runningSteerCount = sourceRunning.session.steered.length;
+
+      const sharedMount = path.join(sourceBranch.worktreePath, ".agent-shared-docs");
+      const outside = path.join(root, "tampered-shared-docs");
+      await mkdir(outside, { recursive: true });
+      await rm(sharedMount, { force: true });
+      await symlink(outside, sharedMount, process.platform === "win32" ? "junction" : "dir");
+
+      const blocked = await prManager.create({
+        proposerAgentId: proposer.id,
+        targetBranch: "main",
+        summary: "Tampered documentation mount must block direct automation dispatch",
+        title: "Blocked PR",
+      });
+
+      expect(blocked.status).toBe("source_review_failed");
+      expect(blocked.failureReason).toContain("Failed to deliver review request");
+      expect(proposer.session.inputs).toHaveLength(proposerInputCount);
+      expect(sourceWaiting.session.inputs).toHaveLength(waitingInputCount);
+      expect(sourceRunning.session.steered).toHaveLength(runningSteerCount);
+      await agentManager.clear();
+      await rm(sharedMount, { force: true });
     } finally {
+      for (const mount of documentationMounts) {
+        await rm(mount, { force: true }).catch(() => undefined);
+      }
       await rm(root, { recursive: true, force: true });
     }
   }, 30_000);
@@ -220,7 +277,7 @@ async function startAgent(
     cwd: branch.worktreePath,
   };
   const runner = agentManager.create(settings);
-  agentManager.startAgent(runner.id, { prompt: `start ${runner.id}` });
+  await agentManager.startAgent(runner.id, { prompt: `start ${runner.id}` });
   const session = query.sessions.at(-1);
   if (!session) throw new Error("expected query session");
   session.output.push(systemInit(runner.id, branch.worktreePath));

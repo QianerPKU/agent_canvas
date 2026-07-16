@@ -38,6 +38,11 @@ export interface AgentTurnContextRequest {
   config: Pick<AgentStartConfig, "cwd" | "branch"> | undefined;
 }
 
+interface PendingAgentTurnContextRequest extends AgentTurnContextRequest {
+  managerGeneration: number;
+  runner: AgentRunner;
+}
+
 export interface AgentManagerDeps {
   query: QueryFn;
   codexQuery?: QueryFn;
@@ -47,7 +52,7 @@ export interface AgentManagerDeps {
     config: Pick<AgentStartConfig, "cwd" | "branch"> | undefined,
   ) => Promise<AgentTurnContextMetadata>;
   resolveFileAccess?: (agentId: string) => AgentFileAccess;
-  prepareFileAccess?: (agentId: string) => Promise<void>;
+  prepareFileAccess?: (agentId: string) => Promise<void> | void;
   resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
 }
 
@@ -77,10 +82,11 @@ export class AgentManager {
     config: Pick<AgentStartConfig, "cwd" | "branch"> | undefined,
   ) => Promise<AgentTurnContextMetadata>;
   private resolveFileAccess?: (agentId: string) => AgentFileAccess;
-  private prepareFileAccess?: (agentId: string) => Promise<void>;
+  private prepareFileAccess?: (agentId: string) => Promise<void> | void;
   private resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
   private counter = 0;
   private suppressEvents = false;
+  private stateGeneration = 0;
 
   constructor(deps: AgentManagerDeps) {
     this.query = deps.query;
@@ -113,53 +119,63 @@ export class AgentManager {
     };
   }
 
-  importState(state: PersistedAgentState | undefined): void {
-    this.suppressEvents = true;
-    for (const runner of this.runners.values()) {
-      void runner.terminate();
-    }
-    this.runners.clear();
-    this.seqs.clear();
-    this.history.clear();
-    this.forkOrigins.clear();
-    this.forkConfigs.clear();
-    this.draftConfigs.clear();
-    this.appSettingsState.fullPermissionMode = state?.appSettings?.fullPermissionMode === true;
-    this.appSettingsState.workDocumentationEnabled =
-      state?.appSettings?.workDocumentationEnabled === true;
-    this.counter = 0;
+  invalidatePendingTurnContexts(): void {
+    this.stateGeneration += 1;
+  }
 
-    const agents = state?.agents ?? [];
-    for (const snapshot of agents) {
-      const restoredSnapshot = { ...snapshot, status: restorableStatus(snapshot.status) };
-      const runner = this.createRunner(snapshot.id, snapshot.config);
-      runner.restore(restoredSnapshot);
-      if (snapshot.forkOrigin) this.forkOrigins.set(snapshot.id, snapshot.forkOrigin);
-      const history = [...(state?.histories[snapshot.id] ?? [])].sort(
-        (left, right) => left.seq - right.seq,
-      );
-      let lastSeq = Math.max(
-        snapshot.lastEventSeq,
-        ...history.map((envelope) => envelope.seq),
-        0,
-      );
-      if (restoredSnapshot.status !== snapshot.status) {
-        lastSeq++;
-        history.push({
-          agentId: snapshot.id,
-          seq: lastSeq,
-          at: this.now(),
-          event: { kind: "status", status: restoredSnapshot.status },
-        });
+  async importState(state: PersistedAgentState | undefined): Promise<void> {
+    this.invalidatePendingTurnContexts();
+    this.suppressEvents = true;
+    try {
+      // A project switch must not leave an old runner alive long enough to emit into a
+      // replacement agent that happens to reuse the same id. Keep event suppression active
+      // until every transport has finished terminating and the replacement state is complete.
+      await Promise.all([...this.runners.values()].map((runner) => runner.terminate()));
+      this.runners.clear();
+      this.seqs.clear();
+      this.history.clear();
+      this.forkOrigins.clear();
+      this.forkConfigs.clear();
+      this.draftConfigs.clear();
+      this.appSettingsState.fullPermissionMode = state?.appSettings?.fullPermissionMode === true;
+      this.appSettingsState.workDocumentationEnabled =
+        state?.appSettings?.workDocumentationEnabled === true;
+      this.counter = 0;
+
+      const agents = state?.agents ?? [];
+      for (const snapshot of agents) {
+        const restoredSnapshot = { ...snapshot, status: restorableStatus(snapshot.status) };
+        const runner = this.createRunner(snapshot.id, snapshot.config);
+        runner.restore(restoredSnapshot);
+        if (snapshot.forkOrigin) this.forkOrigins.set(snapshot.id, snapshot.forkOrigin);
+        const history = [...(state?.histories[snapshot.id] ?? [])].sort(
+          (left, right) => left.seq - right.seq,
+        );
+        let lastSeq = Math.max(
+          snapshot.lastEventSeq,
+          ...history.map((envelope) => envelope.seq),
+          0,
+        );
+        if (restoredSnapshot.status !== snapshot.status) {
+          lastSeq++;
+          history.push({
+            agentId: snapshot.id,
+            seq: lastSeq,
+            at: this.now(),
+            event: { kind: "status", status: restoredSnapshot.status },
+          });
+        }
+        this.history.set(snapshot.id, history);
+        this.seqs.set(snapshot.id, lastSeq);
       }
-      this.history.set(snapshot.id, history);
-      this.seqs.set(snapshot.id, lastSeq);
+      this.counter = maxNumericSuffix(agents.map((agent) => agent.id));
+    } finally {
+      this.suppressEvents = false;
     }
-    this.counter = maxNumericSuffix(agents.map((agent) => agent.id));
-    this.suppressEvents = false;
   }
 
   async clear(): Promise<void> {
+    this.invalidatePendingTurnContexts();
     this.suppressEvents = true;
     try {
       await Promise.all([...this.runners.values()].map((runner) => runner.terminate()));
@@ -197,7 +213,7 @@ export class AgentManager {
           writableDirectories: [],
           sharedResources: [],
         },
-      prepareFileAccess: (agentId) => this.prepareFileAccess?.(agentId) ?? Promise.resolve(),
+      prepareFileAccess: (agentId) => this.prepareFileAccess?.(agentId),
       resolvePromptAccess: (agentId) =>
         this.resolvePromptAccess?.(agentId) ?? {
           readablePrompts: [],
@@ -221,7 +237,7 @@ export class AgentManager {
     this.resolveFileAccess = resolveFileAccess;
   }
 
-  setFileAccessPreparer(prepareFileAccess: (agentId: string) => Promise<void>): void {
+  setFileAccessPreparer(prepareFileAccess: (agentId: string) => Promise<void> | void): void {
     this.prepareFileAccess = prepareFileAccess;
   }
 
@@ -303,14 +319,14 @@ export class AgentManager {
   }
 
   /** 启动一个 agent；若它是 fork 产生的，合并其 fork 配置。 */
-  startAgent(id: string, config: AgentStartConfig): void {
+  startAgent(id: string, config: AgentStartConfig): Promise<void> {
     const runner = this.runners.get(id);
     if (!runner) throw new Error(`未知 agent: ${id}`);
     const forkCfg = this.forkConfigs.get(id);
     const draftCfg = this.draftConfigs.get(id);
     const merged = mergeDefined(draftCfg, forkCfg, config);
     if (!merged?.prompt) throw new Error("缺少 prompt");
-    runner.start(merged as AgentStartConfig);
+    return runner.start(merged as AgentStartConfig);
   }
 
   answerQuestion(id: string, requestId: string, response: AgentQuestionResponse): void {
@@ -408,19 +424,23 @@ export class AgentManager {
   private turnContextRequest(
     agentId: string,
     event: AgentEvent,
-  ): AgentTurnContextRequest | undefined {
+  ): PendingAgentTurnContextRequest | undefined {
     if (event.kind !== "user_input" || event.mode) return undefined;
-    if (!this.runners.has(agentId)) return undefined;
+    const runner = this.runners.get(agentId);
+    if (!runner) return undefined;
     return {
       agentId,
       turnIndex: this.currentTurnIndex(agentId),
       config: this.configOf(agentId),
+      managerGeneration: this.stateGeneration,
+      runner,
     };
   }
 
-  private async emitTurnContext(request: AgentTurnContextRequest): Promise<void> {
+  private async emitTurnContext(request: PendingAgentTurnContextRequest): Promise<void> {
     try {
       const metadata = await this.resolveTurnContext(request.config);
+      if (!this.isCurrentTurnContextRequest(request)) return;
       this.broadcast(request.agentId, {
         kind: "turn_context",
         context: {
@@ -434,6 +454,7 @@ export class AgentManager {
         },
       });
     } catch {
+      if (!this.isCurrentTurnContextRequest(request)) return;
       this.broadcast(request.agentId, {
         kind: "turn_context",
         context: {
@@ -443,6 +464,14 @@ export class AgentManager {
         },
       });
     }
+  }
+
+  private isCurrentTurnContextRequest(request: PendingAgentTurnContextRequest): boolean {
+    return (
+      !this.suppressEvents &&
+      request.managerGeneration === this.stateGeneration &&
+      this.runners.get(request.agentId) === request.runner
+    );
   }
 
   private snapshotOf(id: string): AgentSnapshot {

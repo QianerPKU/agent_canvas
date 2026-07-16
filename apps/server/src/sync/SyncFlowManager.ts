@@ -14,7 +14,7 @@ import type {
 
 type DeliverableRunner = {
   getStatus(): string;
-  send(text: string): void;
+  send(text: string): Promise<void> | void;
   steer(text: string): Promise<void>;
 };
 
@@ -90,7 +90,10 @@ export class SyncFlowManager {
   private readonly flows = new Map<string, SyncFlowSnapshot>();
   private readonly timers = new Map<string, unknown>();
   private readonly listeners = new Set<FlowListener>();
+  private readonly pendingOperations = new Set<symbol>();
   private counter = 0;
+  private importedStateActivated = true;
+  private stateGeneration = 0;
 
   constructor(options: SyncFlowManagerOptions) {
     this.host = options.host;
@@ -116,13 +119,41 @@ export class SyncFlowManager {
     return this.list();
   }
 
-  importState(flows: SyncFlowSnapshot[] | undefined): void {
+  hasOpenFlows(): boolean {
+    return this.list().some((flow) => !CLOSED_STATUSES.includes(flow.status));
+  }
+
+  hasPendingOperations(): boolean {
+    return this.pendingOperations.size > 0;
+  }
+
+  importState(
+    flows: SyncFlowSnapshot[] | undefined,
+    options: { deferActivation?: boolean } = {},
+  ): void {
+    this.stateGeneration += 1;
     for (const flowId of this.timers.keys()) this.closeTimer(flowId);
     this.flows.clear();
     for (const flow of flows ?? []) {
       this.flows.set(flow.id, flow);
     }
     this.counter = maxNumericSuffix([...this.flows.keys()]);
+    this.importedStateActivated = false;
+    if (!options.deferActivation) this.activateImportedState();
+  }
+
+  activateImportedState(): void {
+    if (this.importedStateActivated) return;
+    this.importedStateActivated = true;
+    const generation = this.stateGeneration;
+    for (const flow of [...this.flows.values()]) {
+      if (CLOSED_STATUSES.includes(flow.status) || flow.deadlineAt === undefined) continue;
+      if (flow.deadlineAt <= this.now()) {
+        this.timeoutFlow(flow.id, generation);
+      } else {
+        this.resetTimer(flow.id, flow.deadlineAt, generation);
+      }
+    }
   }
 
   get(id: string): SyncFlowSnapshot | undefined {
@@ -434,7 +465,7 @@ export class SyncFlowManager {
       return;
     }
     if (status === "waiting_input") {
-      runner.send(text);
+      await runner.send(text);
       return;
     }
     throw new Error(`agent ${agentId} is not active (${status})`);
@@ -484,24 +515,47 @@ export class SyncFlowManager {
     );
   }
 
-  private resetTimer(flowId: string, deadlineAt: number): void {
+  private resetTimer(
+    flowId: string,
+    deadlineAt: number,
+    generation = this.stateGeneration,
+  ): void {
     this.closeTimer(flowId);
     const delay = Math.max(0, deadlineAt - this.now());
     this.timers.set(
       flowId,
       this.setTimer(() => {
-        const flow = this.flows.get(flowId);
-        if (!flow || CLOSED_STATUSES.includes(flow.status)) return;
-        this.save({
-          ...flow,
-          status: "timed_out",
-          updatedAt: this.now(),
-          closedAt: this.now(),
-          failureReason: "Sync flow timed out before the required agent responses arrived.",
-        });
-        this.closeTimer(flowId);
+        this.timeoutFlow(flowId, generation);
       }, delay),
     );
+  }
+
+  private timeoutFlow(flowId: string, generation: number): void {
+    if (!this.isCurrentGeneration(generation)) return;
+    const token = Symbol("sync-timeout");
+    this.pendingOperations.add(token);
+    try {
+      const flow = this.flows.get(flowId);
+      if (!flow || CLOSED_STATUSES.includes(flow.status)) return;
+      if (flow.deadlineAt !== undefined && flow.deadlineAt > this.now()) {
+        this.resetTimer(flowId, flow.deadlineAt, generation);
+        return;
+      }
+      this.save({
+        ...flow,
+        status: "timed_out",
+        updatedAt: this.now(),
+        closedAt: this.now(),
+        failureReason: "Sync flow timed out before the required agent responses arrived.",
+      });
+      this.closeTimer(flowId);
+    } finally {
+      this.pendingOperations.delete(token);
+    }
+  }
+
+  private isCurrentGeneration(generation: number): boolean {
+    return generation === this.stateGeneration;
   }
 
   private closeTimer(flowId: string): void {

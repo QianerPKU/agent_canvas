@@ -15,6 +15,16 @@ import { workDocumentationDisabledPrompt } from "./workspaces/workDocumentation.
 /** 让微任务与队列 resolver 跑完。 */
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 const SYSTEM_INIT: SdkMessage = {
   type: "system",
   subtype: "init",
@@ -202,7 +212,7 @@ describe("AgentRunner 生命周期", () => {
     });
     runner.on((event) => events.push(event));
 
-    runner.start({ prompt: "first" });
+    await runner.start({ prompt: "first" });
     ctl.emit(SYSTEM_INIT);
     await flush();
     runner.send("queued second");
@@ -212,7 +222,7 @@ describe("AgentRunner 生命周期", () => {
     await flush();
     await flush();
 
-    expect(prepareFileAccess).toHaveBeenCalledOnce();
+    expect(prepareFileAccess).toHaveBeenCalledTimes(2);
     expect(ctl.inputs.map((input) => input.message.content)).toEqual(["first"]);
     expect(events).toContainEqual({
       kind: "error",
@@ -220,6 +230,249 @@ describe("AgentRunner 生命周期", () => {
     });
     expect(ctl.wasTerminated()).toBe(true);
     expect(runner.getStatus()).toBe("error");
+  });
+
+  it("validates live paths before initial start resolves file access or starts the provider", async () => {
+    const ctl = makeControllableQuery();
+    const query = vi.fn(ctl.query);
+    const resolveFileAccess = vi.fn(() => ({
+      readableFiles: [],
+      writableFiles: [],
+      writableDirectories: ["/unsafe/docs"],
+    }));
+    const runner = new AgentRunner("initial-path-agent", {
+      query,
+      resolveFileAccess,
+      prepareFileAccess: async () => {
+        throw new Error("documentation mount was replaced");
+      },
+    });
+
+    await expect(runner.start({ prompt: "first" })).rejects.toThrow(
+      "documentation mount was replaced",
+    );
+
+    expect(resolveFileAccess).not.toHaveBeenCalled();
+    expect(query).not.toHaveBeenCalled();
+    expect(runner.getStatus()).toBe("error");
+  });
+
+  it.each(["resolve", "reject"] as const)(
+    "does not let a stale %s from start A corrupt start B",
+    async (settlement) => {
+      const ctl = makeControllableQuery();
+      const firstPreparation = deferred();
+      const secondPreparation = deferred();
+      let preparationCall = 0;
+      const events: AgentEvent[] = [];
+      const runner = new AgentRunner("overlapping-start-agent", {
+        query: ctl.query,
+        prepareFileAccess: () =>
+          ++preparationCall === 1 ? firstPreparation.promise : secondPreparation.promise,
+      });
+      runner.on((event) => events.push(event));
+
+      const startA = runner.start({ prompt: "start A" });
+      const startAOutcome = startA.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      await runner.stop();
+      const startB = runner.start({ prompt: "start B" });
+
+      if (settlement === "resolve") firstPreparation.resolve();
+      else firstPreparation.reject(new Error("start A validation failed"));
+      expect(await startAOutcome).toBeInstanceOf(Error);
+
+      expect(runner.getStatus()).toBe("starting");
+      expect(ctl.inputs).toEqual([]);
+      expect(events.filter((event) => event.kind === "error")).toEqual([]);
+
+      secondPreparation.resolve();
+      await startB;
+      await flush();
+
+      expect(ctl.inputs.map((input) => input.message.content)).toEqual(["start B"]);
+      expect(runner.getStatus()).toBe("starting");
+      expect(events.filter((event) => event.kind === "error")).toEqual([]);
+      await runner.terminate();
+    },
+  );
+
+  it("blocks direct waiting-input send when live validation fails", async () => {
+    const ctl = makeControllableQuery();
+    let unsafe = false;
+    const prepareFileAccess = vi.fn(async () => {
+      if (unsafe) throw new Error("documentation mount was replaced");
+    });
+    const runner = new AgentRunner("direct-send-path-agent", {
+      query: ctl.query,
+      prepareFileAccess,
+    });
+
+    await runner.start({ prompt: "first" });
+    ctl.emit(SYSTEM_INIT);
+    ctl.emit(resultMsg());
+    await flush();
+    unsafe = true;
+
+    await expect(runner.send("automation review request")).rejects.toThrow(
+      "documentation mount was replaced",
+    );
+    expect(prepareFileAccess).toHaveBeenCalledTimes(2);
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual(["first"]);
+    expect(runner.getStatus()).toBe("waiting_input");
+  });
+
+  it("blocks direct native steer when live validation fails", async () => {
+    const ctl = makeControllableQuery();
+    let unsafe = false;
+    const prepareFileAccess = vi.fn(async () => {
+      if (unsafe) throw new Error("documentation mount was replaced");
+    });
+    const runner = new AgentRunner("direct-steer-path-agent", {
+      query: ctl.query,
+      prepareFileAccess,
+    });
+
+    await runner.start({ prompt: "first" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+    unsafe = true;
+
+    await expect(runner.steer("automation review request")).rejects.toThrow(
+      "documentation mount was replaced",
+    );
+    expect(prepareFileAccess).toHaveBeenCalledTimes(2);
+    expect(ctl.steeredInputs).toEqual([]);
+    expect(runner.getStatus()).toBe("running");
+  });
+
+  it("blocks compact dispatch when live validation fails", async () => {
+    const ctl = makeControllableQuery();
+    let unsafe = false;
+    const prepareFileAccess = vi.fn(async () => {
+      if (unsafe) throw new Error("documentation mount was replaced");
+    });
+    const runner = new AgentRunner("compact-path-agent", {
+      query: ctl.query,
+      prepareFileAccess,
+    });
+
+    await runner.start({ prompt: "first" });
+    ctl.emit(SYSTEM_INIT);
+    ctl.emit(resultMsg());
+    await flush();
+    unsafe = true;
+
+    await expect(runner.compact()).rejects.toThrow("documentation mount was replaced");
+    expect(prepareFileAccess).toHaveBeenCalledTimes(2);
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual(["first"]);
+    expect(runner.getStatus()).toBe("waiting_input");
+  });
+
+  it("revalidates a stopped session before restarting it with a new input", async () => {
+    const ctl = makeControllableQuery();
+    let unsafe = false;
+    const prepareFileAccess = vi.fn(async () => {
+      if (unsafe) throw new Error("documentation mount was replaced");
+    });
+    const runner = new AgentRunner("stopped-path-agent", {
+      query: ctl.query,
+      prepareFileAccess,
+    });
+
+    await runner.start({ prompt: "first" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+    await runner.stop();
+    unsafe = true;
+
+    await expect(runner.send("resume after stop")).rejects.toThrow(
+      "documentation mount was replaced",
+    );
+    expect(prepareFileAccess).toHaveBeenCalledTimes(2);
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual(["first"]);
+    expect(runner.getStatus()).toBe("error");
+  });
+
+  it("revalidates a restored resumable session before dispatching its first resumed input", async () => {
+    const ctl = makeControllableQuery();
+    const query = vi.fn(ctl.query);
+    const resolveFileAccess = vi.fn(() => ({
+      readableFiles: [],
+      writableFiles: [],
+      writableDirectories: ["/unsafe/docs"],
+    }));
+    const runner = new AgentRunner("resume-path-agent", {
+      query,
+      resolveFileAccess,
+      prepareFileAccess: async () => {
+        throw new Error("documentation mount was replaced");
+      },
+    });
+    runner.restore({
+      id: "resume-path-agent",
+      status: "waiting_input",
+      sessionId: "session-resume",
+      config: { prompt: "old task", resume: "session-resume" },
+      createdAt: 1,
+      lastEventSeq: 0,
+    });
+
+    await expect(runner.send("resume task")).rejects.toThrow(
+      "documentation mount was replaced",
+    );
+
+    expect(resolveFileAccess).not.toHaveBeenCalled();
+    expect(query).not.toHaveBeenCalled();
+    expect(runner.getStatus()).toBe("error");
+  });
+
+  it("does not let stale queued validation failure terminate a restarted session", async () => {
+    const ctl = makeControllableQuery();
+    const queuedPreparation = deferred();
+    let preparationCall = 0;
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("queued-restart-race-agent", {
+      query: ctl.query,
+      prepareFileAccess: () => {
+        preparationCall++;
+        return preparationCall === 2 ? queuedPreparation.promise : undefined;
+      },
+    });
+    runner.on((event) => events.push(event));
+
+    await runner.start({ prompt: "start A" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+    await runner.send("queued for A");
+    ctl.emit(resultMsg());
+    await flush();
+    expect(preparationCall).toBe(2);
+
+    await runner.stop();
+    await runner.send("start B");
+    await runner.send("queued for B");
+    queuedPreparation.reject(new Error("stale A validation failed"));
+    await flush();
+    await flush();
+
+    expect(runner.getStatus()).toBe("starting");
+    expect(events.filter((event) => event.kind === "error")).toEqual([]);
+
+    ctl.emit(SYSTEM_INIT);
+    ctl.emit(resultMsg());
+    await flush();
+
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual([
+      "start A",
+      "start B",
+      "queued for B",
+    ]);
+    expect(runner.getStatus()).toBe("running");
+    expect(events.filter((event) => event.kind === "error")).toEqual([]);
+    await runner.terminate();
   });
 
   it("steer 优先调用底层 handle 的引导能力，并记录 steer 事件", async () => {

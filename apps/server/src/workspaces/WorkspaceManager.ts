@@ -15,6 +15,7 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type {
   AgentFileAccess,
   AgentSharedResourceReference,
@@ -239,13 +240,47 @@ export class WorkspaceManager {
     };
     await this.ensureProjectRootAvailable(projectRoot);
     await mkdir(projectRoot, { recursive: true });
+    const previousSelection = {
+      projectRoot: this.projectRoot,
+      currentProject: this.currentProject,
+      state: this.state,
+      stateLoaded: this.stateLoaded,
+      branchCounter: this.branchCounter,
+      resourceCounter: this.resourceCounter,
+    };
     this.selectProject(project, { branches: [], sharedResources: [] });
-    await this.saveState();
-    return project;
+    try {
+      await this.saveState();
+      return project;
+    } catch (error) {
+      this.advanceProjectGeneration();
+      this.projectRoot = previousSelection.projectRoot;
+      this.currentProject = previousSelection.currentProject;
+      this.state = previousSelection.state;
+      this.stateLoaded = previousSelection.stateLoaded;
+      this.branchCounter = previousSelection.branchCounter;
+      this.resourceCounter = previousSelection.resourceCounter;
+      await rm(path.join(projectRoot, WORKSPACE_STATE_FILE), { force: true }).catch(
+        () => undefined,
+      );
+      throw error;
+    }
   }
 
   async openCanvasProject(input: OpenCanvasProjectInput): Promise<WorkspaceProject> {
     return await this.queueProjectMutation(() => this.openCanvasProjectInternal(input));
+  }
+
+  async closeCanvasProject(): Promise<void> {
+    await this.queueProjectMutation(async () => {
+      this.advanceProjectGeneration();
+      this.projectRoot = undefined;
+      this.currentProject = undefined;
+      this.state = { branches: [], sharedResources: [] };
+      this.stateLoaded = false;
+      this.branchCounter = 0;
+      this.resourceCounter = 0;
+    });
   }
 
   private async openCanvasProjectInternal(
@@ -323,8 +358,8 @@ export class WorkspaceManager {
     const deletingCurrentProject =
       normalizedRootKey(this.currentProject?.projectRoot ?? "") ===
       normalizedRootKey(projectRoot);
-    if (deletingCurrentProject) this.advanceProjectGeneration();
     await rm(projectRoot, { recursive: true, force: false });
+    if (deletingCurrentProject) this.advanceProjectGeneration();
     const index = await this.readProjectIndex();
     await this.writeProjectIndex(
       index.projects.filter(
@@ -334,12 +369,7 @@ export class WorkspaceManager {
       ),
     );
     if (deletingCurrentProject) {
-      this.projectRoot = undefined;
-      this.currentProject = undefined;
-      this.state = { branches: [], sharedResources: [] };
-      this.stateLoaded = false;
-      this.branchCounter = 0;
-      this.resourceCounter = 0;
+      this.clearSelectedProject();
     }
     return project;
   }
@@ -369,8 +399,13 @@ export class WorkspaceManager {
     const projectRoot = this.requireProjectRoot();
     await mkdir(projectRoot, { recursive: true });
     const source = path.resolve(input.localPath ?? this.defaultSourcePath);
-    const cloneSource = normalizeRemoteUrl(input.remoteUrl) ?? source;
-    const remoteUrl = normalizeRemoteUrl(input.remoteUrl) ?? (await this.remoteUrlOf(source)) ?? source;
+    const requestedRemote = normalizeRemoteUrl(input.remoteUrl);
+    const cloneSource = requestedRemote ?? source;
+    const discoveredRemote = requestedRemote ? undefined : await this.remoteUrlOf(source);
+    const remoteUrl = normalizeRepositoryLocation(
+      requestedRemote ?? discoveredRemote ?? source,
+      requestedRemote ? process.cwd() : source,
+    );
     const defaultBranch =
       input.defaultBranch?.trim() || (await this.currentBranch(source)) || "main";
     const localRepoPath = this.localRepoPath(DEFAULT_REPO_ID);
@@ -801,6 +836,15 @@ export class WorkspaceManager {
     );
   }
 
+  private clearSelectedProject(): void {
+    this.projectRoot = undefined;
+    this.currentProject = undefined;
+    this.state = { branches: [], sharedResources: [] };
+    this.stateLoaded = false;
+    this.branchCounter = 0;
+    this.resourceCounter = 0;
+  }
+
   private async ensureProjectOpen(): Promise<void> {
     if (this.projectRoot && this.currentProject) return;
     throw new Error("尚未打开 canvas 项目");
@@ -870,6 +914,7 @@ export class WorkspaceManager {
   private snapshot(): WorkspaceProject {
     return {
       canvasProject: this.currentProject,
+      revision: this.projectGeneration,
       projectRoot: this.requireProjectRoot(),
       repo: this.state.repo,
       branches: [...this.state.branches],
@@ -1283,7 +1328,8 @@ export class WorkspaceManager {
   private workDocumentationRepositoryKey(workspace: BranchWorkspace): string {
     const repo = this.state.repo?.id === workspace.repoId ? this.state.repo : undefined;
     const identity = repo?.remoteUrl || workspace.repoId;
-    return createHash("sha256").update(identity.toLowerCase()).digest("hex").slice(0, 16);
+    const normalizedIdentity = normalizeRepositoryIdentity(identity);
+    return createHash("sha256").update(normalizedIdentity).digest("hex").slice(0, 16);
   }
 
   private async queueWorkDocumentation<T>(task: () => Promise<T>): Promise<T> {
@@ -1716,6 +1762,13 @@ function normalizeRemoteUrl(value: string | undefined): string | undefined {
   return trimmed || undefined;
 }
 
+function normalizeRepositoryLocation(value: string, relativeTo: string): string {
+  if (/^file:/iu.test(value) || path.isAbsolute(value)) return value;
+  if (/^[a-z][a-z\d+.-]*:\/\//iu.test(value)) return value;
+  if (/^(?:[^@/\\]+@)?[^:/\\]+:.+/u.test(value)) return value;
+  return path.resolve(relativeTo, value);
+}
+
 function normalizeBranch(value: string): string {
   const branch = value.trim();
   if (!branch) throw new Error("branch 不能为空");
@@ -2090,6 +2143,29 @@ function uniqueProjectIds(projects: CanvasProjectSummary[]): CanvasProjectSummar
 function normalizedRootKey(root: string): string {
   const resolved = path.resolve(root);
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function normalizeRepositoryIdentity(identity: string): string {
+  const trimmed = identity.trim();
+  if (/^file:/iu.test(trimmed)) {
+    try {
+      return normalizedRootKey(fileURLToPath(trimmed));
+    } catch {
+      // Preserve invalid/opaque values exactly; lower-casing them can merge distinct identities.
+      return trimmed;
+    }
+  }
+  if (path.isAbsolute(trimmed)) return normalizedRootKey(trimmed);
+  const isRemoteUrl = /^[a-z][a-z\d+.-]*:\/\//iu.test(trimmed);
+  const isScpRemote = /^(?:[^@/\\]+@)?[^:/\\]+:.+/u.test(trimmed);
+  if (isRemoteUrl || isScpRemote) {
+    // Preserve the existing remote-repository key scheme so an upgrade does not silently
+    // detach a branch from its established shared documentation directory. Local filesystem
+    // identities are the only identities whose case semantics depend on the host platform.
+    return trimmed.toLowerCase();
+  }
+  const normalized = path.normalize(trimmed);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 function isPathWithin(candidate: string, parent: string): boolean {

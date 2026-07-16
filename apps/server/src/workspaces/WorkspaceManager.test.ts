@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import {
   cp,
   lstat,
@@ -15,8 +16,11 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { WorkspaceManager, type GitRunner } from "./WorkspaceManager.js";
 import { sharedBranchDirectory } from "./workDocumentation.js";
+
+const CASE_DISTINCT_TEST_FILESYSTEM = testFilesystemPreservesCaseDistinctDirectories();
 
 describe("WorkspaceManager", () => {
   it("creates and opens explicit canvas projects", async () => {
@@ -73,6 +77,31 @@ describe("WorkspaceManager", () => {
       expect(await manager.listCanvasProjects()).toEqual([created]);
       await expect(manager.openCanvasProject({ id: created.id })).resolves.toMatchObject({
         projectRoot: customProjectRoot,
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("restores an empty selection when project persistence fails after selection", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-create-rollback-"));
+    try {
+      const blockedProjectsRoot = path.join(root, "projects-root-is-a-file");
+      const projectRoot = path.join(root, "new-project");
+      await writeFile(blockedProjectsRoot, "not a directory", "utf-8");
+      const manager = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot: blockedProjectsRoot,
+        autoOpenDefault: false,
+      });
+
+      await expect(
+        manager.createCanvasProject({ name: "Must Roll Back", projectRoot }),
+      ).rejects.toBeTruthy();
+      expect(manager.currentProjectId()).toBeUndefined();
+      await expect(manager.project()).rejects.toThrow("尚未打开 canvas 项目");
+      await expect(readFile(path.join(projectRoot, "workspace.json"))).rejects.toMatchObject({
+        code: "ENOENT",
       });
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -760,6 +789,122 @@ describe("WorkspaceManager", () => {
     }
   });
 
+  (CASE_DISTINCT_TEST_FILESYSTEM ? it : it.skip).each([
+    "no-origin fallback",
+    "file URL origin",
+    "relative origin",
+  ] as const)(
+    "keeps case-distinct local repositories in separate documentation roots (%s)",
+    async (identityMode) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-doc-repo-case-"));
+      const upperSource = path.join(root, "Repo");
+      const lowerSource = path.join(root, "repo");
+      const projectRoot = path.join(root, "project");
+      await mkdir(upperSource, { recursive: true });
+      await mkdir(lowerSource, { recursive: true });
+
+      try {
+        const [upperRealPath, lowerRealPath] = await Promise.all([
+          realpath(upperSource),
+          realpath(lowerSource),
+        ]);
+        expect(upperRealPath).not.toBe(lowerRealPath);
+
+        const runGit: GitRunner = async (args, options) => {
+          if (args[0] === "remote") {
+            if (identityMode === "no-origin fallback") {
+              throw new Error("repository has no origin");
+            }
+            if (identityMode === "relative origin") return ".";
+            return pathToFileURL(String(options?.cwd)).href;
+          }
+          if (args[0] === "branch") return "main";
+          if (args[0] === "clone") {
+            await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+            return "";
+          }
+          if (args[0] === "rev-parse") {
+            return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+          }
+          return "";
+        };
+        const manager = new WorkspaceManager({
+          defaultSourcePath: upperSource,
+          projectRoot,
+          runGit,
+        });
+
+        const firstProject = await manager.connect({ localPath: upperSource });
+        await manager.prepareWorkDocumentationForAllBranches();
+        const firstMount = path.join(
+          firstProject.branches[0]!.worktreePath,
+          ".agent-shared-docs",
+        );
+        const firstTarget = await realpath(firstMount);
+        const sentinel = path.join(firstTarget, "first-repository.md");
+        await writeFile(sentinel, "first repository only\n", "utf-8");
+
+        // Reconnecting the single-repository project reuses its fixed worktree path. Remove
+        // only that generated checkout/mount while retaining the first shared source as proof.
+        await rm(firstMount, { force: true });
+        await rm(firstProject.branches[0]!.worktreePath, {
+          recursive: true,
+          force: true,
+        });
+        await rm(path.join(projectRoot, "repos", "repo_1", "repo"), {
+          recursive: true,
+          force: true,
+        });
+        const secondProject = await manager.connect({ localPath: lowerSource });
+        await manager.prepareWorkDocumentationForAllBranches();
+        const secondMount = path.join(
+          secondProject.branches[0]!.worktreePath,
+          ".agent-shared-docs",
+        );
+        const secondTarget = await realpath(secondMount);
+
+        expect(secondTarget).not.toBe(firstTarget);
+        await expect(readFile(sentinel, "utf-8")).resolves.toContain("first repository only");
+        await expect(
+          readFile(path.join(secondTarget, "first-repository.md"), "utf-8"),
+        ).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("resolves a relative local origin against its source repository", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-doc-relative-origin-"));
+    const source = path.join(root, "source", "worktree");
+    const projectRoot = path.join(root, "project");
+    await mkdir(source, { recursive: true });
+    const runGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return "../Repository";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      return "";
+    };
+
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: source,
+        projectRoot,
+        runGit,
+      });
+      const workspace = await manager.connect({ localPath: source });
+      expect(workspace.repo?.remoteUrl).toBe(path.resolve(source, "../Repository"));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("waits for in-progress documentation writes before switching projects", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-doc-project-race-"));
     const source = path.join(root, "source-repo");
@@ -1003,7 +1148,7 @@ describe("WorkspaceManager", () => {
     const source = path.join(root, "source-repo");
     const projectRoot = path.join(root, "project");
     const outside = path.join(root, "outside");
-    const remoteUrl = "https://github.com/acme/doc-boundary.git";
+    const remoteUrl = "https://GitHub.com/Acme/Doc-Boundary.git";
     await Promise.all([
       mkdir(source, { recursive: true }),
       mkdir(outside, { recursive: true }),
@@ -1317,6 +1462,21 @@ describe("WorkspaceManager", () => {
     }
   }, 30_000);
 });
+
+function testFilesystemPreservesCaseDistinctDirectories(): boolean {
+  const root = mkdtempSync(path.join(os.tmpdir(), "agent-canvas-case-probe-"));
+  try {
+    const upper = path.join(root, "Repo");
+    const lower = path.join(root, "repo");
+    mkdirSync(upper, { recursive: true });
+    mkdirSync(lower, { recursive: true });
+    const upperOnlyFile = path.join(upper, "upper-only");
+    writeFileSync(upperOnlyFile, "probe\n", "utf-8");
+    return !existsSync(path.join(lower, "upper-only"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
 
 async function runGit(args: string[], cwd: string): Promise<string> {
   return new Promise((resolve, reject) => {

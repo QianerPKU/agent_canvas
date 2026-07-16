@@ -25,7 +25,11 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { api, type WorkDocumentationMutationStatus } from "./api.js";
+import {
+  api,
+  type CanvasProjectOpenResult,
+  type WorkDocumentationMutationStatus,
+} from "./api.js";
 import {
   CODEX_MODELS,
   CODEX_REASONING_EFFORTS,
@@ -50,7 +54,12 @@ import type {
   SyncFlowSnapshot,
 } from "@agent-canvas/shared";
 import "@xyflow/react/dist/style.css";
-import { useAgentCanvas, type AgentActions, type FileActions } from "./useAgentCanvas.js";
+import {
+  useAgentCanvas,
+  workspaceEventIdentity,
+  type AgentActions,
+  type FileActions,
+} from "./useAgentCanvas.js";
 import { TurnNode, type TurnNodeType } from "./nodes/TurnNode.js";
 import type { AgentMap } from "./agentStore.js";
 import {
@@ -129,6 +138,70 @@ export function workDocumentationMutationWarning(
   if (!result.partialSuccess || result.workDocumentation?.ready !== false) return undefined;
   const detail = result.workDocumentation.error?.trim() || "unknown error";
   return `操作已完成，但工作文档初始化失败：${detail}`;
+}
+
+export function adoptOpenedProject(
+  result: CanvasProjectOpenResult,
+  setters: {
+    setWorkspace: (workspace: WorkspaceProject) => void;
+    setLayoutProjectId: (projectId: string | undefined) => void;
+    setProjectError: (error: string | undefined) => void;
+  },
+): void {
+  setters.setWorkspace(result);
+  setters.setLayoutProjectId(result.canvasProject?.id);
+  setters.setProjectError(workDocumentationMutationWarning(result));
+}
+
+export async function resolveCurrentProjectOpenStep<T>(
+  operation: Promise<T>,
+  isCurrent: () => boolean,
+): Promise<T | undefined> {
+  const result = await operation;
+  return isCurrent() ? result : undefined;
+}
+
+export interface ProjectOperationOwnership {
+  token: number;
+  workspaceEventGeneration: number;
+}
+
+export function ownsProjectOperation(
+  ownership: ProjectOperationOwnership,
+  currentToken: number,
+  currentWorkspaceEventGeneration: number,
+  currentWorkspaceIdentity?: string,
+  expectedWorkspaceIdentity?: string,
+): boolean {
+  if (ownership.token !== currentToken) return false;
+  if (ownership.workspaceEventGeneration === currentWorkspaceEventGeneration) return true;
+  return (
+    expectedWorkspaceIdentity !== undefined &&
+    expectedWorkspaceIdentity === currentWorkspaceIdentity
+  );
+}
+
+export function isCurrentWorkspaceUpdate(
+  workspace: WorkspaceProject | undefined,
+  currentWorkspaceIdentity: string | undefined,
+): boolean {
+  return workspaceEventIdentity(workspace) === currentWorkspaceIdentity;
+}
+
+export function adoptDeletedCurrentProject(
+  deletedProjectId: string,
+  currentWorkspace: WorkspaceProject | undefined,
+  setters: {
+    setWorkspace: (workspace: WorkspaceProject | undefined) => void;
+    setLayoutProjectId: (projectId: string | undefined) => void;
+    setProjectError: (error: string | undefined) => void;
+  },
+): boolean {
+  if (currentWorkspace?.canvasProject?.id !== deletedProjectId) return false;
+  setters.setWorkspace(undefined);
+  setters.setLayoutProjectId(undefined);
+  setters.setProjectError(undefined);
+  return true;
 }
 
 export function isSameBranchWorkspace(
@@ -267,6 +340,18 @@ export function canvasLayoutFromNodes(
       windowState: nodeWindowState(node),
     })),
   };
+}
+
+export function canvasLayoutAutosaveReady(
+  currentProjectId: string | undefined,
+  layoutProjectId: string | undefined,
+  layoutReadyProjectId: string | undefined,
+): boolean {
+  return (
+    currentProjectId !== undefined &&
+    currentProjectId === layoutProjectId &&
+    currentProjectId === layoutReadyProjectId
+  );
 }
 
 function layoutById(layout: CanvasNodeLayout[]): Map<string, CanvasNodeLayout> {
@@ -959,6 +1044,10 @@ export default function App(): React.ReactElement {
     prFlows,
     syncFlows,
     commits,
+    workspaceUpdate,
+    currentWorkspaceEventGeneration,
+    currentWorkspaceEventIdentity,
+    invalidateWorkspaceRefresh,
     connected,
     refresh,
     actions,
@@ -969,6 +1058,7 @@ export default function App(): React.ReactElement {
   } = useAgentCanvas();
   const flowRef = useRef<ReactFlowInstance<CanvasNode, Edge> | null>(null);
   const canvasWrapRef = useRef<HTMLDivElement | null>(null);
+  const projectOperationInvocationRef = useRef(0);
   const [nodes, setNodes, onNodesChange] = useNodesState<CanvasNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [savedLayout, setSavedLayout] = useState<CanvasLayoutSnapshot>({
@@ -976,6 +1066,8 @@ export default function App(): React.ReactElement {
     updatedAt: 0,
   });
   const [layoutProjectId, setLayoutProjectId] = useState<string>();
+  const [layoutReadyProjectId, setLayoutReadyProjectId] = useState<string>();
+  const layoutReadyProjectIdRef = useRef<string>();
   const [historyTarget, setHistoryTarget] = useState<HistoryTarget>();
   const [openFileId, setOpenFileId] = useState<string>();
   const [fileOpenError, setFileOpenError] = useState<string>();
@@ -1004,6 +1096,8 @@ export default function App(): React.ReactElement {
   const [agentSettingsTarget, setAgentSettingsTarget] = useState<AgentSettingsTarget>();
   const [projects, setProjects] = useState<CanvasProjectSummary[]>([]);
   const [workspace, setWorkspace] = useState<WorkspaceProject>();
+  const workspaceRef = useRef<WorkspaceProject>();
+  workspaceRef.current = workspace;
   const [projectError, setProjectError] = useState<string>();
   const [branches, setBranches] = useState<BranchOption[]>([]);
   const [pendingPlacements, setPendingPlacements] = useState<NodePlacementOverrides>({});
@@ -1014,6 +1108,31 @@ export default function App(): React.ReactElement {
   const openSyncFlow = syncFlows.find((flow) => flow.id === openSyncFlowId);
   const settingsAgent =
     agentSettingsTarget?.mode === "edit" ? agents[agentSettingsTarget.agentId] : undefined;
+
+  const updateLayoutReadyProjectId = useCallback((projectId: string | undefined) => {
+    layoutReadyProjectIdRef.current = projectId;
+    setLayoutReadyProjectId(projectId);
+  }, []);
+
+  const clearProjectScopedUi = useCallback(() => {
+    updateLayoutReadyProjectId(undefined);
+    setNodes([]);
+    setEdges([]);
+    setPendingPlacements({});
+    setBranches([]);
+    setHistoryTarget(undefined);
+    setOpenFileId(undefined);
+    setOpenCommitId(undefined);
+    setOpenPullRequestId(undefined);
+    setOpenSyncFlowId(undefined);
+    setAgentSettingsTarget(undefined);
+    setCreatingFile(false);
+    setCreatingPrompt(false);
+    setShowingPullRequests(false);
+    setShowingSyncFlows(false);
+    setShowingSettings(false);
+    setFileOpenError(undefined);
+  }, [setEdges, setNodes, updateLayoutReadyProjectId]);
 
   const captureViewportPlacement = useCallback((width: number, height: number) => {
     const flow = flowRef.current;
@@ -1035,29 +1154,55 @@ export default function App(): React.ReactElement {
     }));
   }, []);
 
-  const refreshAppSettings = useCallback(async () => {
-    const settings = await api.settings();
-    setAppSettings(settings);
-    return settings;
-  }, []);
+  const captureProjectOperation = useCallback(
+    (): ProjectOperationOwnership => ({
+      token: projectOperationInvocationRef.current,
+      workspaceEventGeneration: currentWorkspaceEventGeneration(),
+    }),
+    [currentWorkspaceEventGeneration],
+  );
+
+  const beginProjectOperation = useCallback((): ProjectOperationOwnership => {
+    invalidateWorkspaceRefresh();
+    return {
+      token: ++projectOperationInvocationRef.current,
+      workspaceEventGeneration: currentWorkspaceEventGeneration(),
+    };
+  }, [currentWorkspaceEventGeneration, invalidateWorkspaceRefresh]);
+
+  const projectOperationIsCurrent = useCallback(
+    (ownership: ProjectOperationOwnership, expectedWorkspaceIdentity?: string) =>
+      ownsProjectOperation(
+        ownership,
+        projectOperationInvocationRef.current,
+        currentWorkspaceEventGeneration(),
+        currentWorkspaceEventIdentity(),
+        expectedWorkspaceIdentity,
+      ),
+    [currentWorkspaceEventGeneration, currentWorkspaceEventIdentity],
+  );
 
   useEffect(() => {
     let cancelled = false;
+    const ownership = captureProjectOperation();
     void api.listCanvasProjects().then(
       (nextProjects) => {
-        if (!cancelled) setProjects(nextProjects);
+        if (!cancelled && projectOperationIsCurrent(ownership)) setProjects(nextProjects);
       },
       (error) => {
-        if (!cancelled) setProjectError(error instanceof Error ? error.message : String(error));
+        if (!cancelled && projectOperationIsCurrent(ownership)) {
+          setProjectError(error instanceof Error ? error.message : String(error));
+        }
       },
     );
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [captureProjectOperation, projectOperationIsCurrent]);
 
   useEffect(() => {
     let cancelled = false;
+    const ownership = captureProjectOperation();
     void api.config().then(
       (config) => {
         if (!cancelled) setServerConfig(config);
@@ -1066,19 +1211,28 @@ export default function App(): React.ReactElement {
     );
     void api.settings().then(
       (settings) => {
-        if (!cancelled) setAppSettings(settings);
+        if (!cancelled && projectOperationIsCurrent(ownership)) setAppSettings(settings);
       },
       () => undefined,
     );
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [captureProjectOperation, projectOperationIsCurrent]);
 
-  const updateAppSettings = useCallback(async (settings: Partial<AgentCanvasSettings>) => {
-    const updated = await api.updateSettings(settings);
-    setAppSettings(updated);
-  }, []);
+  const updateAppSettings = useCallback(
+    async (settings: Partial<AgentCanvasSettings>) => {
+      const ownership = captureProjectOperation();
+      const expectedWorkspaceIdentity = workspaceEventIdentity(workspaceRef.current);
+      const expectedProjectId = workspaceRef.current?.canvasProject?.id;
+      if (!expectedProjectId) throw new Error("尚未打开 Canvas 项目");
+      const updated = await api.updateSettings(settings, expectedProjectId);
+      if (projectOperationIsCurrent(ownership, expectedWorkspaceIdentity)) {
+        setAppSettings(updated);
+      }
+    },
+    [captureProjectOperation, projectOperationIsCurrent],
+  );
 
   const refreshCodexUsage = useCallback(async () => {
     setCodexUsageError(undefined);
@@ -1094,46 +1248,176 @@ export default function App(): React.ReactElement {
   }, [refreshCodexUsage, showingSettings]);
 
   const refreshBranchOptions = useCallback(async () => {
+    const ownership = captureProjectOperation();
+    const expectedWorkspaceIdentity = workspaceEventIdentity(workspaceRef.current);
     const nextBranches = await api.listBranchOptions();
-    setBranches(nextBranches);
+    if (projectOperationIsCurrent(ownership, expectedWorkspaceIdentity)) {
+      setBranches(nextBranches);
+    }
     return nextBranches;
-  }, []);
+  }, [captureProjectOperation, projectOperationIsCurrent]);
+
+  useEffect(() => {
+    if (
+      !workspaceUpdate ||
+      !isCurrentWorkspaceUpdate(
+        workspaceUpdate.workspace,
+        currentWorkspaceEventIdentity(),
+      )
+    ) {
+      return;
+    }
+    let cancelled = false;
+    const ownership = captureProjectOperation();
+    const isCurrentWorkspaceEvent = () =>
+      !cancelled &&
+      projectOperationIsCurrent(ownership);
+    clearProjectScopedUi();
+    if (!workspaceUpdate.workspace) {
+      setWorkspace(undefined);
+      setLayoutProjectId(undefined);
+      setProjectError(undefined);
+      void Promise.all([
+        api.canvasLayout(),
+        api.settings(),
+        api.listCanvasProjects(),
+        refresh(),
+      ]).then(
+        ([nextLayout, nextSettings, nextProjects]) => {
+          if (!isCurrentWorkspaceEvent()) return;
+          setSavedLayout(nextLayout);
+          setAppSettings(nextSettings);
+          setProjects(nextProjects);
+        },
+        (error) => {
+          if (isCurrentWorkspaceEvent()) {
+            setProjectError(error instanceof Error ? error.message : String(error));
+          }
+        },
+      );
+      return () => {
+        cancelled = true;
+      };
+    }
+    const nextWorkspace: CanvasProjectOpenResult = {
+      ...workspaceUpdate.workspace,
+      partialSuccess: workspaceUpdate.partialSuccess,
+      workDocumentation: workspaceUpdate.workDocumentation,
+    };
+
+    // Project switches are global server state. Adopt the broadcast immediately so every
+    // connected client stops displaying the previous project before auxiliary data reloads.
+    adoptOpenedProject(nextWorkspace, {
+      setWorkspace,
+      setLayoutProjectId,
+      setProjectError,
+    });
+
+    void Promise.all([
+      api.canvasLayout(),
+      api.settings(),
+      api.listCanvasProjects(),
+      nextWorkspace.repo ? api.listBranchOptions() : Promise.resolve([]),
+      refresh(),
+    ]).then(
+      ([nextLayout, nextSettings, nextProjects, nextBranches]) => {
+        if (!isCurrentWorkspaceEvent()) return;
+        setSavedLayout(nextLayout);
+        setAppSettings(nextSettings);
+        setProjects(nextProjects);
+        setBranches(nextBranches);
+        updateLayoutReadyProjectId(nextWorkspace.canvasProject?.id);
+      },
+      (error) => {
+        if (isCurrentWorkspaceEvent()) {
+          setProjectError(error instanceof Error ? error.message : String(error));
+        }
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    captureProjectOperation,
+    clearProjectScopedUi,
+    currentWorkspaceEventIdentity,
+    projectOperationIsCurrent,
+    refresh,
+    updateLayoutReadyProjectId,
+    workspaceUpdate,
+  ]);
 
   const openProject = useCallback(
-    async (id?: string, projectRoot?: string, trustedExternalResourcePaths?: string[]) => {
+    async (
+      id?: string,
+      projectRoot?: string,
+      trustedExternalResourcePaths?: string[],
+      ownership = beginProjectOperation(),
+    ) => {
       setProjectError(undefined);
+      let expectedWorkspaceIdentity: string | undefined;
       try {
-        setLayoutProjectId(undefined);
         const nextWorkspace = await api.openCanvasProject({
           id,
           projectRoot,
           trustedExternalResourcePaths,
         });
-        const [nextLayout] = await Promise.all([
-          api.canvasLayout(),
-          refreshAppSettings(),
-        ]);
-        setNodes([]);
-        setEdges([]);
-        setPendingPlacements({});
+        expectedWorkspaceIdentity = workspaceEventIdentity(nextWorkspace);
+        const isCurrent = () =>
+          projectOperationIsCurrent(ownership, expectedWorkspaceIdentity);
+        if (!isCurrent()) return;
+        api.setWorkspaceContext(nextWorkspace);
+        // A 207 response still means the server switched projects. Adopt that authoritative
+        // state before auxiliary refreshes so their failure cannot leave the old project visible.
+        adoptOpenedProject(nextWorkspace, {
+          setWorkspace,
+          setLayoutProjectId,
+          setProjectError,
+        });
+        clearProjectScopedUi();
+        const auxiliary = await resolveCurrentProjectOpenStep(
+          Promise.all([api.canvasLayout(), api.settings()]),
+          isCurrent,
+        );
+        if (!auxiliary) return;
+        const [nextLayout, nextSettings] = auxiliary;
         setSavedLayout(nextLayout);
+        setAppSettings(nextSettings);
         await refresh();
-        setWorkspace(nextWorkspace);
-        setLayoutProjectId(nextWorkspace.canvasProject?.id);
-        setProjects(await api.listCanvasProjects());
-        setBranches(nextWorkspace.repo ? await api.listBranchOptions() : []);
+        if (!isCurrent()) return;
+        updateLayoutReadyProjectId(nextWorkspace.canvasProject?.id);
+        const projectLists = await resolveCurrentProjectOpenStep(
+          Promise.all([
+            api.listCanvasProjects(),
+            nextWorkspace.repo ? api.listBranchOptions() : Promise.resolve([]),
+          ]),
+          isCurrent,
+        );
+        if (!projectLists) return;
+        setProjects(projectLists[0]);
+        setBranches(projectLists[1]);
       } catch (error) {
-        setProjectError(error instanceof Error ? error.message : String(error));
+        if (projectOperationIsCurrent(ownership, expectedWorkspaceIdentity)) {
+          setProjectError(error instanceof Error ? error.message : String(error));
+        }
       }
     },
-    [refresh, refreshAppSettings, setEdges, setNodes],
+    [
+      beginProjectOperation,
+      clearProjectScopedUi,
+      projectOperationIsCurrent,
+      refresh,
+      updateLayoutReadyProjectId,
+    ],
   );
 
   const loadProject = useCallback(
     async (projectRoot: string) => {
+      const ownership = beginProjectOperation();
       setProjectError(undefined);
       try {
         const inspection = await api.inspectCanvasProject(projectRoot);
+        if (!projectOperationIsCurrent(ownership)) return;
         const externalPaths = inspection.externalSharedResources.map(
           (resource) => resource.sourcePath,
         );
@@ -1143,70 +1427,152 @@ export default function App(): React.ReactElement {
           );
           if (!approved) return;
         }
-        await openProject(undefined, projectRoot, externalPaths);
+        await openProject(undefined, projectRoot, externalPaths, ownership);
       } catch (error) {
-        setProjectError(error instanceof Error ? error.message : String(error));
+        if (projectOperationIsCurrent(ownership)) {
+          setProjectError(error instanceof Error ? error.message : String(error));
+        }
       }
     },
-    [openProject],
+    [beginProjectOperation, openProject, projectOperationIsCurrent],
   );
 
-  const deleteProject = useCallback(async (id: string) => {
-    setProjectError(undefined);
-    try {
-      await api.deleteCanvasProject(id);
-      setProjects(await api.listCanvasProjects());
-    } catch (error) {
-      setProjectError(error instanceof Error ? error.message : String(error));
-    }
-  }, []);
+  const deleteProject = useCallback(
+    async (id: string) => {
+      const ownership = beginProjectOperation();
+      const workspaceAtStart = workspaceRef.current;
+      const deletingCurrent = workspaceAtStart?.canvasProject?.id === id;
+      const expectedWorkspaceIdentity = deletingCurrent
+        ? workspaceEventIdentity(undefined)
+        : workspaceEventIdentity(workspaceAtStart);
+      const isCurrent = () =>
+        projectOperationIsCurrent(ownership, expectedWorkspaceIdentity);
+      setProjectError(undefined);
+      try {
+        const deleted = await api.deleteCanvasProject(id);
+        if (!isCurrent()) return;
+
+        const clearedCurrent = adoptDeletedCurrentProject(
+          deleted.id,
+          workspaceRef.current ?? workspaceAtStart,
+          { setWorkspace, setLayoutProjectId, setProjectError },
+        );
+        if (deletingCurrent || clearedCurrent) {
+          api.setWorkspaceContext(undefined);
+          clearProjectScopedUi();
+        }
+
+        const replacement = await resolveCurrentProjectOpenStep(
+          Promise.all([
+            api.listCanvasProjects(),
+            deletingCurrent ? api.canvasLayout() : Promise.resolve(undefined),
+            deletingCurrent ? api.settings() : Promise.resolve(undefined),
+            deletingCurrent ? refresh() : Promise.resolve(),
+          ]),
+          isCurrent,
+        );
+        if (!replacement) return;
+        const [nextProjects, nextLayout, nextSettings] = replacement;
+        setProjects(nextProjects);
+        if (nextLayout) setSavedLayout(nextLayout);
+        if (nextSettings) setAppSettings(nextSettings);
+      } catch (error) {
+        if (isCurrent()) {
+          setProjectError(error instanceof Error ? error.message : String(error));
+        }
+      }
+    },
+    [
+      beginProjectOperation,
+      clearProjectScopedUi,
+      projectOperationIsCurrent,
+      refresh,
+    ],
+  );
 
   const createProject = useCallback(
     async (name: string, projectRoot?: string) => {
+      const ownership = beginProjectOperation();
       setProjectError(undefined);
+      let expectedWorkspaceIdentity: string | undefined;
       try {
-        setLayoutProjectId(undefined);
         const { workspace: nextWorkspace } = await api.createCanvasProject({
           name,
           projectRoot: projectRoot?.trim() || undefined,
         });
-        const [nextLayout] = await Promise.all([
-          api.canvasLayout(),
-          refreshAppSettings(),
-        ]);
-        setNodes([]);
-        setEdges([]);
-        setPendingPlacements({});
-        setSavedLayout(nextLayout);
-        await refresh();
+        expectedWorkspaceIdentity = workspaceEventIdentity(nextWorkspace);
+        const isCurrent = () =>
+          projectOperationIsCurrent(ownership, expectedWorkspaceIdentity);
+        if (!isCurrent()) return;
+        api.setWorkspaceContext(nextWorkspace);
+        clearProjectScopedUi();
         setWorkspace(nextWorkspace);
         setLayoutProjectId(nextWorkspace.canvasProject?.id);
-        setProjects(await api.listCanvasProjects());
-        setBranches([]);
+        setProjectError(undefined);
+        const auxiliary = await resolveCurrentProjectOpenStep(
+          Promise.all([api.canvasLayout(), api.settings(), refresh()]),
+          isCurrent,
+        );
+        if (!auxiliary) return;
+        const [nextLayout, nextSettings] = auxiliary;
+        setSavedLayout(nextLayout);
+        setAppSettings(nextSettings);
+        updateLayoutReadyProjectId(nextWorkspace.canvasProject?.id);
+        const nextProjects = await resolveCurrentProjectOpenStep(
+          api.listCanvasProjects(),
+          isCurrent,
+        );
+        if (nextProjects) setProjects(nextProjects);
       } catch (error) {
-        setProjectError(error instanceof Error ? error.message : String(error));
+        if (projectOperationIsCurrent(ownership, expectedWorkspaceIdentity)) {
+          setProjectError(error instanceof Error ? error.message : String(error));
+        }
       }
     },
-    [refresh, refreshAppSettings, setEdges, setNodes],
+    [
+      beginProjectOperation,
+      clearProjectScopedUi,
+      projectOperationIsCurrent,
+      refresh,
+      updateLayoutReadyProjectId,
+    ],
   );
 
   const connectRepo = useCallback(
     async (input: { remoteUrl: string; defaultBranch?: string }) => {
+      const ownership = beginProjectOperation();
       setProjectError(undefined);
+      let expectedWorkspaceIdentity: string | undefined;
       try {
         const result = await api.connectWorkspace(input);
+        expectedWorkspaceIdentity = workspaceEventIdentity(result);
+        const isCurrent = () =>
+          projectOperationIsCurrent(ownership, expectedWorkspaceIdentity);
+        if (!isCurrent()) return;
+        api.setWorkspaceContext(result);
         const warning = workDocumentationMutationWarning(result);
         // A 207 can also mean the active project changed while documentation was
         // prepared. Refresh authoritative state instead of consuming a stale payload.
         const nextWorkspace = warning ? await api.workspace() : result;
+        if (!isCurrent() || workspaceEventIdentity(nextWorkspace) !== expectedWorkspaceIdentity) {
+          return;
+        }
+        api.setWorkspaceContext(nextWorkspace);
         setWorkspace(nextWorkspace);
-        await refreshBranchOptions();
+        const nextBranches = await resolveCurrentProjectOpenStep(
+          api.listBranchOptions(),
+          isCurrent,
+        );
+        if (!nextBranches) return;
+        setBranches(nextBranches);
         setProjectError(warning);
       } catch (error) {
-        setProjectError(error instanceof Error ? error.message : String(error));
+        if (projectOperationIsCurrent(ownership, expectedWorkspaceIdentity)) {
+          setProjectError(error instanceof Error ? error.message : String(error));
+        }
       }
     },
-    [refreshBranchOptions],
+    [beginProjectOperation, projectOperationIsCurrent],
   );
 
   const openFileEditor = useCallback((fileId: string) => {
@@ -1233,17 +1599,37 @@ export default function App(): React.ReactElement {
 
   const createBranch = useCallback(
     async (branch: string, baseBranch?: string) => {
+      const ownership = beginProjectOperation();
+      const expectedWorkspaceIdentity = workspaceEventIdentity(workspaceRef.current);
+      const isCurrent = () =>
+        projectOperationIsCurrent(ownership, expectedWorkspaceIdentity);
       setProjectError(undefined);
       const result = await api.createBranch({ branch, baseBranch });
+      if (!isCurrent()) {
+        throw new Error("项目已切换；已忽略旧项目的分支创建结果");
+      }
       const warning = workDocumentationMutationWarning(result);
       if (!warning) {
-        await refreshBranchOptions();
+        const nextBranches = await resolveCurrentProjectOpenStep(
+          api.listBranchOptions(),
+          isCurrent,
+        );
+        if (!nextBranches) throw new Error("项目已切换；已忽略旧项目的分支列表");
+        setBranches(nextBranches);
         return result;
       }
 
       const currentWorkspace = await api.workspace();
+      if (!isCurrent() || workspaceEventIdentity(currentWorkspace) !== expectedWorkspaceIdentity) {
+        throw new Error("项目已切换；已忽略旧项目的工作区结果");
+      }
       setWorkspace(currentWorkspace);
-      await refreshBranchOptions();
+      const nextBranches = await resolveCurrentProjectOpenStep(
+        api.listBranchOptions(),
+        isCurrent,
+      );
+      if (!nextBranches) throw new Error("项目已切换；已忽略旧项目的分支列表");
+      setBranches(nextBranches);
       setProjectError(warning);
       const currentBranch = currentWorkspace.branches.find((candidate) =>
         isSameBranchWorkspace(candidate, result),
@@ -1253,7 +1639,7 @@ export default function App(): React.ReactElement {
       }
       return currentBranch;
     },
-    [refreshBranchOptions],
+    [beginProjectOperation, projectOperationIsCurrent],
   );
 
   useEffect(() => {
@@ -1345,14 +1731,36 @@ export default function App(): React.ReactElement {
   }, [nodes, pendingPlacements]);
 
   useEffect(() => {
-    if (!workspace?.canvasProject?.id || workspace.canvasProject.id !== layoutProjectId) return;
+    const canvasProjectId = workspace?.canvasProject?.id;
+    if (
+      !canvasProjectId ||
+      !canvasLayoutAutosaveReady(
+        canvasProjectId,
+        layoutProjectId,
+        layoutReadyProjectId,
+      )
+    ) {
+      return;
+    }
     if (nodes.length === 0 && savedLayout.nodes.length > 0) return;
+    const ownership = captureProjectOperation();
+    const expectedWorkspaceIdentity = workspaceEventIdentity(workspace);
     const timer = window.setTimeout(() => {
+      if (layoutReadyProjectIdRef.current !== canvasProjectId) return;
+      if (!projectOperationIsCurrent(ownership, expectedWorkspaceIdentity)) return;
       const layout = canvasLayoutFromNodes(nodes);
-      void api.saveCanvasLayout(layout).catch(() => undefined);
+      void api.saveCanvasLayout(layout, canvasProjectId).catch(() => undefined);
     }, 400);
     return () => window.clearTimeout(timer);
-  }, [layoutProjectId, nodes, savedLayout.nodes.length, workspace?.canvasProject?.id]);
+  }, [
+    captureProjectOperation,
+    layoutProjectId,
+    layoutReadyProjectId,
+    nodes,
+    projectOperationIsCurrent,
+    savedLayout.nodes.length,
+    workspace,
+  ]);
 
   const connect = useCallback(
     async (connection: Connection) => {
@@ -1539,9 +1947,13 @@ export default function App(): React.ReactElement {
       {creatingFile && (
         <CreateFileDialog
           onCreate={async (input) => {
+            const ownership = captureProjectOperation();
+            const expectedWorkspaceIdentity = workspaceEventIdentity(workspaceRef.current);
             const placement = captureViewportPlacement(FILE_NODE_WIDTH, FILE_NODE_HEIGHT);
             const file = await fileActions.create(input);
-            rememberNodePlacement(fileNodeId(file.id), placement);
+            if (projectOperationIsCurrent(ownership, expectedWorkspaceIdentity)) {
+              rememberNodePlacement(fileNodeId(file.id), placement);
+            }
           }}
           onClose={() => setCreatingFile(false)}
         />
@@ -1556,11 +1968,14 @@ export default function App(): React.ReactElement {
           codexModelCapabilities={serverConfig.codexModelCapabilities}
           onCreateBranch={createBranch}
           onCreate={async (settings) => {
+            const ownership = captureProjectOperation();
+            const expectedWorkspaceIdentity = workspaceEventIdentity(workspaceRef.current);
             const placement = captureViewportPlacement(
               DEFAULT_NODE_WIDTH,
               DEFAULT_NODE_HEIGHT,
             );
             const id = await actions.create(settings);
+            if (!projectOperationIsCurrent(ownership, expectedWorkspaceIdentity)) return;
             rememberNodePlacement(nodeId(id, 0), placement);
             await refreshBranchOptions();
           }}
@@ -1587,12 +2002,16 @@ export default function App(): React.ReactElement {
       {creatingPrompt && (
         <CreatePromptDialog
           onCreate={async (input) => {
+            const ownership = captureProjectOperation();
+            const expectedWorkspaceIdentity = workspaceEventIdentity(workspaceRef.current);
             const placement = captureViewportPlacement(
               PROMPT_NODE_WIDTH,
               PROMPT_NODE_HEIGHT,
             );
             const prompt = await promptActions.create(input);
-            rememberNodePlacement(promptNodeId(prompt.id), placement);
+            if (projectOperationIsCurrent(ownership, expectedWorkspaceIdentity)) {
+              rememberNodePlacement(promptNodeId(prompt.id), placement);
+            }
           }}
           onClose={() => setCreatingPrompt(false)}
         />
