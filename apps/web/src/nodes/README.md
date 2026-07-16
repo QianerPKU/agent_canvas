@@ -8,7 +8,8 @@
 - New turns use a deterministic position directly under the previous turn. New and derived nodes do
   not move to avoid collisions, so their anchor-relative positions stay fixed even when nodes overlap.
 - New root nodes created from the toolbar, including agent, file, and prompt nodes, lock the current
-  viewport center before creation starts and remain visually centered when creation finishes.
+  viewport center before creation starts and use that point without moving the viewport after the
+  request finishes.
 - Newly forked agent root nodes start beside the parent turn that was used as the fork anchor, unless
   the user already saved or manually placed that node.
 - Derived nodes such as result file, commit, PR, and sync nodes use the source turn as their anchor, so historical

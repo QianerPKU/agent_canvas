@@ -4,7 +4,7 @@ This folder renders the canvas UI for Agent Canvas sync flows:
 
 - `SyncFlowDialog.tsx` starts either `cherry_pick` or `branch_pull` flows through `/api/sync-flows`.
 - `SyncFlowNode.tsx` renders the canvas node connected to the proposer turn via `sourceTurnIndex`.
-  New sync nodes are positioned to the right of that source turn and avoid existing nodes.
+  New sync nodes use a fixed offset to the right of that source turn and may overlap existing nodes.
 - `SyncFlowDetailsWindow.tsx` shows the full request, changed files, review responses, and applied result.
 
 The UI mirrors PR and commit nodes: nodes are draggable, resizable, minimizable, and keep their input

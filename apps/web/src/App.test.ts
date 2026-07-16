@@ -36,7 +36,7 @@ describe("canvasInteractionForTool", () => {
 });
 
 describe("computeFileEdges", () => {
-  it("新一轮节点位于自动最小化的上一轮正下方", () => {
+  it("centers an independent root override while keeping the next turn relative", () => {
     const agents: AgentMap = {
       agent_1: {
         id: "agent_1",
@@ -49,6 +49,8 @@ describe("computeFileEdges", () => {
       },
     };
 
+    const rootPlacement = { x: 900, y: 700 };
+    const rejectedDerivedPlacement = { x: -500, y: -400 };
     const nodes = buildNodes(
       agents,
       [],
@@ -67,16 +69,23 @@ describe("computeFileEdges", () => {
       () => undefined,
       () => undefined,
       () => undefined,
+      [],
+      {
+        "agent_1#0": rootPlacement,
+        "agent_1#1": rejectedDerivedPlacement,
+      },
     );
 
     const first = nodes.find((node) => node.id === "agent_1#0");
     const second = nodes.find((node) => node.id === "agent_1#1");
 
     expect(first).toMatchObject({
+      position: rootPlacement,
       width: 400,
       height: 320,
       data: { windowState: undefined },
     });
+    expect(second?.position).not.toEqual(rejectedDerivedPlacement);
     expect(second?.position.x).toBe(first?.position.x);
     expect(second?.position.y).toBe((first?.position.y ?? 0) + 344);
   });
@@ -138,7 +147,7 @@ describe("computeFileEdges", () => {
     expect(third?.position.y).toBe((second?.position.y ?? 0) + 344);
   });
 
-  it("places same-source commits at one fixed relative position and allows overlap", () => {
+  it("places same-source commit, PR, and sync nodes at one fixed relative position", () => {
     const agents: AgentMap = {
       agent_1: {
         id: "agent_1",
@@ -179,8 +188,40 @@ describe("computeFileEdges", () => {
           createdAt: 2,
         },
       ],
-      [],
-      [],
+      [
+        {
+          id: "pr_flow_1",
+          proposerAgentId: "agent_1",
+          sourceTurnIndex: 0,
+          sourceBranch: "feature/a",
+          targetBranch: "main",
+          summary: "merge feature a",
+          files: [],
+          fileChanges: [],
+          status: "queued",
+          createdAt: 1,
+          updatedAt: 1,
+          reviewRequests: [],
+        },
+      ],
+      [
+        {
+          id: "sync_flow_1",
+          kind: "branch_pull",
+          proposerAgentId: "agent_1",
+          sourceTurnIndex: 0,
+          sourceBranch: "main",
+          targetBranch: "feature/a",
+          strategy: "merge",
+          summary: "catch up with main",
+          reason: "use shared changes",
+          files: [],
+          fileChanges: [],
+          status: "review_collecting",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
       {} as AgentActions,
       {} as FileActions,
       {} as PromptActions,
@@ -192,11 +233,19 @@ describe("computeFileEdges", () => {
       () => undefined,
       () => undefined,
       () => undefined,
+      [],
+      {
+        "commit:commit_1": { x: -100, y: -100 },
+        "pr:pr_flow_1": { x: -200, y: -200 },
+        "sync:sync_flow_1": { x: -300, y: -300 },
+      },
     );
 
     const source = nodes.find((node) => node.id === "agent_1#0");
     const commit1 = nodes.find((node) => node.id === "commit:commit_1");
     const commit2 = nodes.find((node) => node.id === "commit:commit_2");
+    const pullRequest = nodes.find((node) => node.id === "pr:pr_flow_1");
+    const sync = nodes.find((node) => node.id === "sync:sync_flow_1");
 
     const expected = {
       x: (source?.position.x ?? 0) + (source?.width ?? 0) + 36,
@@ -204,6 +253,8 @@ describe("computeFileEdges", () => {
     };
     expect(commit1?.position).toEqual(expected);
     expect(commit2?.position).toEqual(expected);
+    expect(pullRequest?.position).toEqual(expected);
+    expect(sync?.position).toEqual(expected);
   });
 
   it("forked agent root node starts beside its parent anchor turn", () => {
@@ -244,6 +295,8 @@ describe("computeFileEdges", () => {
       () => undefined,
       () => undefined,
       () => undefined,
+      [],
+      { "agent_2#0": { x: -500, y: -400 } },
     );
 
     const parent = nodes.find((node) => node.id === "agent_1#0");
@@ -308,6 +361,8 @@ describe("computeFileEdges", () => {
       () => undefined,
       () => undefined,
       () => undefined,
+      [],
+      { "file:file_1": { x: -500, y: -400 } },
     );
 
     const source = nodes.find((node) => node.id === "agent_1#0");

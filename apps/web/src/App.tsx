@@ -623,7 +623,8 @@ export function buildNodes(
   for (const view of Object.values(agents)) {
     view.turns.forEach((turn, index) => {
       const id = nodeId(view.id, index);
-      const placement = placementOverrides[id];
+      const placement =
+        index === 0 && !view.forkOrigin ? placementOverrides[id] : undefined;
       const existing = byId.get(id);
       const existingTurn = existing?.type === "turn" ? existing : undefined;
       const stored = storedLayoutFor(savedById, id, "turn");
@@ -711,7 +712,7 @@ export function buildNodes(
   const fileX = X0 + Math.max(Object.keys(agents).length, 1) * COL_W;
   files.forEach((file, index) => {
     const id = fileNodeId(file.id);
-    const placement = placementOverrides[id];
+    const placement = file.origin ? undefined : placementOverrides[id];
     const existing = byId.get(id);
     const existingFile = existing?.type === "file" ? existing : undefined;
     const stored = storedLayoutFor(savedById, id, "file");
@@ -1234,16 +1235,6 @@ export default function App(): React.ReactElement {
       return placement ? positionsMatch(node.position, placement) : false;
     });
     if (appliedNodes.length === 0) return;
-
-    const centeredNode = appliedNodes.at(-1);
-    const flow = flowRef.current;
-    if (centeredNode && flow) {
-      void flow.setCenter(
-        centeredNode.position.x + nodeWidth(centeredNode) / 2,
-        centeredNode.position.y + nodeHeight(centeredNode) / 2,
-        { zoom: flow.getZoom() },
-      );
-    }
 
     setPendingPlacements((current) => {
       let changed = false;
