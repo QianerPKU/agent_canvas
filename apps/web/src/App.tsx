@@ -25,7 +25,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { api } from "./api.js";
+import { api, type WorkDocumentationMutationStatus } from "./api.js";
 import {
   CODEX_MODELS,
   CODEX_REASONING_EFFORTS,
@@ -121,6 +121,26 @@ export function canvasInteractionForTool(tool: CanvasTool): {
     selectionOnDrag: tool === "select",
     selectionMode: SelectionMode.Partial,
   };
+}
+
+export function workDocumentationMutationWarning(
+  result: WorkDocumentationMutationStatus,
+): string | undefined {
+  if (!result.partialSuccess || result.workDocumentation?.ready !== false) return undefined;
+  const detail = result.workDocumentation.error?.trim() || "unknown error";
+  return `操作已完成，但工作文档初始化失败：${detail}`;
+}
+
+export function isSameBranchWorkspace(
+  left: BranchWorkspace,
+  right: BranchWorkspace,
+): boolean {
+  return (
+    left.id === right.id &&
+    left.repoId === right.repoId &&
+    left.branch === right.branch &&
+    left.worktreePath === right.worktreePath
+  );
 }
 const X0 = 40;
 const Y0 = 40;
@@ -1174,9 +1194,14 @@ export default function App(): React.ReactElement {
     async (input: { remoteUrl: string; defaultBranch?: string }) => {
       setProjectError(undefined);
       try {
-        const nextWorkspace = await api.connectWorkspace(input);
+        const result = await api.connectWorkspace(input);
+        const warning = workDocumentationMutationWarning(result);
+        // A 207 can also mean the active project changed while documentation was
+        // prepared. Refresh authoritative state instead of consuming a stale payload.
+        const nextWorkspace = warning ? await api.workspace() : result;
         setWorkspace(nextWorkspace);
         await refreshBranchOptions();
+        setProjectError(warning);
       } catch (error) {
         setProjectError(error instanceof Error ? error.message : String(error));
       }
@@ -1206,11 +1231,30 @@ export default function App(): React.ReactElement {
     setAgentSettingsTarget({ mode: "edit", agentId });
   }, []);
 
-  const createBranch = useCallback(async (branch: string, baseBranch?: string) => {
-    const created = await api.createBranch({ branch, baseBranch });
-    await refreshBranchOptions();
-    return created;
-  }, [refreshBranchOptions]);
+  const createBranch = useCallback(
+    async (branch: string, baseBranch?: string) => {
+      setProjectError(undefined);
+      const result = await api.createBranch({ branch, baseBranch });
+      const warning = workDocumentationMutationWarning(result);
+      if (!warning) {
+        await refreshBranchOptions();
+        return result;
+      }
+
+      const currentWorkspace = await api.workspace();
+      setWorkspace(currentWorkspace);
+      await refreshBranchOptions();
+      setProjectError(warning);
+      const currentBranch = currentWorkspace.branches.find((candidate) =>
+        isSameBranchWorkspace(candidate, result),
+      );
+      if (!currentBranch) {
+        throw new Error(`${warning}；当前项目已切换，请在原项目中确认该分支。`);
+      }
+      return currentBranch;
+    },
+    [refreshBranchOptions],
+  );
 
   useEffect(() => {
     setNodes((current) =>
@@ -1619,6 +1663,18 @@ export default function App(): React.ReactElement {
         <div className="file-open-error" role="alert">
           <span>{fileOpenError}</span>
           <button className="icon-button" title="关闭错误提示" onClick={() => setFileOpenError(undefined)}>
+            <X size={15} />
+          </button>
+        </div>
+      )}
+      {projectError && !fileOpenError && (
+        <div className="file-open-error" role="alert">
+          <span>{projectError}</span>
+          <button
+            className="icon-button"
+            title="关闭项目提示"
+            onClick={() => setProjectError(undefined)}
+          >
             <X size={15} />
           </button>
         </div>

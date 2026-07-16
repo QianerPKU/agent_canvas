@@ -14,6 +14,8 @@ import {
   computePullRequestEdges,
   computeResultFileEdges,
   computeSyncFlowEdges,
+  isSameBranchWorkspace,
+  workDocumentationMutationWarning,
 } from "./App.js";
 import { SelectionMode } from "@xyflow/react";
 
@@ -32,6 +34,47 @@ describe("canvasInteractionForTool", () => {
       selectionOnDrag: false,
       selectionMode: SelectionMode.Partial,
     });
+  });
+});
+
+describe("workDocumentationMutationWarning", () => {
+  it("surfaces a 207-style partial documentation failure", () => {
+    expect(
+      workDocumentationMutationWarning({
+        partialSuccess: true,
+        workDocumentation: { ready: false, error: "unsafe documentation link" },
+      }),
+    ).toBe("操作已完成，但工作文档初始化失败：unsafe documentation link");
+  });
+
+  it("does not warn for a complete operation", () => {
+    expect(workDocumentationMutationWarning({})).toBeUndefined();
+  });
+});
+
+describe("isSameBranchWorkspace", () => {
+  const created = {
+    id: "branch_2",
+    repoId: "repo_1",
+    branch: "feature/docs",
+    baseBranch: "main",
+    worktreePath: "C:/projects/a/worktrees/feature-docs",
+    scratchRoot: "C:/projects/a/worktrees/feature-docs/.agent-tmp",
+    isDefault: false,
+    createdAt: 1,
+  };
+
+  it("rejects a same-named branch from a different current project", () => {
+    expect(
+      isSameBranchWorkspace(created, {
+        ...created,
+        worktreePath: "C:/projects/b/worktrees/feature-docs",
+      }),
+    ).toBe(false);
+  });
+
+  it("accepts the exact branch workspace returned by the mutation", () => {
+    expect(isSameBranchWorkspace(created, { ...created })).toBe(true);
   });
 });
 

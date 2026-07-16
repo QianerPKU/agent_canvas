@@ -41,6 +41,16 @@ interface PendingRequest {
   reject: (err: Error) => void;
 }
 
+interface TurnSecurityDefaults {
+  approvalPolicy?: unknown;
+  sandboxPolicy?: Record<string, unknown>;
+}
+
+interface TurnOverrides {
+  params: Record<string, unknown>;
+  restoreSecurity: boolean;
+}
+
 export interface CodexAppServerQueryDeps {
   command?: string;
   spawnFn?: typeof spawn;
@@ -79,23 +89,62 @@ function createHandle(
       const initMessage = mapCodexThreadInit(initResult, { ...options, model: currentModel });
       threadId = (initMessage as { session_id?: string }).session_id ?? "";
       state.threadId = threadId;
+      const securityDefaults = turnSecurityDefaults(initResult, options);
       yield initMessage;
 
       let next: IteratorResult<PromptTurn> = first;
+      let securityRestoreCapabilityProbed = false;
       while (!next.done) {
         if (next.value.text.trim() === "/compact") {
           await client.request("thread/compact/start", { threadId });
           yield* client.readCompactMessages(threadId);
         } else {
-          const started = await client.request("turn/start", {
-            ...turnOverrides(options, currentModel, next.value.fileAccess, next.value.promptAccess),
-            ...reasoningOverride(currentReasoningEffort),
-            threadId,
-            input: codexInputs(next.value),
-          });
-          turnId = stringValue(asRecord(asRecord(started)?.turn)?.id);
-          yield* client.readTurnMessages(threadId, turnId, state);
-          turnId = undefined;
+          const overrides = turnOverrides(
+            options,
+            currentModel,
+            next.value.fileAccess,
+            next.value.promptAccess,
+            securityDefaults,
+          );
+          if (overrides.restoreSecurity && !securityRestoreCapabilityProbed) {
+            await client.request("thread/settings/update", { threadId });
+            securityRestoreCapabilityProbed = true;
+          }
+          let completedMessage: SdkMessage | undefined;
+          try {
+            let started: unknown;
+            try {
+              started = await client.request("turn/start", {
+                ...overrides.params,
+                ...reasoningOverride(currentReasoningEffort),
+                threadId,
+                input: codexInputs(next.value),
+              });
+            } catch (startError) {
+              if (overrides.restoreSecurity) {
+                try {
+                  await restoreSecurityDefaults(client, threadId, undefined, securityDefaults);
+                } catch (restoreError) {
+                  throw new AggregateError(
+                    [asError(startError), asError(restoreError)],
+                    "Codex turn/start failed and thread security defaults could not be restored",
+                  );
+                }
+              }
+              throw startError;
+            }
+            turnId = stringValue(asRecord(asRecord(started)?.turn)?.id);
+            if (overrides.restoreSecurity) {
+              await restoreSecurityDefaults(client, threadId, turnId, securityDefaults);
+            }
+            for await (const message of client.readTurnMessages(threadId, turnId, state)) {
+              if (message.type === "result") completedMessage = message;
+              else yield message;
+            }
+          } finally {
+            turnId = undefined;
+          }
+          if (completedMessage) yield completedMessage;
         }
         next = await promptIterator.next();
       }
@@ -177,7 +226,8 @@ function turnOverrides(
   model: string | undefined,
   fileAccess: AgentFileAccess | undefined,
   promptAccess: AgentPromptAccess | undefined,
-): Record<string, unknown> {
+  securityDefaults: TurnSecurityDefaults,
+): TurnOverrides {
   const params: Record<string, unknown> = {};
   const approvalExemptWritableDirectories = [
     ...new Set([
@@ -195,19 +245,91 @@ function turnOverrides(
         : options?.fileAccess?.sandboxWritableDirectories ?? []),
     ]),
   ];
-  const approvalPolicy = approvalPolicyFor(
-    options?.permissionMode,
-    approvalExemptWritableDirectories.length > 0,
+  const supportsWritableOverrides = canUseWritableOverrides(
+    securityDefaults.sandboxPolicy,
   );
-  if (approvalPolicy) params.approvalPolicy = approvalPolicy;
+  const approvalOverride = turnApprovalPolicy(
+    securityDefaults.approvalPolicy,
+    approvalExemptWritableDirectories.length > 0,
+    supportsWritableOverrides,
+  );
+  if (approvalOverride.policy !== undefined) {
+    params.approvalPolicy = approvalOverride.policy;
+  }
   if (model) params.model = model;
-  const sandboxPolicy = sandboxPolicyFor(
-    options?.permissionMode,
-    options?.cwd,
+  const sandboxOverride = turnSandboxPolicy(
+    securityDefaults.sandboxPolicy,
     writableDirectories,
   );
-  if (sandboxPolicy) params.sandboxPolicy = sandboxPolicy;
+  if (sandboxOverride.policy) params.sandboxPolicy = sandboxOverride.policy;
+  return {
+    params,
+    restoreSecurity: approvalOverride.changed || sandboxOverride.changed,
+  };
+}
+
+function turnSecurityDefaults(
+  initResult: unknown,
+  options: QueryOptions | undefined,
+): TurnSecurityDefaults {
+  const result = asRecord(initResult);
+  const thread = asRecord(result?.thread);
+  const responseSandbox = sandboxPolicyValue(result?.sandbox ?? thread?.sandbox);
+  const responseApproval = ownValue(result, "approvalPolicy") ?? ownValue(thread, "approvalPolicy");
+  return {
+    sandboxPolicy:
+      responseSandbox ?? explicitSandboxPolicyFor(options?.permissionMode),
+    approvalPolicy:
+      responseApproval ?? explicitApprovalPolicyFor(options?.permissionMode),
+  };
+}
+
+function securityDefaultParams(defaults: TurnSecurityDefaults): Record<string, unknown> {
+  const params: Record<string, unknown> = {};
+  if (defaults.approvalPolicy !== undefined) {
+    params.approvalPolicy = defaults.approvalPolicy;
+  }
+  if (defaults.sandboxPolicy) params.sandboxPolicy = defaults.sandboxPolicy;
   return params;
+}
+
+async function restoreSecurityDefaults(
+  client: CodexAppServerClient,
+  threadId: string,
+  activeTurnId: string | undefined,
+  defaults: TurnSecurityDefaults,
+): Promise<void> {
+  const params = { threadId, ...securityDefaultParams(defaults) };
+  try {
+    await client.request("thread/settings/update", params);
+    return;
+  } catch (initialRestoreError) {
+    const recoveryErrors = [asError(initialRestoreError)];
+    if (activeTurnId) {
+      try {
+        await client.request("turn/interrupt", { threadId, turnId: activeTurnId });
+      } catch (interruptError) {
+        recoveryErrors.push(asError(interruptError));
+      }
+    }
+    let restoredOnRetry = false;
+    try {
+      await client.request("thread/settings/update", params);
+      restoredOnRetry = true;
+    } catch (retryRestoreError) {
+      recoveryErrors.push(asError(retryRestoreError));
+    }
+    throw new AggregateError(
+      recoveryErrors,
+      restoredOnRetry
+        ? "Codex thread security restore initially failed; the active turn was stopped and defaults were restored on retry"
+        : "Codex thread security defaults could not be restored after retry",
+    );
+  }
+}
+
+function asError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
 }
 
 function reasoningOverride(reasoningEffort: string): Record<string, unknown> {
@@ -225,6 +347,33 @@ function approvalPolicyFor(
     default:
       return hasWritableFiles ? "never" : undefined;
   }
+}
+
+function explicitApprovalPolicyFor(permissionMode: unknown): string | undefined {
+  return approvalPolicyFor(permissionMode);
+}
+
+function turnApprovalPolicy(
+  securityDefault: unknown,
+  hasApprovalExemptWritableDirectories: boolean,
+  supportsWritableOverrides: boolean,
+): { policy?: unknown; changed: boolean } {
+  if (securityDefault === undefined) {
+    // An older app-server may not report its effective policy. In that case,
+    // do not create a sticky override that cannot be restored exactly.
+    return { changed: false };
+  }
+  const policy =
+    hasApprovalExemptWritableDirectories && supportsWritableOverrides
+      ? "never"
+      : securityDefault;
+  return {
+    policy,
+    changed:
+      hasApprovalExemptWritableDirectories &&
+      supportsWritableOverrides &&
+      !sameJsonValue(policy, securityDefault),
+  };
 }
 
 function sandboxMode(permissionMode: unknown): string | undefined {
@@ -320,29 +469,137 @@ function appendSharedResources(
     .join("\n")}`;
 }
 
-function sandboxPolicyFor(
-  permissionMode: unknown,
-  cwd: string | undefined,
+function turnSandboxPolicy(
+  securityDefault: Record<string, unknown> | undefined,
   writableDirectories: string[],
+): { policy?: Record<string, unknown>; changed: boolean } {
+  if (!securityDefault) {
+    // Preserve unknown user configuration instead of guessing a replacement.
+    return { changed: false };
+  }
+  const type = sandboxPolicyType(securityDefault);
+  if (
+    writableDirectories.length === 0 ||
+    type === "dangerFullAccess" ||
+    type === "externalSandbox"
+  ) {
+    return { policy: securityDefault, changed: false };
+  }
+  if (type === "workspaceWrite") {
+    const writableRoots = arrayValue(securityDefault.writableRoots).filter(
+      (root): root is string => typeof root === "string",
+    );
+    const extendedRoots = [
+      ...new Set([
+        ...writableRoots,
+        ...writableDirectories.map((directory) => path.resolve(directory)),
+      ]),
+    ];
+    if (extendedRoots.length === writableRoots.length) {
+      return { policy: securityDefault, changed: false };
+    }
+    return {
+      policy: { ...securityDefault, writableRoots: extendedRoots },
+      changed: true,
+    };
+  }
+  // workspaceWrite always grants the entire cwd. Never use it to satisfy a
+  // narrower file/directory grant when the original sandbox was read-only.
+  return { policy: securityDefault, changed: false };
+}
+
+function canUseWritableOverrides(
+  securityDefault: Record<string, unknown> | undefined,
+): boolean {
+  if (!securityDefault) return false;
+  const type = sandboxPolicyType(securityDefault);
+  return (
+    type === "workspaceWrite" ||
+    type === "dangerFullAccess" ||
+    type === "externalSandbox"
+  );
+}
+
+function explicitSandboxPolicyFor(
+  permissionMode: unknown,
 ): Record<string, unknown> | undefined {
-  if (permissionMode === "bypassPermissions") return { type: "dangerFullAccess" };
-  if (permissionMode === "plan") {
-    return { type: "readOnly", networkAccess: false };
+  switch (permissionMode) {
+    case "bypassPermissions":
+      return { type: "dangerFullAccess" };
+    case "plan":
+      return { type: "readOnly", networkAccess: false };
+    case "acceptEdits":
+      return {
+        type: "workspaceWrite",
+        // workspaceWrite already includes cwd; writableRoots are additional.
+        writableRoots: [],
+        networkAccess: false,
+        excludeTmpdirEnvVar: false,
+        excludeSlashTmp: false,
+      };
+    default:
+      return undefined;
   }
-  if (permissionMode !== "acceptEdits" && writableDirectories.length === 0) {
-    return undefined;
+}
+
+function sandboxPolicyValue(value: unknown): Record<string, unknown> | undefined {
+  const record = asRecord(value);
+  if (!record || !isRestorableSandboxPolicy(record)) return undefined;
+  return { ...record };
+}
+
+function isRestorableSandboxPolicy(value: Record<string, unknown>): boolean {
+  switch (sandboxPolicyType(value)) {
+    case "dangerFullAccess":
+      return true;
+    case "readOnly":
+      return typeof value.networkAccess === "boolean";
+    case "workspaceWrite":
+      return (
+        (value.writableRoots === undefined ||
+          (Array.isArray(value.writableRoots) &&
+            value.writableRoots.every((root) => typeof root === "string"))) &&
+        typeof value.networkAccess === "boolean" &&
+        typeof value.excludeTmpdirEnvVar === "boolean" &&
+        typeof value.excludeSlashTmp === "boolean"
+      );
+    case "externalSandbox":
+      return value.networkAccess === "restricted" || value.networkAccess === "enabled";
+    default:
+      return false;
   }
-  const writableRoots = [
-    path.resolve(cwd ?? process.cwd()),
-    ...writableDirectories.map((directory) => path.resolve(directory)),
-  ];
-  return {
-    type: "workspaceWrite",
-    writableRoots: [...new Set(writableRoots)],
-    networkAccess: false,
-    excludeTmpdirEnvVar: false,
-    excludeSlashTmp: false,
-  };
+}
+
+function sandboxPolicyType(value: Record<string, unknown>): string {
+  switch (stringValue(value.type)) {
+    case "danger-full-access":
+    case "dangerFullAccess":
+      return "dangerFullAccess";
+    case "read-only":
+    case "readOnly":
+      return "readOnly";
+    case "workspace-write":
+    case "workspaceWrite":
+      return "workspaceWrite";
+    case "external-sandbox":
+    case "externalSandbox":
+      return "externalSandbox";
+    default:
+      return "";
+  }
+}
+
+function sameJsonValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function ownValue(
+  record: Record<string, unknown> | undefined,
+  key: string,
+): unknown | undefined {
+  return record && Object.prototype.hasOwnProperty.call(record, key)
+    ? record[key]
+    : undefined;
 }
 
 function inputText(input: SdkUserInput): string {

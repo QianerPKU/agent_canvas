@@ -20,11 +20,37 @@ function userInput(
   };
 }
 
-function makeFakeSpawn(options: { completeTurnStart?: boolean } = {}) {
+interface FakeSecurityDefaults {
+  sandboxPolicy?: Record<string, unknown>;
+  approvalPolicy?: unknown;
+  responseLocation?: "topLevel" | "thread" | "missing";
+}
+
+function makeFakeSpawn(
+  options: {
+    completeTurnStart?: boolean;
+    rejectSettingsUpdateCalls?: number[];
+    rejectTurnStart?: boolean;
+    securityDefaults?: FakeSecurityDefaults;
+  } = {},
+) {
   const completeTurnStart = options.completeTurnStart ?? true;
+  const securityDefaults = options.securityDefaults;
+  const responseLocation = securityDefaults?.responseLocation ?? "topLevel";
   const requests: string[] = [];
   const messages: Array<{ id?: number; method?: string; params?: Record<string, unknown> }> = [];
   const responses: Array<{ id?: number; result?: unknown; error?: unknown }> = [];
+  const effectiveTurnSecurity: Array<{
+    sandboxPolicy?: unknown;
+    approvalPolicy?: unknown;
+  }> = [];
+  const securityUpdates: Array<{
+    sandboxPolicy?: unknown;
+    approvalPolicy?: unknown;
+  }> = [];
+  let stickySandboxPolicy = securityDefaults?.sandboxPolicy;
+  let stickyApprovalPolicy = securityDefaults?.approvalPolicy;
+  let settingsUpdateCounter = 0;
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   const stderr = new PassThrough();
@@ -69,12 +95,52 @@ function makeFakeSpawn(options: { completeTurnStart?: boolean } = {}) {
         write({ id: message.id, result: {} });
         break;
       case "thread/start":
-        write({
-          id: message.id,
-          result: { thread: { id: "thread-1", cwd: "C:/repo" }, model: "gpt-5.5" },
-        });
+        {
+          const thread: Record<string, unknown> = { id: "thread-1", cwd: "C:/repo" };
+          const result: Record<string, unknown> = {
+            thread,
+            model: "gpt-5.5",
+            cwd: "C:/repo",
+          };
+          if (responseLocation === "thread") {
+            if (securityDefaults?.sandboxPolicy !== undefined) {
+              thread.sandbox = securityDefaults.sandboxPolicy;
+            }
+            if (securityDefaults?.approvalPolicy !== undefined) {
+              thread.approvalPolicy = securityDefaults.approvalPolicy;
+            }
+          } else if (responseLocation === "topLevel") {
+            if (securityDefaults?.sandboxPolicy !== undefined) {
+              result.sandbox = securityDefaults.sandboxPolicy;
+            }
+            if (securityDefaults?.approvalPolicy !== undefined) {
+              result.approvalPolicy = securityDefaults.approvalPolicy;
+            }
+          }
+          write({
+            id: message.id,
+            result,
+          });
+        }
         break;
       case "turn/start":
+        if (Object.prototype.hasOwnProperty.call(message.params, "sandboxPolicy")) {
+          stickySandboxPolicy = message.params?.sandboxPolicy as Record<string, unknown>;
+        }
+        if (Object.prototype.hasOwnProperty.call(message.params, "approvalPolicy")) {
+          stickyApprovalPolicy = message.params?.approvalPolicy;
+        }
+        effectiveTurnSecurity.push({
+          sandboxPolicy: stickySandboxPolicy,
+          approvalPolicy: stickyApprovalPolicy,
+        });
+        if (options.rejectTurnStart) {
+          write({
+            id: message.id,
+            error: { code: -32602, message: "turn rejected after applying settings" },
+          });
+          break;
+        }
         turnCounter += 1;
         write({ id: message.id, result: { turn: { id: `turn-${turnCounter}` } } });
         if (completeTurnStart) {
@@ -86,6 +152,35 @@ function makeFakeSpawn(options: { completeTurnStart?: boolean } = {}) {
             },
           });
         }
+        break;
+      case "thread/settings/update":
+        settingsUpdateCounter += 1;
+        if (options.rejectSettingsUpdateCalls?.includes(settingsUpdateCounter)) {
+          write({
+            id: message.id,
+            error: {
+              code: -32603,
+              message: `settings update ${settingsUpdateCounter} rejected`,
+            },
+          });
+          break;
+        }
+        if (Object.prototype.hasOwnProperty.call(message.params, "sandboxPolicy")) {
+          stickySandboxPolicy = message.params?.sandboxPolicy as Record<string, unknown>;
+        }
+        if (Object.prototype.hasOwnProperty.call(message.params, "approvalPolicy")) {
+          stickyApprovalPolicy = message.params?.approvalPolicy;
+        }
+        if (
+          Object.prototype.hasOwnProperty.call(message.params, "sandboxPolicy") ||
+          Object.prototype.hasOwnProperty.call(message.params, "approvalPolicy")
+        ) {
+          securityUpdates.push({
+            sandboxPolicy: stickySandboxPolicy,
+            approvalPolicy: stickyApprovalPolicy,
+          });
+        }
+        write({ id: message.id, result: {} });
         break;
       case "turn/interrupt":
         write({ id: message.id, result: {} });
@@ -143,6 +238,8 @@ function makeFakeSpawn(options: { completeTurnStart?: boolean } = {}) {
     requests,
     messages,
     responses,
+    effectiveTurnSecurity,
+    securityUpdates,
     proc,
   };
 }
@@ -181,8 +278,20 @@ describe("Codex app-server query", () => {
     expect(fake.proc.kill).toHaveBeenCalledOnce();
   });
 
-  it("把每轮文件引用和额外写目录映射到 Codex 原生输入与 sandboxPolicy", async () => {
-    const fake = makeFakeSpawn();
+  it("每轮临时写权限结束后恢复 Codex 线程原始安全策略", async () => {
+    const originalSandboxPolicy = {
+      type: "workspaceWrite",
+      writableRoots: ["C:/preconfigured-root"],
+      networkAccess: true,
+      excludeTmpdirEnvVar: true,
+      excludeSlashTmp: true,
+    };
+    const fake = makeFakeSpawn({
+      securityDefaults: {
+        sandboxPolicy: originalSandboxPolicy,
+        approvalPolicy: "untrusted",
+      },
+    });
     const prompt = new AsyncMessageQueue<SdkUserInput>();
     prompt.push(
       userInput(
@@ -305,14 +414,14 @@ describe("Codex app-server query", () => {
     expect(turnStarts[0]?.params?.sandboxPolicy).toEqual({
       type: "workspaceWrite",
       writableRoots: [
-        expect.stringMatching(/C:[\\/]repo$/),
+        "C:/preconfigured-root",
         expect.stringMatching(/C:[\\/]shared[\\/]output$/),
         expect.stringMatching(/C:[\\/]models[\\/]weights$/),
         expect.stringMatching(/C:[\\/]prompts$/),
       ],
-      networkAccess: false,
-      excludeTmpdirEnvVar: false,
-      excludeSlashTmp: false,
+      networkAccess: true,
+      excludeTmpdirEnvVar: true,
+      excludeSlashTmp: true,
     });
     expect(turnStarts[0]?.params?.approvalPolicy).toBe("never");
     expect(turnStarts[1]?.params?.input).toEqual([
@@ -326,14 +435,14 @@ describe("Codex app-server query", () => {
     expect(turnStarts[1]?.params?.sandboxPolicy).toEqual({
       type: "workspaceWrite",
       writableRoots: [
-        expect.stringMatching(/C:[\\/]repo$/),
+        "C:/preconfigured-root",
         expect.stringMatching(/C:[\\/]agent-docs$/),
       ],
-      networkAccess: false,
-      excludeTmpdirEnvVar: false,
-      excludeSlashTmp: false,
+      networkAccess: true,
+      excludeTmpdirEnvVar: true,
+      excludeSlashTmp: true,
     });
-    expect(turnStarts[1]?.params?.approvalPolicy).toBeUndefined();
+    expect(turnStarts[1]?.params?.approvalPolicy).toBe("untrusted");
     expect(turnStarts[2]?.params?.input).toEqual([
       {
         type: "text",
@@ -341,8 +450,384 @@ describe("Codex app-server query", () => {
         text_elements: [],
       },
     ]);
-    expect(turnStarts[2]?.params?.sandboxPolicy).toBeUndefined();
-    expect(turnStarts[2]?.params?.approvalPolicy).toBeUndefined();
+    expect(turnStarts[2]?.params?.sandboxPolicy).toEqual(originalSandboxPolicy);
+    expect(turnStarts[2]?.params?.approvalPolicy).toBe("untrusted");
+    expect(fake.effectiveTurnSecurity).toEqual([
+      {
+        sandboxPolicy: turnStarts[0]?.params?.sandboxPolicy,
+        approvalPolicy: "never",
+      },
+      {
+        sandboxPolicy: turnStarts[1]?.params?.sandboxPolicy,
+        approvalPolicy: "untrusted",
+      },
+      {
+        sandboxPolicy: originalSandboxPolicy,
+        approvalPolicy: "untrusted",
+      },
+    ]);
+    expect(fake.securityUpdates).toEqual([
+      {
+        sandboxPolicy: originalSandboxPolicy,
+        approvalPolicy: "untrusted",
+      },
+      {
+        sandboxPolicy: originalSandboxPolicy,
+        approvalPolicy: "untrusted",
+      },
+    ]);
+    const firstOverrideRequests = fake.messages
+      .filter(
+        (message) =>
+          message.method === "turn/start" || message.method === "thread/settings/update",
+      )
+      .slice(0, 3);
+    expect(firstOverrideRequests.map((message) => message.method)).toEqual([
+      "thread/settings/update",
+      "turn/start",
+      "thread/settings/update",
+    ]);
+    expect(firstOverrideRequests[0]?.params).toEqual({ threadId: "thread-1" });
+    expect(firstOverrideRequests[2]?.params).toEqual({
+      threadId: "thread-1",
+      sandboxPolicy: originalSandboxPolicy,
+      approvalPolicy: "untrusted",
+    });
+    await handle.terminate?.();
+  });
+
+  it("从 thread 响应读取只读基线且不会为工作文档扩大整个 cwd 写权限", async () => {
+    const originalSandboxPolicy = { type: "readOnly", networkAccess: true };
+    const fake = makeFakeSpawn({
+      securityDefaults: {
+        sandboxPolicy: originalSandboxPolicy,
+        approvalPolicy: "on-request",
+        responseLocation: "thread",
+      },
+    });
+    const prompt = new AsyncMessageQueue<SdkUserInput>();
+    prompt.push(
+      userInput("维护工作文档", {
+        readableFiles: [],
+        writableFiles: [],
+        sandboxWritableDirectories: ["C:/repo/.agent-docs", "C:/shared/branch-docs"],
+        writableDirectories: ["C:/canvas-output"],
+      }),
+    );
+
+    const handle = createCodexAppServerQuery({ spawnFn: fake.spawnFn })({
+      prompt,
+      options: { cwd: "C:/repo" },
+    });
+    const iterator = handle[Symbol.asyncIterator]();
+    await iterator.next();
+    await iterator.next();
+
+    const turnStart = fake.messages.find((message) => message.method === "turn/start");
+    expect(turnStart?.params?.sandboxPolicy).toEqual(originalSandboxPolicy);
+    expect(turnStart?.params?.approvalPolicy).toBe("on-request");
+    expect(fake.effectiveTurnSecurity).toEqual([
+      {
+        sandboxPolicy: originalSandboxPolicy,
+        approvalPolicy: "on-request",
+      },
+    ]);
+    expect(fake.securityUpdates).toEqual([]);
+    await handle.terminate?.();
+  });
+
+  it("策略响应缺失或只有 mode 时保留用户默认值且不创建不可恢复的 sticky override", async () => {
+    const modeOnlySandboxProjection = { type: "workspaceWrite" };
+    const fake = makeFakeSpawn({
+      securityDefaults: {
+        sandboxPolicy: modeOnlySandboxProjection,
+        responseLocation: "topLevel",
+      },
+    });
+    const prompt = new AsyncMessageQueue<SdkUserInput>();
+    prompt.push(
+      userInput("处理可写目标并维护文档", {
+        readableFiles: [],
+        writableFiles: [],
+        sandboxWritableDirectories: ["C:/repo/.agent-docs"],
+        writableDirectories: ["C:/canvas-output"],
+      }),
+    );
+
+    const handle = createCodexAppServerQuery({ spawnFn: fake.spawnFn })({
+      prompt,
+      options: { cwd: "C:/repo" },
+    });
+    const iterator = handle[Symbol.asyncIterator]();
+    await iterator.next();
+    await iterator.next();
+
+    const turnStart = fake.messages.find((message) => message.method === "turn/start");
+    expect(turnStart?.params?.sandboxPolicy).toBeUndefined();
+    expect(turnStart?.params?.approvalPolicy).toBeUndefined();
+    expect(fake.effectiveTurnSecurity).toEqual([
+      {
+        sandboxPolicy: modeOnlySandboxProjection,
+        approvalPolicy: undefined,
+      },
+    ]);
+    expect(fake.securityUpdates).toEqual([]);
+    await handle.terminate?.();
+
+    const hiddenSandboxPolicy = { type: "readOnly", networkAccess: false };
+    const missing = makeFakeSpawn({
+      securityDefaults: {
+        sandboxPolicy: hiddenSandboxPolicy,
+        approvalPolicy: "untrusted",
+        responseLocation: "missing",
+      },
+    });
+    const missingPrompt = new AsyncMessageQueue<SdkUserInput>();
+    missingPrompt.push(
+      userInput("维护工作文档", {
+        readableFiles: [],
+        writableFiles: [],
+        sandboxWritableDirectories: ["C:/repo/.agent-docs"],
+        writableDirectories: [],
+      }),
+    );
+    const missingHandle = createCodexAppServerQuery({ spawnFn: missing.spawnFn })({
+      prompt: missingPrompt,
+      options: { cwd: "C:/repo" },
+    });
+    const missingIterator = missingHandle[Symbol.asyncIterator]();
+    await missingIterator.next();
+    await missingIterator.next();
+
+    const missingTurnStart = missing.messages.find(
+      (message) => message.method === "turn/start",
+    );
+    expect(missingTurnStart?.params?.sandboxPolicy).toBeUndefined();
+    expect(missingTurnStart?.params?.approvalPolicy).toBeUndefined();
+    expect(missing.effectiveTurnSecurity).toEqual([
+      {
+        sandboxPolicy: hiddenSandboxPolicy,
+        approvalPolicy: "untrusted",
+      },
+    ]);
+    expect(missing.securityUpdates).toEqual([]);
+    await missingHandle.terminate?.();
+  });
+
+  it("未完成的临时工作文档 turn 在等待消息前恢复线程基线并可安全终止", async () => {
+    const originalSandboxPolicy = {
+      type: "workspaceWrite",
+      writableRoots: ["C:/existing-root"],
+      networkAccess: false,
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false,
+    };
+    const fake = makeFakeSpawn({
+      completeTurnStart: false,
+      securityDefaults: {
+        sandboxPolicy: originalSandboxPolicy,
+        approvalPolicy: "untrusted",
+      },
+    });
+    const prompt = new AsyncMessageQueue<SdkUserInput>();
+    prompt.push(
+      userInput("维护工作文档", {
+        readableFiles: [],
+        writableFiles: [],
+        sandboxWritableDirectories: ["C:/repo/.agent-docs"],
+        writableDirectories: [],
+      }),
+    );
+
+    const handle = createCodexAppServerQuery({ spawnFn: fake.spawnFn })({
+      prompt,
+      options: { cwd: "C:/repo" },
+    });
+    const iterator = handle[Symbol.asyncIterator]();
+    await iterator.next();
+    const pendingTurn = iterator.next();
+    void pendingTurn.catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(fake.securityUpdates).toEqual([
+      {
+        sandboxPolicy: originalSandboxPolicy,
+        approvalPolicy: "untrusted",
+      },
+    ]);
+    expect(
+      fake.messages
+        .filter(
+          (message) =>
+            message.method === "turn/start" ||
+            message.method === "thread/settings/update",
+        )
+        .map((message) => message.method),
+    ).toEqual([
+      "thread/settings/update",
+      "turn/start",
+      "thread/settings/update",
+    ]);
+    await handle.terminate?.();
+    expect(fake.proc.kill).toHaveBeenCalledOnce();
+  });
+
+  it("安全恢复能力探测失败时不发送 turn/start", async () => {
+    const originalSandboxPolicy = {
+      type: "workspaceWrite",
+      writableRoots: [],
+      networkAccess: false,
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false,
+    };
+    const fake = makeFakeSpawn({
+      rejectSettingsUpdateCalls: [1],
+      securityDefaults: {
+        sandboxPolicy: originalSandboxPolicy,
+        approvalPolicy: "on-request",
+      },
+    });
+    const prompt = new AsyncMessageQueue<SdkUserInput>();
+    prompt.push(
+      userInput("维护工作文档", {
+        readableFiles: [],
+        writableFiles: [],
+        sandboxWritableDirectories: ["C:/repo/.agent-docs"],
+        writableDirectories: [],
+      }),
+    );
+
+    const handle = createCodexAppServerQuery({ spawnFn: fake.spawnFn })({
+      prompt,
+      options: { cwd: "C:/repo" },
+    });
+    const iterator = handle[Symbol.asyncIterator]();
+    await iterator.next();
+    await expect(iterator.next()).rejects.toThrow("settings update 1 rejected");
+
+    const probe = fake.messages.find(
+      (message) => message.method === "thread/settings/update",
+    );
+    expect(probe?.params).toEqual({ threadId: "thread-1" });
+    expect(fake.messages.some((message) => message.method === "turn/start")).toBe(false);
+    expect(fake.securityUpdates).toEqual([]);
+    await handle.terminate?.();
+  });
+
+  it("立即恢复失败时中断活动 turn、重试恢复并终止该轮", async () => {
+    const originalSandboxPolicy = {
+      type: "workspaceWrite",
+      writableRoots: ["C:/existing-root"],
+      networkAccess: false,
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false,
+    };
+    const fake = makeFakeSpawn({
+      completeTurnStart: false,
+      rejectSettingsUpdateCalls: [2],
+      securityDefaults: {
+        sandboxPolicy: originalSandboxPolicy,
+        approvalPolicy: "untrusted",
+      },
+    });
+    const prompt = new AsyncMessageQueue<SdkUserInput>();
+    prompt.push(
+      userInput("维护工作文档", {
+        readableFiles: [],
+        writableFiles: [],
+        sandboxWritableDirectories: ["C:/repo/.agent-docs"],
+        writableDirectories: [],
+      }),
+    );
+
+    const handle = createCodexAppServerQuery({ spawnFn: fake.spawnFn })({
+      prompt,
+      options: { cwd: "C:/repo" },
+    });
+    const iterator = handle[Symbol.asyncIterator]();
+    await iterator.next();
+    await expect(iterator.next()).rejects.toThrow(
+      "the active turn was stopped and defaults were restored on retry",
+    );
+
+    expect(
+      fake.messages
+        .filter((message) =>
+          ["thread/settings/update", "turn/start", "turn/interrupt"].includes(
+            message.method ?? "",
+          ),
+        )
+        .map((message) => message.method),
+    ).toEqual([
+      "thread/settings/update",
+      "turn/start",
+      "thread/settings/update",
+      "turn/interrupt",
+      "thread/settings/update",
+    ]);
+    expect(
+      fake.messages.find((message) => message.method === "turn/interrupt")?.params,
+    ).toEqual({ threadId: "thread-1", turnId: "turn-1" });
+    expect(fake.securityUpdates).toEqual([
+      {
+        sandboxPolicy: originalSandboxPolicy,
+        approvalPolicy: "untrusted",
+      },
+    ]);
+    await handle.terminate?.();
+  });
+
+  it("turn/start 在应用 sticky 设置后报错也会尝试恢复线程基线", async () => {
+    const originalSandboxPolicy = {
+      type: "workspaceWrite",
+      writableRoots: [],
+      networkAccess: false,
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false,
+    };
+    const fake = makeFakeSpawn({
+      rejectTurnStart: true,
+      securityDefaults: {
+        sandboxPolicy: originalSandboxPolicy,
+        approvalPolicy: "on-request",
+      },
+    });
+    const prompt = new AsyncMessageQueue<SdkUserInput>();
+    prompt.push(
+      userInput("维护工作文档", {
+        readableFiles: [],
+        writableFiles: [],
+        sandboxWritableDirectories: ["C:/repo/.agent-docs"],
+        writableDirectories: [],
+      }),
+    );
+
+    const handle = createCodexAppServerQuery({ spawnFn: fake.spawnFn })({
+      prompt,
+      options: { cwd: "C:/repo" },
+    });
+    const iterator = handle[Symbol.asyncIterator]();
+    await iterator.next();
+    await expect(iterator.next()).rejects.toThrow("turn rejected after applying settings");
+    expect(fake.securityUpdates).toEqual([
+      {
+        sandboxPolicy: originalSandboxPolicy,
+        approvalPolicy: "on-request",
+      },
+    ]);
+    expect(
+      fake.messages
+        .filter(
+          (message) =>
+            message.method === "turn/start" ||
+            message.method === "thread/settings/update",
+        )
+        .map((message) => message.method),
+    ).toEqual([
+      "thread/settings/update",
+      "turn/start",
+      "thread/settings/update",
+    ]);
     await handle.terminate?.();
   });
 

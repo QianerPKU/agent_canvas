@@ -39,6 +39,8 @@ export interface AgentRunnerDeps {
   codexQuery?: QueryFn;
   now?: () => number;
   resolveFileAccess?: (agentId: string) => AgentFileAccess;
+  /** Revalidate asynchronous workspace invariants immediately before queued input is dispatched. */
+  prepareFileAccess?: (agentId: string) => Promise<void>;
   resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
   fullPermissionMode?: () => boolean;
   workDocumentationEnabled?: () => boolean;
@@ -71,6 +73,7 @@ export class AgentRunner {
   private readonly queries: Record<AgentProvider, QueryFn>;
   private readonly now: () => number;
   private readonly resolveFileAccess?: (agentId: string) => AgentFileAccess;
+  private readonly prepareFileAccess?: (agentId: string) => Promise<void>;
   private readonly resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
   private readonly fullPermissionMode: () => boolean;
   private readonly workDocumentationEnabled: () => boolean;
@@ -108,6 +111,7 @@ export class AgentRunner {
     };
     this.now = deps.now ?? Date.now;
     this.resolveFileAccess = deps.resolveFileAccess;
+    this.prepareFileAccess = deps.prepareFileAccess;
     this.resolvePromptAccess = deps.resolvePromptAccess;
     this.fullPermissionMode = deps.fullPermissionMode ?? (() => false);
     this.workDocumentationEnabled = deps.workDocumentationEnabled ?? (() => false);
@@ -362,7 +366,6 @@ export class AgentRunner {
   async stop(): Promise<void> {
     if (isTerminalStatus(this.status) || this.status === "idle") return;
     this.compactPending = false;
-    this.policyPromptInjectionPending = false;
     this.pendingQueuedInputs = [];
     this.interruptedTurnPending = true;
     this.cancelPendingQuestions("cancel");
@@ -451,7 +454,7 @@ export class AgentRunner {
       for await (const msg of handle) {
         if (handle !== this.handle) return;
         for (const event of mapSdkMessage(msg)) {
-          this.applyEvent(event);
+          await this.applyEvent(event);
         }
       }
       if (handle !== this.handle) return;
@@ -559,7 +562,7 @@ export class AgentRunner {
     this.pendingApprovals.clear();
   }
 
-  private applyEvent(event: AgentEvent): void {
+  private async applyEvent(event: AgentEvent): Promise<void> {
     if (this.interruptedTurnPending) {
       if (event.kind === "result") this.interruptedTurnPending = false;
       return;
@@ -606,6 +609,23 @@ export class AgentRunner {
         } else {
           const queuedInput = this.pendingQueuedInputs.shift();
           if (queuedInput) {
+            // A queued message can sit behind a long-running turn. Revalidate links,
+            // markers, tracked paths, and realpaths at the moment access is granted.
+            try {
+              await this.prepareFileAccess?.(this.id);
+            } catch (error) {
+              this.pendingQueuedInputs = [];
+              inputQueue.close();
+              await this.handle?.terminate?.().catch(() => undefined);
+              throw error;
+            }
+            if (
+              inputQueue !== this.inputQueue ||
+              inputQueue.isClosed ||
+              isTerminalStatus(this.status)
+            ) {
+              return;
+            }
             inputQueue.push(
               toUserInput(
                 queuedInput,

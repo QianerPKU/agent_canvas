@@ -180,6 +180,7 @@ describe("HTTP server", () => {
   let port = 0;
   let root = "";
   let projectRoot = "";
+  let trackedWorkDocumentationCwd: string | undefined;
   let syncHost: FakeSyncHost;
   let syncFlowManager: SyncFlowManager;
   const openFile = vi
@@ -207,6 +208,14 @@ describe("HTTP server", () => {
       }
       if (args[0] === "rev-parse") {
         return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      if (
+        args[0] === "ls-files" &&
+        trackedWorkDocumentationCwd &&
+        path.resolve(options?.cwd ?? "").toLowerCase() ===
+          path.resolve(trackedWorkDocumentationCwd).toLowerCase()
+      ) {
+        return ".agent-docs/index.md";
       }
       return "";
     };
@@ -367,6 +376,67 @@ describe("HTTP server", () => {
       fullPermissionMode: false,
       workDocumentationEnabled: false,
     });
+  });
+
+  it("reports work-documentation failures as partial success after workspace mutations", async () => {
+    const mainWorkspace = path.join(projectRoot, "repos", "repo_1", "repo");
+    const enabled = await request(port, "PATCH", "/api/settings", {
+      workDocumentationEnabled: true,
+    });
+    expect(enabled.status).toBe(200);
+
+    trackedWorkDocumentationCwd = mainWorkspace;
+    const connected = await request(port, "POST", "/api/workspace/connect", {
+      localPath: root,
+    });
+    expect(connected.status).toBe(207);
+    expect(connected.json).toMatchObject({
+      partialSuccess: true,
+      workDocumentation: {
+        ready: false,
+        error: expect.stringContaining("Git"),
+      },
+      branches: [{ branch: "main", worktreePath: mainWorkspace }],
+    });
+    expect((await request(port, "GET", "/api/workspace")).json.branches).toContainEqual(
+      expect.objectContaining({ branch: "main", worktreePath: mainWorkspace }),
+    );
+
+    trackedWorkDocumentationCwd = undefined;
+    expect(
+      (await request(port, "PATCH", "/api/settings", { workDocumentationEnabled: true }))
+        .status,
+    ).toBe(200);
+
+    const branchName = "feature/partial-documentation";
+    const branchWorkspace = path.join(
+      projectRoot,
+      "worktrees",
+      "repo_1",
+      "feature-partial-documentation",
+    );
+    trackedWorkDocumentationCwd = branchWorkspace;
+    const created = await request(port, "POST", "/api/workspace/branches", {
+      branch: branchName,
+    });
+    expect(created.status).toBe(207);
+    expect(created.json).toMatchObject({
+      branch: { branch: branchName, worktreePath: branchWorkspace },
+      partialSuccess: true,
+      workDocumentation: {
+        ready: false,
+        error: expect.stringContaining("Git"),
+      },
+    });
+    expect((await request(port, "GET", "/api/workspace/branches")).json.branches).toContainEqual(
+      expect.objectContaining({ branch: branchName, worktreePath: branchWorkspace }),
+    );
+
+    trackedWorkDocumentationCwd = undefined;
+    expect(
+      (await request(port, "PATCH", "/api/settings", { workDocumentationEnabled: false }))
+        .status,
+    ).toBe(200);
   });
 
   it("exposes Codex login status and starts device auth", async () => {

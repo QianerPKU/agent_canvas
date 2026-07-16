@@ -314,6 +314,22 @@ describe("AgentManager fork", () => {
     });
   });
 
+  it("clear resets all application settings", async () => {
+    const { query } = makeQuery();
+    const manager = new AgentManager({ query });
+    manager.updateAppSettings({
+      fullPermissionMode: true,
+      workDocumentationEnabled: true,
+    });
+
+    await manager.clear();
+
+    expect(manager.appSettings()).toEqual({
+      fullPermissionMode: false,
+      workDocumentationEnabled: false,
+    });
+  });
+
   it("currentTurnIndex follows completed result turns", async () => {
     const { query, out } = makeWaitingQuery();
     const mgr = new AgentManager({ query });

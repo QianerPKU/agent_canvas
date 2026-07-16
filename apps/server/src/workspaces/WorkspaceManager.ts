@@ -60,6 +60,19 @@ export interface WorkDocumentationOptions {
   workDocumentationEnabled?: boolean;
 }
 
+export interface WorkspaceProjectRevision {
+  projectId: string;
+  projectRoot: string;
+  generation: number;
+}
+
+export class WorkspaceProjectChangedError extends Error {
+  constructor() {
+    super("Canvas project changed while the operation was in progress; retry the operation");
+    this.name = "WorkspaceProjectChangedError";
+  }
+}
+
 interface WorkspaceState {
   project?: CanvasProjectSummary;
   repo?: GitHubConnection;
@@ -86,6 +99,8 @@ interface ProjectIndex {
 interface WorkDocumentationContext {
   workspace: BranchWorkspace;
   projectRoot: string;
+  projectId: string;
+  projectGeneration: number;
   repositoryKey: string;
 }
 
@@ -107,6 +122,7 @@ export class WorkspaceManager {
   private branchCounter = 0;
   private resourceCounter = 0;
   private documentationPrepareChain: Promise<void> = Promise.resolve();
+  private projectMutationChain: Promise<void> = Promise.resolve();
   private readonly ignoreWriteChains = new Map<string, Promise<void>>();
   private readonly preparedWorkDocumentation = new Set<string>();
   private projectGeneration = 0;
@@ -140,6 +156,29 @@ export class WorkspaceManager {
 
   currentProjectId(): string | undefined {
     return this.currentProject?.id;
+  }
+
+  captureProjectRevision(): WorkspaceProjectRevision {
+    const project = this.currentProject;
+    const projectRoot = this.projectRoot;
+    if (!project || !projectRoot) throw new Error("No Canvas project is currently open");
+    return {
+      projectId: project.id,
+      projectRoot,
+      generation: this.projectGeneration,
+    };
+  }
+
+  assertProjectRevision(revision: WorkspaceProjectRevision): void {
+    const current = this.currentProject;
+    if (
+      !current ||
+      revision.generation !== this.projectGeneration ||
+      revision.projectId !== current.id ||
+      normalizedRootKey(revision.projectRoot) !== normalizedRootKey(this.projectRoot ?? "")
+    ) {
+      throw new WorkspaceProjectChangedError();
+    }
   }
 
   async listCanvasProjects(): Promise<CanvasProjectSummary[]> {
@@ -176,6 +215,12 @@ export class WorkspaceManager {
   }
 
   async createCanvasProject(input: CreateCanvasProjectInput): Promise<CanvasProjectSummary> {
+    return await this.queueProjectMutation(() => this.createCanvasProjectInternal(input));
+  }
+
+  private async createCanvasProjectInternal(
+    input: CreateCanvasProjectInput,
+  ): Promise<CanvasProjectSummary> {
     const name = normalizeName(input.name);
     const explicitRoot = normalizeOptionalProjectRoot(input.projectRoot);
     const id = explicitRoot
@@ -200,6 +245,12 @@ export class WorkspaceManager {
   }
 
   async openCanvasProject(input: OpenCanvasProjectInput): Promise<WorkspaceProject> {
+    return await this.queueProjectMutation(() => this.openCanvasProjectInternal(input));
+  }
+
+  private async openCanvasProjectInternal(
+    input: OpenCanvasProjectInput,
+  ): Promise<WorkspaceProject> {
     const projectRoot = normalizeOptionalProjectRoot(input.projectRoot);
     const projects = await this.listCanvasProjects();
     const indexed = input.id
@@ -256,6 +307,10 @@ export class WorkspaceManager {
   }
 
   async deleteCanvasProject(id: string): Promise<CanvasProjectSummary> {
+    return await this.queueProjectMutation(() => this.deleteCanvasProjectInternal(id));
+  }
+
+  private async deleteCanvasProjectInternal(id: string): Promise<CanvasProjectSummary> {
     const project = (await this.listCanvasProjects()).find((candidate) => candidate.id === id);
     if (!project) throw new Error(`未知 canvas 项目: ${id}`);
     const projectRoot = path.resolve(project.projectRoot);
@@ -265,6 +320,10 @@ export class WorkspaceManager {
       throw new Error("不能删除包含项目列表根目录的文件夹");
     }
     if (path.parse(projectRoot).root === projectRoot) throw new Error("不能删除文件系统根目录");
+    const deletingCurrentProject =
+      normalizedRootKey(this.currentProject?.projectRoot ?? "") ===
+      normalizedRootKey(projectRoot);
+    if (deletingCurrentProject) this.advanceProjectGeneration();
     await rm(projectRoot, { recursive: true, force: false });
     const index = await this.readProjectIndex();
     await this.writeProjectIndex(
@@ -274,7 +333,7 @@ export class WorkspaceManager {
           normalizedRootKey(candidate.projectRoot) !== normalizedRootKey(projectRoot),
       ),
     );
-    if (normalizedRootKey(this.currentProject?.projectRoot ?? "") === normalizedRootKey(projectRoot)) {
+    if (deletingCurrentProject) {
       this.projectRoot = undefined;
       this.currentProject = undefined;
       this.state = { branches: [], sharedResources: [] };
@@ -292,6 +351,19 @@ export class WorkspaceManager {
   }
 
   async connect(input: ConnectGitHubInput = {}): Promise<WorkspaceProject> {
+    return (await this.connectWithProjectRevision(input)).workspace;
+  }
+
+  async connectWithProjectRevision(
+    input: ConnectGitHubInput = {},
+  ): Promise<{ workspace: WorkspaceProject; revision: WorkspaceProjectRevision }> {
+    return await this.queueProjectMutation(async () => {
+      const workspace = await this.connectInternal(input);
+      return { workspace, revision: this.captureProjectRevision() };
+    });
+  }
+
+  private async connectInternal(input: ConnectGitHubInput = {}): Promise<WorkspaceProject> {
     await this.ensureProjectOpen();
     await this.loadStateIfNeeded();
     const projectRoot = this.requireProjectRoot();
@@ -310,11 +382,11 @@ export class WorkspaceManager {
       localRepoPath,
       connectedAt: this.now(),
     });
+    this.advanceProjectGeneration();
     this.state = { repo, branches: [], sharedResources: [] };
-    this.resetWorkDocumentationPreparation();
     this.branchCounter = 0;
     this.resourceCounter = 0;
-    await this.createBranch({ branch: defaultBranch });
+    await this.createBranchInternal({ branch: defaultBranch });
     await this.saveState();
     return this.snapshot();
   }
@@ -346,6 +418,21 @@ export class WorkspaceManager {
   }
 
   async createBranch(input: CreateBranchWorkspaceInput): Promise<BranchWorkspace> {
+    return (await this.createBranchWithProjectRevision(input)).branch;
+  }
+
+  async createBranchWithProjectRevision(
+    input: CreateBranchWorkspaceInput,
+  ): Promise<{ branch: BranchWorkspace; revision: WorkspaceProjectRevision }> {
+    return await this.queueProjectMutation(async () => {
+      const branch = await this.createBranchInternal(input);
+      return { branch, revision: this.captureProjectRevision() };
+    });
+  }
+
+  private async createBranchInternal(
+    input: CreateBranchWorkspaceInput,
+  ): Promise<BranchWorkspace> {
     await this.ensureProjectOpen();
     await this.loadStateIfNeeded();
     const repo = this.requireRepo();
@@ -385,6 +472,14 @@ export class WorkspaceManager {
   }
 
   async createSharedResource(input: CreateSharedResourceInput): Promise<SharedResourceMount> {
+    return await this.queueProjectMutation(() =>
+      this.createSharedResourceInternal(input),
+    );
+  }
+
+  private async createSharedResourceInternal(
+    input: CreateSharedResourceInput,
+  ): Promise<SharedResourceMount> {
     await this.ensureProjectOpen();
     await this.loadStateIfNeeded();
     const repo = this.requireRepo();
@@ -544,37 +639,51 @@ export class WorkspaceManager {
     options: WorkDocumentationOptions = {},
   ): Promise<string | undefined> {
     const workspace = this.branchOf(config?.branchWorkspaceId);
-    const documentationContext =
-      workspace && options.workDocumentationEnabled
-        ? this.captureWorkDocumentationContext(workspace)
-        : undefined;
     const cwd = workspace?.worktreePath ?? config?.cwd;
     if (!cwd) return undefined;
     const scratchDirectory = path.join(cwd, ".agent-tmp", agentId);
-    await mkdir(scratchDirectory, { recursive: true });
-    if (workspace) await this.ensureIgnored(workspace, [".agent-tmp/"]);
-    if (documentationContext) {
-      await this.queueWorkDocumentation(() =>
-        this.ensureWorkDocumentation(documentationContext),
-      );
+    if (!workspace) {
+      await mkdir(scratchDirectory, { recursive: true });
+      return scratchDirectory;
     }
-    return scratchDirectory;
+
+    // Capture the project synchronously so a queued operation cannot accidentally bind a
+    // reused branch id to a different project before it enters the mutation chain.
+    const workspaceContext = this.captureWorkDocumentationContext(workspace);
+    return await this.queueProjectMutation(async () => {
+      this.assertWorkDocumentationContextCurrent(workspaceContext);
+      await mkdir(scratchDirectory, { recursive: true });
+      await this.ensureIgnored(workspace, [".agent-tmp/"]);
+      this.assertWorkDocumentationContextCurrent(workspaceContext);
+      if (options.workDocumentationEnabled) {
+        await this.queueWorkDocumentation(() =>
+          this.ensureWorkDocumentation(workspaceContext),
+        );
+      }
+      this.assertWorkDocumentationContextCurrent(workspaceContext);
+      return scratchDirectory;
+    });
   }
 
-  async prepareWorkDocumentationForAllBranches(): Promise<void> {
-    const projectGeneration = this.projectGeneration;
-    await this.ensureProjectOpen();
-    await this.loadStateIfNeeded();
-    if (projectGeneration !== this.projectGeneration) {
-      throw new Error("Canvas 项目已在工作文档初始化期间切换，请重试");
-    }
-    const contexts = this.state.branches.map((workspace) =>
-      this.captureWorkDocumentationContext(workspace),
-    );
-    await this.queueWorkDocumentation(async () => {
-      for (const context of contexts) {
-        await this.ensureWorkDocumentation(context);
-      }
+  async prepareWorkDocumentationForAllBranches(
+    expectedRevision?: WorkspaceProjectRevision,
+  ): Promise<void> {
+    await this.queueProjectMutation(async () => {
+      await this.ensureProjectOpen();
+      const revision = expectedRevision ?? this.captureProjectRevision();
+      this.assertProjectRevision(revision);
+      await this.loadStateIfNeeded();
+      this.assertProjectRevision(revision);
+      const contexts = this.state.branches.map((workspace) =>
+        this.captureWorkDocumentationContext(workspace, revision),
+      );
+      await this.queueWorkDocumentation(async () => {
+        this.assertProjectRevision(revision);
+        for (const context of contexts) {
+          await this.ensureWorkDocumentation(context);
+        }
+        this.assertProjectRevision(revision);
+      });
     });
   }
 
@@ -605,9 +714,16 @@ export class WorkspaceManager {
       sourcePath: resource.sourcePath,
       access: resource.access,
     }));
-    const documentation = options.workDocumentationEnabled
-      ? this.workDocumentationPaths(this.captureWorkDocumentationContext(workspace))
+    const documentationContext = options.workDocumentationEnabled
+      ? this.captureWorkDocumentationContext(workspace)
       : undefined;
+    const documentation =
+      documentationContext &&
+      this.preparedWorkDocumentation.has(
+        this.workDocumentationPreparationKey(documentationContext),
+      )
+        ? this.workDocumentationPaths(documentationContext)
+        : undefined;
     if (documentation) {
       sharedResources.push({
         name: "Agent Canvas 当前 branch 共享概要",
@@ -674,8 +790,7 @@ export class WorkspaceManager {
   }
 
   private selectProject(project: CanvasProjectSummary, state?: WorkspaceState): void {
-    this.projectGeneration += 1;
-    this.resetWorkDocumentationPreparation();
+    this.advanceProjectGeneration();
     this.currentProject = { ...project, projectRoot: path.resolve(project.projectRoot) };
     this.projectRoot = this.currentProject.projectRoot;
     this.state = state ?? { branches: [], sharedResources: [] };
@@ -828,12 +943,27 @@ export class WorkspaceManager {
 
   private captureWorkDocumentationContext(
     workspace: BranchWorkspace,
+    revision: WorkspaceProjectRevision = this.captureProjectRevision(),
   ): WorkDocumentationContext {
+    this.assertProjectRevision(revision);
     return {
       workspace: { ...workspace },
-      projectRoot: this.requireProjectRoot(),
+      projectRoot: revision.projectRoot,
+      projectId: revision.projectId,
+      projectGeneration: revision.generation,
       repositoryKey: this.workDocumentationRepositoryKey(workspace),
     };
+  }
+
+  private workDocumentationPreparationKey(context: WorkDocumentationContext): string {
+    return [
+      context.projectId,
+      context.projectGeneration,
+      context.projectRoot,
+      context.repositoryKey,
+      context.workspace.worktreePath,
+      context.workspace.branch,
+    ].join("\u0000");
   }
 
   private workDocumentationPaths(context: WorkDocumentationContext) {
@@ -879,21 +1009,28 @@ export class WorkspaceManager {
   }
 
   private async ensureWorkDocumentation(context: WorkDocumentationContext): Promise<void> {
-    const preparationKey = [
-      context.projectRoot,
-      context.repositoryKey,
-      context.workspace.worktreePath,
-      context.workspace.branch,
-    ].join("\u0000");
-    if (this.preparedWorkDocumentation.has(preparationKey)) return;
-
+    const preparationKey = this.workDocumentationPreparationKey(context);
     const { workspace } = context;
     const documentation = this.workDocumentationPaths(context);
+    this.assertWorkDocumentationContextCurrent(context);
+    if (this.preparedWorkDocumentation.has(preparationKey)) {
+      try {
+        await this.validatePreparedWorkDocumentation(context, documentation);
+        this.assertWorkDocumentationContextCurrent(context);
+        return;
+      } catch (error) {
+        this.preparedWorkDocumentation.delete(preparationKey);
+        throw error;
+      }
+    }
+
     await this.preflightWorkDocumentation(context, documentation);
+    this.assertWorkDocumentationContextCurrent(context);
     await this.ensureIgnored(workspace, [
       WORK_DOCUMENTATION_PATHS.isolatedDirectory,
       WORK_DOCUMENTATION_PATHS.sharedMountDirectory,
     ]);
+    this.assertWorkDocumentationContextCurrent(context);
 
     await ensureDirectoryWithinRoot(
       workspace.worktreePath,
@@ -912,6 +1049,7 @@ export class WorkspaceManager {
       isolatedMarker,
       `${WORK_DOCUMENTATION_PATHS.isolatedDirectory}/ 缺少有效的 Agent Canvas 管理标记`,
     );
+    this.assertWorkDocumentationContextCurrent(context);
 
     await ensureDirectoryWithinRoot(
       context.projectRoot,
@@ -953,6 +1091,7 @@ export class WorkspaceManager {
       "共享 branch 概要必须是普通文件",
     );
     await ensureLink(documentation.sharedSourceDirectory, documentation.sharedMountDirectory);
+    this.assertWorkDocumentationContextCurrent(context);
 
     const sharedIndex = await readRegularFile(documentation.sharedSourceIndex);
     const nextSharedIndex = ensureSharedBranchIndexEntry(
@@ -963,6 +1102,9 @@ export class WorkspaceManager {
     if (nextSharedIndex !== sharedIndex) {
       await writeRegularFile(documentation.sharedSourceIndex, nextSharedIndex);
     }
+    this.assertWorkDocumentationContextCurrent(context);
+    await this.validatePreparedWorkDocumentation(context, documentation);
+    this.assertWorkDocumentationContextCurrent(context);
     this.preparedWorkDocumentation.add(preparationKey);
   }
 
@@ -971,20 +1113,9 @@ export class WorkspaceManager {
     documentation: ReturnType<WorkspaceManager["workDocumentationPaths"]>,
   ): Promise<void> {
     const { workspace } = context;
-    const trackedDocumentation = await this.runGit(
-      [
-        "ls-files",
-        "--",
-        WORK_DOCUMENTATION_PATHS.isolatedDirectory,
-        WORK_DOCUMENTATION_PATHS.sharedMountDirectory,
-      ],
-      { cwd: workspace.worktreePath },
-    );
-    if (trackedDocumentation.trim()) {
-      throw new Error(
-        `${WORK_DOCUMENTATION_PATHS.isolatedDirectory}/ 或 ${WORK_DOCUMENTATION_PATHS.sharedMountDirectory}/ 已包含 Git 跟踪文件，无法启用工作文档维护`,
-      );
-    }
+    this.assertWorkDocumentationContextCurrent(context);
+    await this.assertWorkDocumentationUntracked(workspace);
+    this.assertWorkDocumentationContextCurrent(context);
 
     const isolatedMarker = path.join(
       documentation.isolatedDirectory,
@@ -1042,6 +1173,113 @@ export class WorkspaceManager {
     );
   }
 
+  private async validatePreparedWorkDocumentation(
+    context: WorkDocumentationContext,
+    documentation: ReturnType<WorkspaceManager["workDocumentationPaths"]>,
+  ): Promise<void> {
+    const { workspace } = context;
+    this.assertWorkDocumentationContextCurrent(context);
+    await this.assertWorkDocumentationUntracked(workspace);
+    this.assertWorkDocumentationContextCurrent(context);
+
+    await assertOrdinaryDirectory(
+      documentation.isolatedDirectory,
+      `${WORK_DOCUMENTATION_PATHS.isolatedDirectory}/ 必须是普通目录`,
+    );
+    await ensureDirectoryWithinRoot(workspace.worktreePath, documentation.isolatedDirectory, {
+      allowRootMapping: true,
+      createMissing: false,
+    });
+    await assertRegularFile(
+      path.join(documentation.isolatedDirectory, WORK_DOCUMENTATION_MANAGED_MARKER),
+      `${WORK_DOCUMENTATION_PATHS.isolatedDirectory}/ 缺少有效的 Agent Canvas 管理标记`,
+    );
+    await assertRegularFile(
+      documentation.isolatedIndex,
+      `${WORK_DOCUMENTATION_PATHS.isolatedIndex} 必须是普通文件`,
+    );
+
+    await assertOrdinaryDirectory(
+      documentation.sharedSourceDirectory,
+      `${WORK_DOCUMENTATION_PATHS.sharedMountDirectory}/ 的共享源必须是普通目录`,
+    );
+    await ensureDirectoryWithinRoot(
+      context.projectRoot,
+      documentation.sharedSourceDirectory,
+      { allowRootMapping: true, createMissing: false },
+    );
+    await assertRegularFile(
+      path.join(documentation.sharedSourceDirectory, WORK_DOCUMENTATION_MANAGED_MARKER),
+      `${WORK_DOCUMENTATION_PATHS.sharedMountDirectory}/ 缺少有效的 Agent Canvas 管理标记`,
+    );
+    await assertRegularFile(
+      documentation.sharedSourceIndex,
+      `${WORK_DOCUMENTATION_PATHS.sharedIndex} 必须是普通文件`,
+    );
+    await assertOrdinaryDirectory(
+      documentation.branchSourceDirectory,
+      "当前 branch 共享概要目录必须是普通目录",
+    );
+    await ensureDirectoryWithinRoot(
+      documentation.sharedSourceDirectory,
+      documentation.branchSourceDirectory,
+      { createMissing: false },
+    );
+    await assertRegularFile(
+      documentation.branchOverview,
+      "共享 branch 概要必须是普通文件",
+    );
+    await assertExistingLinkPointsTo(
+      documentation.sharedSourceDirectory,
+      documentation.sharedMountDirectory,
+    );
+    await assertSameRealPath(
+      documentation.sharedSourceIndex,
+      documentation.sharedIndex,
+      "共享工作文档索引映射已改变",
+    );
+    await assertSameRealPath(
+      documentation.branchSourceDirectory,
+      documentation.branchMountDirectory,
+      "当前 branch 共享概要映射已改变",
+    );
+  }
+
+  private async assertWorkDocumentationUntracked(workspace: BranchWorkspace): Promise<void> {
+    const trackedDocumentation = await this.runGit(
+      [
+        "ls-files",
+        "--",
+        WORK_DOCUMENTATION_PATHS.isolatedDirectory,
+        WORK_DOCUMENTATION_PATHS.sharedMountDirectory,
+      ],
+      { cwd: workspace.worktreePath },
+    );
+    if (trackedDocumentation.trim()) {
+      throw new Error(
+        `${WORK_DOCUMENTATION_PATHS.isolatedDirectory}/ 或 ${WORK_DOCUMENTATION_PATHS.sharedMountDirectory}/ 已包含 Git 跟踪文件，无法启用工作文档维护`,
+      );
+    }
+  }
+
+  private assertWorkDocumentationContextCurrent(context: WorkDocumentationContext): void {
+    this.assertProjectRevision({
+      projectId: context.projectId,
+      projectRoot: context.projectRoot,
+      generation: context.projectGeneration,
+    });
+    const currentWorkspace = this.branchOf(context.workspace.id);
+    if (
+      !currentWorkspace ||
+      currentWorkspace.repoId !== context.workspace.repoId ||
+      currentWorkspace.branch !== context.workspace.branch ||
+      normalizedRootKey(currentWorkspace.worktreePath) !==
+        normalizedRootKey(context.workspace.worktreePath)
+    ) {
+      throw new WorkspaceProjectChangedError();
+    }
+  }
+
   private workDocumentationRepositoryKey(workspace: BranchWorkspace): string {
     const repo = this.state.repo?.id === workspace.repoId ? this.state.repo : undefined;
     const identity = repo?.remoteUrl || workspace.repoId;
@@ -1055,6 +1293,20 @@ export class WorkspaceManager {
       () => undefined,
     );
     return await result;
+  }
+
+  private async queueProjectMutation<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.projectMutationChain.then(task, task);
+    this.projectMutationChain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return await result;
+  }
+
+  private advanceProjectGeneration(): void {
+    this.projectGeneration += 1;
+    this.resetWorkDocumentationPreparation();
   }
 
   private async applyResource(
@@ -1280,6 +1532,35 @@ async function assertLinkCanPointTo(sourcePath: string, mountPath: string): Prom
   }
 }
 
+async function assertExistingLinkPointsTo(
+  sourcePath: string,
+  mountPath: string,
+): Promise<void> {
+  const mountStat = await lstatIfExists(mountPath);
+  if (!mountStat?.isSymbolicLink()) {
+    throw new Error(`共享资源挂载点缺失或不是映射: ${mountPath}`);
+  }
+  const [currentTarget, expectedTarget] = await Promise.all([
+    realpath(mountPath),
+    realpath(sourcePath),
+  ]);
+  if (!sameFileSystemPath(currentTarget, expectedTarget)) {
+    throw new Error(`共享资源挂载点已映射到其他目录: ${mountPath} -> ${currentTarget}`);
+  }
+}
+
+async function assertSameRealPath(
+  expectedPath: string,
+  actualPath: string,
+  message: string,
+): Promise<void> {
+  const [expected, actual] = await Promise.all([
+    realpath(expectedPath),
+    realpath(actualPath),
+  ]);
+  if (!sameFileSystemPath(expected, actual)) throw new Error(message);
+}
+
 function sameFileSystemPath(left: string, right: string): boolean {
   const normalizedLeft = path.resolve(left);
   const normalizedRight = path.resolve(right);
@@ -1344,6 +1625,11 @@ async function ensureDirectoryWithinRoot(
 async function assertRegularFile(filePath: string, message: string): Promise<void> {
   const stat = await lstatIfExists(filePath);
   if (!stat?.isFile() || stat.isSymbolicLink()) throw new Error(message);
+}
+
+async function assertOrdinaryDirectory(directoryPath: string, message: string): Promise<void> {
+  const stat = await lstatIfExists(directoryPath);
+  if (!stat?.isDirectory() || stat.isSymbolicLink()) throw new Error(message);
 }
 
 async function assertRegularFileIfExists(filePath: string, message: string): Promise<void> {

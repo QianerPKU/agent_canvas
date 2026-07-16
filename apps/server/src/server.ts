@@ -51,7 +51,10 @@ import { PromptManager } from "./prompts/PromptManager.js";
 import { PullRequestFlowManager } from "./pullRequests/PullRequestFlowManager.js";
 import { CodexAuthManager } from "./sdk/CodexAuthManager.js";
 import { SyncFlowManager } from "./sync/SyncFlowManager.js";
-import { WorkspaceManager } from "./workspaces/WorkspaceManager.js";
+import {
+  WorkspaceManager,
+  WorkspaceProjectChangedError,
+} from "./workspaces/WorkspaceManager.js";
 
 export interface CreateServerResult {
   httpServer: http.Server;
@@ -120,6 +123,11 @@ export function createServer(
       }),
     ),
   );
+  manager.setFileAccessPreparer(async (agentId) => {
+    await workspaceManager.prepareAgentWorkspace(agentId, manager.configOf(agentId), {
+      workDocumentationEnabled: manager.appSettings().workDocumentationEnabled,
+    });
+  });
   const promptManager =
     options.promptManager ??
     new PromptManager({
@@ -316,13 +324,15 @@ async function handleHttp(
     }
     try {
       if (body?.workDocumentationEnabled) {
-        await workspaceManager.prepareWorkDocumentationForAllBranches();
+        const revision = workspaceManager.captureProjectRevision();
+        await workspaceManager.prepareWorkDocumentationForAllBranches(revision);
+        workspaceManager.assertProjectRevision(revision);
       }
       const settings = manager.updateAppSettings(body ?? {});
       canvasState.saveSoon();
       return sendJson(res, 200, settings);
     } catch (error) {
-      return sendJson(res, 400, { error: errMsg(error) });
+      return sendJson(res, workspaceErrorStatus(error), { error: errMsg(error) });
     }
   }
 
@@ -422,16 +432,29 @@ async function handleHttp(
 
   if (method === "POST" && path === "/api/workspace/connect") {
     const body = await readJson<ConnectGitHubInput>(req);
+    let connected: Awaited<ReturnType<WorkspaceManager["connectWithProjectRevision"]>>;
     try {
-      const workspace = await workspaceManager.connect(body ?? {});
-      if (manager.appSettings().workDocumentationEnabled) {
-        await workspaceManager.prepareWorkDocumentationForAllBranches();
-      }
-      canvasState.saveSoon();
-      return sendJson(res, 200, workspace);
+      connected = await workspaceManager.connectWithProjectRevision(body ?? {});
     } catch (error) {
       return sendJson(res, 400, { error: errMsg(error) });
     }
+    if (manager.appSettings().workDocumentationEnabled) {
+      try {
+        await workspaceManager.prepareWorkDocumentationForAllBranches(connected.revision);
+        workspaceManager.assertProjectRevision(connected.revision);
+      } catch (error) {
+        // The repository connection is already persisted; removing it here could discard
+        // work created by another request, so expose the documentation failure explicitly.
+        canvasState.saveSoon();
+        return sendJson(res, 207, {
+          ...connected.workspace,
+          partialSuccess: true,
+          workDocumentation: { ready: false, error: errMsg(error) },
+        });
+      }
+    }
+    canvasState.saveSoon();
+    return sendJson(res, 200, connected.workspace);
   }
 
   if (method === "GET" && path === "/api/workspace/branches") {
@@ -453,15 +476,27 @@ async function handleHttp(
   if (method === "POST" && path === "/api/workspace/branches") {
     const body = await readJson<CreateBranchWorkspaceInput>(req);
     if (!body?.branch) return sendJson(res, 400, { error: "缺少 branch" });
+    let created: Awaited<ReturnType<WorkspaceManager["createBranchWithProjectRevision"]>>;
     try {
-      const branch = await workspaceManager.createBranch(body);
-      if (manager.appSettings().workDocumentationEnabled) {
-        await workspaceManager.prepareWorkDocumentationForAllBranches();
-      }
-      return sendJson(res, 201, { branch });
+      created = await workspaceManager.createBranchWithProjectRevision(body);
     } catch (error) {
       return sendJson(res, 400, { error: errMsg(error) });
     }
+    if (manager.appSettings().workDocumentationEnabled) {
+      try {
+        await workspaceManager.prepareWorkDocumentationForAllBranches(created.revision);
+        workspaceManager.assertProjectRevision(created.revision);
+      } catch (error) {
+        // The git worktree is already persisted. Do not delete it as compensation because
+        // another process may have started using it before documentation preparation failed.
+        return sendJson(res, 207, {
+          branch: created.branch,
+          partialSuccess: true,
+          workDocumentation: { ready: false, error: errMsg(error) },
+        });
+      }
+    }
+    return sendJson(res, 201, { branch: created.branch });
   }
 
   if (method === "GET" && path === "/api/workspace/shared-resources") {
@@ -1194,6 +1229,10 @@ function send(ws: WebSocket, frame: ServerFrame): void {
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function workspaceErrorStatus(error: unknown): number {
+  return error instanceof WorkspaceProjectChangedError ? 409 : 400;
 }
 
 async function serverConfig(

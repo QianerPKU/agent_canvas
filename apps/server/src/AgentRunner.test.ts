@@ -189,6 +189,39 @@ describe("AgentRunner 生命周期", () => {
     expect(runner.getStatus()).toBe("waiting_input");
   });
 
+  it("revalidates file access when a queued input is actually dispatched", async () => {
+    const ctl = makeControllableQuery();
+    const events: AgentEvent[] = [];
+    let unsafe = false;
+    const prepareFileAccess = vi.fn(async () => {
+      if (unsafe) throw new Error("work documentation path changed");
+    });
+    const runner = new AgentRunner("queued-path-agent", {
+      query: ctl.query,
+      prepareFileAccess,
+    });
+    runner.on((event) => events.push(event));
+
+    runner.start({ prompt: "first" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+    runner.send("queued second");
+    unsafe = true;
+
+    ctl.emit(resultMsg());
+    await flush();
+    await flush();
+
+    expect(prepareFileAccess).toHaveBeenCalledOnce();
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual(["first"]);
+    expect(events).toContainEqual({
+      kind: "error",
+      message: "work documentation path changed",
+    });
+    expect(ctl.wasTerminated()).toBe(true);
+    expect(runner.getStatus()).toBe("error");
+  });
+
   it("steer 优先调用底层 handle 的引导能力，并记录 steer 事件", async () => {
     const ctl = makeControllableQuery();
     const events: AgentEvent[] = [];
@@ -395,6 +428,36 @@ describe("AgentRunner 生命周期", () => {
     expect(runner.getStatus()).toBe("running");
     expect(ctl.wasTerminated()).toBe(false);
     expect(ctl.inputs.map((input) => input.message.content)).toEqual(["x", "y"]);
+  });
+
+  it("preserves a pending documentation policy across stop and stopped-session reuse", async () => {
+    const ctl = makeControllableQuery();
+    let workDocumentationEnabled = false;
+    const runner = new AgentRunner("stopped-documentation-policy-agent", {
+      query: ctl.query,
+      workDocumentationEnabled: () => workDocumentationEnabled,
+    });
+    runner.start({ prompt: "first", branchWorkspaceId: "branch_1" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+
+    workDocumentationEnabled = true;
+    runner.refreshPolicyPrompt();
+    await runner.stop();
+    ctl.emit(resultMsg());
+    await flush();
+
+    runner.send("continue");
+    await flush();
+
+    expect(runner.getStatus()).toBe("running");
+    expect(ctl.wasTerminated()).toBe(false);
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual(["first", "continue"]);
+    expect(readablePromptContents(ctl.inputs.at(-1))).toEqual([
+      agentCanvasPolicyPrompt("stopped-documentation-policy-agent", {
+        workDocumentationEnabled: true,
+      }),
+    ]);
   });
 
   it("compact 作为独立一轮，完成后回到 waiting_input", async () => {

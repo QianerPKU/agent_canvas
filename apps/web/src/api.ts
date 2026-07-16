@@ -45,6 +45,17 @@ import type {
 
 const BASE = "/api";
 
+export interface WorkDocumentationMutationStatus {
+  partialSuccess?: boolean;
+  workDocumentation?: {
+    ready: boolean;
+    error?: string;
+  };
+}
+
+export type WorkspaceConnectionResult = WorkspaceProject & WorkDocumentationMutationStatus;
+export type BranchCreationResult = BranchWorkspace & WorkDocumentationMutationStatus;
+
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(BASE + path, {
     headers: { "Content-Type": "application/json" },
@@ -98,7 +109,7 @@ export const api = {
     }).then((r) => r.project),
   workspace: () => call<WorkspaceProject>("/workspace"),
   connectWorkspace: (input: ConnectGitHubInput) =>
-    call<WorkspaceProject>("/workspace/connect", {
+    call<WorkspaceConnectionResult>("/workspace/connect", {
       method: "POST",
       body: JSON.stringify(input),
     }),
@@ -107,10 +118,14 @@ export const api = {
   listBranchOptions: () =>
     call<{ branches: BranchOption[] }>("/workspace/branch-options").then((r) => r.branches),
   createBranch: (input: CreateBranchWorkspaceInput) =>
-    call<{ branch: BranchWorkspace }>("/workspace/branches", {
+    call<{ branch: BranchWorkspace } & WorkDocumentationMutationStatus>("/workspace/branches", {
       method: "POST",
       body: JSON.stringify(input),
-    }).then((r) => r.branch),
+    }).then((result): BranchCreationResult => ({
+      ...result.branch,
+      partialSuccess: result.partialSuccess,
+      workDocumentation: result.workDocumentation,
+    })),
   listPullRequestFlows: () =>
     call<{ flows: PullRequestFlowSnapshot[] }>("/pr-flows").then((r) => r.flows),
   listSyncFlows: () =>

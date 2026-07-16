@@ -47,6 +47,7 @@ export interface AgentManagerDeps {
     config: Pick<AgentStartConfig, "cwd" | "branch"> | undefined,
   ) => Promise<AgentTurnContextMetadata>;
   resolveFileAccess?: (agentId: string) => AgentFileAccess;
+  prepareFileAccess?: (agentId: string) => Promise<void>;
   resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
 }
 
@@ -76,6 +77,7 @@ export class AgentManager {
     config: Pick<AgentStartConfig, "cwd" | "branch"> | undefined,
   ) => Promise<AgentTurnContextMetadata>;
   private resolveFileAccess?: (agentId: string) => AgentFileAccess;
+  private prepareFileAccess?: (agentId: string) => Promise<void>;
   private resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
   private counter = 0;
   private suppressEvents = false;
@@ -87,6 +89,7 @@ export class AgentManager {
     this.now = deps.now ?? Date.now;
     this.resolveTurnContext = deps.resolveTurnContext ?? defaultResolveTurnContext;
     this.resolveFileAccess = deps.resolveFileAccess;
+    this.prepareFileAccess = deps.prepareFileAccess;
     this.resolvePromptAccess = deps.resolvePromptAccess;
   }
 
@@ -167,6 +170,7 @@ export class AgentManager {
       this.forkConfigs.clear();
       this.draftConfigs.clear();
       this.appSettingsState.fullPermissionMode = false;
+      this.appSettingsState.workDocumentationEnabled = false;
       this.counter = 0;
     } finally {
       this.suppressEvents = false;
@@ -193,6 +197,7 @@ export class AgentManager {
           writableDirectories: [],
           sharedResources: [],
         },
+      prepareFileAccess: (agentId) => this.prepareFileAccess?.(agentId) ?? Promise.resolve(),
       resolvePromptAccess: (agentId) =>
         this.resolvePromptAccess?.(agentId) ?? {
           readablePrompts: [],
@@ -214,6 +219,10 @@ export class AgentManager {
 
   setFileAccessResolver(resolveFileAccess: (agentId: string) => AgentFileAccess): void {
     this.resolveFileAccess = resolveFileAccess;
+  }
+
+  setFileAccessPreparer(prepareFileAccess: (agentId: string) => Promise<void>): void {
+    this.prepareFileAccess = prepareFileAccess;
   }
 
   setPromptAccessResolver(resolvePromptAccess: (agentId: string) => AgentPromptAccess): void {

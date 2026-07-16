@@ -613,7 +613,7 @@ describe("WorkspaceManager", () => {
       await writeFile(featureIndex, "# Agent maintained\n", "utf-8");
       await manager.prepareWorkDocumentationForAllBranches();
       await expect(readFile(featureIndex, "utf-8")).resolves.toBe("# Agent maintained\n");
-      expect(documentationPreflights).toBe(2);
+      expect(documentationPreflights).toBe(8);
       expect(
         (await readFile(featureSharedIndex, "utf-8")).match(/agent-canvas:branch:/gu),
       ).toHaveLength(2);
@@ -670,12 +670,103 @@ describe("WorkspaceManager", () => {
     }
   });
 
-  it("keeps queued documentation bound to the project that scheduled it", async () => {
+  it("revalidates cached work documentation before restoring agent access", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-work-docs-revalidate-"));
+    const source = path.join(root, "source-repo");
+    const projectRoot = path.join(root, "project");
+    const outside = path.join(root, "outside");
+    await Promise.all([mkdir(source, { recursive: true }), mkdir(outside, { recursive: true })]);
+    let trackedDocumentation = false;
+    const runGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return "https://github.com/acme/work-docs-revalidate.git";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      if (args[0] === "ls-files") {
+        return trackedDocumentation ? ".agent-docs/index.md" : "";
+      }
+      return "";
+    };
+
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: source,
+        projectRoot,
+        runGit,
+      });
+      const workspace = (await manager.connect({ localPath: source })).branches[0]!;
+      const config = { branchWorkspaceId: workspace.id };
+      const options = { workDocumentationEnabled: true };
+      const isolatedMarker = path.join(
+        workspace.worktreePath,
+        ".agent-docs",
+        ".agent-canvas-managed",
+      );
+      const sharedMount = path.join(workspace.worktreePath, ".agent-shared-docs");
+
+      await manager.prepareAgentWorkspace("agent_1", config, options);
+      expect(manager.accessForAgent(config, options).readableFiles).toHaveLength(2);
+
+      await rm(isolatedMarker);
+      await expect(
+        manager.prepareAgentWorkspace("agent_1", config, options),
+      ).rejects.toThrow(".agent-docs/");
+      expect(manager.accessForAgent(config, options).readableFiles).toEqual([]);
+
+      await writeFile(
+        isolatedMarker,
+        "Agent Canvas managed work documentation. Do not commit or remove this marker.\n",
+        "utf-8",
+      );
+      await manager.prepareAgentWorkspace("agent_1", config, options);
+
+      trackedDocumentation = true;
+      await expect(
+        manager.prepareAgentWorkspace("agent_1", config, options),
+      ).rejects.toThrow("Git");
+      expect(manager.accessForAgent(config, options).readableFiles).toEqual([]);
+
+      trackedDocumentation = false;
+      await manager.prepareAgentWorkspace("agent_1", config, options);
+      const expectedSharedSource = await realpath(sharedMount);
+      await rm(sharedMount, { force: true });
+      await symlink(
+        outside,
+        sharedMount,
+        process.platform === "win32" ? "junction" : "dir",
+      );
+      await expect(
+        manager.prepareAgentWorkspace("agent_1", config, options),
+      ).rejects.toThrow("映射");
+      expect(manager.accessForAgent(config, options).readableFiles).toEqual([]);
+
+      await rm(sharedMount, { force: true });
+      await symlink(
+        expectedSharedSource,
+        sharedMount,
+        process.platform === "win32" ? "junction" : "dir",
+      );
+      await expect(
+        manager.prepareAgentWorkspace("agent_1", config, options),
+      ).resolves.toBeDefined();
+      expect(manager.accessForAgent(config, options).readableFiles).toHaveLength(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("waits for in-progress documentation writes before switching projects", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-doc-project-race-"));
     const source = path.join(root, "source-repo");
     const projectsRoot = path.join(root, "projects");
     await mkdir(source, { recursive: true });
     let blockDocumentation = false;
+    let documentationChecks = 0;
     let signalBlocked!: () => void;
     let releaseDocumentation!: () => void;
     const blocked = new Promise<void>((resolve) => {
@@ -695,9 +786,12 @@ describe("WorkspaceManager", () => {
         return path.join(options?.cwd ?? "", ".git", "info", "exclude");
       }
       if (args[0] === "ls-files" && blockDocumentation) {
-        blockDocumentation = false;
-        signalBlocked();
-        await released;
+        documentationChecks += 1;
+        if (documentationChecks === 2) {
+          blockDocumentation = false;
+          signalBlocked();
+          await released;
+        }
       }
       return "";
     };
@@ -712,26 +806,194 @@ describe("WorkspaceManager", () => {
       const projectA = await manager.createCanvasProject({ name: "Project A" });
       const workspaceA = (await manager.connect({ localPath: source })).branches[0]!;
       blockDocumentation = true;
-      const preparing = manager.prepareAgentWorkspace(
-        "agent_a",
-        { branchWorkspaceId: workspaceA.id },
-        { workDocumentationEnabled: true },
-      );
+      const preparing = manager.prepareWorkDocumentationForAllBranches();
       await blocked;
 
-      const projectB = await manager.createCanvasProject({ name: "Project B" });
-      releaseDocumentation();
-      await preparing;
-
-      const sharedTarget = await realpath(
-        path.join(workspaceA.worktreePath, ".agent-shared-docs"),
+      await expect(
+        readFile(path.join(workspaceA.worktreePath, ".agent-docs", "index.md"), "utf-8"),
+      ).resolves.toContain("main");
+      let switchSettled = false;
+      const switching = manager.createCanvasProject({ name: "Project B" });
+      void switching.then(
+        () => {
+          switchSettled = true;
+        },
+        () => {
+          switchSettled = true;
+        },
       );
-      expect(path.relative(projectA.projectRoot, sharedTarget)).not.toMatch(/^\.\.(?:[\\/]|$)/u);
+      await Promise.resolve();
+      expect(switchSettled).toBe(false);
+      expect(manager.currentProjectId()).toBe(projectA.id);
+      releaseDocumentation();
+      await expect(preparing).resolves.toBeUndefined();
+      const projectB = await switching;
+
+      await expect(
+        lstat(path.join(projectA.projectRoot, "shared", "_agent-canvas")),
+      ).resolves.toMatchObject({ isDirectory: expect.any(Function) });
       await expect(
         lstat(path.join(projectB.projectRoot, "shared", "_agent-canvas")),
       ).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       releaseDocumentation?.();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("waits for in-progress documentation writes before deleting their project", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-doc-delete-race-"));
+    const source = path.join(root, "source-repo");
+    const projectsRoot = path.join(root, "projects");
+    await mkdir(source, { recursive: true });
+    let blockDocumentation = false;
+    let documentationChecks = 0;
+    let signalBlocked!: () => void;
+    let releaseDocumentation!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      signalBlocked = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      releaseDocumentation = resolve;
+    });
+    const runGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return "https://github.com/acme/project-delete-race.git";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      if (args[0] === "ls-files" && blockDocumentation) {
+        documentationChecks += 1;
+        if (documentationChecks === 2) {
+          blockDocumentation = false;
+          signalBlocked();
+          await released;
+        }
+      }
+      return "";
+    };
+
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: source,
+        projectsRoot,
+        autoOpenDefault: false,
+        runGit,
+      });
+      const project = await manager.createCanvasProject({ name: "Delete Me" });
+      await manager.connect({ localPath: source });
+      blockDocumentation = true;
+      const preparing = manager.prepareWorkDocumentationForAllBranches();
+      await blocked;
+
+      await expect(
+        lstat(path.join(project.projectRoot, "shared", "_agent-canvas")),
+      ).resolves.toMatchObject({ isDirectory: expect.any(Function) });
+      let deleteSettled = false;
+      const deleting = manager.deleteCanvasProject(project.id);
+      void deleting.then(
+        () => {
+          deleteSettled = true;
+        },
+        () => {
+          deleteSettled = true;
+        },
+      );
+      await Promise.resolve();
+      expect(deleteSettled).toBe(false);
+      expect(manager.currentProjectId()).toBe(project.id);
+
+      releaseDocumentation();
+      await expect(preparing).resolves.toBeUndefined();
+      await expect(deleting).resolves.toEqual(project);
+      await expect(lstat(project.projectRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      releaseDocumentation?.();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps shared-resource creation bound to its project while a switch is queued", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-resource-project-race-"));
+    const source = path.join(root, "source-repo");
+    const projectsRoot = path.join(root, "projects");
+    await mkdir(source, { recursive: true });
+    let blockResourceMount = false;
+    let signalBlocked!: () => void;
+    let releaseResource!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      signalBlocked = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      releaseResource = resolve;
+    });
+    const runGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return "https://github.com/acme/resource-project-race.git";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        if (blockResourceMount) {
+          blockResourceMount = false;
+          signalBlocked();
+          await released;
+        }
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      return "";
+    };
+
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: source,
+        projectsRoot,
+        autoOpenDefault: false,
+        runGit,
+      });
+      const projectA = await manager.createCanvasProject({ name: "Project A" });
+      const workspaceA = (await manager.connect({ localPath: source })).branches[0]!;
+      blockResourceMount = true;
+      const creatingResource = manager.createSharedResource({
+        name: "Dataset",
+        mountPath: ".agent-resources/dataset",
+        access: "readOnly",
+      });
+      await blocked;
+
+      let switchSettled = false;
+      const switching = manager.createCanvasProject({ name: "Project B" });
+      void switching.then(
+        () => {
+          switchSettled = true;
+        },
+        () => {
+          switchSettled = true;
+        },
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      expect(switchSettled).toBe(false);
+      expect(manager.currentProjectId()).toBe(projectA.id);
+
+      releaseResource();
+      const resource = await creatingResource;
+      await switching;
+      expect((await manager.project()).sharedResources).toEqual([]);
+
+      const reopenedA = await manager.openCanvasProject({ id: projectA.id });
+      expect(reopenedA.sharedResources).toContainEqual(
+        expect.objectContaining({ id: resource.id, sourcePath: resource.sourcePath }),
+      );
+      await expect(
+        realpath(path.join(workspaceA.worktreePath, ".agent-resources", "dataset")),
+      ).resolves.toBe(await realpath(resource.sourcePath));
+    } finally {
+      releaseResource?.();
       await rm(root, { recursive: true, force: true });
     }
   });
