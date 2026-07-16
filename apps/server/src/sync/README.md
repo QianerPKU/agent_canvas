@@ -23,13 +23,17 @@ reviews for different branches may run in parallel. A queued sync flow has no ac
 or review deadline, so queue waiting time does not count toward its 10 minute review timeout. The
 deadline starts when the review actually begins.
 
-Approval, rejection, timeout, or cancellation releases the target-branch slot and immediately lets
-the next eligible review start. Approval releases the slot when apply authorization is issued; the
-queue does not wait for the proposer to finish the git operation or report `applied`.
+Approval, rejection, timeout, or cancellation invalidates the target-branch slot. If a prompt
+delivery is still in flight, the reservation is retained until that delivery settles, preventing a
+blocked `steer` from overlapping the next same-branch review. Approval otherwise releases the slot
+when apply authorization is issued; the queue does not wait for the proposer to finish the git
+operation or report `applied`.
 
-When persisted canvas state is restored, the server rebuilds the shared queue and active branch
-ownership before starting queued reviews. Active review timers are restored from their saved
-deadlines; an already-expired review times out and releases its branch during recovery.
+When persisted canvas state is restored, an in-progress sync review is requeued and its old deadline
+is discarded. Agents, prompts, and layout are restored before the shared PR/sync queue is rebuilt and
+drained. The head starts with a fresh request and deadline only when the target branch has an active
+agent; otherwise it remains queued and is retried automatically when an agent becomes active. This
+prevents zero-reviewer auto-approval and premature prompt delivery during project reload.
 
 ## Review Contract
 

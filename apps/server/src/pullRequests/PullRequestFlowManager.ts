@@ -139,8 +139,21 @@ export class PullRequestFlowManager {
     for (const flowId of this.timers.keys()) this.closeTimer(flowId);
     this.flows.clear();
     for (const flow of flows ?? []) {
-      const restored =
-        flow.status === "queued" && !flow.currentStage
+      const collectingStage: PullRequestReviewStage | undefined =
+        flow.status === "source_review_collecting"
+          ? "source_preflight"
+          : flow.status === "target_review_collecting"
+            ? "target_merge"
+            : undefined;
+      const restored = collectingStage
+        ? {
+            ...flow,
+            status: "queued" as const,
+            currentStage: collectingStage,
+            deadlineAt: undefined,
+            failureReason: "Review was requeued because its previous delivery cannot survive reload.",
+          }
+        : flow.status === "queued" && !flow.currentStage
           ? { ...flow, currentStage: "source_preflight" as const }
           : flow;
       this.flows.set(restored.id, restored);
@@ -389,6 +402,16 @@ export class PullRequestFlowManager {
     if (epoch !== this.stateEpoch) return "started";
     flow = this.requireFlow(flowId);
     if (flow.status !== "queued" || flow.currentStage !== stage) return "started";
+    const reviewers = this.activeReviewersFor(flow, stage);
+    if (reviewers.length === 0) {
+      const branch = stage === "source_preflight" ? flow.sourceBranch : flow.targetBranch;
+      this.save({
+        ...flow,
+        failureReason: `Queued PR review is waiting for an active reviewer on branch ${branch}.`,
+        updatedAt: this.now(),
+      });
+      return "deferred";
+    }
     this.save({
       ...flow,
       status:
@@ -398,18 +421,18 @@ export class PullRequestFlowManager {
       failureReason: undefined,
       updatedAt: this.now(),
     });
-    await this.startReviewStage(flowId, stage, epoch);
+    await this.startReviewStage(flowId, stage, reviewers, epoch);
     return "started";
   }
 
   private async startReviewStage(
     flowId: string,
     stage: PullRequestReviewStage,
+    reviewers: AgentSnapshot[],
     epoch: number,
   ): Promise<void> {
     if (epoch !== this.stateEpoch) return;
     const flow = this.requireFlow(flowId);
-    const reviewers = this.activeReviewersFor(flow, stage);
     const request: PullRequestReviewRequest = {
       id: `${flow.id}:${stage}:${flow.reviewRequests.length + 1}`,
       stage,
@@ -432,16 +455,19 @@ export class PullRequestFlowManager {
     });
     this.resetTimer(flowId, request.deadlineAt);
 
-    if (reviewers.length === 0) {
-      await this.finishStageIfComplete(flowId, epoch);
-      return;
-    }
-
     for (const reviewer of reviewers) {
       try {
-        await this.deliverToAgent(reviewer.id, reviewPrompt(this.requireFlow(flowId), stage));
+        const delivery = await this.reviewQueue.runWhileReserved(
+          reviewJobId(flowId, stage),
+          async () =>
+            await this.deliverToAgent(
+              reviewer.id,
+              reviewPrompt(this.requireFlow(flowId), stage),
+            ),
+        );
+        if (delivery.status === "invalidated") return;
       } catch (error) {
-        if (epoch !== this.stateEpoch) return;
+        if (!this.isCurrentReview(flowId, stage, request.id, epoch)) return;
         this.recordSyntheticResponse(
           flowId,
           stage,
@@ -450,9 +476,9 @@ export class PullRequestFlowManager {
           `Failed to deliver review request: ${errorMessage(error)}`,
         );
       }
-      if (epoch !== this.stateEpoch) return;
+      if (!this.isCurrentReview(flowId, stage, request.id, epoch)) return;
     }
-    if (epoch !== this.stateEpoch) return;
+    if (!this.isCurrentReview(flowId, stage, request.id, epoch)) return;
     await this.finishStageIfComplete(flowId, epoch);
   }
 
@@ -539,7 +565,11 @@ export class PullRequestFlowManager {
     if (retryCount < this.reviewRetryLimit) {
       request.retryCounts[agentId] = retryCount + 1;
       this.saveRequest(flowId, request);
-      await this.deliverToAgent(agentId, retryPrompt(flow, stage));
+      const delivery = await this.reviewQueue.runWhileReserved(
+        reviewJobId(flowId, stage),
+        async () => await this.deliverToAgent(agentId, retryPrompt(flow, stage)),
+      );
+      if (delivery.status === "invalidated") return;
       return;
     }
     this.recordReviewResponse(flowId, stage, {
@@ -562,6 +592,7 @@ export class PullRequestFlowManager {
     const flow = this.requireFlow(flowId);
     const request = currentRequest(flow, flow.currentStage);
     if (!request || request.pendingAgentIds.length > 0) return;
+    if (!hasCompleteReviewerCoverage(request)) return;
     this.closeTimer(flowId);
     const allApproved = request.responses.every((response) => response.decision === "approve");
     if (request.stage === "source_preflight") {
@@ -793,6 +824,20 @@ export class PullRequestFlowManager {
     this.timers.delete(flowId);
   }
 
+  private isCurrentReview(
+    flowId: string,
+    stage: PullRequestReviewStage,
+    requestId: string,
+    epoch: number,
+  ): boolean {
+    if (epoch !== this.stateEpoch) return false;
+    const flow = this.flows.get(flowId);
+    if (!flow || flow.currentStage !== stage) return false;
+    const expectedStatus =
+      stage === "source_preflight" ? "source_review_collecting" : "target_review_collecting";
+    return flow.status === expectedStatus && currentRequest(flow, stage)?.id === requestId;
+  }
+
   private assertCurrentEpoch(epoch: number): void {
     if (epoch !== this.stateEpoch) {
       throw new Error("PR flow state changed while the operation was in progress");
@@ -846,6 +891,19 @@ function currentRequest(
 ): PullRequestReviewRequest | undefined {
   if (!stage) return undefined;
   return [...flow.reviewRequests].reverse().find((request) => request.stage === stage);
+}
+
+function hasCompleteReviewerCoverage(request: PullRequestReviewRequest): boolean {
+  const requested = new Set(request.requestedAgentIds);
+  const responded = new Set(request.responses.map((response) => response.agentId));
+  return (
+    request.requestedAgentIds.length > 0 &&
+    requested.size === request.requestedAgentIds.length &&
+    request.pendingAgentIds.length === 0 &&
+    request.responses.length === request.requestedAgentIds.length &&
+    responded.size === request.responses.length &&
+    request.requestedAgentIds.every((agentId) => responded.has(agentId))
+  );
 }
 
 function lastHistorySeq(history: AgentEventEnvelope[]): number {

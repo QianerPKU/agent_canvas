@@ -12,6 +12,9 @@ import {
 class FakeRunner {
   readonly sent: string[] = [];
   readonly steered: string[] = [];
+  activeSteers = 0;
+  maxConcurrentSteers = 0;
+  private nextSteerBlock?: Promise<void>;
 
   constructor(private status: string) {}
 
@@ -28,8 +31,21 @@ class FakeRunner {
     this.status = "running";
   }
 
+  blockNextSteerUntil(block: Promise<void>): void {
+    this.nextSteerBlock = block;
+  }
+
   async steer(text: string): Promise<void> {
     this.steered.push(text);
+    const block = this.nextSteerBlock;
+    this.nextSteerBlock = undefined;
+    this.activeSteers += 1;
+    this.maxConcurrentSteers = Math.max(this.maxConcurrentSteers, this.activeSteers);
+    try {
+      await block;
+    } finally {
+      this.activeSteers -= 1;
+    }
   }
 }
 
@@ -98,6 +114,22 @@ afterEach(() => {
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+async function waitUntil(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (predicate()) return;
+    await Promise.resolve();
+  }
+  throw new Error("condition was not reached");
+}
+
 describe("PullRequestFlowManager", () => {
   it("authorizes create and merge after source and target approvals", async () => {
     let now = 1000;
@@ -162,6 +194,38 @@ describe("PullRequestFlowManager", () => {
     flow = manager.get(flow.id)!;
     expect(flow.status).toBe("merge_authorized");
     expect(proposer.sent.at(-1)).toContain("authorized to merge the PR");
+  });
+
+  it("keeps a target review queued when the target branch has no active reviewers", async () => {
+    let now = 1500;
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/a", "waiting_input");
+    host.addAgent("agent_2", "main", "stopped");
+    const manager = new PullRequestFlowManager({ host, now: () => now });
+
+    let flow = await manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "main",
+      summary: "Target reviewer is offline",
+      files: ["src/a.ts"],
+    });
+
+    now += 1;
+    proposer.setStatus("waiting_input");
+    host.assistant("agent_1", reviewJson(flow, "source_preflight", "approve"), now);
+    await manager.handleAgentEvent(host.result("agent_1", now));
+    flow = manager.get(flow.id)!;
+    expect(flow.status).toBe("create_pr_authorized");
+
+    flow = await manager.recordPrCreated(flow.id, { prNumber: 13 });
+
+    expect(flow).toMatchObject({
+      status: "queued",
+      currentStage: "target_merge",
+    });
+    expect(flow.failureReason).toContain("waiting for an active reviewer on branch main");
+    expect(flow.reviewRequests).toHaveLength(1);
+    expect(flow.reviewRequests[0]?.stage).toBe("source_preflight");
   });
 
   it("retries invalid review JSON and then blocks the flow", async () => {
@@ -299,6 +363,92 @@ describe("PullRequestFlowManager", () => {
     expect(manager.get(second.id)?.reviewRequests).toHaveLength(1);
     expect(proposer.steered).toHaveLength(1);
     expect(proposer.steered[0]).toContain(`flowId: ${second.id}`);
+  });
+
+  it("keeps the branch reserved when a cancelled PR still has a blocked review delivery", async () => {
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/shared", "running");
+    const blockedDelivery = deferred();
+    proposer.blockNextSteerUntil(blockedDelivery.promise);
+    const manager = new PullRequestFlowManager({ host });
+
+    const firstCreate = manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "main",
+      summary: "Blocked first PR",
+      files: ["src/first.ts"],
+    });
+    await waitUntil(() => proposer.steered.length === 1);
+    const firstId = manager.list()[0]!.id;
+    const second = await manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "release",
+      summary: "Queued second PR",
+      files: ["src/second.ts"],
+    });
+
+    expect(second).toMatchObject({ status: "queued", currentStage: "source_preflight" });
+    manager.cancel(firstId);
+    await Promise.resolve();
+
+    expect(manager.get(firstId)?.status).toBe("cancelled");
+    expect(manager.get(second.id)?.status).toBe("queued");
+    expect(proposer.steered).toHaveLength(1);
+    expect(proposer.activeSteers).toBe(1);
+
+    blockedDelivery.resolve();
+    await firstCreate;
+    await waitUntil(() => manager.get(second.id)?.status === "source_review_collecting");
+
+    expect(proposer.steered).toHaveLength(2);
+    expect(proposer.steered[1]).toContain(`flowId: ${second.id}`);
+    expect(proposer.maxConcurrentSteers).toBe(1);
+  });
+
+  it("keeps the branch reserved when a timed out PR still has a blocked review delivery", async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/shared", "running");
+    const blockedDelivery = deferred();
+    proposer.blockNextSteerUntil(blockedDelivery.promise);
+    const manager = new PullRequestFlowManager({
+      host,
+      now: () => now,
+      reviewTimeoutMs: 10,
+    });
+
+    const firstCreate = manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "main",
+      summary: "Blocked timeout PR",
+      files: ["src/first.ts"],
+    });
+    await waitUntil(() => proposer.steered.length === 1);
+    const firstId = manager.list()[0]!.id;
+    const second = await manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "release",
+      summary: "Queued after timeout",
+      files: ["src/second.ts"],
+    });
+
+    now = 11;
+    vi.advanceTimersByTime(11);
+    await Promise.resolve();
+
+    expect(manager.get(firstId)?.status).toBe("timed_out");
+    expect(manager.get(second.id)?.status).toBe("queued");
+    expect(proposer.steered).toHaveLength(1);
+    expect(proposer.activeSteers).toBe(1);
+
+    blockedDelivery.resolve();
+    await firstCreate;
+    await waitUntil(() => manager.get(second.id)?.status === "source_review_collecting");
+
+    expect(proposer.steered).toHaveLength(2);
+    expect(proposer.steered[1]).toContain(`flowId: ${second.id}`);
+    expect(proposer.maxConcurrentSteers).toBe(1);
   });
 
   it("runs source reviews on different branches in parallel and queues their target reviews", async () => {
@@ -490,11 +640,11 @@ describe("PullRequestFlowManager", () => {
     expect(proposer.sent[0]).toContain(`flowId: ${second.id}`);
   });
 
-  it("restores an active review deadline and releases it on timeout", async () => {
+  it("requeues a restored collecting review without its old deadline and redelivers after retry", async () => {
     vi.useFakeTimers();
     let now = 8000;
     const host = new FakeHost();
-    host.addAgent("agent_1", "feature/a", "waiting_input");
+    const proposer = host.addAgent("agent_1", "feature/a", "waiting_input");
     const original = new PullRequestFlowManager({
       host,
       now: () => now,
@@ -508,6 +658,9 @@ describe("PullRequestFlowManager", () => {
     });
     const persisted = original.exportState();
     original.cancel(flow.id);
+    proposer.sent.length = 0;
+    proposer.steered.length = 0;
+    proposer.setStatus("stopped");
 
     const restored = new PullRequestFlowManager({
       host,
@@ -515,10 +668,42 @@ describe("PullRequestFlowManager", () => {
       reviewTimeoutMs: 10,
     });
     restored.importState(persisted);
+    await waitUntil(() =>
+      restored.get(flow.id)?.failureReason?.includes("active reviewer") === true &&
+      restored
+        .getReviewQueue()
+        .stateOf(`pull_request:${flow.id}:source_preflight`) === "queued",
+    );
+
+    expect(restored.get(flow.id)).toMatchObject({
+      status: "queued",
+      currentStage: "source_preflight",
+    });
+    expect(restored.get(flow.id)?.deadlineAt).toBeUndefined();
+    expect(restored.get(flow.id)?.reviewRequests).toHaveLength(1);
+    expect(restored.get(flow.id)?.failureReason).toContain("active reviewer");
+
     now += 11;
     vi.advanceTimersByTime(11);
 
-    expect(restored.get(flow.id)?.status).toBe("timed_out");
+    expect(restored.get(flow.id)?.status).toBe("queued");
+    expect(proposer.sent).toHaveLength(0);
+    expect(proposer.steered).toHaveLength(0);
+
+    proposer.setStatus("running");
+    await restored.getReviewQueue().retryBranch("feature/a");
+
+    const retried = restored.get(flow.id)!;
+    expect(retried.status).toBe("source_review_collecting");
+    expect(retried.deadlineAt).toBe(now + 10);
+    expect(retried.reviewRequests).toHaveLength(2);
+    expect(retried.reviewRequests[1]?.id).not.toBe(retried.reviewRequests[0]?.id);
+    expect(retried.reviewRequests[1]?.requestedAgentIds).toEqual(["agent_1"]);
+    expect(proposer.steered).toHaveLength(1);
+    expect(proposer.steered[0]).toContain(`flowId: ${flow.id}`);
+
+    vi.advanceTimersByTime(9);
+    expect(restored.get(flow.id)?.status).toBe("source_review_collecting");
   });
 
   it("does not let an in-flight review start mutate a newly imported project", async () => {
@@ -557,12 +742,59 @@ describe("PullRequestFlowManager", () => {
       files: ["src/new.ts"],
     });
     expect(fresh.id).toBe("pr_flow_1");
-    expect(fresh.status).toBe("source_review_collecting");
+    expect(fresh.status).toBe("queued");
 
     releaseStaleCheck();
     await expect(staleCreate).rejects.toThrow("state changed");
+    await waitUntil(() => manager.get(fresh.id)?.status === "source_review_collecting");
     expect(manager.get(fresh.id)?.summary).toBe("New project review");
     expect(manager.get(fresh.id)?.status).toBe("source_review_collecting");
+  });
+
+  it("keeps an imported same-branch review queued until stale delivery settles", async () => {
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/shared", "running");
+    const staleDelivery = deferred();
+    proposer.blockNextSteerUntil(staleDelivery.promise);
+    const manager = new PullRequestFlowManager({ host });
+
+    const staleCreate = manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "main",
+      summary: "Old project delivery",
+      files: ["src/old.ts"],
+    });
+    await waitUntil(() => proposer.steered.length === 1);
+    const staleFlow = manager.list()[0]!;
+    const importedFlow: PullRequestFlowSnapshot = {
+      ...staleFlow,
+      id: "pr_flow_42",
+      summary: "Imported project delivery",
+      status: "queued",
+      currentStage: "source_preflight",
+      deadlineAt: undefined,
+      failureReason: undefined,
+      reviewRequests: [],
+      createdAt: staleFlow.createdAt + 1,
+      updatedAt: staleFlow.updatedAt + 1,
+    };
+
+    manager.importState([importedFlow]);
+    await Promise.resolve();
+
+    expect(manager.get(importedFlow.id)?.status).toBe("queued");
+    expect(proposer.steered).toHaveLength(1);
+    expect(proposer.activeSteers).toBe(1);
+
+    staleDelivery.resolve();
+    await expect(staleCreate).rejects.toThrow("state changed");
+    await waitUntil(
+      () => manager.get(importedFlow.id)?.status === "source_review_collecting",
+    );
+
+    expect(proposer.steered).toHaveLength(2);
+    expect(proposer.steered[1]).toContain(`flowId: ${importedFlow.id}`);
+    expect(proposer.maxConcurrentSteers).toBe(1);
   });
 
   it("resolves changed files when a flow is created without explicit files", async () => {

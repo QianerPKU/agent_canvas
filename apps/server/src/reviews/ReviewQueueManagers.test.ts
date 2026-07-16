@@ -333,11 +333,12 @@ describe("shared branch review queue across flow managers", () => {
     );
   });
 
-  it("demotes a conflicting restored review so snapshots match recovered queue ownership", async () => {
+  it("requeues restored deliveries in persisted FIFO order independent of import order", async () => {
+    let now = 1000;
     const host = new FakeHost();
     host.addAgent("agent_current", "feature/current", "waiting_input");
-    const originalPr = new PullRequestFlowManager({ host });
-    const originalSync = new SyncFlowManager({ host });
+    const originalPr = new PullRequestFlowManager({ host, now: () => now });
+    const originalSync = new SyncFlowManager({ host, now: () => now });
 
     const pr = await originalPr.create({
       proposerAgentId: "agent_current",
@@ -345,6 +346,7 @@ describe("shared branch review queue across flow managers", () => {
       summary: "Persisted PR review",
       files: ["src/pr.ts"],
     });
+    now = 2000;
     const pull = await originalSync.create({
       kind: "branch_pull",
       proposerAgentId: "agent_current",
@@ -356,37 +358,61 @@ describe("shared branch review queue across flow managers", () => {
     });
     const prState = originalPr.exportState();
     const syncState = originalSync.exportState();
+    const oldPrRequest = prState[0]?.reviewRequests[0];
+    const oldSyncRequest = syncState[0]?.reviewRequest;
+    expect(oldPrRequest?.requestedAt).toBe(1000);
+    expect(oldSyncRequest?.requestedAt).toBe(2000);
     originalPr.cancel(pr.id);
     originalSync.cancel(pull.id);
+    now = 3000;
 
     const reviewQueue = new BranchReviewQueue();
-    const restoredPr = new PullRequestFlowManager({ host, reviewQueue });
-    const restoredSync = new SyncFlowManager({ host, reviewQueue });
+    const restoredPr = new PullRequestFlowManager({ host, reviewQueue, now: () => now });
+    const restoredSync = new SyncFlowManager({ host, reviewQueue, now: () => now });
     reviewQueue.clear();
     restoredPr.importState(prState);
     restoredSync.importState(syncState);
-    await Promise.resolve();
+    await waitUntil(() => restoredPr.get(pr.id)?.status === "source_review_collecting");
 
     expect(restoredPr.get(pr.id)?.status).toBe("source_review_collecting");
+    expect(restoredPr.get(pr.id)?.reviewRequests).toHaveLength(2);
+    expect(restoredPr.get(pr.id)?.reviewRequests[0]).toEqual(oldPrRequest);
+    expect(restoredPr.get(pr.id)?.reviewRequests[1]?.requestedAt).toBe(3000);
     expect(restoredSync.get(pull.id)?.status).toBe("queued");
-    expect(restoredSync.get(pull.id)?.reviewRequest).toBeUndefined();
+    expect(restoredSync.get(pull.id)?.reviewRequest).toEqual(oldSyncRequest);
+
+    host.assistant("agent_current", syncReviewJson(pull), now + 1);
+    await dispatchResult(restoredPr, restoredSync, host.result("agent_current", now + 1));
+
+    expect(restoredSync.get(pull.id)?.status).toBe("queued");
+    expect(restoredSync.get(pull.id)?.reviewRequest).toEqual(oldSyncRequest);
 
     const reverseQueue = new BranchReviewQueue();
-    const reversePr = new PullRequestFlowManager({ host, reviewQueue: reverseQueue });
-    const reverseSync = new SyncFlowManager({ host, reviewQueue: reverseQueue });
+    const reversePr = new PullRequestFlowManager({
+      host,
+      reviewQueue: reverseQueue,
+      now: () => now,
+    });
+    const reverseSync = new SyncFlowManager({
+      host,
+      reviewQueue: reverseQueue,
+      now: () => now,
+    });
     reverseSync.importState(syncState);
     reversePr.importState(prState);
-    await Promise.resolve();
+    await waitUntil(() => reversePr.get(pr.id)?.status === "source_review_collecting");
 
-    expect(reverseSync.get(pull.id)?.status).toBe("review_collecting");
-    expect(reversePr.get(pr.id)?.status).toBe("queued");
-    expect(reversePr.get(pr.id)?.reviewRequests[0]?.pendingAgentIds).toContain("agent_current");
+    expect(reversePr.get(pr.id)?.status).toBe("source_review_collecting");
+    expect(reversePr.get(pr.id)?.reviewRequests).toHaveLength(2);
+    expect(reversePr.get(pr.id)?.reviewRequests[0]).toEqual(oldPrRequest);
+    expect(reverseSync.get(pull.id)?.status).toBe("queued");
+    expect(reverseSync.get(pull.id)?.reviewRequest).toEqual(oldSyncRequest);
 
-    host.assistant("agent_current", prReviewJson(pr), 1);
-    await dispatchResult(reversePr, reverseSync, host.result("agent_current", 1));
+    host.assistant("agent_current", syncReviewJson(pull), now + 2);
+    await dispatchResult(reversePr, reverseSync, host.result("agent_current", now + 2));
 
-    expect(reversePr.get(pr.id)?.status).toBe("queued");
-    expect(reversePr.get(pr.id)?.reviewRequests[0]?.responses).toEqual([]);
+    expect(reverseSync.get(pull.id)?.status).toBe("queued");
+    expect(reverseSync.get(pull.id)?.reviewRequest).toEqual(oldSyncRequest);
   });
 
   it("releases a completed review before a proposer notification finishes", async () => {

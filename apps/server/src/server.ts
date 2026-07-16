@@ -90,7 +90,7 @@ export interface CreateServerOptions {
 interface CanvasStateController {
   getLayout(): CanvasLayoutSnapshot;
   setLayout(layout: Partial<CanvasLayoutSnapshot>): Promise<CanvasLayoutSnapshot>;
-  loadProjectState(): Promise<void>;
+  switchProject<T>(selectProject: () => Promise<T>): Promise<T>;
   unloadProjectState(): Promise<void>;
   saveNow(): Promise<void>;
   saveSoon(): void;
@@ -224,6 +224,13 @@ export function createServer(
 
   // 把 manager 的事件广播到所有 WS 客户端
   manager.onEvent((envelope) => {
+    if (
+      envelope.event.kind === "status" &&
+      (envelope.event.status === "running" || envelope.event.status === "waiting_input")
+    ) {
+      const branch = manager.configOf(envelope.agentId)?.branch?.trim();
+      if (branch) void reviewQueue.retryBranch(branch).catch(() => undefined);
+    }
     void pullRequestFlowManager.handleAgentEvent(envelope);
     void syncFlowManager.handleAgentEvent(envelope);
     broadcastFrame({ type: "event", envelope });
@@ -344,9 +351,9 @@ async function handleHttp(
     const body = await readJson<CreateCanvasProjectInput>(req);
     if (!body?.name) return sendJson(res, 400, { error: "缺少项目名称" });
     try {
-      await canvasState.saveNow();
-      const project = await workspaceManager.createCanvasProject(body);
-      await canvasState.loadProjectState();
+      const project = await canvasState.switchProject(
+        async () => await workspaceManager.createCanvasProject(body),
+      );
       broadcastHello();
       return sendJson(res, 201, { project, workspace: await workspaceManager.project() });
     } catch (error) {
@@ -360,9 +367,9 @@ async function handleHttp(
       return sendJson(res, 400, { error: "缺少项目 id 或项目文件夹" });
     }
     try {
-      await canvasState.saveNow();
-      const workspace = await workspaceManager.openCanvasProject(body);
-      await canvasState.loadProjectState();
+      const workspace = await canvasState.switchProject(
+        async () => await workspaceManager.openCanvasProject(body),
+      );
       broadcastHello();
       return sendJson(res, 200, { workspace });
     } catch (error) {
@@ -1206,6 +1213,8 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
   let layout = emptyCanvasLayout();
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   let saveChain: Promise<void> = Promise.resolve();
+  let restoring = false;
+  let saveRequestedDuringRestore = false;
 
   const applyProjectStorageRoots = (projectRoot: string): void => {
     deps.fileManager.setIsolatedRoot(path.join(projectRoot, "files"));
@@ -1236,13 +1245,56 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
     await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf-8");
   };
 
-  const saveNow = async (): Promise<void> => {
+  const flushSave = async (): Promise<void> => {
     if (saveTimer) {
       clearTimeout(saveTimer);
       saveTimer = undefined;
     }
     saveChain = saveChain.then(saveCurrentProject, saveCurrentProject);
     await saveChain;
+  };
+
+  const scheduleSave = (): void => {
+    if (restoring) {
+      saveRequestedDuringRestore = true;
+      return;
+    }
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      saveTimer = undefined;
+      void saveNow();
+    }, 100);
+  };
+
+  const saveNow = async (): Promise<void> => {
+    if (restoring) {
+      saveRequestedDuringRestore = true;
+      return;
+    }
+    await flushSave();
+  };
+
+  const restoreSelectedProject = async (): Promise<void> => {
+    const project = await deps.workspaceManager.project();
+    applyProjectStorageRoots(project.projectRoot);
+    const state = await readCanvasProjectState(path.join(project.projectRoot, CANVAS_STATE_FILE));
+
+    // Invalidate the old project's timers, async deliveries, and branch reservations before any
+    // asynchronous restoration work can yield.
+    deps.reviewQueue.clear();
+    deps.pullRequestFlowManager.importState(undefined);
+    deps.syncFlowManager.importState(undefined);
+
+    deps.manager.importState(state?.agents);
+    deps.fileManager.importState(state?.files);
+    deps.commitManager.importState(state?.commits);
+    await deps.promptManager.importState(state?.prompts);
+    layout = sanitizeCanvasLayout(state?.layout);
+
+    // Keep both owner imports adjacent. replaceOwner() drains in a microtask, so this rebuilds the
+    // complete shared queue only after agents, prompts, and layout are ready.
+    deps.pullRequestFlowManager.importState(state?.prFlows);
+    deps.syncFlowManager.importState(state?.syncFlows);
   };
 
   return {
@@ -1252,42 +1304,53 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
       await saveNow();
       return layout;
     },
-    loadProjectState: async () => {
-      const project = await deps.workspaceManager.project();
-      applyProjectStorageRoots(project.projectRoot);
-      const state = await readCanvasProjectState(path.join(project.projectRoot, CANVAS_STATE_FILE));
-      deps.manager.importState(state?.agents);
-      deps.fileManager.importState(state?.files);
-      deps.commitManager.importState(state?.commits);
-      deps.reviewQueue.clear();
-      deps.pullRequestFlowManager.importState(state?.prFlows);
-      deps.syncFlowManager.importState(state?.syncFlows);
-      await deps.promptManager.importState(state?.prompts);
-      layout = sanitizeCanvasLayout(state?.layout);
+    switchProject: async <T>(selectProject: () => Promise<T>): Promise<T> => {
+      if (restoring) throw new Error("canvas project restoration is already in progress");
+      restoring = true;
+      saveRequestedDuringRestore = false;
+      let restoredSuccessfully = false;
+      try {
+        // Save the old project while the barrier prevents late flow/agent events from scheduling a
+        // write against whichever project becomes current next.
+        await flushSave();
+        const selected = await selectProject();
+        await restoreSelectedProject();
+        restoredSuccessfully = true;
+        return selected;
+      } finally {
+        restoring = false;
+        const shouldSaveRestoredState = restoredSuccessfully && saveRequestedDuringRestore;
+        saveRequestedDuringRestore = false;
+        if (shouldSaveRestoredState) {
+          scheduleSave();
+        }
+      }
     },
     unloadProjectState: async () => {
+      restoring = true;
+      saveRequestedDuringRestore = false;
       if (saveTimer) {
         clearTimeout(saveTimer);
         saveTimer = undefined;
       }
-      await saveChain;
-      await deps.manager.clear();
-      deps.fileManager.importState(undefined);
-      await deps.promptManager.importState(undefined);
-      deps.commitManager.importState(undefined);
-      deps.pullRequestFlowManager.importState(undefined);
-      deps.syncFlowManager.importState(undefined);
-      layout = emptyCanvasLayout();
-      applyProjectStorageRoots(path.join(deps.workspaceManager.projectListRoot(), ".inactive"));
+      try {
+        await saveChain;
+        deps.reviewQueue.clear();
+        deps.pullRequestFlowManager.importState(undefined);
+        deps.syncFlowManager.importState(undefined);
+        await deps.manager.clear();
+        deps.fileManager.importState(undefined);
+        await deps.promptManager.importState(undefined);
+        deps.commitManager.importState(undefined);
+        layout = emptyCanvasLayout();
+        applyProjectStorageRoots(path.join(deps.workspaceManager.projectListRoot(), ".inactive"));
+      } finally {
+        restoring = false;
+        saveRequestedDuringRestore = false;
+      }
     },
     saveNow,
-    saveSoon: () => {
-      if (saveTimer) clearTimeout(saveTimer);
-      saveTimer = setTimeout(() => {
-        saveTimer = undefined;
-        void saveNow();
-      }, 100);
-    },
+    saveSoon: scheduleSave,
   };
 }
 

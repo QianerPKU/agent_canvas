@@ -2,6 +2,10 @@ export type BranchReviewStartResult = "started" | "deferred";
 
 export type BranchReviewJobState = "queued" | "active";
 
+export type BranchReviewLeaseResult<T> =
+  | { status: "completed"; value: T }
+  | { status: "invalidated" };
+
 export interface BranchReviewJob {
   id: string;
   owner: string;
@@ -15,6 +19,9 @@ interface StoredBranchReviewJob extends BranchReviewJob {
   state: BranchReviewJobState;
   sequence: number;
   deferred: boolean;
+  startPending: boolean;
+  inFlightLeases: number;
+  completionRequested: boolean;
 }
 
 interface StartAttempt {
@@ -31,7 +38,7 @@ interface StartAttempt {
  */
 export class BranchReviewQueue {
   private readonly jobs = new Map<string, StoredBranchReviewJob>();
-  private readonly activeByBranch = new Map<string, string>();
+  private readonly activeByBranch = new Map<string, StoredBranchReviewJob>();
   private readonly scheduledBranches = new Set<string>();
   private sequence = 0;
   private generation = 0;
@@ -60,15 +67,48 @@ export class BranchReviewQueue {
     return job.state;
   }
 
+  async retryBranch(branch: string): Promise<BranchReviewJobState | undefined> {
+    const head = this.firstQueuedJob(branch);
+    if (!head) return undefined;
+    return await this.retry(head.id);
+  }
+
+  async runWhileReserved<T>(
+    id: string,
+    work: () => T | Promise<T>,
+  ): Promise<BranchReviewLeaseResult<T>> {
+    const job = this.jobs.get(id);
+    if (!job || job.state !== "active" || job.completionRequested) {
+      return { status: "invalidated" };
+    }
+
+    job.inFlightLeases += 1;
+    let value: T | undefined;
+    let failure: unknown;
+    let failed = false;
+    try {
+      value = await work();
+    } catch (error) {
+      failed = true;
+      failure = error;
+    }
+
+    const invalidated = this.jobs.get(id) !== job || job.completionRequested;
+    this.releaseLease(job);
+    if (invalidated) return { status: "invalidated" };
+    if (failed) throw failure;
+    return { status: "completed", value: value as T };
+  }
+
   complete(id: string): void {
     const job = this.jobs.get(id);
     if (!job) return;
 
-    this.jobs.delete(id);
-    if (this.activeByBranch.get(job.branch) === id) {
-      this.activeByBranch.delete(job.branch);
+    job.completionRequested = true;
+    if (job.state === "active" && (job.startPending || job.inFlightLeases > 0)) {
+      return;
     }
-    this.scheduleDrain(job.branch);
+    this.finalize(job);
   }
 
   release(id: string): void {
@@ -81,9 +121,8 @@ export class BranchReviewQueue {
 
   clear(): void {
     this.generation += 1;
-    this.jobs.clear();
-    this.activeByBranch.clear();
     this.scheduledBranches.clear();
+    for (const job of [...this.jobs.values()]) this.retire(job);
     this.sequence = 0;
   }
 
@@ -117,10 +156,7 @@ export class BranchReviewQueue {
     for (const current of [...this.jobs.values()]) {
       if (current.owner !== owner) continue;
       affectedBranches.add(current.branch);
-      this.jobs.delete(current.id);
-      if (this.activeByBranch.get(current.branch) === current.id) {
-        this.activeByBranch.delete(current.branch);
-      }
+      this.retire(current);
     }
 
     const restored = jobs
@@ -135,7 +171,7 @@ export class BranchReviewQueue {
       if (this.activeByBranch.has(job.branch)) {
         job.state = "queued";
       } else {
-        this.activeByBranch.set(job.branch, job.id);
+        this.activeByBranch.set(job.branch, job);
       }
     }
 
@@ -151,13 +187,14 @@ export class BranchReviewQueue {
     // Claim synchronously before invoking user code. Concurrent and re-entrant drains therefore
     // observe the branch as busy and cannot start this or another job twice.
     job.state = "active";
-    this.activeByBranch.set(branch, job.id);
+    job.startPending = true;
+    this.activeByBranch.set(branch, job);
 
     let started: BranchReviewStartResult | Promise<BranchReviewStartResult>;
     try {
       started = job.start();
     } catch (error) {
-      this.deferAfterStartFailure(job);
+      this.settleStart(job, "deferred");
       const done = Promise.reject<BranchReviewJobState>(error);
       void done.catch(() => undefined);
       return { id: job.id, done };
@@ -166,19 +203,13 @@ export class BranchReviewQueue {
     const done = Promise.resolve(started).then(
       (result): BranchReviewJobState => {
         if (result !== "started" && result !== "deferred") {
-          this.deferAfterStartFailure(job);
+          this.settleStart(job, "deferred");
           throw new Error(`invalid branch review start result for ${job.id}: ${String(result)}`);
         }
-        const current = this.jobs.get(job.id);
-        if (current !== job) return result === "started" ? "active" : "queued";
-        if (result === "deferred") {
-          this.deferAfterStartFailure(job);
-          return "queued";
-        }
-        return "active";
+        return this.settleStart(job, result);
       },
       (error): never => {
-        this.deferAfterStartFailure(job);
+        this.settleStart(job, "deferred");
         throw error;
       },
     );
@@ -188,15 +219,52 @@ export class BranchReviewQueue {
     return { id: job.id, done };
   }
 
-  private deferAfterStartFailure(job: StoredBranchReviewJob): void {
-    if (this.jobs.get(job.id) !== job) return;
-    job.state = "queued";
-    job.deferred = true;
-    if (this.activeByBranch.get(job.branch) === job.id) {
+  private settleStart(
+    job: StoredBranchReviewJob,
+    result: BranchReviewStartResult,
+  ): BranchReviewJobState {
+    job.startPending = false;
+    if (job.completionRequested) {
+      if (job.inFlightLeases === 0) this.finalize(job);
+      return result === "started" ? "active" : "queued";
+    }
+    if (this.jobs.get(job.id) !== job) {
+      this.finalize(job);
+      return result === "started" ? "active" : "queued";
+    }
+    if (result === "deferred") {
+      job.state = "queued";
+      job.deferred = true;
+      if (this.activeByBranch.get(job.branch) === job) {
+        this.activeByBranch.delete(job.branch);
+      }
+      // Deliberately do not drain here. This deferred head must continue blocking later jobs until
+      // an explicit retry, completion, replacement, or a later enqueue asks the branch to drain.
+      return "queued";
+    }
+    return "active";
+  }
+
+  private releaseLease(job: StoredBranchReviewJob): void {
+    job.inFlightLeases = Math.max(0, job.inFlightLeases - 1);
+    if (job.completionRequested && !job.startPending && job.inFlightLeases === 0) {
+      this.finalize(job);
+    }
+  }
+
+  private finalize(job: StoredBranchReviewJob): void {
+    if (this.jobs.get(job.id) === job) this.jobs.delete(job.id);
+    if (this.activeByBranch.get(job.branch) === job) {
       this.activeByBranch.delete(job.branch);
     }
-    // Deliberately do not drain here. This deferred head must continue blocking later jobs until
-    // an explicit retry, completion, replacement, or a later enqueue asks the branch to drain.
+    this.scheduleDrain(job.branch);
+  }
+
+  private retire(job: StoredBranchReviewJob): void {
+    if (this.jobs.get(job.id) === job) this.jobs.delete(job.id);
+    job.completionRequested = true;
+    if (job.state === "active" && (job.startPending || job.inFlightLeases > 0)) return;
+    this.finalize(job);
   }
 
   private nextQueuedJob(branch: string): StoredBranchReviewJob | undefined {
@@ -231,6 +299,9 @@ export class BranchReviewQueue {
       state,
       sequence: ++this.sequence,
       deferred: false,
+      startPending: false,
+      inFlightLeases: 0,
+      completionRequested: false,
     };
     this.jobs.set(stored.id, stored);
     return stored;

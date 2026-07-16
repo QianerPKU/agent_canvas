@@ -18,11 +18,11 @@ PR and sync reviews use one shared, review-stage queue. A PR does not reserve bo
 
 Only one review stage may run on a branch at a time. Stages waiting for the same branch start in FIFO order, while stages for different branches may run in parallel. This prevents a new review prompt from steering an agent away from an earlier review on the same branch without unnecessarily serializing unrelated work.
 
-The branch slot is released as soon as the review stage approves, fails, times out, or is cancelled. Source review therefore does not retain the slot while the proposer creates the PR, and target review does not retain it while the proposer performs the merge. Releasing a slot immediately schedules the next eligible stage; it does not wait for the overall PR flow to reach `merged`.
+The branch slot is invalidated as soon as the review stage approves, fails, times out, or is cancelled. If a review prompt is still being delivered, the slot remains reserved until that delivery settles; only then can the next same-branch stage start. This prevents a blocked `steer` from overlapping the next review. Source review still does not retain the slot while the proposer creates the PR, and target review does not retain it while the proposer performs the merge.
 
-A queued stage has no review deadline, so time spent waiting does not count toward the review timeout. Its deadline and timer start only when the stage actually begins collecting responses. If a queued source stage fails the branch readiness recheck because its source no longer includes the target branch head, it remains queued with a `failureReason`. After the proposer syncs and pushes the source branch, `POST /api/pr-flows/:id/retry` rechecks readiness.
+A queued stage has no review deadline, so time spent waiting does not count toward the review timeout. Its deadline and timer start only when the stage actually begins collecting responses. A stage also remains queued when its branch has no running or waiting agent; an agent transition back to an active status retries the head automatically. If a queued source stage fails the branch readiness recheck because its source no longer includes the target branch head, it remains queued with a `failureReason`. After the proposer syncs and pushes the source branch, `POST /api/pr-flows/:id/retry` rechecks readiness.
 
-When persisted canvas state is restored, the server rebuilds the shared queue and its active branch ownership before draining queued stages. It also restores active review timers from their saved deadlines; an already-expired review is timed out and releases its branch before the next stage is selected.
+When persisted canvas state is restored, an in-progress review is converted back to `queued`, its old deadline is discarded, and its previous request remains as audit history. The server first restores agents, prompts, and layout, then atomically rebuilds the PR and sync portions of the shared queue. An eligible head starts with a fresh request and deadline; a head without an active reviewer stays queued instead of being vacuously approved. This also ensures no review prompt or partial state save occurs while project restoration is incomplete.
 
 ## Flow
 
@@ -77,6 +77,6 @@ Merge-complete output:
 
 ## Tests
 
-`PullRequestFlowManager.test.ts` covers source review approval, PR creation, target review approval, merge authorization, invalid JSON retry failure, timeout behavior, per-stage branch queueing, FIFO release, persistence recovery, and changed-file resolution.
+`PullRequestFlowManager.test.ts` covers source review approval, PR creation, target review approval, merge authorization, invalid JSON retry failure, timeout behavior, per-stage branch queueing, blocked-delivery cancellation and timeout, zero-reviewer deferral, FIFO release, persistence recovery, and changed-file resolution.
 
 `PullRequestFlowManager.integration.test.ts` creates a real temporary git repository and bare remote, uses `WorkspaceManager` to clone `main`, `feature/pr-flow`, and `feature/other`, starts multiple fake agents, and verifies review delivery across source and target branches.

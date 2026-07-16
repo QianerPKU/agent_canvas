@@ -65,6 +65,132 @@ describe("BranchReviewQueue", () => {
     await expect(Promise.all([main, release])).resolves.toEqual(["active", "active"]);
   });
 
+  it("does not release a completed reservation until its pending start settles", async () => {
+    const queue = new BranchReviewQueue();
+    const firstStart = deferred<BranchReviewStartResult>();
+    const starts: string[] = [];
+
+    const first = queue.enqueue(
+      job("first", "main", 1, () => {
+        starts.push("first");
+        return firstStart.promise;
+      }),
+    );
+    await expect(
+      queue.enqueue(
+        job("second", "main", 2, () => {
+          starts.push("second");
+          return "started";
+        }),
+      ),
+    ).resolves.toBe("queued");
+
+    queue.complete("first");
+    await flushMicrotasks();
+    expect(queue.stateOf("first")).toBe("active");
+    expect(starts).toEqual(["first"]);
+
+    firstStart.resolve("started");
+    await expect(first).resolves.toBe("active");
+    await flushMicrotasks();
+
+    expect(queue.stateOf("first")).toBeUndefined();
+    expect(queue.stateOf("second")).toBe("active");
+    expect(starts).toEqual(["first", "second"]);
+  });
+
+  it("invalidates an in-flight lease and holds the branch until its work settles", async () => {
+    const queue = new BranchReviewQueue();
+    const delivery = deferred<void>();
+    const starts: string[] = [];
+
+    await queue.enqueue(job("first", "main", 1, () => "started"));
+    const leased = queue.runWhileReserved("first", async () => {
+      starts.push("delivery");
+      await delivery.promise;
+    });
+    await expect(
+      queue.enqueue(
+        job("second", "main", 2, () => {
+          starts.push("second");
+          return "started";
+        }),
+      ),
+    ).resolves.toBe("queued");
+
+    queue.complete("first");
+    await flushMicrotasks();
+    expect(starts).toEqual(["delivery"]);
+
+    delivery.resolve(undefined);
+    await expect(leased).resolves.toEqual({ status: "invalidated" });
+    await flushMicrotasks();
+
+    expect(starts).toEqual(["delivery", "second"]);
+    expect(queue.stateOf("second")).toBe("active");
+  });
+
+  it("keeps a cleared branch reserved until its retired delivery lease settles", async () => {
+    const queue = new BranchReviewQueue();
+    const delivery = deferred<void>();
+    const starts: string[] = [];
+
+    await queue.enqueue(job("old-project", "main", 1, () => "started"));
+    const leased = queue.runWhileReserved("old-project", async () => {
+      starts.push("old-delivery");
+      await delivery.promise;
+    });
+    queue.clear();
+
+    await expect(
+      queue.enqueue(
+        job("new-project", "main", 1, () => {
+          starts.push("new-review");
+          return "started";
+        }),
+      ),
+    ).resolves.toBe("queued");
+    await flushMicrotasks();
+    expect(starts).toEqual(["old-delivery"]);
+
+    delivery.resolve(undefined);
+    await expect(leased).resolves.toEqual({ status: "invalidated" });
+    await flushMicrotasks();
+
+    expect(starts).toEqual(["old-delivery", "new-review"]);
+    expect(queue.stateOf("new-project")).toBe("active");
+  });
+
+  it("lets a replacement reuse an id only after the retired start settles", async () => {
+    const queue = new BranchReviewQueue();
+    const oldStart = deferred<BranchReviewStartResult>();
+    const starts: string[] = [];
+
+    const oldEnqueue = queue.enqueue(
+      job("same-id", "main", 1, () => {
+        starts.push("old-start");
+        return oldStart.promise;
+      }),
+    );
+    const restored = queue.replaceOwner("test", [
+      job("same-id", "main", 1, () => {
+        starts.push("new-start");
+        return "started";
+      }),
+    ]);
+
+    expect(restored.get("same-id")).toBe("queued");
+    await flushMicrotasks();
+    expect(starts).toEqual(["old-start"]);
+
+    oldStart.resolve("started");
+    await expect(oldEnqueue).resolves.toBe("active");
+    await flushMicrotasks();
+
+    expect(starts).toEqual(["old-start", "new-start"]);
+    expect(queue.stateOf("same-id")).toBe("active");
+  });
+
   it("keeps a deferred head queued and prevents later jobs from skipping it", async () => {
     const queue = new BranchReviewQueue();
     let ready = false;
