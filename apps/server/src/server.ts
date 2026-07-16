@@ -36,6 +36,7 @@ import type {
   UpdateCanvasFileInput,
   UpdateCanvasPromptInput,
 } from "@agent-canvas/shared";
+import { isTerminalStatus } from "@agent-canvas/shared";
 import { AgentManager } from "./AgentManager.js";
 import { detectCodexModels, type CodexModelDetection } from "./codexModels.js";
 import { readCodexUsage } from "./codexUsage.js";
@@ -72,6 +73,7 @@ type CodexModelDetectionInput =
 
 export interface CreateServerOptions {
   defaultCwd?: string;
+  allowedOrigins?: string[];
   openFile?: (filePath: string, options?: OpenInVscodeOptions) => Promise<void>;
   pickDirectory?: PickDirectory;
   promptManager?: PromptManager;
@@ -87,6 +89,7 @@ interface CanvasStateController {
   getLayout(): CanvasLayoutSnapshot;
   setLayout(layout: Partial<CanvasLayoutSnapshot>): Promise<CanvasLayoutSnapshot>;
   loadProjectState(): Promise<void>;
+  unloadProjectState(): Promise<void>;
   saveNow(): Promise<void>;
   saveSoon(): void;
 }
@@ -142,6 +145,7 @@ export function createServer(
     });
   const commitManager = options.commitManager ?? new CommitManager();
   const codexAuthManager = options.codexAuthManager ?? new CodexAuthManager();
+  const allowedOrigins = resolveAllowedOrigins(options.allowedOrigins);
   manager.setPromptAccessResolver((agentId) => promptManager.accessFor(agentId));
   const canvasState = createCanvasStateController({
     manager,
@@ -171,12 +175,20 @@ export function createServer(
       canvasState,
       broadcastHello,
       broadcastFrame,
+      allowedOrigins,
     ).catch((err) => {
       sendJson(res, 500, { error: errMsg(err) });
     });
   });
 
-  const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+  const wss = new WebSocketServer({
+    server: httpServer,
+    path: "/ws",
+    verifyClient: (info, done) => {
+      const trusted = isTrustedOrigin(info.origin, allowedOrigins);
+      done(trusted, trusted ? undefined : 403, trusted ? undefined : "Forbidden origin");
+    },
+  });
   const broadcastFrame = (frame: ServerFrame): void => {
     const data = JSON.stringify(frame);
     for (const client of wss.clients) {
@@ -251,9 +263,13 @@ async function handleHttp(
   canvasState: CanvasStateController,
   broadcastHello: () => void,
   broadcastFrame: (frame: ServerFrame) => void,
+  allowedOrigins: Set<string>,
 ): Promise<void> {
-  setCors(res);
+  setCors(req, res, allowedOrigins);
   if (req.method === "OPTIONS") {
+    if (!isTrustedBrowserRequest(req, allowedOrigins)) {
+      return sendJson(res, 403, { error: "forbidden origin" });
+    }
     res.writeHead(204);
     res.end();
     return;
@@ -262,6 +278,9 @@ async function handleHttp(
   const url = new URL(req.url ?? "/", "http://localhost");
   const path = url.pathname;
   const method = req.method ?? "GET";
+  if (method !== "GET" && method !== "HEAD" && !isTrustedBrowserRequest(req, allowedOrigins)) {
+    return sendJson(res, 403, { error: "forbidden origin" });
+  }
 
   if (method === "GET" && path === "/api/health") {
     return sendJson(res, 200, { ok: true });
@@ -323,13 +342,54 @@ async function handleHttp(
 
   if (method === "POST" && path === "/api/canvas-projects/open") {
     const body = await readJson<OpenCanvasProjectInput>(req);
-    if (!body?.id) return sendJson(res, 400, { error: "缺少项目 id" });
+    if (!body?.id && !body?.projectRoot?.trim()) {
+      return sendJson(res, 400, { error: "缺少项目 id 或项目文件夹" });
+    }
     try {
       await canvasState.saveNow();
       const workspace = await workspaceManager.openCanvasProject(body);
       await canvasState.loadProjectState();
       broadcastHello();
       return sendJson(res, 200, { workspace });
+    } catch (error) {
+      return sendJson(res, 404, { error: errMsg(error) });
+    }
+  }
+
+  if (method === "POST" && path === "/api/canvas-projects/inspect") {
+    const body = await readJson<{ projectRoot?: string }>(req);
+    if (!body?.projectRoot?.trim()) {
+      return sendJson(res, 400, { error: "缺少项目文件夹" });
+    }
+    try {
+      const inspection = await workspaceManager.inspectCanvasProject(body.projectRoot);
+      return sendJson(res, 200, { inspection });
+    } catch (error) {
+      return sendJson(res, 400, { error: errMsg(error) });
+    }
+  }
+
+  const canvasProjectMatch = path.match(/^\/api\/canvas-projects\/([^/]+)$/u);
+  if (method === "DELETE" && canvasProjectMatch) {
+    if (req.headers["x-agent-canvas-intent"] !== "delete-project") {
+      return sendJson(res, 403, { error: "missing delete-project intent" });
+    }
+    try {
+      const projectId = decodeURIComponent(canvasProjectMatch[1]!);
+      const deletingCurrentProject = workspaceManager.currentProjectId() === projectId;
+      if (
+        deletingCurrentProject &&
+        manager.list().some((agent) => !isTerminalStatus(agent.status))
+      ) {
+        return sendJson(res, 409, {
+          error: "当前项目仍有活动 agent；请先终止全部 agent 后再删除",
+        });
+      }
+      await canvasState.saveNow();
+      if (deletingCurrentProject) await canvasState.unloadProjectState();
+      const project = await workspaceManager.deleteCanvasProject(projectId);
+      broadcastHello();
+      return sendJson(res, 200, { project });
     } catch (error) {
       return sendJson(res, 404, { error: errMsg(error) });
     }
@@ -1008,10 +1068,63 @@ async function handleHttp(
 
 // ---- helpers ----
 
-function setCors(res: http.ServerResponse): void {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+function setCors(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  allowedOrigins: Set<string>,
+): void {
+  const origin = req.headers.origin;
+  if (origin && isTrustedOrigin(origin, allowedOrigins)) {
+    res.setHeader("Access-Control-Allow-Origin", new URL(origin).origin);
+    res.setHeader("Vary", "Origin");
+  }
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,X-Agent-Canvas-Intent");
+}
+
+function resolveAllowedOrigins(configured: string[] | undefined): Set<string> {
+  const fromEnvironment = process.env.AGENT_CANVAS_ALLOWED_ORIGINS
+    ?.split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+  const origins = configured ?? fromEnvironment ?? [
+    "http://127.0.0.1:5317",
+    "http://localhost:5317",
+  ];
+  const normalized = new Set<string>();
+  for (const origin of origins) {
+    try {
+      const parsed = new URL(origin);
+      if ((parsed.protocol === "http:" || parsed.protocol === "https:") && isLoopbackHost(parsed.hostname)) {
+        normalized.add(parsed.origin);
+      }
+    } catch {
+      // Invalid configured origins are ignored instead of widening access.
+    }
+  }
+  return normalized;
+}
+
+function isTrustedBrowserRequest(
+  req: http.IncomingMessage,
+  allowedOrigins: Set<string>,
+): boolean {
+  const fetchSite = req.headers["sec-fetch-site"];
+  if (fetchSite === "cross-site") return false;
+  return isTrustedOrigin(req.headers.origin, allowedOrigins);
+}
+
+function isTrustedOrigin(origin: string | undefined, allowedOrigins: Set<string>): boolean {
+  if (!origin) return true;
+  try {
+    return allowedOrigins.has(new URL(origin).origin);
+  } catch {
+    return false;
+  }
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
 }
 
 function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
@@ -1135,6 +1248,21 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
       deps.pullRequestFlowManager.importState(state?.prFlows);
       deps.syncFlowManager.importState(state?.syncFlows);
       layout = sanitizeCanvasLayout(state?.layout);
+    },
+    unloadProjectState: async () => {
+      if (saveTimer) {
+        clearTimeout(saveTimer);
+        saveTimer = undefined;
+      }
+      await saveChain;
+      await deps.manager.clear();
+      deps.fileManager.importState(undefined);
+      await deps.promptManager.importState(undefined);
+      deps.commitManager.importState(undefined);
+      deps.pullRequestFlowManager.importState(undefined);
+      deps.syncFlowManager.importState(undefined);
+      layout = emptyCanvasLayout();
+      applyProjectStorageRoots(path.join(deps.workspaceManager.projectListRoot(), ".inactive"));
     },
     saveNow,
     saveSoon: () => {

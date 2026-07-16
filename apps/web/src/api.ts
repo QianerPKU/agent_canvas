@@ -13,6 +13,7 @@ import type {
   BranchOption,
   BranchWorkspace,
   CanvasLayoutSnapshot,
+  CanvasProjectInspection,
   CodexAuthStatus,
   CodexLoginSession,
   CanvasProjectSummary,
@@ -30,6 +31,7 @@ import type {
   FileConnectionAccess,
   ForkAgentInput,
   ForkOrigin,
+  OpenCanvasProjectInput,
   PullRequestCreatedInput,
   PullRequestFlowSnapshot,
   PromptConnectionAccess,
@@ -79,11 +81,21 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
-  openCanvasProject: (id: string) =>
+  openCanvasProject: (input: OpenCanvasProjectInput | string) =>
     call<{ workspace: WorkspaceProject }>("/canvas-projects/open", {
       method: "POST",
-      body: JSON.stringify({ id }),
+      body: JSON.stringify(typeof input === "string" ? { id: input } : input),
     }).then((r) => r.workspace),
+  inspectCanvasProject: (projectRoot: string) =>
+    call<{ inspection: CanvasProjectInspection }>("/canvas-projects/inspect", {
+      method: "POST",
+      body: JSON.stringify({ projectRoot }),
+    }).then((r) => r.inspection),
+  deleteCanvasProject: (id: string) =>
+    call<{ project: CanvasProjectSummary }>(`/canvas-projects/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: { "X-Agent-Canvas-Intent": "delete-project" },
+    }).then((r) => r.project),
   workspace: () => call<WorkspaceProject>("/workspace"),
   connectWorkspace: (input: ConnectGitHubInput) =>
     call<WorkspaceProject>("/workspace/connect", {

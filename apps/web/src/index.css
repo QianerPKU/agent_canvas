@@ -134,20 +134,47 @@ body {
   min-height: 56px;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 9px 11px;
   border: 1px solid #d8dee8;
   border-radius: 6px;
   color: #111827;
   background: #fff;
+  overflow: hidden;
+}
+
+.project-row__open {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 0;
+  color: inherit;
+  background: transparent;
   cursor: pointer;
   text-align: left;
 }
 
-.project-row span {
+.project-row__open span {
   min-width: 0;
   display: grid;
   gap: 3px;
+}
+
+.project-row__delete {
+  align-self: stretch;
+  display: grid;
+  place-items: center;
+  width: 46px;
+  border: 0;
+  border-left: 1px solid #e5e7eb;
+  color: #b91c1c;
+  background: #fff;
+  cursor: pointer;
+}
+
+.project-row__delete:hover:not(:disabled) {
+  background: #fef2f2;
 }
 
 .project-row small,
@@ -162,6 +189,12 @@ body {
 .project-create {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.project-load {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   gap: 8px;
 }
 
@@ -182,6 +215,7 @@ body {
 }
 
 .project-create button,
+.project-load button,
 .project-connect-button {
   min-height: 34px;
   display: inline-flex;

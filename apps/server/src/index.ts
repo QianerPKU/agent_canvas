@@ -33,8 +33,8 @@ const { httpServer } = createServer(manager, fileManager, {
   workspaceManager,
 });
 
-httpServer.listen(PORT, () => {
-  console.log(`[agent-canvas] server listening on http://localhost:${PORT}`);
+httpServer.listen(PORT, "127.0.0.1", () => {
+  console.log(`[agent-canvas] server listening on http://127.0.0.1:${PORT}`);
   console.log(`[agent-canvas] websocket on ws://localhost:${PORT}/ws`);
   console.log(`[agent-canvas] default cwd ${WORKSPACE_ROOT}`);
   console.log(`[agent-canvas] project root ${workspaceManager.root()}`);

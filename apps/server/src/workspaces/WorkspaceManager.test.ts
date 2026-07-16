@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { WorkspaceManager, type GitRunner } from "./WorkspaceManager.js";
@@ -54,10 +54,350 @@ describe("WorkspaceManager", () => {
       expect(await readFile(path.join(customProjectRoot, "workspace.json"), "utf-8")).toContain(
         '"branches": []',
       );
+      expect(
+        JSON.parse(await readFile(path.join(customProjectRoot, "workspace.json"), "utf-8")),
+      ).toMatchObject({ project: created });
       expect(await manager.listCanvasProjects()).toEqual([created]);
       await expect(manager.openCanvasProject({ id: created.id })).resolves.toMatchObject({
         projectRoot: customProjectRoot,
       });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("loads and registers a project from an arbitrary folder", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-load-project-"));
+    try {
+      const customProjectRoot = path.join(root, "elsewhere", "saved-canvas");
+      const creator = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot: path.join(root, "creator-index"),
+        autoOpenDefault: false,
+        now: () => 100,
+      });
+      const created = await creator.createCanvasProject({
+        name: "Saved Canvas",
+        projectRoot: customProjectRoot,
+      });
+      const loader = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot: path.join(root, "loader-index"),
+        autoOpenDefault: false,
+        now: () => 200,
+      });
+
+      const opened = await loader.openCanvasProject({ projectRoot: customProjectRoot });
+
+      expect(opened.canvasProject).toEqual({ ...created, openedAt: 200 });
+      expect(await loader.listCanvasProjects()).toEqual([{ ...created, openedAt: 200 }]);
+      expect(
+        JSON.parse(await readFile(path.join(root, "loader-index", "index.json"), "utf-8")),
+      ).toMatchObject({ projects: [{ id: created.id, projectRoot: customProjectRoot }] });
+
+      const configured = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectRoot: customProjectRoot,
+        projectsRoot: path.join(root, "configured-index"),
+        now: () => 300,
+      });
+      expect(await configured.listCanvasProjects()).toEqual([{ ...created, openedAt: 200 }]);
+      await expect(configured.project()).resolves.toMatchObject({
+        canvasProject: { id: created.id, name: created.name },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("relocates internal paths when a project is moved or copied", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-relocate-project-"));
+    const projectsRoot = path.join(root, "projects");
+    const originalRoot = path.join(projectsRoot, "original");
+    const movedRoot = path.join(projectsRoot, "moved");
+    const copiedRoot = path.join(projectsRoot, "copied");
+    try {
+      const creator = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+        now: () => 250,
+      });
+      await creator.createCanvasProject({ name: "Relocatable", projectRoot: originalRoot });
+      const workspacePath = path.join(originalRoot, "workspace.json");
+      const document = JSON.parse(await readFile(workspacePath, "utf-8"));
+      document.repo = {
+        id: "repo_1",
+        remoteUrl: "https://github.com/acme/demo.git",
+        defaultBranch: "main",
+        localRepoPath: path.join(originalRoot, "repos", "repo_1", "repo"),
+        connectedAt: 250,
+      };
+      document.branches = [
+        {
+          id: "branch_1",
+          repoId: "repo_1",
+          branch: "main",
+          baseBranch: "main",
+          worktreePath: path.join(originalRoot, "repos", "repo_1", "repo"),
+          scratchRoot: path.join(originalRoot, "repos", "repo_1", "repo", ".agent-tmp"),
+          isDefault: true,
+          createdAt: 250,
+        },
+      ];
+      document.sharedResources = [
+        {
+          id: "shared_1",
+          repoId: "repo_1",
+          name: "dataset",
+          sourcePath: path.join(originalRoot, "shared", "repo_1", "dataset"),
+          mountPath: "data/dataset",
+          access: "readOnly",
+          createdAt: 250,
+        },
+      ];
+      await writeFile(workspacePath, `${JSON.stringify(document, undefined, 2)}\n`, "utf-8");
+      await rename(originalRoot, movedRoot);
+
+      const movedLoader = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+        now: () => 260,
+      });
+      const moved = await movedLoader.openCanvasProject({ projectRoot: movedRoot });
+      expect(moved.repo?.localRepoPath).toBe(path.join(movedRoot, "repos", "repo_1", "repo"));
+      expect(moved.branches[0]?.worktreePath).toBe(
+        path.join(movedRoot, "repos", "repo_1", "repo"),
+      );
+      expect(moved.sharedResources[0]?.sourcePath).toBe(
+        path.join(movedRoot, "shared", "repo_1", "dataset"),
+      );
+
+      await cp(movedRoot, copiedRoot, { recursive: true });
+      const copiedLoader = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+        now: () => 270,
+      });
+      const listed = await copiedLoader.listCanvasProjects();
+      expect(listed.map((project) => project.projectRoot).sort()).toEqual(
+        [copiedRoot, movedRoot].sort(),
+      );
+      expect(new Set(listed.map((project) => project.id)).size).toBe(2);
+      const copied = await copiedLoader.openCanvasProject({ projectRoot: copiedRoot });
+      expect(copied.repo?.localRepoPath).toBe(path.join(copiedRoot, "repos", "repo_1", "repo"));
+      expect(copied.branches[0]?.scratchRoot).toBe(
+        path.join(copiedRoot, "repos", "repo_1", "repo", ".agent-tmp"),
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("requires explicit authorization for external shared resources on import", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-external-resource-"));
+    try {
+      const projectRoot = path.join(root, "external-project");
+      const externalSource = path.join(root, "external-dataset");
+      await mkdir(externalSource, { recursive: true });
+      const creator = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot: path.join(root, "creator-index"),
+        autoOpenDefault: false,
+        now: () => 280,
+      });
+      await creator.createCanvasProject({ name: "External", projectRoot });
+      const workspacePath = path.join(projectRoot, "workspace.json");
+      const document = JSON.parse(await readFile(workspacePath, "utf-8"));
+      document.repo = {
+        id: "repo_1",
+        remoteUrl: "https://github.com/acme/demo.git",
+        defaultBranch: "main",
+        localRepoPath: path.join(projectRoot, "repos", "repo_1", "repo"),
+        connectedAt: 280,
+      };
+      document.sharedResources = [
+        {
+          id: "shared_1",
+          repoId: "repo_1",
+          name: "external dataset",
+          sourcePath: externalSource,
+          mountPath: "data/external",
+          access: "readOnly",
+          createdAt: 280,
+        },
+      ];
+      await writeFile(workspacePath, `${JSON.stringify(document, undefined, 2)}\n`, "utf-8");
+      const before = await readFile(workspacePath, "utf-8");
+      const loader = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot: path.join(root, "loader-index"),
+        autoOpenDefault: false,
+      });
+
+      const inspection = await loader.inspectCanvasProject(projectRoot);
+      expect(inspection.externalSharedResources).toEqual([
+        expect.objectContaining({ sourcePath: externalSource, access: "readOnly" }),
+      ]);
+      await expect(loader.openCanvasProject({ projectRoot })).rejects.toThrow(
+        "外部共享资源需要重新授权",
+      );
+      await expect(readFile(workspacePath, "utf-8")).resolves.toBe(before);
+      await expect(
+        loader.openCanvasProject({
+          projectRoot,
+          trustedExternalResourcePaths: [externalSource],
+        }),
+      ).resolves.toMatchObject({
+        sharedResources: [expect.objectContaining({ sourcePath: externalSource })],
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects unversioned and malicious workspace files without rewriting them", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-malicious-project-"));
+    try {
+      const arbitraryRoot = path.join(root, "arbitrary");
+      await mkdir(arbitraryRoot, { recursive: true });
+      const arbitraryPath = path.join(arbitraryRoot, "workspace.json");
+      const arbitraryContent = '{"branches":[],"sharedResources":[]}\n';
+      await writeFile(arbitraryPath, arbitraryContent, "utf-8");
+      const loader = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot: path.join(root, "index"),
+        autoOpenDefault: false,
+      });
+
+      await expect(loader.inspectCanvasProject(arbitraryRoot)).rejects.toThrow("schema 必须为");
+      await expect(readFile(arbitraryPath, "utf-8")).resolves.toBe(arbitraryContent);
+
+      const maliciousRoot = path.join(root, "malicious");
+      const creator = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot: path.join(root, "creator-index"),
+        autoOpenDefault: false,
+        now: () => 290,
+      });
+      await creator.createCanvasProject({ name: "Malicious", projectRoot: maliciousRoot });
+      const maliciousPath = path.join(maliciousRoot, "workspace.json");
+      const document = JSON.parse(await readFile(maliciousPath, "utf-8"));
+      document.repo = {
+        id: "repo_1",
+        remoteUrl: "https://github.com/acme/demo.git",
+        defaultBranch: "main",
+        localRepoPath: path.join(root, "outside-repo"),
+        connectedAt: 290,
+      };
+      const maliciousContent = `${JSON.stringify(document, undefined, 2)}\n`;
+      await writeFile(maliciousPath, maliciousContent, "utf-8");
+
+      await expect(loader.inspectCanvasProject(maliciousRoot)).rejects.toThrow(
+        "repo.localRepoPath 必须位于项目目录内",
+      );
+      await expect(readFile(maliciousPath, "utf-8")).resolves.toBe(maliciousContent);
+
+      document.repo.localRepoPath = path.join(maliciousRoot, "repos", "repo_1", "repo");
+      document.sharedResources = [
+        {
+          id: "shared_1",
+          repoId: "repo_1",
+          name: "escape",
+          sourcePath: path.join(root, "outside-resource"),
+          mountPath: "../escape",
+          access: "readOnly",
+          createdAt: 290,
+        },
+      ];
+      await writeFile(maliciousPath, `${JSON.stringify(document, undefined, 2)}\n`, "utf-8");
+      await expect(loader.inspectCanvasProject(maliciousRoot)).rejects.toThrow(
+        "mountPath 必须是安全相对路径",
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("discovers projects under the default root when the index is missing", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-discover-project-"));
+    const projectsRoot = path.join(root, "projects");
+    try {
+      const creator = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+        now: () => 300,
+      });
+      const created = await creator.createCanvasProject({ name: "Discoverable" });
+      await rm(path.join(projectsRoot, "index.json"));
+      const loader = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+
+      expect(await loader.listCanvasProjects()).toEqual([created]);
+      await expect(loader.openCanvasProject({ id: created.id })).resolves.toMatchObject({
+        projectRoot: created.projectRoot,
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("deletes a project directory and removes it from the index", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-delete-project-"));
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot: path.join(root, "projects"),
+        autoOpenDefault: false,
+        now: () => 400,
+      });
+      const created = await manager.createCanvasProject({ name: "Disposable" });
+      await writeFile(path.join(created.projectRoot, "canvas-state.json"), "saved", "utf-8");
+
+      await expect(manager.deleteCanvasProject(created.id)).resolves.toEqual(created);
+
+      await expect(readFile(path.join(created.projectRoot, "workspace.json"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      expect(await manager.listCanvasProjects()).toEqual([]);
+      await expect(manager.project()).rejects.toThrow("尚未打开 canvas 项目");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not overwrite a non-empty folder when creating a project", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-project-collision-"));
+    const projectRoot = path.join(root, "existing");
+    try {
+      await mkdir(projectRoot, { recursive: true });
+      await writeFile(path.join(projectRoot, "keep.txt"), "keep", "utf-8");
+      const manager = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot: path.join(root, "projects"),
+        autoOpenDefault: false,
+      });
+
+      await expect(
+        manager.createCanvasProject({ name: "Collision", projectRoot }),
+      ).rejects.toThrow("项目文件夹必须为空");
+      await expect(readFile(path.join(projectRoot, "keep.txt"), "utf-8")).resolves.toBe("keep");
+
+      const containingRoot = path.join(root, "containing-root");
+      const containingManager = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot: path.join(containingRoot, "project-index"),
+        autoOpenDefault: false,
+      });
+      await expect(
+        containingManager.createCanvasProject({ name: "Unsafe", projectRoot: containingRoot }),
+      ).rejects.toThrow("项目文件夹不能包含项目列表根目录");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
