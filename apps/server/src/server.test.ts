@@ -10,6 +10,7 @@ import { CommitManager } from "./commits/CommitManager.js";
 import { createServer } from "./server.js";
 import { FileManager } from "./files/FileManager.js";
 import { PromptManager } from "./prompts/PromptManager.js";
+import { CodexAuthManager } from "./sdk/CodexAuthManager.js";
 import { SyncFlowManager, type SyncFlowAgentHost } from "./sync/SyncFlowManager.js";
 import type { QueryFn } from "./sdk/types.js";
 import { WorkspaceManager, type GitRunner } from "./workspaces/WorkspaceManager.js";
@@ -98,6 +99,41 @@ class FakeSyncHost implements SyncFlowAgentHost {
     this.history.push(envelope);
     this.runner.setStatus("waiting_input");
     return envelope;
+  }
+}
+
+class FakeCodexAuthManager extends CodexAuthManager {
+  private loginStarted = false;
+
+  override async status() {
+    return {
+      state: this.loginStarted ? ("authenticated" as const) : ("unauthenticated" as const),
+      message: this.loginStarted ? "Logged in with ChatGPT" : "Not logged in",
+    };
+  }
+
+  override startDeviceLogin() {
+    this.loginStarted = true;
+    return this.loginSession()!;
+  }
+
+  override loginSession() {
+    return this.loginStarted
+      ? {
+          id: "codex_login_1",
+          state: "running" as const,
+          startedAt: 1,
+          updatedAt: 1,
+          loginUrl: "https://auth.openai.com/device",
+          userCode: "ABCD-EFGH",
+          output: "Open https://auth.openai.com/device and enter code: ABCD-EFGH",
+        }
+      : undefined;
+  }
+
+  override cancelLogin() {
+    this.loginStarted = false;
+    return undefined;
   }
 }
 
@@ -190,6 +226,7 @@ describe("HTTP server", () => {
       promptManager,
       workspaceManager,
       syncFlowManager,
+      codexAuthManager: new FakeCodexAuthManager(),
       codexModelDetection: {
         models: ["gpt-5.6-sol", "gpt-5.6-terra"],
         defaultModel: "gpt-5.6-sol",
@@ -298,6 +335,28 @@ describe("HTTP server", () => {
     expect(updated).toEqual({ status: 200, json: { fullPermissionMode: true } });
 
     await request(port, "PATCH", "/api/settings", { fullPermissionMode: false });
+  });
+
+  it("exposes Codex login status and starts device auth", async () => {
+    const initial = await request(port, "GET", "/api/codex-auth/status");
+    expect(initial).toEqual({
+      status: 200,
+      json: {
+        status: { state: "unauthenticated", message: "Not logged in" },
+        login: null,
+      },
+    });
+
+    const started = await request(port, "POST", "/api/codex-auth/login");
+    expect(started.status).toBe(202);
+    expect(started.json.login).toMatchObject({
+      state: "running",
+      loginUrl: "https://auth.openai.com/device",
+      userCode: "ABCD-EFGH",
+    });
+
+    const authenticated = await request(port, "GET", "/api/codex-auth/status");
+    expect(authenticated.json.status.state).toBe("authenticated");
   });
 
   it("exposes GitHub workspace branches and creates agents on a selected branch", async () => {
@@ -894,13 +953,13 @@ describe("HTTP server", () => {
   });
 });
 
-async function removeTempRoot(root: string): Promise<void> {
-  for (let attempt = 0; attempt < 5; attempt++) {
+async function removeTempRoot(target: string): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
-      await rm(root, { recursive: true, force: true });
+      await rm(target, { recursive: true, force: true });
       return;
     } catch (error) {
-      if (attempt === 4 || (error as NodeJS.ErrnoException).code !== "EBUSY") throw error;
+      if ((error as NodeJS.ErrnoException).code !== "EBUSY" || attempt === 4) throw error;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }
