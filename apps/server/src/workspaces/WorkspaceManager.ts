@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { constants } from "node:fs";
+import { constants, type Dirent } from "node:fs";
 import {
   access,
   lstat,
   mkdir,
+  readdir,
   readFile,
   rm,
   symlink,
@@ -18,6 +19,7 @@ import type {
   BranchDiffSummary,
   BranchOption,
   BranchWorkspace,
+  CanvasProjectInspection,
   CanvasProjectSummary,
   ConnectGitHubInput,
   CreateBranchWorkspaceInput,
@@ -44,9 +46,22 @@ export interface GitRunner {
 }
 
 interface WorkspaceState {
+  project?: CanvasProjectSummary;
   repo?: GitHubConnection;
   branches: BranchWorkspace[];
   sharedResources: SharedResourceMount[];
+}
+
+interface WorkspaceDocument extends WorkspaceState {
+  schema: typeof WORKSPACE_SCHEMA;
+  version: typeof WORKSPACE_VERSION;
+  project: CanvasProjectSummary;
+}
+
+interface RelocatedWorkspace {
+  project: CanvasProjectSummary;
+  state: WorkspaceState;
+  externalSharedResources: CanvasProjectInspection["externalSharedResources"];
 }
 
 interface ProjectIndex {
@@ -56,6 +71,8 @@ interface ProjectIndex {
 const DEFAULT_REPO_ID = "repo_1";
 const WORKSPACE_STATE_FILE = "workspace.json";
 const PROJECT_INDEX_FILE = "index.json";
+const WORKSPACE_SCHEMA = "agent-canvas/workspace";
+const WORKSPACE_VERSION = 1;
 
 export class WorkspaceManager {
   private readonly defaultSourcePath: string;
@@ -92,16 +109,45 @@ export class WorkspaceManager {
     return this.projectRoot ?? this.projectsRoot;
   }
 
+  projectListRoot(): string {
+    return this.projectsRoot;
+  }
+
+  currentProjectId(): string | undefined {
+    return this.currentProject?.id;
+  }
+
   async listCanvasProjects(): Promise<CanvasProjectSummary[]> {
     const index = await this.readProjectIndex();
-    const projects = [...index.projects];
-    if (
-      this.currentProject &&
-      !projects.some((project) => project.id === this.currentProject?.id)
-    ) {
-      projects.unshift(this.currentProject);
+    const byRoot = new Map<string, CanvasProjectSummary>();
+    for (const indexed of index.projects) {
+      try {
+        const project = await this.readProjectSummary(indexed.projectRoot, indexed);
+        byRoot.set(normalizedRootKey(project.projectRoot), project);
+      } catch {
+        // Stale and invalid index entries are omitted. A valid custom project can be loaded by path.
+      }
     }
-    return projects.sort((a, b) => (b.openedAt ?? b.createdAt) - (a.openedAt ?? a.createdAt));
+    for (const discovered of await this.discoverProjects()) {
+      const key = normalizedRootKey(discovered.projectRoot);
+      if (!byRoot.has(key)) byRoot.set(key, discovered);
+    }
+    if (this.currentProject) {
+      let current = this.currentProject;
+      try {
+        current = await this.readProjectSummary(current.projectRoot);
+        this.currentProject = current;
+      } catch {
+        // A configured project root may be intentionally empty until its first save.
+      }
+      const key = normalizedRootKey(current.projectRoot);
+      byRoot.set(key, { ...byRoot.get(key), ...current });
+    }
+    const projects = uniqueProjectIds([...byRoot.values()]).sort(
+      (a, b) => (b.openedAt ?? b.createdAt) - (a.openedAt ?? a.createdAt),
+    );
+    await this.writeProjectIndex(projects);
+    return projects;
   }
 
   async createCanvasProject(input: CreateCanvasProjectInput): Promise<CanvasProjectSummary> {
@@ -111,6 +157,9 @@ export class WorkspaceManager {
       ? projectIdFromExplicitRoot(explicitRoot)
       : `${safePathPart(name)}-${this.now().toString(36)}`;
     const projectRoot = explicitRoot ?? path.join(this.projectsRoot, id);
+    if (isPathWithin(this.projectsRoot, projectRoot)) {
+      throw new Error("项目文件夹不能包含项目列表根目录");
+    }
     const project: CanvasProjectSummary = {
       id,
       name,
@@ -118,21 +167,97 @@ export class WorkspaceManager {
       createdAt: this.now(),
       openedAt: this.now(),
     };
+    await this.ensureProjectRootAvailable(projectRoot);
     await mkdir(projectRoot, { recursive: true });
-    await this.upsertProject(project);
-    await this.openProject(project);
+    this.selectProject(project, { branches: [], sharedResources: [] });
     await this.saveState();
     return project;
   }
 
   async openCanvasProject(input: OpenCanvasProjectInput): Promise<WorkspaceProject> {
-    const index = await this.readProjectIndex();
-    const project = index.projects.find((candidate) => candidate.id === input.id);
-    if (!project) throw new Error(`未知 canvas 项目: ${input.id}`);
-    const opened = { ...project, openedAt: this.now() };
-    await this.upsertProject(opened);
-    await this.openProject(opened);
+    const projectRoot = normalizeOptionalProjectRoot(input.projectRoot);
+    const projects = await this.listCanvasProjects();
+    const indexed = input.id
+      ? projects.find((candidate) => candidate.id === input.id)
+      : undefined;
+    if (!indexed && !projectRoot) {
+      throw new Error(input.id ? `未知 canvas 项目: ${input.id}` : "缺少项目 id 或项目文件夹");
+    }
+    if (
+      indexed &&
+      projectRoot &&
+      normalizedRootKey(indexed.projectRoot) !== normalizedRootKey(projectRoot)
+    ) {
+      throw new Error("项目 id 与项目文件夹不匹配");
+    }
+    const resolvedRoot = path.resolve(projectRoot ?? indexed!.projectRoot);
+    const registered =
+      indexed ??
+      projects.find(
+        (candidate) => normalizedRootKey(candidate.projectRoot) === normalizedRootKey(resolvedRoot),
+      );
+    const document = await this.readWorkspaceDocument(resolvedRoot);
+    const relocated = relocateWorkspace(document, resolvedRoot, {
+      requireExternalTrust: !registered,
+      trustedExternalResourcePaths: input.trustedExternalResourcePaths,
+    });
+    let project = { ...relocated.project, id: registered?.id ?? relocated.project.id };
+    if (
+      !registered &&
+      projects.some(
+        (candidate) =>
+          candidate.id === project.id &&
+          normalizedRootKey(candidate.projectRoot) !== normalizedRootKey(resolvedRoot),
+      )
+    ) {
+      project = { ...project, id: projectIdFromExplicitRoot(resolvedRoot) };
+    }
+    const opened = { ...project, projectRoot: resolvedRoot, openedAt: this.now() };
+    this.selectProject(opened, { ...relocated.state, project: opened });
+    await this.saveState();
     return this.snapshot();
+  }
+
+  async inspectCanvasProject(projectRoot: string): Promise<CanvasProjectInspection> {
+    const resolvedRoot = path.resolve(normalizeRequiredProjectRoot(projectRoot));
+    const document = await this.readWorkspaceDocument(resolvedRoot);
+    const relocated = relocateWorkspace(document, resolvedRoot, {
+      requireExternalTrust: false,
+    });
+    return {
+      project: relocated.project,
+      externalSharedResources: relocated.externalSharedResources,
+    };
+  }
+
+  async deleteCanvasProject(id: string): Promise<CanvasProjectSummary> {
+    const project = (await this.listCanvasProjects()).find((candidate) => candidate.id === id);
+    if (!project) throw new Error(`未知 canvas 项目: ${id}`);
+    const projectRoot = path.resolve(project.projectRoot);
+    const document = await this.readWorkspaceDocument(projectRoot);
+    relocateWorkspace(document, projectRoot, { requireExternalTrust: false });
+    if (isPathWithin(this.projectsRoot, projectRoot)) {
+      throw new Error("不能删除包含项目列表根目录的文件夹");
+    }
+    if (path.parse(projectRoot).root === projectRoot) throw new Error("不能删除文件系统根目录");
+    await rm(projectRoot, { recursive: true, force: false });
+    const index = await this.readProjectIndex();
+    await this.writeProjectIndex(
+      index.projects.filter(
+        (candidate) =>
+          candidate.id !== id &&
+          normalizedRootKey(candidate.projectRoot) !== normalizedRootKey(projectRoot),
+      ),
+    );
+    if (normalizedRootKey(this.currentProject?.projectRoot ?? "") === normalizedRootKey(projectRoot)) {
+      this.projectRoot = undefined;
+      this.currentProject = undefined;
+      this.state = { branches: [], sharedResources: [] };
+      this.stateLoaded = false;
+      this.branchCounter = 0;
+      this.resourceCounter = 0;
+    }
+    return project;
   }
 
   async project(): Promise<WorkspaceProject> {
@@ -449,15 +574,15 @@ export class WorkspaceManager {
     };
   }
 
-  private async openProject(project: CanvasProjectSummary): Promise<void> {
-    this.currentProject = project;
-    this.projectRoot = path.resolve(project.projectRoot);
-    this.state = { branches: [], sharedResources: [] };
-    this.stateLoaded = false;
-    this.branchCounter = 0;
-    this.resourceCounter = 0;
-    await mkdir(this.projectRoot, { recursive: true });
-    await this.loadStateIfNeeded();
+  private selectProject(project: CanvasProjectSummary, state?: WorkspaceState): void {
+    this.currentProject = { ...project, projectRoot: path.resolve(project.projectRoot) };
+    this.projectRoot = this.currentProject.projectRoot;
+    this.state = state ?? { branches: [], sharedResources: [] };
+    this.stateLoaded = state !== undefined;
+    this.branchCounter = maxNumericSuffix(this.state.branches.map((branch) => branch.id));
+    this.resourceCounter = maxNumericSuffix(
+      this.state.sharedResources.map((resource) => resource.id),
+    );
   }
 
   private async ensureProjectOpen(): Promise<void> {
@@ -472,34 +597,54 @@ export class WorkspaceManager {
 
   private async loadStateIfNeeded(): Promise<void> {
     if (this.stateLoaded) return;
-    this.stateLoaded = true;
-    const statePath = this.statePath();
+    if (!(await exists(this.statePath()))) {
+      this.state = { project: this.currentProject, branches: [], sharedResources: [] };
+      this.branchCounter = 0;
+      this.resourceCounter = 0;
+      this.stateLoaded = true;
+      return;
+    }
     try {
-      const parsed = JSON.parse(await readFile(statePath, "utf-8")) as WorkspaceState;
-      this.state = {
-        repo: parsed.repo,
-        branches: Array.isArray(parsed.branches) ? parsed.branches : [],
-        sharedResources: Array.isArray(parsed.sharedResources) ? parsed.sharedResources : [],
-      };
+      const projectRoot = this.requireProjectRoot();
+      const document = await this.readWorkspaceDocument(projectRoot);
+      const relocated = relocateWorkspace(document, projectRoot, {
+        requireExternalTrust:
+          normalizedRootKey(document.project.projectRoot) !== normalizedRootKey(projectRoot),
+      });
+      this.currentProject = relocated.project;
+      this.state = relocated.state;
       this.branchCounter = maxNumericSuffix(this.state.branches.map((branch) => branch.id));
       this.resourceCounter = maxNumericSuffix(
         this.state.sharedResources.map((resource) => resource.id),
       );
-    } catch {
-      this.state = { branches: [], sharedResources: [] };
+      this.stateLoaded = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      this.state = { project: this.currentProject, branches: [], sharedResources: [] };
       this.branchCounter = 0;
       this.resourceCounter = 0;
+      this.stateLoaded = true;
     }
   }
 
   private async saveState(): Promise<void> {
     const statePath = this.statePath();
+    this.state.project = this.currentProject;
+    const document: WorkspaceDocument = {
+      schema: WORKSPACE_SCHEMA,
+      version: WORKSPACE_VERSION,
+      project: this.currentProject!,
+      repo: this.state.repo,
+      branches: this.state.branches,
+      sharedResources: this.state.sharedResources,
+    };
     await mkdir(path.dirname(statePath), { recursive: true });
     await writeFile(
       statePath,
-      `${JSON.stringify(this.state, undefined, 2)}\n`,
+      `${JSON.stringify(document, undefined, 2)}\n`,
       "utf-8",
     );
+    if (this.currentProject) await this.upsertProject(this.currentProject);
   }
 
   private statePath(): string {
@@ -625,14 +770,89 @@ export class WorkspaceManager {
     const index = await this.readProjectIndex();
     const projects = [
       project,
-      ...index.projects.filter((candidate) => candidate.id !== project.id),
+      ...index.projects.filter(
+        (candidate) =>
+          candidate.id !== project.id &&
+          normalizedRootKey(candidate.projectRoot) !== normalizedRootKey(project.projectRoot),
+      ),
     ];
+    await this.writeProjectIndex(projects);
+  }
+
+  private async writeProjectIndex(projects: CanvasProjectSummary[]): Promise<void> {
     await mkdir(this.projectsRoot, { recursive: true });
     await writeFile(
       this.projectIndexPath(),
       `${JSON.stringify({ projects }, undefined, 2)}\n`,
       "utf-8",
     );
+  }
+
+  private async discoverProjects(): Promise<CanvasProjectSummary[]> {
+    let entries: Dirent[];
+    try {
+      entries = await readdir(this.projectsRoot, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    const projects = await Promise.all(
+      entries
+        .filter((entry) => entry.isDirectory())
+        .map(async (entry) => {
+          try {
+            return await this.readProjectSummary(path.join(this.projectsRoot, entry.name));
+          } catch {
+            return undefined;
+          }
+        }),
+    );
+    return projects.filter((project): project is CanvasProjectSummary => !!project);
+  }
+
+  private async readProjectSummary(
+    projectRoot: string,
+    fallback?: CanvasProjectSummary,
+  ): Promise<CanvasProjectSummary> {
+    const resolvedRoot = path.resolve(projectRoot);
+    const document = await this.readWorkspaceDocument(resolvedRoot);
+    const relocated = relocateWorkspace(document, resolvedRoot, {
+      requireExternalTrust:
+        normalizedRootKey(document.project.projectRoot) !== normalizedRootKey(resolvedRoot),
+    });
+    const project = relocated.project;
+    return fallback && normalizedRootKey(fallback.projectRoot) === normalizedRootKey(resolvedRoot)
+      ? { ...project, id: fallback.id }
+      : project;
+  }
+
+  private async readWorkspaceDocument(projectRoot: string): Promise<WorkspaceDocument> {
+    const resolvedRoot = path.resolve(projectRoot);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await readFile(path.join(resolvedRoot, WORKSPACE_STATE_FILE), "utf-8"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new Error(`所选文件夹不是 Canvas 项目: ${resolvedRoot}`);
+      }
+      throw new Error(`无法读取 Canvas 项目 ${resolvedRoot}: ${errorMessage(error)}`);
+    }
+    return parseWorkspaceDocument(parsed, resolvedRoot);
+  }
+
+  private async ensureProjectRootAvailable(projectRoot: string): Promise<void> {
+    let entries: string[];
+    try {
+      entries = await readdir(projectRoot);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    if (entries.length === 0) return;
+    if (entries.includes(WORKSPACE_STATE_FILE)) {
+      throw new Error(`文件夹中已有 Canvas 项目，请使用“加载项目”: ${projectRoot}`);
+    }
+    throw new Error(`项目文件夹必须为空: ${projectRoot}`);
   }
 
   private projectIndexPath(): string {
@@ -749,9 +969,21 @@ function normalizeOptionalProjectRoot(value: string | undefined): string | undef
   return trimmed ? path.resolve(trimmed) : undefined;
 }
 
+function normalizeRequiredProjectRoot(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error("项目文件夹不能为空");
+  return path.resolve(trimmed);
+}
+
 function normalizeRelativePath(value: string): string {
-  const normalized = value.replace(/\\/gu, "/").trim().replace(/^\/+/u, "");
-  if (!normalized || path.isAbsolute(normalized) || normalized.split("/").includes("..")) {
+  const normalized = value.replace(/\\/gu, "/").trim();
+  if (
+    !normalized ||
+    normalized.startsWith("/") ||
+    path.posix.isAbsolute(normalized) ||
+    path.win32.isAbsolute(normalized) ||
+    normalized.split("/").some((part) => !part || part === "." || part === "..")
+  ) {
     throw new Error("共享资源挂载路径必须是工作区内的相对路径");
   }
   return normalized;
@@ -782,6 +1014,325 @@ function projectIdFromExplicitRoot(root: string): string {
   const name = safePathPart(path.basename(root));
   const hash = createHash("sha256").update(path.resolve(root).toLowerCase()).digest("hex").slice(0, 12);
   return name ? `${name}-${hash}` : hash;
+}
+
+function parseWorkspaceDocument(value: unknown, projectRoot: string): WorkspaceDocument {
+  if (!isRecord(value)) throw invalidWorkspace(projectRoot, "根节点必须是对象");
+  if (value.schema !== WORKSPACE_SCHEMA) {
+    throw invalidWorkspace(projectRoot, `schema 必须为 ${WORKSPACE_SCHEMA}`);
+  }
+  if (value.version !== WORKSPACE_VERSION) {
+    throw invalidWorkspace(projectRoot, `不支持的 version: ${String(value.version)}`);
+  }
+  const project = parseProjectSummary(value.project, projectRoot);
+  const repo = value.repo === undefined ? undefined : parseRepository(value.repo, projectRoot);
+  const branches = parseArray(value.branches, "branches", projectRoot).map((branch) =>
+    parseBranchWorkspace(branch, projectRoot),
+  );
+  const sharedResources = parseArray(
+    value.sharedResources,
+    "sharedResources",
+    projectRoot,
+  ).map((resource) => parseSharedResource(resource, projectRoot));
+  ensureUniqueIds(branches, "branch", projectRoot);
+  ensureUniqueIds(sharedResources, "shared resource", projectRoot);
+  if (!repo && (branches.length > 0 || sharedResources.length > 0)) {
+    throw invalidWorkspace(projectRoot, "未连接 repo 时不能包含 branch 或 shared resource");
+  }
+  if (repo) {
+    if (branches.some((branch) => branch.repoId !== repo.id)) {
+      throw invalidWorkspace(projectRoot, "branch.repoId 与 repo.id 不匹配");
+    }
+    if (sharedResources.some((resource) => resource.repoId !== repo.id)) {
+      throw invalidWorkspace(projectRoot, "sharedResource.repoId 与 repo.id 不匹配");
+    }
+  }
+  return {
+    schema: WORKSPACE_SCHEMA,
+    version: WORKSPACE_VERSION,
+    project,
+    repo,
+    branches,
+    sharedResources,
+  };
+}
+
+function parseProjectSummary(value: unknown, projectRoot: string): CanvasProjectSummary {
+  const record = requiredRecord(value, "project", projectRoot);
+  const storedRoot = requiredAbsolutePath(record.projectRoot, "project.projectRoot", projectRoot);
+  const openedAt = optionalTimestamp(record.openedAt, "project.openedAt", projectRoot);
+  return {
+    id: requiredIdentifier(record.id, "project.id", projectRoot),
+    name: requiredString(record.name, "project.name", projectRoot),
+    projectRoot: storedRoot,
+    createdAt: requiredTimestamp(record.createdAt, "project.createdAt", projectRoot),
+    ...(openedAt === undefined ? {} : { openedAt }),
+  };
+}
+
+function parseRepository(value: unknown, projectRoot: string): GitHubConnection {
+  const record = requiredRecord(value, "repo", projectRoot);
+  const owner = optionalString(record.owner, "repo.owner", projectRoot);
+  const repoName = optionalString(record.repo, "repo.repo", projectRoot);
+  return {
+    id: requiredIdentifier(record.id, "repo.id", projectRoot),
+    remoteUrl: requiredString(record.remoteUrl, "repo.remoteUrl", projectRoot),
+    ...(owner === undefined ? {} : { owner }),
+    ...(repoName === undefined ? {} : { repo: repoName }),
+    defaultBranch: normalizeBranch(requiredString(record.defaultBranch, "repo.defaultBranch", projectRoot)),
+    localRepoPath: requiredAbsolutePath(record.localRepoPath, "repo.localRepoPath", projectRoot),
+    connectedAt: requiredTimestamp(record.connectedAt, "repo.connectedAt", projectRoot),
+  };
+}
+
+function parseBranchWorkspace(value: unknown, projectRoot: string): BranchWorkspace {
+  const record = requiredRecord(value, "branch", projectRoot);
+  const baseBranch = optionalString(record.baseBranch, "branch.baseBranch", projectRoot);
+  return {
+    id: requiredIdentifier(record.id, "branch.id", projectRoot),
+    repoId: requiredIdentifier(record.repoId, "branch.repoId", projectRoot),
+    branch: normalizeBranch(requiredString(record.branch, "branch.branch", projectRoot)),
+    ...(baseBranch === undefined ? {} : { baseBranch: normalizeBranch(baseBranch) }),
+    worktreePath: requiredAbsolutePath(record.worktreePath, "branch.worktreePath", projectRoot),
+    scratchRoot: requiredAbsolutePath(record.scratchRoot, "branch.scratchRoot", projectRoot),
+    isDefault: requiredBoolean(record.isDefault, "branch.isDefault", projectRoot),
+    createdAt: requiredTimestamp(record.createdAt, "branch.createdAt", projectRoot),
+  };
+}
+
+function parseSharedResource(value: unknown, projectRoot: string): SharedResourceMount {
+  const record = requiredRecord(value, "shared resource", projectRoot);
+  const access = record.access;
+  if (access !== "readOnly" && access !== "readWrite") {
+    throw invalidWorkspace(projectRoot, "sharedResource.access 必须为 readOnly 或 readWrite");
+  }
+  return {
+    id: requiredIdentifier(record.id, "sharedResource.id", projectRoot),
+    repoId: requiredIdentifier(record.repoId, "sharedResource.repoId", projectRoot),
+    name: requiredString(record.name, "sharedResource.name", projectRoot),
+    sourcePath: requiredAbsolutePath(record.sourcePath, "sharedResource.sourcePath", projectRoot),
+    mountPath: validateStoredRelativePath(
+      requiredString(record.mountPath, "sharedResource.mountPath", projectRoot),
+      projectRoot,
+    ),
+    access,
+    createdAt: requiredTimestamp(record.createdAt, "sharedResource.createdAt", projectRoot),
+  };
+}
+
+function relocateWorkspace(
+  document: WorkspaceDocument,
+  targetRoot: string,
+  options: {
+    requireExternalTrust: boolean;
+    trustedExternalResourcePaths?: string[];
+  },
+): RelocatedWorkspace {
+  const oldRoot = path.resolve(document.project.projectRoot);
+  const nextRoot = path.resolve(targetRoot);
+  const trusted = new Set(
+    (options.trustedExternalResourcePaths ?? []).map((resourcePath) =>
+      normalizedRootKey(path.resolve(resourcePath)),
+    ),
+  );
+  const relocateInternal = (storedPath: string, label: string): string => {
+    if (!isPathWithin(storedPath, oldRoot)) {
+      throw invalidWorkspace(targetRoot, `${label} 必须位于项目目录内`);
+    }
+    const relative = path.relative(oldRoot, storedPath);
+    return path.resolve(nextRoot, relative);
+  };
+  const repo = document.repo
+    ? {
+        ...document.repo,
+        localRepoPath: relocateInternal(document.repo.localRepoPath, "repo.localRepoPath"),
+      }
+    : undefined;
+  if (repo && !isRepoStoragePath(repo.localRepoPath, nextRoot, repo.id)) {
+    throw invalidWorkspace(targetRoot, "repo.localRepoPath 不符合项目内部目录约定");
+  }
+  const branches = document.branches.map((branch) => {
+    const worktreePath = relocateInternal(branch.worktreePath, "branch.worktreePath");
+    const scratchRoot = relocateInternal(branch.scratchRoot, "branch.scratchRoot");
+    if (!isBranchStoragePath(worktreePath, nextRoot, branch.repoId, repo?.localRepoPath)) {
+      throw invalidWorkspace(targetRoot, `branch ${branch.id} 的 worktreePath 不合法`);
+    }
+    if (normalizedRootKey(scratchRoot) !== normalizedRootKey(path.join(worktreePath, ".agent-tmp"))) {
+      throw invalidWorkspace(targetRoot, `branch ${branch.id} 的 scratchRoot 不合法`);
+    }
+    return { ...branch, worktreePath, scratchRoot };
+  });
+  const externalSharedResources: CanvasProjectInspection["externalSharedResources"] = [];
+  const sharedResources = document.sharedResources.map((resource) => {
+    let sourcePath: string;
+    if (isPathWithin(resource.sourcePath, oldRoot)) {
+      sourcePath = relocateInternal(resource.sourcePath, "sharedResource.sourcePath");
+      if (!isPathWithin(sourcePath, path.join(nextRoot, "shared"))) {
+        throw invalidWorkspace(targetRoot, `shared resource ${resource.id} 的内部路径不合法`);
+      }
+    } else {
+      sourcePath = path.resolve(resource.sourcePath);
+      externalSharedResources.push({
+        id: resource.id,
+        name: resource.name,
+        sourcePath,
+        access: resource.access,
+      });
+      if (options.requireExternalTrust && !trusted.has(normalizedRootKey(sourcePath))) {
+        throw new Error(`外部共享资源需要重新授权: ${sourcePath}`);
+      }
+    }
+    return { ...resource, sourcePath };
+  });
+  const project = { ...document.project, projectRoot: nextRoot };
+  return {
+    project,
+    state: { project, repo, branches, sharedResources },
+    externalSharedResources,
+  };
+}
+
+function isRepoStoragePath(candidate: string, projectRoot: string, repoId: string): boolean {
+  return normalizedRootKey(candidate) === normalizedRootKey(path.join(projectRoot, "repos", repoId, "repo"));
+}
+
+function isBranchStoragePath(
+  candidate: string,
+  projectRoot: string,
+  repoId: string,
+  localRepoPath: string | undefined,
+): boolean {
+  if (localRepoPath && normalizedRootKey(candidate) === normalizedRootKey(localRepoPath)) return true;
+  return isPathWithin(candidate, path.join(projectRoot, "worktrees", repoId));
+}
+
+function validateStoredRelativePath(value: string, projectRoot: string): string {
+  const normalized = value.replace(/\\/gu, "/").trim();
+  if (
+    !normalized ||
+    normalized.startsWith("/") ||
+    path.posix.isAbsolute(normalized) ||
+    path.win32.isAbsolute(normalized) ||
+    normalized.split("/").some((part) => !part || part === "." || part === "..")
+  ) {
+    throw invalidWorkspace(projectRoot, "sharedResource.mountPath 必须是安全相对路径");
+  }
+  return normalized;
+}
+
+function requiredRecord(
+  value: unknown,
+  field: string,
+  projectRoot: string,
+): Record<string, unknown> {
+  if (!isRecord(value)) throw invalidWorkspace(projectRoot, `${field} 必须是对象`);
+  return value;
+}
+
+function parseArray(value: unknown, field: string, projectRoot: string): unknown[] {
+  if (!Array.isArray(value)) throw invalidWorkspace(projectRoot, `${field} 必须是数组`);
+  return value;
+}
+
+function requiredString(value: unknown, field: string, projectRoot: string): string {
+  const parsed = nonEmptyString(value);
+  if (!parsed) throw invalidWorkspace(projectRoot, `${field} 必须是非空字符串`);
+  return parsed;
+}
+
+function optionalString(value: unknown, field: string, projectRoot: string): string | undefined {
+  if (value === undefined) return undefined;
+  return requiredString(value, field, projectRoot);
+}
+
+function requiredIdentifier(value: unknown, field: string, projectRoot: string): string {
+  const parsed = requiredString(value, field, projectRoot);
+  if (!/^[a-zA-Z0-9._-]+$/u.test(parsed)) {
+    throw invalidWorkspace(projectRoot, `${field} 包含非法字符`);
+  }
+  return parsed;
+}
+
+function requiredAbsolutePath(value: unknown, field: string, projectRoot: string): string {
+  const parsed = requiredString(value, field, projectRoot);
+  if (!path.isAbsolute(parsed)) throw invalidWorkspace(projectRoot, `${field} 必须是绝对路径`);
+  return path.resolve(parsed);
+}
+
+function requiredTimestamp(value: unknown, field: string, projectRoot: string): number {
+  const parsed = finiteTimestamp(value);
+  if (parsed === undefined) throw invalidWorkspace(projectRoot, `${field} 必须是有效时间戳`);
+  return parsed;
+}
+
+function optionalTimestamp(value: unknown, field: string, projectRoot: string): number | undefined {
+  if (value === undefined) return undefined;
+  return requiredTimestamp(value, field, projectRoot);
+}
+
+function requiredBoolean(value: unknown, field: string, projectRoot: string): boolean {
+  if (typeof value !== "boolean") throw invalidWorkspace(projectRoot, `${field} 必须是布尔值`);
+  return value;
+}
+
+function ensureUniqueIds(
+  values: Array<{ id: string }>,
+  label: string,
+  projectRoot: string,
+): void {
+  const ids = new Set<string>();
+  for (const value of values) {
+    if (ids.has(value.id)) throw invalidWorkspace(projectRoot, `${label} id 重复: ${value.id}`);
+    ids.add(value.id);
+  }
+}
+
+function invalidWorkspace(projectRoot: string, message: string): Error {
+  return new Error(`Canvas 项目配置格式不合法 (${path.resolve(projectRoot)}): ${message}`);
+}
+
+function uniqueProjectIds(projects: CanvasProjectSummary[]): CanvasProjectSummary[] {
+  const rootsById = new Map<string, string>();
+  return projects.map((project) => {
+    const rootKey = normalizedRootKey(project.projectRoot);
+    const existingRoot = rootsById.get(project.id);
+    if (!existingRoot || existingRoot === rootKey) {
+      rootsById.set(project.id, rootKey);
+      return project;
+    }
+    const id = projectIdFromExplicitRoot(project.projectRoot);
+    rootsById.set(id, rootKey);
+    return { ...project, id };
+  });
+}
+
+function normalizedRootKey(root: string): string {
+  const resolved = path.resolve(root);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function isPathWithin(candidate: string, parent: string): boolean {
+  const relative = path.relative(path.resolve(parent), path.resolve(candidate));
+  return (
+    relative === "" ||
+    (!path.isAbsolute(relative) && !relative.startsWith(`..${path.sep}`) && relative !== "..")
+  );
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function finiteTimestamp(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function defaultProjectRoot(defaultSourcePath: string): string {

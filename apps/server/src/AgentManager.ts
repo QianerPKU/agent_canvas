@@ -147,6 +147,23 @@ export class AgentManager {
     this.suppressEvents = false;
   }
 
+  async clear(): Promise<void> {
+    this.suppressEvents = true;
+    try {
+      await Promise.all([...this.runners.values()].map((runner) => runner.terminate()));
+      this.runners.clear();
+      this.seqs.clear();
+      this.history.clear();
+      this.forkOrigins.clear();
+      this.forkConfigs.clear();
+      this.draftConfigs.clear();
+      this.appSettingsState.fullPermissionMode = false;
+      this.counter = 0;
+    } finally {
+      this.suppressEvents = false;
+    }
+  }
+
   private createRunner(
     id: string,
     draftConfig: Partial<AgentStartConfig>,
