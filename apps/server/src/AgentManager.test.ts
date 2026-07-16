@@ -140,6 +140,21 @@ describe("AgentManager fork", () => {
     expect(codex.calls.at(-1)?.model).toBe("gpt-5.5");
   });
 
+  it("Codex start passes reasoning effort to the provider", async () => {
+    const codex = makeQuery("codex-thread");
+    const mgr = new AgentManager({ query: codex.query, codexQuery: codex.query });
+
+    const agent = mgr.create();
+    mgr.startAgent(agent.id, {
+      prompt: "p",
+      provider: "codex",
+      reasoningEffort: "xhigh",
+    });
+    await flush();
+
+    expect(codex.calls.at(-1)?.reasoningEffort).toBe("xhigh");
+  });
+
   it("create stores provider, cwd and private system prompt settings", () => {
     const { query } = makeQuery();
     const mgr = new AgentManager({ query, defaultCwd: "/repo" });

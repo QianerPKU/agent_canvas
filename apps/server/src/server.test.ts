@@ -191,8 +191,21 @@ describe("HTTP server", () => {
       workspaceManager,
       syncFlowManager,
       codexModelDetection: {
-        models: ["gpt-5.6", "gpt-5.5"],
-        defaultModel: "gpt-5.6",
+        models: ["gpt-5.6-sol", "gpt-5.6-terra"],
+        defaultModel: "gpt-5.6-sol",
+        reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
+        modelCapabilities: [
+          {
+            model: "gpt-5.6-sol",
+            reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
+            defaultReasoningEffort: "medium",
+          },
+          {
+            model: "gpt-5.6-terra",
+            reasoningEfforts: ["low", "medium", "high", "xhigh"],
+            defaultReasoningEffort: "medium",
+          },
+        ],
         version: "0.141.0",
       },
       commitManager: new CommitManager({
@@ -249,8 +262,21 @@ describe("HTTP server", () => {
       json: {
         defaultCwd: root,
         projectRoot,
-        codexModels: ["gpt-5.6", "gpt-5.5"],
-        defaultCodexModel: "gpt-5.6",
+        codexModels: ["gpt-5.6-sol", "gpt-5.6-terra"],
+        defaultCodexModel: "gpt-5.6-sol",
+        codexReasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
+        codexModelCapabilities: [
+          {
+            model: "gpt-5.6-sol",
+            reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
+            defaultReasoningEffort: "medium",
+          },
+          {
+            model: "gpt-5.6-terra",
+            reasoningEfforts: ["low", "medium", "high", "xhigh"],
+            defaultReasoningEffort: "medium",
+          },
+        ],
         codexVersion: "0.141.0",
       },
     });

@@ -9,6 +9,7 @@ import {
   type AgentSettings,
   type BranchOption,
   type BranchWorkspace,
+  type CodexModelCapability,
   type CodexModel,
   type UpdateAgentSettingsInput,
 } from "@agent-canvas/shared";
@@ -20,6 +21,8 @@ type AgentSettingsDialogProps =
       branches: BranchOption[];
       codexModels?: readonly string[];
       defaultCodexModel?: string;
+      codexReasoningEfforts?: readonly string[];
+      codexModelCapabilities?: readonly CodexModelCapability[];
       onCreate: (settings: AgentSettings) => Promise<void>;
       onCreateBranch: (branch: string, baseBranch?: string) => Promise<BranchWorkspace>;
       onClose: () => void;
@@ -30,6 +33,8 @@ type AgentSettingsDialogProps =
       branches: BranchOption[];
       codexModels?: readonly string[];
       defaultCodexModel?: string;
+      codexReasoningEfforts?: readonly string[];
+      codexModelCapabilities?: readonly CodexModelCapability[];
       canChangeBranch: boolean;
       onCreateBranch: (branch: string, baseBranch?: string) => Promise<BranchWorkspace>;
       onUpdate: (
@@ -44,6 +49,10 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
   const agent = props.mode === "edit" ? props.agent : undefined;
   const codexModels = props.codexModels?.length ? props.codexModels : CODEX_MODELS;
   const defaultCodexModel = props.defaultCodexModel ?? DEFAULT_CODEX_MODEL;
+  const codexReasoningEfforts = props.codexReasoningEfforts?.length
+    ? props.codexReasoningEfforts
+    : CODEX_REASONING_EFFORTS;
+  const codexModelCapabilities = props.codexModelCapabilities ?? [];
   const [provider, setProvider] = useState<AgentProvider>(agent?.provider ?? "codex");
   const [codexModelValue, setCodexModelValue] = useState<CodexModel>(
     codexModel(agent?.model, codexModels, defaultCodexModel),
@@ -67,6 +76,11 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
   const canChangeBranch = props.mode === "create" || props.canChangeBranch;
   const branches = mergeBranchOptions(props.branches, extraBranches);
   const selectedBranch = branches.find((branch) => branch.branch === branchName);
+  const reasoningEffortOptions = reasoningEffortsForModel(
+    codexModelValue,
+    codexModelCapabilities,
+    codexReasoningEfforts,
+  );
 
   useEffect(() => {
     if (!isCreate && agent) {
@@ -85,6 +99,12 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
       setBranchName(props.branches[0].branch);
     }
   }, [branchName, props]);
+
+  useEffect(() => {
+    if (reasoningEffort && !reasoningEffortOptions.includes(reasoningEffort)) {
+      setReasoningEffort("");
+    }
+  }, [reasoningEffort, reasoningEffortOptions]);
 
   useEffect(() => {
     if (branches.length === 0) return;
@@ -237,7 +257,7 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
               onChange={(event) => setReasoningEffort(event.target.value)}
             >
               <option value="">默认</option>
-              {CODEX_REASONING_EFFORTS.map((candidate) => (
+              {reasoningEffortOptions.map((candidate) => (
                 <option key={candidate} value={candidate}>
                   {candidate}
                 </option>
@@ -392,6 +412,15 @@ function codexReasoningEffortUpdate(
   if (provider !== "codex") return undefined;
   const selected = selectedReasoningEffort(provider, reasoningEffort);
   return selected !== null || previous ? selected : undefined;
+}
+
+function reasoningEffortsForModel(
+  model: string,
+  capabilities: readonly CodexModelCapability[],
+  fallback: readonly string[],
+): readonly string[] {
+  const capability = capabilities.find((candidate) => candidate.model === model);
+  return capability?.reasoningEfforts.length ? capability.reasoningEfforts : fallback;
 }
 
 function mergeBranchOptions(
