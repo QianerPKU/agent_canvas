@@ -110,7 +110,7 @@ export interface SyncFlowSnapshot {
   status: SyncFlowStatus;
   createdAt: number;
   updatedAt: number;
-  /** Persistent tie-breaker for the flow's current branch-review queue job. */
+  /** Persistent FIFO position for the flow's current branch-review queue job. */
   reviewQueueSequence?: number;
   closedAt?: number;
   failureReason?: string;

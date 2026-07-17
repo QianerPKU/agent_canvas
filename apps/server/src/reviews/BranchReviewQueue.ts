@@ -12,11 +12,12 @@ export interface BranchReviewJob {
   branch: string;
   order: number;
   /**
-   * Persistent, queue-wide tie-breaker for jobs with the same `order`.
+   * Persistent, queue-wide FIFO position. This is the authoritative ordering key.
    *
    * Managers that share a queue should reserve this value when a review stage is created and
-   * persist it with their flow snapshot. Jobs without a sequence remain supported for backwards
-   * compatibility and receive one when they are stored.
+   * persist it with their flow snapshot. Unlike wall-clock-derived `order`, it cannot move when a
+   * deferred stage eventually starts or when the system clock moves backwards. Jobs without a
+   * sequence remain supported for backwards compatibility and receive one when they are stored.
    */
   sequence?: number;
   state?: BranchReviewJobState;
@@ -53,7 +54,33 @@ export class BranchReviewQueue {
 
   /** Reserves the next queue-wide sequence for a job whose ordering must survive persistence. */
   reserveSequence(): number {
+    if (this.sequence >= Number.MAX_SAFE_INTEGER) {
+      throw new Error("branch review sequence exhausted");
+    }
     return ++this.sequence;
+  }
+
+  /**
+   * Gives a pre-sequence snapshot a deterministic position independent of manager import order.
+   * Distinct legacy admission timestamps retain their recoverable order; exact ties fall through
+   * to the queue's stable secondary keys because their original cross-owner order is unknowable.
+   */
+  reserveLegacySequence(admittedAt: number): number {
+    if (!Number.isFinite(admittedAt)) {
+      throw new Error("invalid admission time for legacy branch review job");
+    }
+    const sequence = Math.max(
+      1,
+      Math.min(Number.MAX_SAFE_INTEGER - 1, Math.trunc(admittedAt)),
+    );
+    this.observeSequence(sequence);
+    return sequence;
+  }
+
+  /** Advances the sequence floor while persisted jobs are being restored but not yet activated. */
+  observeSequence(sequence: number): void {
+    this.assertSequence(sequence, "restored branch review job");
+    this.sequence = Math.max(this.sequence, sequence);
   }
 
   async enqueue(job: BranchReviewJob): Promise<BranchReviewJobState> {
@@ -308,7 +335,7 @@ export class BranchReviewQueue {
 
   private store(job: BranchReviewJob, state: BranchReviewJobState): StoredBranchReviewJob {
     const sequence = job.sequence ?? this.reserveSequence();
-    this.sequence = Math.max(this.sequence, sequence);
+    this.observeSequence(sequence);
     const stored: StoredBranchReviewJob = {
       ...job,
       state,
@@ -327,18 +354,19 @@ export class BranchReviewQueue {
     if (!job.owner.trim()) throw new Error(`missing branch review owner for ${job.id}`);
     if (!job.branch.trim()) throw new Error(`missing branch for review job ${job.id}`);
     if (!Number.isFinite(job.order)) throw new Error(`invalid order for review job ${job.id}`);
-    if (
-      job.sequence !== undefined &&
-      (!Number.isSafeInteger(job.sequence) || job.sequence <= 0)
-    ) {
-      throw new Error(`invalid sequence for review job ${job.id}`);
-    }
+    if (job.sequence !== undefined) this.assertSequence(job.sequence, `review job ${job.id}`);
     if (typeof job.start !== "function") throw new Error(`missing start callback for ${job.id}`);
+  }
+
+  private assertSequence(sequence: number, description: string): void {
+    if (!Number.isSafeInteger(sequence) || sequence <= 0) {
+      throw new Error(`invalid sequence for ${description}`);
+    }
   }
 }
 
 function compareJobs(a: StoredBranchReviewJob, b: StoredBranchReviewJob): number {
-  return a.order - b.order || a.sequence - b.sequence || compareJobIds(a.id, b.id);
+  return a.sequence - b.sequence || a.order - b.order || compareJobIds(a.id, b.id);
 }
 
 function compareJobIds(a: string, b: string): number {

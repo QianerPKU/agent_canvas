@@ -382,6 +382,87 @@ describe("BranchReviewQueue", () => {
     expect(queue.reserveSequence()).toBe(3);
   });
 
+  it("observes restored sequence floors before deferred activation", () => {
+    const queue = new BranchReviewQueue();
+
+    queue.observeSequence(7);
+
+    expect(queue.reserveSequence()).toBe(8);
+  });
+
+  it("rejects an exhausted sequence before returning an unsafe position", () => {
+    const queue = new BranchReviewQueue();
+    queue.observeSequence(Number.MAX_SAFE_INTEGER);
+
+    expect(() => queue.reserveSequence()).toThrow("branch review sequence exhausted");
+    expect(() => queue.reserveSequence()).toThrow("branch review sequence exhausted");
+  });
+
+  it("migrates legacy positions independently of restoration order", () => {
+    const queue = new BranchReviewQueue();
+
+    const newer = queue.reserveLegacySequence(2000);
+    const older = queue.reserveLegacySequence(1000);
+
+    expect(older).toBeLessThan(newer);
+    expect(queue.reserveSequence()).toBe(2001);
+  });
+
+  it("keeps an older deferred head ahead when the wall clock moves backwards", async () => {
+    const queue = new BranchReviewQueue();
+    const starts: string[] = [];
+    let olderReady = false;
+
+    await expect(
+      queue.enqueue(
+        job(
+          "older",
+          "main",
+          100,
+          () => {
+            starts.push(olderReady ? "older-retry" : "older-attempt");
+            return olderReady ? "started" : "deferred";
+          },
+          undefined,
+          "test",
+          queue.reserveSequence(),
+        ),
+      ),
+    ).resolves.toBe("queued");
+
+    // The younger job sees a smaller wall-clock order, but its persistent sequence is later.
+    await expect(
+      queue.enqueue(
+        job(
+          "younger",
+          "main",
+          50,
+          () => {
+            starts.push("younger");
+            return "started";
+          },
+          undefined,
+          "test",
+          queue.reserveSequence(),
+        ),
+      ),
+    ).resolves.toBe("queued");
+
+    expect(starts).toEqual(["older-attempt"]);
+    expect(queue.stateOf("older")).toBe("queued");
+    expect(queue.stateOf("younger")).toBe("queued");
+
+    olderReady = true;
+    await expect(queue.retryBranch("main")).resolves.toBe("active");
+    expect(starts).toEqual(["older-attempt", "older-retry"]);
+    expect(queue.stateOf("younger")).toBe("queued");
+
+    queue.complete("older");
+    await flushMicrotasks();
+    expect(starts).toEqual(["older-attempt", "older-retry", "younger"]);
+    expect(queue.stateOf("younger")).toBe("active");
+  });
+
   it("clears all reservations and invalidates already scheduled restore drains", async () => {
     const queue = new BranchReviewQueue();
     let starts = 0;

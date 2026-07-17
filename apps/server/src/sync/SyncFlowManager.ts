@@ -156,11 +156,15 @@ export class SyncFlowManager {
                 "Review was requeued because its previous delivery cannot survive reload.",
             }
           : flow;
-      if (restored.status === "queued" && restored.reviewQueueSequence === undefined) {
-        restored = {
-          ...restored,
-          reviewQueueSequence: this.reviewQueue.reserveSequence(),
-        };
+      if (restored.status === "queued") {
+        if (restored.reviewQueueSequence === undefined) {
+          restored = {
+            ...restored,
+            reviewQueueSequence: this.reviewQueue.reserveLegacySequence(restored.createdAt),
+          };
+        } else {
+          this.reviewQueue.observeSequence(restored.reviewQueueSequence);
+        }
       }
       this.flows.set(flow.id, restored);
     }
@@ -328,7 +332,7 @@ export class SyncFlowManager {
       id: reviewJobId(flow.id),
       owner: REVIEW_QUEUE_OWNER,
       branch: flow.targetBranch,
-      order: flow.reviewRequest?.requestedAt ?? flow.createdAt,
+      order: flow.createdAt,
       sequence: flow.reviewQueueSequence,
       state,
       start: async () =>

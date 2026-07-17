@@ -345,6 +345,58 @@ describe("shared branch review queue across flow managers", () => {
     );
   });
 
+  it("admits a PR target stage behind a pull already queued on the target branch", async () => {
+    let now = 4500;
+    const host = new FakeHost();
+    host.addAgent("agent_source", "feature/a", "waiting_input");
+    const targetAgent = host.addAgent("agent_main", "main", "waiting_input");
+    const reviewQueue = new BranchReviewQueue();
+    const prManager = new PullRequestFlowManager({ host, reviewQueue, now: () => now });
+    const syncManager = new SyncFlowManager({ host, reviewQueue, now: () => now });
+
+    const pr = await prManager.create({
+      proposerAgentId: "agent_source",
+      targetBranch: "main",
+      summary: "Move from source review to a separately admitted target review",
+      files: ["src/pr-target-after-sync.ts"],
+    });
+    const sourceSequence = pr.reviewQueueSequence!;
+    now += 1;
+    host.assistant("agent_source", prReviewJson(pr), now);
+    await dispatchResult(prManager, syncManager, host.result("agent_source", now));
+    expect(prManager.get(pr.id)?.status).toBe("create_pr_authorized");
+
+    const pull = await syncManager.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_main",
+      sourceBranch: "release",
+      targetBranch: "main",
+      summary: "Occupy the target branch before the PR target stage is admitted",
+      reason: "The PR target stage must receive a fresh later queue position",
+      files: ["src/sync-before-pr-target.ts"],
+    });
+    expect(pull.status).toBe("review_collecting");
+
+    const targetPr = await prManager.recordPrCreated(pr.id, { prNumber: 8 });
+    expect(targetPr).toMatchObject({ status: "queued", currentStage: "target_merge" });
+    expect(targetPr.reviewQueueSequence).toBeGreaterThan(sourceSequence);
+    expect(targetPr.reviewQueueSequence).toBeGreaterThan(pull.reviewQueueSequence!);
+    expect(
+      matchingDeliveries(targetAgent, "Agent Canvas PR review request", targetPr.id),
+    ).toHaveLength(0);
+
+    now += 1;
+    host.assistant("agent_main", syncReviewJson(pull), now);
+    await dispatchResult(prManager, syncManager, host.result("agent_main", now));
+    await waitUntil(() => prManager.get(pr.id)?.status === "target_review_collecting");
+
+    expect(
+      matchingDeliveries(targetAgent, "Agent Canvas PR review request", targetPr.id),
+    ).toHaveLength(1);
+    prManager.cancel(pr.id);
+    syncManager.cancel(pull.id);
+  });
+
   it("requeues restored deliveries in persisted FIFO order independent of import order", async () => {
     let now = 1000;
     const host = new FakeHost();
@@ -513,6 +565,191 @@ describe("shared branch review queue across flow managers", () => {
 
     expect(
       matchingDeliveries(restoredRunner, "Agent Canvas PR review request", pr.id),
+    ).toHaveLength(1);
+  });
+
+  it("migrates sequence-less cross-manager snapshots by stable admission time", async () => {
+    let now = 1000;
+    const originalHost = new FakeHost();
+    originalHost.addAgent("agent_current", "feature/current", "waiting_input");
+    const originalQueue = new BranchReviewQueue();
+    const originalPr = new PullRequestFlowManager({
+      host: originalHost,
+      reviewQueue: originalQueue,
+      now: () => now,
+    });
+    const originalSync = new SyncFlowManager({
+      host: originalHost,
+      reviewQueue: originalQueue,
+      now: () => now,
+    });
+
+    const olderSync = await originalSync.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_current",
+      sourceBranch: "main",
+      targetBranch: "feature/current",
+      summary: "Legacy sync admitted first",
+      reason: "Its sequence was not persisted by the old snapshot format",
+      files: ["src/legacy-sync.ts"],
+    });
+    now = 2000;
+    const youngerPr = await originalPr.create({
+      proposerAgentId: "agent_current",
+      targetBranch: "main",
+      summary: "Legacy PR admitted second",
+      files: ["src/legacy-pr.ts"],
+    });
+    expect(olderSync.status).toBe("review_collecting");
+    expect(youngerPr.status).toBe("queued");
+
+    const syncState = originalSync.exportState().map(({ reviewQueueSequence: _, ...flow }) => flow);
+    const prState = originalPr.exportState().map(({ reviewQueueSequence: _, ...flow }) => flow);
+    originalSync.cancel(olderSync.id);
+    originalPr.cancel(youngerPr.id);
+
+    const restoredHost = new FakeHost();
+    const restoredRunner = restoredHost.addAgent(
+      "agent_current",
+      "feature/current",
+      "waiting_input",
+    );
+    const restoredQueue = new BranchReviewQueue();
+    const restoredPr = new PullRequestFlowManager({
+      host: restoredHost,
+      reviewQueue: restoredQueue,
+      now: () => now,
+    });
+    const restoredSync = new SyncFlowManager({
+      host: restoredHost,
+      reviewQueue: restoredQueue,
+      now: () => now,
+    });
+
+    // Production restores PR first. Legacy migration must not turn import order into FIFO order.
+    restoredPr.importState(prState as PullRequestFlowSnapshot[], { deferActivation: true });
+    restoredSync.importState(syncState as SyncFlowSnapshot[], { deferActivation: true });
+    restoredPr.activateImportedState();
+    restoredSync.activateImportedState();
+    await waitUntil(() => restoredSync.get(olderSync.id)?.status === "review_collecting");
+
+    expect(restoredSync.get(olderSync.id)?.reviewQueueSequence).toBe(1000);
+    expect(restoredPr.get(youngerPr.id)?.reviewQueueSequence).toBe(2000);
+    expect(restoredPr.get(youngerPr.id)?.status).toBe("queued");
+    expect(
+      matchingDeliveries(restoredRunner, "Agent Canvas sync review request", olderSync.id),
+    ).toHaveLength(1);
+    expect(
+      matchingDeliveries(restoredRunner, "Agent Canvas PR review request", youngerPr.id),
+    ).toHaveLength(0);
+
+    restoredSync.cancel(olderSync.id);
+    restoredPr.cancel(youngerPr.id);
+  });
+
+  it("keeps an older deferred stage first after it starts late and the managers reload", async () => {
+    let now = 1000;
+    const branch = "feature/shared";
+    const originalHost = new FakeHost();
+    originalHost.addAgent("agent_control", "control", "waiting_input");
+    const originalQueue = new BranchReviewQueue();
+    const originalPr = new PullRequestFlowManager({
+      host: originalHost,
+      reviewQueue: originalQueue,
+      now: () => now,
+    });
+    const originalSync = new SyncFlowManager({
+      host: originalHost,
+      reviewQueue: originalQueue,
+      now: () => now,
+    });
+
+    const olderSync = await originalSync.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_control",
+      sourceBranch: "main",
+      targetBranch: branch,
+      summary: "Older review waits for a branch reviewer",
+      reason: "Its original admission must survive a later activation",
+      files: ["src/older-sync.ts"],
+    });
+    expect(olderSync.status).toBe("queued");
+    expect(olderSync.reviewRequest).toBeUndefined();
+
+    now = 2000;
+    const youngerPr = await originalPr.create({
+      proposerAgentId: "agent_control",
+      sourceBranch: branch,
+      targetBranch: "main",
+      summary: "Younger PR waits behind the older sync review",
+      files: ["src/younger-pr.ts"],
+    });
+    expect(olderSync.createdAt).toBe(1000);
+    expect(youngerPr.createdAt).toBe(2000);
+    expect(youngerPr.status).toBe("queued");
+    expect(olderSync.reviewQueueSequence).toBeLessThan(youngerPr.reviewQueueSequence!);
+
+    now = 3000;
+    const originalReviewer = originalHost.addAgent("agent_shared", branch, "waiting_input");
+    await originalQueue.retryBranch(branch);
+    expect(originalSync.get(olderSync.id)?.status).toBe("review_collecting");
+    expect(originalSync.get(olderSync.id)?.reviewRequest?.requestedAt).toBe(3000);
+    expect(originalSync.get(olderSync.id)?.reviewRequest?.requestedAt).toBeGreaterThan(
+      youngerPr.createdAt,
+    );
+    expect(originalPr.get(youngerPr.id)?.status).toBe("queued");
+    expect(
+      matchingDeliveries(originalReviewer, "Agent Canvas sync review request", olderSync.id),
+    ).toHaveLength(1);
+    expect(
+      matchingDeliveries(originalReviewer, "Agent Canvas PR review request", youngerPr.id),
+    ).toHaveLength(0);
+
+    const syncState = originalSync.exportState();
+    const prState = originalPr.exportState();
+    originalSync.cancel(olderSync.id);
+    originalPr.cancel(youngerPr.id);
+
+    const restoredHost = new FakeHost();
+    restoredHost.addAgent("agent_control", "control", "waiting_input");
+    const restoredReviewer = restoredHost.addAgent("agent_shared", branch, "waiting_input");
+    const restoredQueue = new BranchReviewQueue();
+    const restoredPr = new PullRequestFlowManager({
+      host: restoredHost,
+      reviewQueue: restoredQueue,
+      now: () => now,
+    });
+    const restoredSync = new SyncFlowManager({
+      host: restoredHost,
+      reviewQueue: restoredQueue,
+      now: () => now,
+    });
+
+    // Restore the younger owner first; the persisted stage sequence must still keep it second.
+    restoredPr.importState(prState, { deferActivation: true });
+    restoredSync.importState(syncState, { deferActivation: true });
+    restoredPr.activateImportedState();
+    restoredSync.activateImportedState();
+    await waitUntil(() => restoredSync.get(olderSync.id)?.status === "review_collecting");
+
+    expect(restoredSync.get(olderSync.id)?.reviewQueueSequence).toBe(
+      olderSync.reviewQueueSequence,
+    );
+    expect(restoredPr.get(youngerPr.id)?.reviewQueueSequence).toBe(
+      youngerPr.reviewQueueSequence,
+    );
+    expect(restoredPr.get(youngerPr.id)?.status).toBe("queued");
+    expect(
+      matchingDeliveries(restoredReviewer, "Agent Canvas sync review request", olderSync.id),
+    ).toHaveLength(1);
+    expect(
+      matchingDeliveries(restoredReviewer, "Agent Canvas PR review request", youngerPr.id),
+    ).toHaveLength(0);
+
+    restoredSync.cancel(olderSync.id);
+    await waitUntil(() => restoredPr.get(youngerPr.id)?.status === "source_review_collecting");
+    expect(
+      matchingDeliveries(restoredReviewer, "Agent Canvas PR review request", youngerPr.id),
     ).toHaveLength(1);
   });
 

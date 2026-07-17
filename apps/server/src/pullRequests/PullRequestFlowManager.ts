@@ -170,11 +170,18 @@ export class PullRequestFlowManager {
         : flow.status === "queued" && !flow.currentStage
           ? { ...flow, currentStage: "source_preflight" as const }
           : flow;
-      if (queuedOrCollectingStage(restored) && restored.reviewQueueSequence === undefined) {
-        restored = {
-          ...restored,
-          reviewQueueSequence: this.reviewQueue.reserveSequence(),
-        };
+      const restoredStage = queuedOrCollectingStage(restored);
+      if (restoredStage) {
+        if (restored.reviewQueueSequence === undefined) {
+          restored = {
+            ...restored,
+            reviewQueueSequence: this.reviewQueue.reserveLegacySequence(
+              reviewJobOrder(restored, restoredStage),
+            ),
+          };
+        } else {
+          this.reviewQueue.observeSequence(restored.reviewQueueSequence);
+        }
       }
       this.flows.set(restored.id, restored);
     }
@@ -933,9 +940,7 @@ function reviewJobId(flowId: string, stage: PullRequestReviewStage): string {
 }
 
 function reviewJobOrder(flow: PullRequestFlowSnapshot, stage: PullRequestReviewStage): number {
-  const request = currentRequest(flow, stage);
-  if (request) return request.requestedAt;
-  if (stage === "target_merge") return flow.pr?.createdAt ?? flow.updatedAt;
+  if (stage === "target_merge") return flow.pr?.createdAt ?? flow.createdAt;
   return flow.createdAt;
 }
 
