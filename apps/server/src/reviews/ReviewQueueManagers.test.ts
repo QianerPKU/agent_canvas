@@ -633,8 +633,8 @@ describe("shared branch review queue across flow managers", () => {
     restoredSync.activateImportedState();
     await waitUntil(() => restoredSync.get(olderSync.id)?.status === "review_collecting");
 
-    expect(restoredSync.get(olderSync.id)?.reviewQueueSequence).toBe(1000);
-    expect(restoredPr.get(youngerPr.id)?.reviewQueueSequence).toBe(2000);
+    expect(restoredSync.get(olderSync.id)?.reviewQueueSequence).toBe(1);
+    expect(restoredPr.get(youngerPr.id)?.reviewQueueSequence).toBe(2);
     expect(restoredPr.get(youngerPr.id)?.status).toBe("queued");
     expect(
       matchingDeliveries(restoredRunner, "Agent Canvas sync review request", olderSync.id),
@@ -645,6 +645,57 @@ describe("shared branch review queue across flow managers", () => {
 
     restoredSync.cancel(olderSync.id);
     restoredPr.cancel(youngerPr.id);
+  });
+
+  it("migrates equal-time legacy pr_flow_9 before pr_flow_10 by numeric order", async () => {
+    const now = 1000;
+    const host = new FakeHost();
+    const reviewer = host.addAgent("agent_current", "feature/current", "waiting_input");
+    const reviewQueue = new BranchReviewQueue();
+    const manager = new PullRequestFlowManager({ host, reviewQueue, now: () => now });
+    const flow9: PullRequestFlowSnapshot = {
+      id: "pr_flow_9",
+      proposerAgentId: "agent_current",
+      sourceBranch: "feature/current",
+      targetBranch: "main",
+      summary: "Legacy PR nine",
+      files: ["src/legacy-9.ts"],
+      fileChanges: [{ status: "specified", path: "src/legacy-9.ts" }],
+      status: "queued",
+      createdAt: now,
+      updatedAt: now,
+      currentStage: "source_preflight",
+      reviewRequests: [],
+    };
+    const flow10: PullRequestFlowSnapshot = {
+      ...flow9,
+      id: "pr_flow_10",
+      summary: "Legacy PR ten",
+      files: ["src/legacy-10.ts"],
+      fileChanges: [{ status: "specified", path: "src/legacy-10.ts" }],
+    };
+
+    // Reverse persisted array order so only numeric flow order can recover the original FIFO.
+    manager.importState([flow10, flow9], { deferActivation: true });
+    manager.activateImportedState();
+    await waitUntil(() => manager.get(flow9.id)?.status === "source_review_collecting");
+
+    expect(manager.get(flow9.id)?.reviewQueueSequence).toBe(1);
+    expect(manager.get(flow10.id)?.reviewQueueSequence).toBe(2);
+    expect(manager.get(flow10.id)?.status).toBe("queued");
+    expect(
+      matchingDeliveries(reviewer, "Agent Canvas PR review request", flow9.id),
+    ).toHaveLength(1);
+    expect(
+      matchingDeliveries(reviewer, "Agent Canvas PR review request", flow10.id),
+    ).toHaveLength(0);
+
+    manager.cancel(flow9.id);
+    await waitUntil(() => manager.get(flow10.id)?.status === "source_review_collecting");
+    expect(
+      matchingDeliveries(reviewer, "Agent Canvas PR review request", flow10.id),
+    ).toHaveLength(1);
+    manager.cancel(flow10.id);
   });
 
   it("keeps an older deferred stage first after it starts late and the managers reload", async () => {

@@ -157,12 +157,7 @@ export class SyncFlowManager {
             }
           : flow;
       if (restored.status === "queued") {
-        if (restored.reviewQueueSequence === undefined) {
-          restored = {
-            ...restored,
-            reviewQueueSequence: this.reviewQueue.reserveLegacySequence(restored.createdAt),
-          };
-        } else {
+        if (restored.reviewQueueSequence !== undefined) {
           this.reviewQueue.observeSequence(restored.reviewQueueSequence);
         }
       }
@@ -334,6 +329,14 @@ export class SyncFlowManager {
       branch: flow.targetBranch,
       order: flow.createdAt,
       sequence: flow.reviewQueueSequence,
+      onSequenceAssigned: (sequence) => {
+        const current = this.flows.get(flow.id);
+        if (!current || (current.status !== "queued" && current.status !== "review_collecting")) {
+          return;
+        }
+        if (current.reviewQueueSequence === sequence) return;
+        this.flows.set(flow.id, { ...current, reviewQueueSequence: sequence });
+      },
       state,
       start: async () =>
         await this.trackPendingOperation(

@@ -398,14 +398,133 @@ describe("BranchReviewQueue", () => {
     expect(() => queue.reserveSequence()).toThrow("branch review sequence exhausted");
   });
 
-  it("migrates legacy positions independently of restoration order", () => {
+  it("normalizes sequence-less restore jobs independently of restoration order", async () => {
     const queue = new BranchReviewQueue();
+    const assigned = new Map<string, number>();
+    const starts: string[] = [];
 
-    const newer = queue.reserveLegacySequence(2000);
-    const older = queue.reserveLegacySequence(1000);
+    queue.replaceOwner("pull_request", [
+      job(
+        "pull_request:pr_flow_2:source_preflight",
+        "main",
+        2000,
+        () => {
+          starts.push("newer");
+          return "started";
+        },
+        "queued",
+        "pull_request",
+        undefined,
+        (sequence) => assigned.set("newer", sequence),
+      ),
+      job(
+        "pull_request:pr_flow_1:source_preflight",
+        "main",
+        1000,
+        () => {
+          starts.push("older");
+          return "started";
+        },
+        "queued",
+        "pull_request",
+        undefined,
+        (sequence) => assigned.set("older", sequence),
+      ),
+    ]);
+    await flushMicrotasks();
 
-    expect(older).toBeLessThan(newer);
-    expect(queue.reserveSequence()).toBe(2001);
+    expect(assigned.get("older")).toBe(1);
+    expect(assigned.get("newer")).toBe(2);
+    expect(starts).toEqual(["older"]);
+    expect(queue.reserveSequence()).toBe(3);
+  });
+
+  it("normalizes equal-time pr_flow_9 before pr_flow_10 by numeric flow order", async () => {
+    const queue = new BranchReviewQueue();
+    const assigned = new Map<string, number>();
+    const starts: string[] = [];
+
+    queue.replaceOwner("pull_request", [
+      job(
+        "pull_request:pr_flow_10:source_preflight",
+        "main",
+        1000,
+        () => {
+          starts.push("10");
+          return "started";
+        },
+        "queued",
+        "pull_request",
+        undefined,
+        (sequence) => assigned.set("10", sequence),
+      ),
+      job(
+        "pull_request:pr_flow_9:source_preflight",
+        "main",
+        1000,
+        () => {
+          starts.push("9");
+          return "started";
+        },
+        "queued",
+        "pull_request",
+        undefined,
+        (sequence) => assigned.set("9", sequence),
+      ),
+    ]);
+    await flushMicrotasks();
+
+    expect(assigned.get("9")).toBe(1);
+    expect(assigned.get("10")).toBe(2);
+    expect(starts).toEqual(["9"]);
+
+    queue.complete("pull_request:pr_flow_9:source_preflight");
+    await flushMicrotasks();
+    expect(starts).toEqual(["9", "10"]);
+  });
+
+  it("normalizes equal-time sync_flow_9 before sync_flow_10 without job suffixes", async () => {
+    const queue = new BranchReviewQueue();
+    const assigned = new Map<string, number>();
+    const starts: string[] = [];
+
+    queue.replaceOwner("sync", [
+      job(
+        "sync:sync_flow_10",
+        "main",
+        1000,
+        () => {
+          starts.push("10");
+          return "started";
+        },
+        "queued",
+        "sync",
+        undefined,
+        (sequence) => assigned.set("10", sequence),
+      ),
+      job(
+        "sync:sync_flow_9",
+        "main",
+        1000,
+        () => {
+          starts.push("9");
+          return "started";
+        },
+        "queued",
+        "sync",
+        undefined,
+        (sequence) => assigned.set("9", sequence),
+      ),
+    ]);
+    await flushMicrotasks();
+
+    expect(assigned.get("9")).toBe(1);
+    expect(assigned.get("10")).toBe(2);
+    expect(starts).toEqual(["9"]);
+
+    queue.complete("sync:sync_flow_9");
+    await flushMicrotasks();
+    expect(starts).toEqual(["9", "10"]);
   });
 
   it("keeps an older deferred head ahead when the wall clock moves backwards", async () => {
@@ -513,8 +632,9 @@ function job(
   state?: BranchReviewJob["state"],
   owner = "test",
   sequence?: number,
+  onSequenceAssigned?: BranchReviewJob["onSequenceAssigned"],
 ): BranchReviewJob {
-  return { id, owner, branch, order, sequence, state, start };
+  return { id, owner, branch, order, sequence, onSequenceAssigned, state, start };
 }
 
 function deferred<T>(): {

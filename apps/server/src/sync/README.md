@@ -33,7 +33,8 @@ When persisted canvas state is restored, an in-progress sync review is requeued 
 is discarded. An authoritative queue-wide sequence is persisted when each current PR or sync review
 stage is admitted, preserving total FIFO order across deferred activation, later request timestamps,
 equal timestamps, wall-clock rollback, and manager import order. Legacy snapshots without it receive
-a deterministic position from their immutable stage admission time. Agents, prompts, and layout are restored before the
+a distinct normalized position based on immutable stage admission time and natural numeric flow order
+before either queue owner drains. Agents, prompts, and layout are restored before the
 shared PR/sync queue is rebuilt and drained. The head starts with a fresh request and deadline only
 when the target branch has an active agent; otherwise it remains queued and is retried automatically
 when an agent becomes active or a waiting agent switches onto that branch. This prevents zero-reviewer

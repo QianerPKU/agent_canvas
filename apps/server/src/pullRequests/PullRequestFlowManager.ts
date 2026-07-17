@@ -171,17 +171,8 @@ export class PullRequestFlowManager {
           ? { ...flow, currentStage: "source_preflight" as const }
           : flow;
       const restoredStage = queuedOrCollectingStage(restored);
-      if (restoredStage) {
-        if (restored.reviewQueueSequence === undefined) {
-          restored = {
-            ...restored,
-            reviewQueueSequence: this.reviewQueue.reserveLegacySequence(
-              reviewJobOrder(restored, restoredStage),
-            ),
-          };
-        } else {
-          this.reviewQueue.observeSequence(restored.reviewQueueSequence);
-        }
+      if (restoredStage && restored.reviewQueueSequence !== undefined) {
+        this.reviewQueue.observeSequence(restored.reviewQueueSequence);
       }
       this.flows.set(restored.id, restored);
     }
@@ -386,6 +377,12 @@ export class PullRequestFlowManager {
       branch: stage === "source_preflight" ? flow.sourceBranch : flow.targetBranch,
       order: reviewJobOrder(flow, stage),
       sequence: flow.reviewQueueSequence,
+      onSequenceAssigned: (sequence) => {
+        const current = this.flows.get(flow.id);
+        if (!current || queuedOrCollectingStage(current) !== stage) return;
+        if (current.reviewQueueSequence === sequence) return;
+        this.flows.set(flow.id, { ...current, reviewQueueSequence: sequence });
+      },
       state,
       start: async () =>
         await this.trackPendingOperation(async () =>

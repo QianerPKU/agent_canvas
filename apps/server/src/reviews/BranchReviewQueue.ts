@@ -20,6 +20,8 @@ export interface BranchReviewJob {
    * sequence remain supported for backwards compatibility and receive one when they are stored.
    */
   sequence?: number;
+  /** Receives a migrated sequence when a legacy restored job did not persist one. */
+  onSequenceAssigned?: (sequence: number) => void;
   state?: BranchReviewJobState;
   start: () => BranchReviewStartResult | Promise<BranchReviewStartResult>;
 }
@@ -27,6 +29,7 @@ export interface BranchReviewJob {
 interface StoredBranchReviewJob extends BranchReviewJob {
   state: BranchReviewJobState;
   sequence: number;
+  legacySequence: boolean;
   deferred: boolean;
   startPending: boolean;
   inFlightLeases: number;
@@ -50,30 +53,17 @@ export class BranchReviewQueue {
   private readonly activeByBranch = new Map<string, StoredBranchReviewJob>();
   private readonly scheduledBranches = new Set<string>();
   private sequence = 0;
+  private authoritativeSequenceFloor = 0;
   private generation = 0;
 
   /** Reserves the next queue-wide sequence for a job whose ordering must survive persistence. */
   reserveSequence(): number {
+    this.freezeLegacySequences();
     if (this.sequence >= Number.MAX_SAFE_INTEGER) {
       throw new Error("branch review sequence exhausted");
     }
-    return ++this.sequence;
-  }
-
-  /**
-   * Gives a pre-sequence snapshot a deterministic position independent of manager import order.
-   * Distinct legacy admission timestamps retain their recoverable order; exact ties fall through
-   * to the queue's stable secondary keys because their original cross-owner order is unknowable.
-   */
-  reserveLegacySequence(admittedAt: number): number {
-    if (!Number.isFinite(admittedAt)) {
-      throw new Error("invalid admission time for legacy branch review job");
-    }
-    const sequence = Math.max(
-      1,
-      Math.min(Number.MAX_SAFE_INTEGER - 1, Math.trunc(admittedAt)),
-    );
-    this.observeSequence(sequence);
+    const sequence = ++this.sequence;
+    this.authoritativeSequenceFloor = Math.max(this.authoritativeSequenceFloor, sequence);
     return sequence;
   }
 
@@ -81,6 +71,7 @@ export class BranchReviewQueue {
   observeSequence(sequence: number): void {
     this.assertSequence(sequence, "restored branch review job");
     this.sequence = Math.max(this.sequence, sequence);
+    this.authoritativeSequenceFloor = Math.max(this.authoritativeSequenceFloor, sequence);
   }
 
   async enqueue(job: BranchReviewJob): Promise<BranchReviewJobState> {
@@ -164,6 +155,7 @@ export class BranchReviewQueue {
     this.scheduledBranches.clear();
     for (const job of [...this.jobs.values()]) this.retire(job);
     this.sequence = 0;
+    this.authoritativeSequenceFloor = 0;
   }
 
   /**
@@ -199,9 +191,9 @@ export class BranchReviewQueue {
       this.retire(current);
     }
 
-    const restored = jobs
-      .map((job) => this.store(job, job.state ?? "queued"))
-      .sort(compareJobs);
+    const restored = jobs.map((job) => this.store(job, job.state ?? "queued", true));
+    this.normalizeLegacySequences();
+    restored.sort(compareJobs);
     for (const job of restored) affectedBranches.add(job.branch);
 
     // Rebuild active reservations deterministically. Existing owners keep live reservations;
@@ -333,13 +325,19 @@ export class BranchReviewQueue {
     });
   }
 
-  private store(job: BranchReviewJob, state: BranchReviewJobState): StoredBranchReviewJob {
-    const sequence = job.sequence ?? this.reserveSequence();
-    this.observeSequence(sequence);
+  private store(
+    job: BranchReviewJob,
+    state: BranchReviewJobState,
+    restoring = false,
+  ): StoredBranchReviewJob {
+    const legacySequence = restoring && job.sequence === undefined;
+    const sequence = job.sequence ?? (legacySequence ? 1 : this.reserveSequence());
+    if (!legacySequence) this.observeSequence(sequence);
     const stored: StoredBranchReviewJob = {
       ...job,
       state,
       sequence,
+      legacySequence,
       deferred: false,
       startPending: false,
       inFlightLeases: 0,
@@ -349,12 +347,42 @@ export class BranchReviewQueue {
     return stored;
   }
 
+  private normalizeLegacySequences(): void {
+    const legacyJobs = [...this.jobs.values()]
+      .filter((job) => job.legacySequence)
+      .sort(compareLegacyJobs);
+    if (Number.MAX_SAFE_INTEGER - this.authoritativeSequenceFloor < legacyJobs.length) {
+      throw new Error("branch review sequence exhausted");
+    }
+    let sequence = this.authoritativeSequenceFloor;
+    for (const job of legacyJobs) {
+      sequence += 1;
+      job.sequence = sequence;
+      job.onSequenceAssigned?.(sequence);
+    }
+    this.sequence = Math.max(this.sequence, sequence);
+  }
+
+  private freezeLegacySequences(): void {
+    for (const job of this.jobs.values()) {
+      if (!job.legacySequence) continue;
+      job.legacySequence = false;
+      this.authoritativeSequenceFloor = Math.max(
+        this.authoritativeSequenceFloor,
+        job.sequence,
+      );
+    }
+  }
+
   private assertJob(job: BranchReviewJob): void {
     if (!job.id.trim()) throw new Error("missing branch review job id");
     if (!job.owner.trim()) throw new Error(`missing branch review owner for ${job.id}`);
     if (!job.branch.trim()) throw new Error(`missing branch for review job ${job.id}`);
     if (!Number.isFinite(job.order)) throw new Error(`invalid order for review job ${job.id}`);
     if (job.sequence !== undefined) this.assertSequence(job.sequence, `review job ${job.id}`);
+    if (job.onSequenceAssigned !== undefined && typeof job.onSequenceAssigned !== "function") {
+      throw new Error(`invalid sequence callback for review job ${job.id}`);
+    }
     if (typeof job.start !== "function") throw new Error(`missing start callback for ${job.id}`);
   }
 
@@ -369,6 +397,40 @@ function compareJobs(a: StoredBranchReviewJob, b: StoredBranchReviewJob): number
   return a.sequence - b.sequence || a.order - b.order || compareJobIds(a.id, b.id);
 }
 
+function compareLegacyJobs(a: StoredBranchReviewJob, b: StoredBranchReviewJob): number {
+  return a.order - b.order || compareJobIds(a.id, b.id);
+}
+
 function compareJobIds(a: string, b: string): number {
+  const parsedA = parseGeneratedJobId(a);
+  const parsedB = parseGeneratedJobId(b);
+  if (parsedA && parsedB && parsedA.prefix === parsedB.prefix) {
+    const numeric = compareDecimalStrings(parsedA.numericId, parsedB.numericId);
+    if (numeric !== 0) return numeric;
+    const suffix = compareStrings(parsedA.suffix, parsedB.suffix);
+    if (suffix !== 0) return suffix;
+  }
+  return compareStrings(a, b);
+}
+
+function parseGeneratedJobId(
+  id: string,
+): { prefix: string; numericId: string; suffix: string } | undefined {
+  const match = /^(pull_request:pr_flow_|sync:sync_flow_)(\d+)(:.*)?$/u.exec(id);
+  if (!match) return undefined;
+  return { prefix: match[1]!, numericId: match[2]!, suffix: match[3] ?? "" };
+}
+
+function compareDecimalStrings(a: string, b: string): number {
+  const normalizedA = a.replace(/^0+(?=\d)/u, "");
+  const normalizedB = b.replace(/^0+(?=\d)/u, "");
+  return (
+    normalizedA.length - normalizedB.length ||
+    compareStrings(normalizedA, normalizedB) ||
+    compareStrings(a, b)
+  );
+}
+
+function compareStrings(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
