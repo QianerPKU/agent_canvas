@@ -50,6 +50,7 @@ import {
 } from "./files/VscodeFileOpener.js";
 import { PromptManager } from "./prompts/PromptManager.js";
 import { PullRequestFlowManager } from "./pullRequests/PullRequestFlowManager.js";
+import { BranchReviewQueue } from "./reviews/BranchReviewQueue.js";
 import { CodexAuthManager } from "./sdk/CodexAuthManager.js";
 import { SyncFlowManager } from "./sync/SyncFlowManager.js";
 import {
@@ -75,6 +76,7 @@ export interface CreateServerResult {
   syncFlowManager: SyncFlowManager;
   commitManager: CommitManager;
   codexAuthManager: CodexAuthManager;
+  flushCanvasState(): Promise<void>;
 }
 
 type CodexModelDetectionInput =
@@ -91,6 +93,7 @@ export interface CreateServerOptions {
   workspaceManager?: WorkspaceManager;
   pullRequestFlowManager?: PullRequestFlowManager;
   syncFlowManager?: SyncFlowManager;
+  reviewQueue?: BranchReviewQueue;
   commitManager?: CommitManager;
   codexAuthManager?: CodexAuthManager;
   codexModelDetection?: CodexModelDetectionInput;
@@ -157,10 +160,20 @@ export function createServer(
     new PromptManager({
       workspaceRoot: defaultCwd,
     });
+  const injectedReviewQueues = [
+    options.reviewQueue,
+    options.pullRequestFlowManager?.getReviewQueue(),
+    options.syncFlowManager?.getReviewQueue(),
+  ].filter((queue): queue is BranchReviewQueue => queue !== undefined);
+  const reviewQueue = injectedReviewQueues[0] ?? new BranchReviewQueue();
+  if (injectedReviewQueues.some((queue) => queue !== reviewQueue)) {
+    throw new Error("PR and sync flow managers must share the same branch review queue");
+  }
   const pullRequestFlowManager =
     options.pullRequestFlowManager ??
     new PullRequestFlowManager({
       host: manager,
+      reviewQueue,
       ensureBranchesReady: async ({ sourceBranch, targetBranch }) =>
         await workspaceManager.ensurePullRequestBranchesReady(sourceBranch, targetBranch),
       resolveChangedFiles: async ({ sourceBranch, targetBranch }) =>
@@ -170,6 +183,7 @@ export function createServer(
     options.syncFlowManager ??
     new SyncFlowManager({
       host: manager,
+      reviewQueue,
       resolveChangedFiles: async ({ kind, sourceBranch, targetBranch, commitSha }) => {
         if (kind === "cherry_pick") {
           return await workspaceManager.changedFilesForCommit(commitSha, sourceBranch);
@@ -186,6 +200,7 @@ export function createServer(
     fileManager,
     promptManager,
     workspaceManager,
+    reviewQueue,
     pullRequestFlowManager,
     syncFlowManager,
     commitManager,
@@ -241,6 +256,7 @@ export function createServer(
         workspaceManager,
         pullRequestFlowManager,
         syncFlowManager,
+        reviewQueue,
         commitManager,
         codexAuthManager,
         defaultCwd,
@@ -332,6 +348,14 @@ export function createServer(
       .runProjectTransaction(
         async () => {
           broadcastFrame({ type: "event", envelope });
+          if (
+            envelope.event.kind === "status" &&
+            (envelope.event.status === "running" ||
+              envelope.event.status === "waiting_input")
+          ) {
+            const branch = manager.configOf(envelope.agentId)?.branch?.trim();
+            if (branch) await reviewQueue.retryBranch(branch);
+          }
           await Promise.all([
             pullRequestFlowManager.handleAgentEvent(envelope),
             syncFlowManager.handleAgentEvent(envelope),
@@ -370,6 +394,7 @@ export function createServer(
     syncFlowManager,
     commitManager,
     codexAuthManager,
+    flushCanvasState: async () => await canvasState.saveNow(),
   };
 }
 
@@ -382,6 +407,7 @@ async function handleHttp(
   workspaceManager: WorkspaceManager,
   pullRequestFlowManager: PullRequestFlowManager,
   syncFlowManager: SyncFlowManager,
+  reviewQueue: BranchReviewQueue,
   commitManager: CommitManager,
   codexAuthManager: CodexAuthManager,
   defaultCwd: string,
@@ -1377,6 +1403,12 @@ async function handleHttp(
           const snapshot = manager.updateSettings(id, settings, {
             branchSwitchPrompt: branchChanged ? branchSwitchPrompt(diff) : undefined,
           });
+          if (branchChanged && snapshot.status === "waiting_input") {
+            const destinationBranch = snapshot.config?.branch?.trim();
+            if (destinationBranch) {
+              await reviewQueue.retryBranch(destinationBranch);
+            }
+          }
           canvasState.saveSoon();
           return sendJson(res, 200, snapshot);
         } catch (error) {
@@ -1726,6 +1758,7 @@ interface CanvasStateControllerDeps {
   fileManager: FileManager;
   promptManager: PromptManager;
   workspaceManager: WorkspaceManager;
+  reviewQueue: BranchReviewQueue;
   pullRequestFlowManager: PullRequestFlowManager;
   syncFlowManager: SyncFlowManager;
   commitManager: CommitManager;
@@ -1834,6 +1867,14 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
     );
     await deps.workspaceManager.validateCurrentProjectRoot();
     const state = parseCanvasProjectState(canvasStateSnapshot?.content);
+
+    // Retire old-project deliveries before any asynchronous import can yield. Retired leases keep
+    // their branch reservation until the underlying transport settles, so a new same-branch
+    // review cannot overlap a stale blocked steer.
+    deps.reviewQueue.clear();
+    deps.pullRequestFlowManager.importState(undefined, { deferActivation: true });
+    deps.syncFlowManager.importState(undefined, { deferActivation: true });
+
     await deps.manager.importState(state?.agents);
     await deps.workspaceManager.validateCurrentProjectRoot();
     await deps.fileManager.importState(state?.files);
@@ -1841,9 +1882,12 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
     await deps.promptManager.importState(state?.prompts);
     await deps.workspaceManager.validateCurrentProjectRoot();
     deps.commitManager.importState(state?.commits);
+    layout = sanitizeCanvasLayout(state?.layout);
+
+    // Both owners are imported without activation only after agents, prompts, commits, and layout
+    // are complete. The route activates them together after broadcasting the restored snapshot.
     deps.pullRequestFlowManager.importState(state?.prFlows, { deferActivation: true });
     deps.syncFlowManager.importState(state?.syncFlows, { deferActivation: true });
-    layout = sanitizeCanvasLayout(state?.layout);
     canvasStateWritable = true;
     if (deps.manager.appSettings().workDocumentationEnabled) {
       try {
@@ -1910,6 +1954,11 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
         // the user explicitly reopens or replaces it.
         if (projectId && canvasStateProjectId === undefined) {
           await loadProjectState();
+          // An already-open WorkspaceManager has no explicit project-open route to perform the
+          // deferred handoff. Activate both queue owners before the triggering mutation can add
+          // new work, preserving restored FIFO order and zero-reviewer deferral on server start.
+          deps.pullRequestFlowManager.activateImportedState();
+          deps.syncFlowManager.activateImportedState();
         }
         if (!projectId || projectId !== canvasStateProjectId || !canvasStateWritable) {
           throw new Error(
@@ -1934,12 +1983,13 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
     loadProjectState,
     resetProjectStateAfterFailedLoad: async (error) => {
       clearSaveTimer();
+      deps.reviewQueue.clear();
+      deps.pullRequestFlowManager.importState(undefined, { deferActivation: true });
+      deps.syncFlowManager.importState(undefined, { deferActivation: true });
       await deps.manager.clear();
       await deps.fileManager.importState(undefined);
       await deps.promptManager.importState(undefined);
       deps.commitManager.importState(undefined);
-      deps.pullRequestFlowManager.importState(undefined);
-      deps.syncFlowManager.importState(undefined);
       layout = emptyCanvasLayout();
       const project = await deps.workspaceManager.project();
       applyProjectStorageRoots(
@@ -1957,12 +2007,13 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
     },
     unloadProjectState: async () => {
       clearSaveTimer();
+      deps.reviewQueue.clear();
+      deps.pullRequestFlowManager.importState(undefined, { deferActivation: true });
+      deps.syncFlowManager.importState(undefined, { deferActivation: true });
       await deps.manager.clear();
       await deps.fileManager.importState(undefined);
       await deps.promptManager.importState(undefined);
       deps.commitManager.importState(undefined);
-      deps.pullRequestFlowManager.importState(undefined);
-      deps.syncFlowManager.importState(undefined);
       layout = emptyCanvasLayout();
       workDocumentationStatus = { ready: true };
       canvasStateProjectId = undefined;

@@ -8,26 +8,33 @@ Each review request includes a concrete changed-file list. By default the server
 
 Before a PR flow can be created, the source branch must already include the target branch head. The server fetches the target branch and rejects the flow unless `origin/<target>` is an ancestor of the source branch, so the proposer must pull, merge, or rebase the target branch into the source branch first.
 
-## Queueing
+## Shared Branch Review Queue
 
-PR flows reserve both their `sourceBranch` and `targetBranch` while they are `queued` or active. If a new flow shares either branch with an existing queued or active flow, it enters `queued` and does not send review prompts yet.
+PR and sync reviews use one shared, review-stage queue. A PR does not reserve both branches for its entire lifetime. Instead, each review stage occupies only the branch whose agents must review it:
 
-When a flow closes (`merged`, `cancelled`, `timed_out`, `source_review_failed`, `target_review_failed`, or `blocked`), the manager scans queued flows in creation order and starts every candidate whose source and target branches are now free. This preserves FIFO ordering for flows that share a source or target branch without letting an older sync-blocked queued flow stall unrelated ready flows.
+- `source_preflight` uses the PR's `sourceBranch`.
+- `target_merge` uses the PR's `targetBranch`.
+- A sync review uses its `targetBranch`, so a pull into a PR source branch is serialized with that PR's source review.
 
-If a queued flow fails the branch readiness recheck because its source no longer includes the target branch head, it remains queued with a `failureReason`. After the proposer syncs and pushes the source branch, `POST /api/pr-flows/:id/retry` rechecks readiness and starts source review when the branches are ready.
+Only one review stage may run on a branch at a time. Stages waiting for the same branch start in FIFO order, while stages for different branches may run in parallel. This prevents a new review prompt from steering an agent away from an earlier review on the same branch without unnecessarily serializing unrelated work.
+
+The branch slot is invalidated as soon as the review stage approves, fails, times out, or is cancelled. If a review prompt is still being delivered, the slot remains reserved until that delivery settles; only then can the next same-branch stage start. This prevents a blocked `steer` from overlapping the next review. Source review still does not retain the slot while the proposer creates the PR, and target review does not retain it while the proposer performs the merge.
+
+A queued stage has no review deadline, so time spent waiting does not count toward the review timeout. Its deadline and timer start only when the stage actually begins collecting responses. A stage also remains queued when its branch has no running or waiting agent; an agent transition back to an active status, or a waiting agent switching onto the branch, retries the head automatically. If a queued source stage fails the branch readiness recheck because its source no longer includes the target branch head, it remains queued with a `failureReason`. After the proposer syncs and pushes the source branch, `POST /api/pr-flows/:id/retry` rechecks readiness.
+
+When persisted canvas state is restored, an in-progress review is converted back to `queued`, its old deadline is discarded, and its previous request remains as audit history. Each queued stage persists an authoritative sequence allocated when that stage enters the shared queue. Deferred activation, a later request timestamp, equal timestamps, and wall-clock rollback therefore cannot change PR/sync FIFO order across reloads. Older snapshots without a sequence remain loadable: all restored legacy jobs are normalized together by immutable stage admission time, then by natural numeric flow order for recoverable same-owner ties, before receiving distinct sequences. Exact legacy cross-owner ties use a stable natural job-id fallback because their original order was never recorded. The server first restores agents, prompts, and layout, then atomically rebuilds the PR and sync portions of the shared queue. An eligible head starts with a fresh request and deadline; a head without an active reviewer stays queued instead of being vacuously approved. This also ensures no review prompt or partial state save occurs while project restoration is incomplete.
 
 ## Flow
 
 1. The caller creates a PR flow with proposer agent, source branch, target branch, summary, and optional file scope.
-2. If the relevant branches are reserved, the flow becomes `queued`.
-3. Otherwise, active agents on the source branch receive a source preflight review request.
-4. Review agents must return the fixed JSON schema. Invalid JSON is retried once, then recorded as `blocked`.
-5. After all source reviews approve, the proposer receives `create_pr` authorization.
-6. After the proposer creates the GitHub PR, it reports `agentCanvasPrEvent: "pr_created"` or the UI calls `POST /api/pr-flows/:id/pr-created`.
-7. Active agents on the target branch receive a target merge review request.
-8. After all target reviews approve, the proposer receives `merge_pr` authorization.
+2. Its source preflight stage enters the shared queue for `sourceBranch` and starts when it reaches the head of that branch's queue.
+3. Active agents on the source branch receive the review request. Review agents must return the fixed JSON schema; invalid JSON is retried once, then recorded as `blocked`.
+4. Source approval releases `sourceBranch` and grants `create_pr` authorization. Failure, timeout, or cancellation also releases the branch without granting authorization.
+5. After the proposer creates the GitHub PR, it reports `agentCanvasPrEvent: "pr_created"` or the UI calls `POST /api/pr-flows/:id/pr-created`.
+6. The target merge stage enters the shared queue for `targetBranch`; active target-branch agents receive the request only after that stage acquires the branch.
+7. Target approval releases `targetBranch` and grants `merge_pr` authorization. The actual merge and its `merged` report happen after the queue slot has already been released.
 
-Any review or authorization stage defaults to a 2 hour timeout. After timeout, the flow enters `timed_out`, no further authorization is granted, and the manager attempts to start the next queued flow for the affected branches.
+An active review or authorization stage defaults to a 2 hour timeout. Queue waiting time is excluded from review timeout accounting, and a review-stage timeout releases the occupied branch before the next queued stage starts.
 
 ## Agent Output Protocol
 
@@ -70,6 +77,6 @@ Merge-complete output:
 
 ## Tests
 
-`PullRequestFlowManager.test.ts` covers source review approval, PR creation, target review approval, merge authorization, invalid JSON retry failure, timeout behavior, branch queueing, queued branch reservation, and changed-file resolution.
+`PullRequestFlowManager.test.ts` covers source review approval, PR creation, target review approval, merge authorization, invalid JSON retry failure, timeout behavior, per-stage branch queueing, blocked-delivery cancellation and timeout, zero-reviewer deferral, FIFO release, persistence recovery, and changed-file resolution.
 
 `PullRequestFlowManager.integration.test.ts` creates a real temporary git repository and bare remote, uses `WorkspaceManager` to clone `main`, `feature/pr-flow`, and `feature/other`, starts multiple fake agents, and verifies review delivery across source and target branches.

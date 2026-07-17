@@ -143,6 +143,7 @@ export function syncStatusMeta(status: SyncFlowSnapshot["status"]): {
   color: string;
 } {
   const labels: Record<SyncFlowSnapshot["status"], { label: string; color: string }> = {
+    queued: { label: "waiting for branch review", color: "#64748b" },
     review_collecting: { label: "reviewing", color: "#2563eb" },
     review_failed: { label: "review rejected", color: "#dc2626" },
     apply_authorized: { label: "authorized", color: "#7c3aed" },

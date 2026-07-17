@@ -3,6 +3,7 @@ import type { AgentStatus } from "./events.js";
 export type SyncFlowKind = "cherry_pick" | "branch_pull";
 
 export type SyncFlowStatus =
+  | "queued"
   | "review_collecting"
   | "review_failed"
   | "apply_authorized"
@@ -68,6 +69,7 @@ export interface SyncFlowReviewRequest {
   retryCounts: Record<string, number>;
   responses: SyncFlowReviewResponse[];
   requestedAt: number;
+  requestedAfterSeqs?: Record<string, number>;
   deadlineAt: number;
 }
 
@@ -108,6 +110,8 @@ export interface SyncFlowSnapshot {
   status: SyncFlowStatus;
   createdAt: number;
   updatedAt: number;
+  /** Persistent FIFO position for the flow's current branch-review queue job. */
+  reviewQueueSequence?: number;
   closedAt?: number;
   failureReason?: string;
   deadlineAt?: number;

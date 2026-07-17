@@ -225,7 +225,10 @@ export class AgentManager {
     this.seqs.set(id, 0);
     this.history.set(id, []);
     this.draftConfigs.set(id, draftConfig);
-    runner.on((event) => this.broadcast(id, event));
+    runner.on((event) => {
+      if (this.runners.get(id) !== runner) return;
+      this.broadcast(id, event);
+    });
     return runner;
   }
 

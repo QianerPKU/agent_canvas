@@ -11,6 +11,11 @@ import type {
   SyncFlowReviewResponse,
   SyncFlowSnapshot,
 } from "@agent-canvas/shared";
+import {
+  BranchReviewQueue,
+  type BranchReviewJob,
+  type BranchReviewStartResult,
+} from "../reviews/BranchReviewQueue.js";
 
 type DeliverableRunner = {
   deliver(text: string): Promise<void>;
@@ -38,6 +43,7 @@ export interface ResolveSyncChangedFiles {
 
 export interface SyncFlowManagerOptions {
   host: SyncFlowAgentHost;
+  reviewQueue?: BranchReviewQueue;
   resolveChangedFiles?: ResolveSyncChangedFiles;
   now?: () => number;
   reviewTimeoutMs?: number;
@@ -69,6 +75,7 @@ interface ParsedAgentEvent {
 
 const DEFAULT_REVIEW_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_REVIEW_RETRY_LIMIT = 1;
+const REVIEW_QUEUE_OWNER = "sync";
 const CLOSED_STATUSES: SyncFlowSnapshot["status"][] = [
   "review_failed",
   "applied",
@@ -79,6 +86,7 @@ const CLOSED_STATUSES: SyncFlowSnapshot["status"][] = [
 
 export class SyncFlowManager {
   private readonly host: SyncFlowAgentHost;
+  private readonly reviewQueue: BranchReviewQueue;
   private readonly resolveChangedFiles?: ResolveSyncChangedFiles;
   private readonly now: () => number;
   private readonly reviewTimeoutMs: number;
@@ -95,6 +103,7 @@ export class SyncFlowManager {
 
   constructor(options: SyncFlowManagerOptions) {
     this.host = options.host;
+    this.reviewQueue = options.reviewQueue ?? new BranchReviewQueue();
     this.resolveChangedFiles = options.resolveChangedFiles;
     this.now = options.now ?? Date.now;
     this.reviewTimeoutMs = options.reviewTimeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
@@ -131,9 +140,28 @@ export class SyncFlowManager {
   ): void {
     this.stateGeneration += 1;
     for (const flowId of this.timers.keys()) this.closeTimer(flowId);
+    // Retire live reservations immediately. An in-flight lease keeps its branch occupied until
+    // delivery settles, while deferred activation prevents restored prompts from being sent
+    // before the rest of the project state is authoritative.
+    this.reviewQueue.replaceOwner(REVIEW_QUEUE_OWNER, []);
     this.flows.clear();
     for (const flow of flows ?? []) {
-      this.flows.set(flow.id, flow);
+      let restored =
+        flow.status === "review_collecting"
+          ? {
+              ...flow,
+              status: "queued" as const,
+              deadlineAt: undefined,
+              failureReason:
+                "Review was requeued because its previous delivery cannot survive reload.",
+            }
+          : flow;
+      if (restored.status === "queued") {
+        if (restored.reviewQueueSequence !== undefined) {
+          this.reviewQueue.observeSequence(restored.reviewQueueSequence);
+        }
+      }
+      this.flows.set(flow.id, restored);
     }
     this.counter = maxNumericSuffix([...this.flows.keys()]);
     this.importedStateActivated = false;
@@ -144,6 +172,11 @@ export class SyncFlowManager {
     if (this.importedStateActivated) return;
     this.importedStateActivated = true;
     const generation = this.stateGeneration;
+    const reviewJobs = this.list().flatMap((flow) => {
+      if (flow.status !== "queued") return [];
+      return [this.reviewJob(flow, "queued")];
+    });
+    this.reviewQueue.replaceOwner(REVIEW_QUEUE_OWNER, reviewJobs);
     for (const flow of [...this.flows.values()]) {
       if (CLOSED_STATUSES.includes(flow.status) || flow.deadlineAt === undefined) continue;
       if (flow.deadlineAt <= this.now()) {
@@ -154,11 +187,16 @@ export class SyncFlowManager {
     }
   }
 
+  getReviewQueue(): BranchReviewQueue {
+    return this.reviewQueue;
+  }
+
   get(id: string): SyncFlowSnapshot | undefined {
     return this.flows.get(id);
   }
 
   async create(input: CreateSyncFlowInput): Promise<SyncFlowSnapshot> {
+    const epoch = this.stateGeneration;
     if (!input?.proposerAgentId) throw new Error("missing proposerAgentId");
     if (!input.summary?.trim()) throw new Error("missing summary");
     if (!input.reason?.trim()) throw new Error("missing reason");
@@ -190,10 +228,12 @@ export class SyncFlowManager {
       targetCwd: proposer.config.cwd,
       files: input.files,
     });
+    this.assertCurrentEpoch(epoch);
     if (fileChanges.length === 0) {
       throw new Error("sync flow requires a concrete changed file list");
     }
 
+    const createdAt = this.now();
     const flow: SyncFlowSnapshot = {
       id: `sync_flow_${++this.counter}`,
       kind: input.kind,
@@ -208,12 +248,15 @@ export class SyncFlowManager {
       reason: input.reason.trim(),
       files: pathsFromFileChanges(fileChanges),
       fileChanges,
-      status: "review_collecting",
-      createdAt: this.now(),
-      updatedAt: this.now(),
+      status: "queued",
+      createdAt,
+      updatedAt: createdAt,
+      reviewQueueSequence: this.reviewQueue.reserveSequence(),
     };
     this.flows.set(flow.id, flow);
-    await this.startReview(flow.id);
+    this.save(flow);
+    await this.reviewQueue.enqueue(this.reviewJob(flow, "queued"));
+    this.assertCurrentEpoch(epoch);
     return this.requireFlow(flow.id);
   }
 
@@ -259,26 +302,92 @@ export class SyncFlowManager {
       closedAt: this.now(),
     };
     this.save(next);
+    if (flow.status === "queued" || flow.status === "review_collecting") {
+      this.reviewQueue.complete(reviewJobId(flow.id));
+    }
     return next;
   }
 
   async handleAgentEvent(envelope: AgentEventEnvelope): Promise<void> {
     if (envelope.event.kind !== "result") return;
+    const epoch = this.stateGeneration;
     await Promise.resolve();
-    await this.captureReviewResult(envelope.agentId);
-    await this.captureAgentSyncEvent(envelope.agentId);
+    if (epoch !== this.stateGeneration) return;
+    await this.captureReviewResult(envelope, epoch);
+    if (epoch !== this.stateGeneration) return;
+    await this.captureAgentSyncEvent(envelope, epoch);
   }
 
-  private async startReview(flowId: string): Promise<void> {
+  private reviewJob(
+    flow: SyncFlowSnapshot,
+    state: BranchReviewJob["state"],
+  ): BranchReviewJob {
+    const epoch = this.stateGeneration;
+    return {
+      id: reviewJobId(flow.id),
+      owner: REVIEW_QUEUE_OWNER,
+      branch: flow.targetBranch,
+      order: flow.createdAt,
+      sequence: flow.reviewQueueSequence,
+      onSequenceAssigned: (sequence) => {
+        const current = this.flows.get(flow.id);
+        if (!current || (current.status !== "queued" && current.status !== "review_collecting")) {
+          return;
+        }
+        if (current.reviewQueueSequence === sequence) return;
+        this.flows.set(flow.id, { ...current, reviewQueueSequence: sequence });
+      },
+      state,
+      start: async () =>
+        await this.trackPendingOperation(
+          async () => await this.activateQueuedReview(flow.id, epoch),
+        ),
+    };
+  }
+
+  private async activateQueuedReview(
+    flowId: string,
+    epoch: number,
+  ): Promise<BranchReviewStartResult> {
+    if (epoch !== this.stateGeneration) return "started";
     const flow = this.requireFlow(flowId);
+    if (flow.status !== "queued") return "started";
     const reviewers = this.activeReviewersFor(flow);
+    if (reviewers.length === 0) {
+      this.save({
+        ...flow,
+        failureReason: `Queued sync review is waiting for an active reviewer on branch ${flow.targetBranch}.`,
+        updatedAt: this.now(),
+      });
+      return "deferred";
+    }
+    this.save({
+      ...flow,
+      status: "review_collecting",
+      failureReason: undefined,
+      updatedAt: this.now(),
+    });
+    await this.startReview(flowId, reviewers, epoch);
+    return "started";
+  }
+
+  private async startReview(
+    flowId: string,
+    reviewers: AgentSnapshot[],
+    epoch: number,
+  ): Promise<void> {
+    if (epoch !== this.stateGeneration) return;
+    const flow = this.requireFlow(flowId);
     const request: SyncFlowReviewRequest = {
-      id: `${flow.id}:review:1`,
+      id: nextReviewRequestId(flow),
       requestedAgentIds: reviewers.map((agent) => agent.id),
       pendingAgentIds: reviewers.map((agent) => agent.id),
       retryCounts: Object.fromEntries(reviewers.map((agent) => [agent.id, 0])),
       responses: [],
       requestedAt: this.now(),
+      requestedAfterSeqs: Object.fromEntries(
+        reviewers.map((agent) => [agent.id, lastHistorySeq(this.host.historyOf(agent.id))]),
+      ),
       deadlineAt: this.now() + this.reviewTimeoutMs,
     };
     this.save({
@@ -289,15 +398,16 @@ export class SyncFlowManager {
     });
     this.resetTimer(flowId, request.deadlineAt);
 
-    if (reviewers.length === 0) {
-      await this.finishReviewIfComplete(flowId);
-      return;
-    }
-
     for (const reviewer of reviewers) {
       try {
-        await this.deliverToAgent(reviewer.id, reviewPrompt(this.requireFlow(flowId)));
+        const delivery = await this.reviewQueue.runWhileReserved(
+          reviewJobId(flowId),
+          async () =>
+            await this.deliverToAgent(reviewer.id, reviewPrompt(this.requireFlow(flowId))),
+        );
+        if (delivery.status === "invalidated") return;
       } catch (error) {
+        if (!this.isCurrentReview(flowId, request.id, epoch)) return;
         this.recordSyntheticResponse(
           flowId,
           reviewer.id,
@@ -305,18 +415,28 @@ export class SyncFlowManager {
           `Failed to deliver sync review request: ${errorMessage(error)}`,
         );
       }
+      if (!this.isCurrentReview(flowId, request.id, epoch)) return;
     }
-    await this.finishReviewIfComplete(flowId);
+    if (!this.isCurrentReview(flowId, request.id, epoch)) return;
+    await this.finishReviewIfComplete(flowId, epoch);
   }
 
-  private async captureReviewResult(agentId: string): Promise<void> {
+  private async captureReviewResult(envelope: AgentEventEnvelope, epoch: number): Promise<void> {
+    const agentId = envelope.agentId;
     const openFlows = this.listOpenReviewFlowsFor(agentId);
     for (const flow of openFlows) {
       const request = flow.reviewRequest!;
-      const rawText = assistantTextSince(this.host.historyOf(agentId), request.requestedAt);
+      const rawText = assistantTextForResult(
+        this.host.historyOf(agentId),
+        envelope.seq,
+        request.requestedAt,
+        request.requestedAfterSeqs?.[agentId],
+      );
       const parsed = parseReview(rawText, flow.id);
       if (!parsed) {
-        await this.handleInvalidReview(flow.id, agentId);
+        if (hasRecognizedAgentCanvasOutput(rawText)) continue;
+        await this.handleInvalidReview(flow.id, agentId, epoch);
+        if (epoch !== this.stateGeneration) return;
         continue;
       }
       this.recordReviewResponse(flow.id, {
@@ -329,23 +449,33 @@ export class SyncFlowManager {
         retryCount: request.retryCounts[agentId] ?? 0,
         receivedAt: this.now(),
       });
-      await this.finishReviewIfComplete(flow.id);
+      await this.finishReviewIfComplete(flow.id, epoch);
+      if (epoch !== this.stateGeneration) return;
     }
   }
 
-  private async captureAgentSyncEvent(agentId: string): Promise<void> {
+  private async captureAgentSyncEvent(envelope: AgentEventEnvelope, epoch: number): Promise<void> {
+    const agentId = envelope.agentId;
     const possibleFlows = this.list().filter(
       (flow) => flow.proposerAgentId === agentId && flow.status === "apply_authorized",
     );
     for (const flow of possibleFlows) {
       const since = flow.applyAuthorization?.issuedAt ?? flow.updatedAt;
-      const parsed = parseAgentSyncEvent(assistantTextSince(this.host.historyOf(agentId), since));
+      const parsed = parseAgentSyncEvent(
+        assistantTextForResult(this.host.historyOf(agentId), envelope.seq, since),
+      );
       if (!parsed || parsed.flowId !== flow.id) continue;
       this.recordApplied(flow.id, parsed, agentId);
+      if (epoch !== this.stateGeneration) return;
     }
   }
 
-  private async handleInvalidReview(flowId: string, agentId: string): Promise<void> {
+  private async handleInvalidReview(
+    flowId: string,
+    agentId: string,
+    epoch: number,
+  ): Promise<void> {
+    if (epoch !== this.stateGeneration) return;
     const flow = this.requireFlow(flowId);
     const request = flow.reviewRequest;
     if (!request || !request.pendingAgentIds.includes(agentId)) return;
@@ -357,7 +487,11 @@ export class SyncFlowManager {
         reviewRequest: { ...request },
         updatedAt: this.now(),
       });
-      await this.deliverToAgent(agentId, retryPrompt(flow));
+      const delivery = await this.reviewQueue.runWhileReserved(
+        reviewJobId(flowId),
+        async () => await this.deliverToAgent(agentId, retryPrompt(flow)),
+      );
+      if (delivery.status === "invalidated") return;
       return;
     }
     this.recordReviewResponse(flowId, {
@@ -370,27 +504,31 @@ export class SyncFlowManager {
       retryCount,
       receivedAt: this.now(),
     });
-    await this.finishReviewIfComplete(flowId);
+    if (epoch !== this.stateGeneration) return;
+    await this.finishReviewIfComplete(flowId, epoch);
   }
 
-  private async finishReviewIfComplete(flowId: string): Promise<void> {
+  private async finishReviewIfComplete(flowId: string, epoch: number): Promise<void> {
+    if (epoch !== this.stateGeneration) return;
     const flow = this.requireFlow(flowId);
+    if (flow.status !== "review_collecting") return;
     const request = flow.reviewRequest;
     if (!request || request.pendingAgentIds.length > 0) return;
+    if (!hasCompleteReviewerCoverage(request)) return;
     this.closeTimer(flowId);
     const allApproved = request.responses.every((response) => response.decision === "approve");
     if (!allApproved) {
       const next = this.failFlow(flow, "review_failed", reviewSummary(request.responses));
-      await this.notifyProposer(next, reviewFailurePrompt(next, request.responses));
+      this.reviewQueue.complete(reviewJobId(flowId));
+      await this.notifyProposer(next, reviewFailurePrompt(next, request.responses), epoch);
       return;
     }
-    await this.authorizeApply(flow, request.responses);
+    const next = this.authorizeApply(flow);
+    this.reviewQueue.complete(reviewJobId(flowId));
+    await this.notifyProposer(next, applyAuthorizationPrompt(next, request.responses), epoch);
   }
 
-  private async authorizeApply(
-    flow: SyncFlowSnapshot,
-    responses: SyncFlowReviewResponse[],
-  ): Promise<void> {
+  private authorizeApply(flow: SyncFlowSnapshot): SyncFlowSnapshot {
     const authorization = {
       agentId: flow.proposerAgentId,
       issuedAt: this.now(),
@@ -405,7 +543,7 @@ export class SyncFlowManager {
     };
     this.save(next);
     this.resetTimer(flow.id, authorization.expiresAt);
-    await this.notifyProposer(next, applyAuthorizationPrompt(next, responses));
+    return next;
   }
 
   private failFlow(
@@ -425,11 +563,20 @@ export class SyncFlowManager {
     return next;
   }
 
-  private async notifyProposer(flow: SyncFlowSnapshot, text: string): Promise<void> {
+  private async notifyProposer(
+    flow: SyncFlowSnapshot,
+    text: string,
+    epoch: number,
+  ): Promise<void> {
+    if (!this.isCurrentGeneration(epoch)) return;
     try {
       await this.deliverToAgent(flow.proposerAgentId, text);
     } catch (error) {
-      if (!CLOSED_STATUSES.includes(flow.status)) {
+      if (
+        this.isCurrentGeneration(epoch) &&
+        this.flows.get(flow.id) === flow &&
+        !CLOSED_STATUSES.includes(flow.status)
+      ) {
         this.failFlow(flow, "blocked", `Failed to deliver proposer signal: ${errorMessage(error)}`);
       }
     }
@@ -538,6 +685,9 @@ export class SyncFlowManager {
         failureReason: "Sync flow timed out before the required agent responses arrived.",
       });
       this.closeTimer(flowId);
+      if (flow.status === "queued" || flow.status === "review_collecting") {
+        this.reviewQueue.complete(reviewJobId(flowId));
+      }
     } finally {
       this.pendingOperations.delete(token);
     }
@@ -551,6 +701,31 @@ export class SyncFlowManager {
     const timer = this.timers.get(flowId);
     if (timer !== undefined) this.clearTimer(timer);
     this.timers.delete(flowId);
+  }
+
+  private isCurrentReview(flowId: string, requestId: string, epoch: number): boolean {
+    if (epoch !== this.stateGeneration) return false;
+    const flow = this.flows.get(flowId);
+    return (
+      flow?.status === "review_collecting" &&
+      flow.reviewRequest?.id === requestId
+    );
+  }
+
+  private assertCurrentEpoch(epoch: number): void {
+    if (epoch !== this.stateGeneration) {
+      throw new Error("Sync flow state changed while the operation was in progress");
+    }
+  }
+
+  private async trackPendingOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const token = Symbol("sync-review-operation");
+    this.pendingOperations.add(token);
+    try {
+      return await operation();
+    } finally {
+      this.pendingOperations.delete(token);
+    }
   }
 
   private requireFlow(id: string): SyncFlowSnapshot {
@@ -571,13 +746,64 @@ export class SyncFlowManager {
   }
 }
 
+function reviewJobId(flowId: string): string {
+  return `${REVIEW_QUEUE_OWNER}:${flowId}:review`;
+}
+
+function nextReviewRequestId(flow: SyncFlowSnapshot): string {
+  const prefix = `${flow.id}:review:`;
+  const previousSuffix = flow.reviewRequest?.id.startsWith(prefix)
+    ? Number(flow.reviewRequest.id.slice(prefix.length))
+    : 0;
+  const nextSuffix = Number.isSafeInteger(previousSuffix) && previousSuffix > 0
+    ? previousSuffix + 1
+    : flow.reviewRequest
+      ? 2
+      : 1;
+  return `${prefix}${nextSuffix}`;
+}
+
 function isActiveAgentStatus(status: string): boolean {
   return status === "running" || status === "waiting_input";
 }
 
-function assistantTextSince(history: AgentEventEnvelope[], at: number): string {
+function lastHistorySeq(history: AgentEventEnvelope[]): number {
+  return history.reduce((max, entry) => Math.max(max, entry.seq), 0);
+}
+
+function hasCompleteReviewerCoverage(request: SyncFlowReviewRequest): boolean {
+  const requested = new Set(request.requestedAgentIds);
+  const responded = new Set(request.responses.map((response) => response.agentId));
+  return (
+    request.requestedAgentIds.length > 0 &&
+    requested.size === request.requestedAgentIds.length &&
+    request.pendingAgentIds.length === 0 &&
+    request.responses.length === request.requestedAgentIds.length &&
+    responded.size === request.responses.length &&
+    request.requestedAgentIds.every((agentId) => responded.has(agentId))
+  );
+}
+
+function assistantTextForResult(
+  history: AgentEventEnvelope[],
+  resultSeq: number,
+  requestedAt: number,
+  requestedAfterSeq?: number,
+): string {
+  const previousResultSeq = history.reduce(
+    (max, entry) =>
+      entry.seq < resultSeq && entry.event.kind === "result" ? Math.max(max, entry.seq) : max,
+    0,
+  );
+  const afterSeq = Math.max(previousResultSeq, requestedAfterSeq ?? 0);
   return history
-    .filter((entry) => entry.at >= at && entry.event.kind === "assistant_text")
+    .filter(
+      (entry) =>
+        entry.seq > afterSeq &&
+        entry.seq < resultSeq &&
+        entry.at >= requestedAt &&
+        entry.event.kind === "assistant_text",
+    )
     .map((entry) => (entry.event.kind === "assistant_text" ? entry.event.text : ""))
     .join("");
 }
@@ -617,6 +843,31 @@ function parseAgentSyncEvent(text: string): ParsedAgentEvent | undefined {
     };
   }
   return undefined;
+}
+
+function hasRecognizedAgentCanvasOutput(text: string): boolean {
+  return parseJsonObjects(text).some((candidate) => {
+    if (!isRecord(candidate) || typeof candidate.flowId !== "string") return false;
+    if (candidate.agentCanvasPrEvent === "pr_created" || candidate.agentCanvasPrEvent === "merged") {
+      return true;
+    }
+    if (candidate.agentCanvasSyncEvent === "applied") return true;
+    if (
+      candidate.agentCanvasPrReview === true &&
+      (candidate.stage === "source_preflight" || candidate.stage === "target_merge") &&
+      isReviewDecision(candidate.decision) &&
+      typeof candidate.summary === "string" &&
+      candidate.summary.trim()
+    ) {
+      return true;
+    }
+    return (
+      candidate.agentCanvasSyncReview === true &&
+      isReviewDecision(candidate.decision) &&
+      typeof candidate.summary === "string" &&
+      Boolean(candidate.summary.trim())
+    );
+  });
 }
 
 function parseJsonObjects(text: string): unknown[] {

@@ -461,6 +461,49 @@ describe("AgentManager fork", () => {
     expect(events).toContain("turn_context");
   });
 
+  it("ignores late events from a runner replaced during state restoration", async () => {
+    const { query, out } = makeWaitingQuery();
+    const mgr = new AgentManager({ query });
+    const forwarded: string[] = [];
+    mgr.onEvent((envelope) => forwarded.push(envelope.event.kind));
+
+    const original = mgr.create({ branch: "feature/reload" });
+    mgr.startAgent(original.id, {
+      prompt: "review before reload",
+      branch: "feature/reload",
+    });
+    out.push({
+      type: "system",
+      subtype: "init",
+      session_id: "session-before-reload",
+      model: "test",
+      cwd: "/repo",
+      tools: [],
+    });
+    await flush();
+
+    const persisted = mgr.exportState();
+    await mgr.importState(persisted);
+    const historyLengthAfterRestore = mgr.historyOf(original.id).length;
+    const forwardedAfterRestore = forwarded.length;
+
+    out.push({
+      type: "assistant",
+      message: {
+        id: "late-message",
+        role: "assistant",
+        content: [{ type: "text", text: "late output from the replaced runner" }],
+      },
+    });
+    out.push({ type: "result", subtype: "success", is_error: false });
+    await flush();
+
+    expect(mgr.historyOf(original.id)).toHaveLength(historyLengthAfterRestore);
+    expect(forwarded).toHaveLength(forwardedAfterRestore);
+    expect(mgr.get(original.id)).not.toBe(original);
+    expect(mgr.get(original.id)?.getStatus()).toBe("stopped");
+  });
+
   it("drops a delayed turn context after project state replaces the runner identity", async () => {
     let resolveOldContext!: (metadata: {
       branch?: string;

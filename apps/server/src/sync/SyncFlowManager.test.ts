@@ -5,6 +5,7 @@ import { SyncFlowManager, type SyncFlowAgentHost } from "./SyncFlowManager.js";
 class FakeRunner {
   readonly sent: string[] = [];
   readonly steered: string[] = [];
+  private nextSteerBlock?: Promise<void>;
   private deliveryError?: Error;
 
   constructor(private status: string) {}
@@ -15,6 +16,10 @@ class FakeRunner {
 
   setStatus(status: string): void {
     this.status = status;
+  }
+
+  blockNextSteerUntil(promise: Promise<void>): void {
+    this.nextSteerBlock = promise;
   }
 
   failDelivery(message: string): void {
@@ -30,6 +35,9 @@ class FakeRunner {
   async steer(text: string): Promise<void> {
     if (this.deliveryError) throw this.deliveryError;
     this.steered.push(text);
+    const block = this.nextSteerBlock;
+    this.nextSteerBlock = undefined;
+    if (block) await block;
   }
 
   async deliver(text: string): Promise<void> {
@@ -253,18 +261,117 @@ describe("SyncFlowManager", () => {
     expect(proposer.sent.at(-1)).toContain("Do not apply this sync flow");
   });
 
-  it("times out when reviewers do not all respond", async () => {
+  it("queues reviews for the same current branch and starts the next after authorization", async () => {
+    let now = 3500;
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/current", "waiting_input");
+    const manager = new SyncFlowManager({ host, now: () => now });
+
+    const first = await manager.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_1",
+      sourceBranch: "main",
+      summary: "First pull",
+      reason: "Need the first update",
+      files: ["src/first.ts"],
+    });
+    const second = await manager.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_1",
+      sourceBranch: "release",
+      summary: "Second pull",
+      reason: "Need the second update",
+      files: ["src/second.ts"],
+    });
+
+    expect(first.status).toBe("review_collecting");
+    expect(second.status).toBe("queued");
+    expect(second.reviewRequest).toBeUndefined();
+    expect(proposer.sent).toHaveLength(1);
+    expect(proposer.steered).toHaveLength(0);
+
+    now += 1;
+    proposer.setStatus("waiting_input");
+    host.assistant("agent_1", reviewJson(first, "approve"), now);
+    await manager.handleAgentEvent(host.result("agent_1", now));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(manager.get(first.id)?.status).toBe("apply_authorized");
+    expect(manager.get(second.id)?.status).toBe("review_collecting");
+    expect(manager.get(second.id)?.reviewRequest).toBeDefined();
+    expect(proposer.steered).toHaveLength(1);
+    expect(proposer.steered[0]).toContain(`flowId: ${second.id}`);
+  });
+
+  it("keeps the next same-branch review queued until cancelled delivery settles", async () => {
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/current", "running");
+    const manager = new SyncFlowManager({ host });
+
+    let releaseDelivery!: () => void;
+    const deliveryBlock = new Promise<void>((resolve) => {
+      releaseDelivery = resolve;
+    });
+    proposer.blockNextSteerUntil(deliveryBlock);
+
+    const firstCreation = manager.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_1",
+      sourceBranch: "main",
+      summary: "Cancelled pull",
+      reason: "Exercise queue cancellation",
+      files: ["src/first.ts"],
+    });
+    await waitForMicrotasks(() => proposer.steered.length === 1);
+    expect(manager.hasPendingOperations()).toBe(true);
+    const first = manager.list()[0]!;
+    const second = await manager.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_1",
+      sourceBranch: "release",
+      summary: "Pull after cancellation",
+      reason: "Must start after the branch slot is released",
+      files: ["src/second.ts"],
+    });
+    expect(second.status).toBe("queued");
+
+    manager.cancel(first.id);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(manager.get(first.id)?.status).toBe("cancelled");
+    expect(manager.get(second.id)?.status).toBe("queued");
+    expect(proposer.steered).toHaveLength(1);
+
+    releaseDelivery();
+    await firstCreation;
+    await waitForMicrotasks(() => manager.get(second.id)?.status === "review_collecting");
+    await waitForMicrotasks(() => !manager.hasPendingOperations());
+
+    expect(manager.get(second.id)?.status).toBe("review_collecting");
+    expect(manager.hasPendingOperations()).toBe(false);
+    expect(proposer.steered).toHaveLength(2);
+    expect(proposer.steered[1]).toContain(`flowId: ${second.id}`);
+  });
+
+  it("keeps the next same-branch review queued until timed-out delivery settles", async () => {
     vi.useFakeTimers();
     let now = 0;
     const host = new FakeHost();
-    host.addAgent("agent_1", "feature/current", "waiting_input");
+    const proposer = host.addAgent("agent_1", "feature/current", "running");
     const manager = new SyncFlowManager({
       host,
       now: () => now,
       reviewTimeoutMs: 10,
     });
 
-    const flow = await manager.create({
+    let releaseDelivery!: () => void;
+    const deliveryBlock = new Promise<void>((resolve) => {
+      releaseDelivery = resolve;
+    });
+    proposer.blockNextSteerUntil(deliveryBlock);
+
+    const firstCreation = manager.create({
       kind: "cherry_pick",
       proposerAgentId: "agent_1",
       commitSha: "abcdef123456",
@@ -272,10 +379,115 @@ describe("SyncFlowManager", () => {
       reason: "Needs review",
       files: ["src/timeout.ts"],
     });
+    await waitForMicrotasks(() => proposer.steered.length === 1);
+    expect(manager.hasPendingOperations()).toBe(true);
+    const first = manager.list()[0]!;
+    const second = await manager.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_1",
+      sourceBranch: "release",
+      summary: "Pull after timeout",
+      reason: "Must wait for the timed-out delivery to settle",
+      files: ["src/after-timeout.ts"],
+    });
+    expect(second.status).toBe("queued");
+
     now = 11;
     vi.advanceTimersByTime(11);
 
-    expect(manager.get(flow.id)?.status).toBe("timed_out");
+    expect(manager.get(first.id)?.status).toBe("timed_out");
+    expect(manager.get(second.id)?.status).toBe("queued");
+    expect(proposer.steered).toHaveLength(1);
+
+    releaseDelivery();
+    await firstCreation;
+    await waitForMicrotasks(() => manager.get(second.id)?.status === "review_collecting");
+    await waitForMicrotasks(() => !manager.hasPendingOperations());
+
+    expect(manager.get(second.id)?.status).toBe("review_collecting");
+    expect(manager.hasPendingOperations()).toBe(false);
+    expect(proposer.steered).toHaveLength(2);
+    expect(proposer.steered[1]).toContain(`flowId: ${second.id}`);
+  });
+
+  it.each(["timed_out", "cancelled", "applied"] as const)(
+    "does not let a late proposer-delivery rejection overwrite %s state",
+    async (terminalStatus) => {
+      vi.useFakeTimers();
+      let now = 0;
+      const host = new FakeHost();
+      const proposer = host.addAgent("agent_1", "feature/current", "running");
+      const reviewer = host.addAgent("agent_2", "feature/current", "running");
+      const manager = new SyncFlowManager({
+        host,
+        now: () => now,
+        reviewTimeoutMs: 10,
+      });
+
+      const flow = await manager.create({
+        kind: "branch_pull",
+        proposerAgentId: "agent_1",
+        sourceBranch: "main",
+        summary: `Late rejection after ${terminalStatus}`,
+        reason: "Exercise stale proposer-delivery rejection handling",
+        files: ["src/late-delivery.ts"],
+      });
+
+      now = 1;
+      host.assistant("agent_1", reviewJson(flow, "approve"), now);
+      await manager.handleAgentEvent(host.result("agent_1", now));
+      proposer.setStatus("running");
+
+      let rejectDelivery!: (reason: Error) => void;
+      const blockedDelivery = new Promise<void>((_resolve, reject) => {
+        rejectDelivery = reject;
+      });
+      proposer.blockNextSteerUntil(blockedDelivery);
+
+      now = 2;
+      host.assistant("agent_2", reviewJson(flow, "approve"), now);
+      const finishReview = manager.handleAgentEvent(host.result("agent_2", now));
+      await waitForMicrotasks(
+        () => manager.get(flow.id)?.status === "apply_authorized" && proposer.steered.length === 2,
+      );
+
+      if (terminalStatus === "timed_out") {
+        now = 13;
+        vi.advanceTimersByTime(11);
+      } else if (terminalStatus === "cancelled") {
+        manager.cancel(flow.id);
+      } else {
+        manager.recordApplied(flow.id, { summary: "Sync applied before delivery settled" });
+      }
+      expect(manager.get(flow.id)?.status).toBe(terminalStatus);
+
+      rejectDelivery(new Error("late proposer delivery failed"));
+      await finishReview;
+
+      expect(manager.get(flow.id)?.status).toBe(terminalStatus);
+    },
+  );
+
+  it("keeps a review queued when its target branch has no active reviewers", async () => {
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/current", "waiting_input");
+    const manager = new SyncFlowManager({ host });
+
+    const flow = await manager.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_1",
+      sourceBranch: "release",
+      targetBranch: "main",
+      summary: "Pull release into main",
+      reason: "Wait for a main-branch reviewer",
+      files: ["src/main.ts"],
+    });
+
+    expect(flow.status).toBe("queued");
+    expect(flow.reviewRequest).toBeUndefined();
+    expect(flow.failureReason).toContain("waiting for an active reviewer on branch main");
+    expect(proposer.sent).toEqual([]);
+    expect(proposer.steered).toEqual([]);
   });
 
   it("rebuilds future timers and immediately expires overdue flows on import", async () => {
@@ -288,7 +500,7 @@ describe("SyncFlowManager", () => {
       now: () => now,
       reviewTimeoutMs: 10,
     });
-    const flow = await original.create({
+    let flow = await original.create({
       kind: "cherry_pick",
       proposerAgentId: "agent_1",
       commitSha: "abcdef123456",
@@ -296,6 +508,12 @@ describe("SyncFlowManager", () => {
       reason: "Exercise import",
       files: ["src/import-timeout.ts"],
     });
+    now = 1;
+    host.runners.get("agent_1")?.setStatus("waiting_input");
+    host.assistant("agent_1", reviewJson(flow, "approve"), now);
+    await original.handleAgentEvent(host.result("agent_1", now));
+    flow = original.get(flow.id)!;
+    expect(flow.status).toBe("apply_authorized");
     const state = original.exportState();
     original.importState(undefined);
 
@@ -325,7 +543,7 @@ describe("SyncFlowManager", () => {
       now: () => now,
       reviewTimeoutMs: 10,
     });
-    const flow = await original.create({
+    let flow = await original.create({
       kind: "cherry_pick",
       proposerAgentId: "agent_1",
       commitSha: "abcdef123456",
@@ -333,6 +551,12 @@ describe("SyncFlowManager", () => {
       reason: "Publish workspace first",
       files: ["src/deferred-import.ts"],
     });
+    now = 1;
+    host.runners.get("agent_1")?.setStatus("waiting_input");
+    host.assistant("agent_1", reviewJson(flow, "approve"), now);
+    await original.handleAgentEvent(host.result("agent_1", now));
+    flow = original.get(flow.id)!;
+    expect(flow.status).toBe("apply_authorized");
     const state = original.exportState();
     original.importState(undefined);
     now = 20;
@@ -343,7 +567,7 @@ describe("SyncFlowManager", () => {
     restored.importState(state, { deferActivation: true });
     vi.advanceTimersByTime(100);
 
-    expect(restored.get(flow.id)?.status).toBe("review_collecting");
+    expect(restored.get(flow.id)?.status).toBe("apply_authorized");
     expect(observed).toEqual([]);
     restored.activateImportedState();
     expect(restored.get(flow.id)?.status).toBe("timed_out");
@@ -385,6 +609,14 @@ describe("SyncFlowManager", () => {
     expect(manager.hasPendingOperations()).toBe(false);
   });
 });
+
+async function waitForMicrotasks(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 25; attempt += 1) {
+    if (predicate()) return;
+    await Promise.resolve();
+  }
+  throw new Error("timed out waiting for async sync review work");
+}
 
 function reviewJson(
   flow: SyncFlowSnapshot,

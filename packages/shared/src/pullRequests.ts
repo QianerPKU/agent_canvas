@@ -64,6 +64,7 @@ export interface PullRequestReviewRequest {
   retryCounts: Record<string, number>;
   responses: PullRequestReviewResponse[];
   requestedAt: number;
+  requestedAfterSeqs?: Record<string, number>;
   deadlineAt: number;
 }
 
@@ -93,6 +94,8 @@ export interface PullRequestFlowSnapshot {
   status: PullRequestFlowStatus;
   createdAt: number;
   updatedAt: number;
+  /** Persistent FIFO position for the flow's current branch-review queue job. */
+  reviewQueueSequence?: number;
   closedAt?: number;
   failureReason?: string;
   currentStage?: PullRequestReviewStage;
