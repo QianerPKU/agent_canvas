@@ -608,6 +608,25 @@ describe("SyncFlowManager", () => {
     expect(manager.list()).toEqual([]);
     expect(manager.hasPendingOperations()).toBe(false);
   });
+
+  it("uses the same two hour default timeout as PR reviews", async () => {
+    const now = 5000;
+    const host = new FakeHost();
+    host.addAgent("agent_1", "feature/current", "waiting_input");
+    const manager = new SyncFlowManager({ host, now: () => now });
+
+    const flow = await manager.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_1",
+      sourceBranch: "main",
+      summary: "Default timeout",
+      reason: "Match the PR review deadline",
+      files: ["src/default-timeout.ts"],
+    });
+
+    expect(flow.deadlineAt).toBe(now + 2 * 60 * 60 * 1000);
+    expect(flow.reviewRequest?.deadlineAt).toBe(now + 2 * 60 * 60 * 1000);
+  });
 });
 
 async function waitForMicrotasks(predicate: () => boolean): Promise<void> {

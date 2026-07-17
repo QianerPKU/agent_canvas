@@ -16,6 +16,7 @@ import {
   type BranchReviewJob,
   type BranchReviewStartResult,
 } from "../reviews/BranchReviewQueue.js";
+import { DEFAULT_BRANCH_REVIEW_TIMEOUT_MS } from "../reviews/reviewDefaults.js";
 
 type DeliverableRunner = {
   deliver(text: string): Promise<void>;
@@ -73,7 +74,6 @@ interface ParsedAgentEvent {
   fileChanges?: SyncFlowChangedFile[];
 }
 
-const DEFAULT_REVIEW_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_REVIEW_RETRY_LIMIT = 1;
 const REVIEW_QUEUE_OWNER = "sync";
 const CLOSED_STATUSES: SyncFlowSnapshot["status"][] = [
@@ -106,7 +106,7 @@ export class SyncFlowManager {
     this.reviewQueue = options.reviewQueue ?? new BranchReviewQueue();
     this.resolveChangedFiles = options.resolveChangedFiles;
     this.now = options.now ?? Date.now;
-    this.reviewTimeoutMs = options.reviewTimeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
+    this.reviewTimeoutMs = options.reviewTimeoutMs ?? DEFAULT_BRANCH_REVIEW_TIMEOUT_MS;
     this.reviewRetryLimit = options.reviewRetryLimit ?? DEFAULT_REVIEW_RETRY_LIMIT;
     this.setTimer = options.setTimer ?? ((callback, delay) => setTimeout(callback, delay));
     this.clearTimer =
