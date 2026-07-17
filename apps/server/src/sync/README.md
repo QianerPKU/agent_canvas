@@ -7,8 +7,8 @@
 
 The manager mirrors the PR flow delivery mechanics: active agents on the target branch review the
 request, running agents receive a steer message, waiting agents receive a normal send, invalid JSON
-is retried once, and a 10 minute timeout closes stale flows. The manager only grants permission; the
-proposer agent still performs the actual git commands and reports completion.
+is retried once, and a 2 hour timeout matching PR reviews closes stale flows. The manager only grants
+permission; the proposer agent still performs the actual git commands and reports completion.
 
 ## Shared Branch Review Queue
 
@@ -20,7 +20,7 @@ for that same branch.
 
 Only one review may run on a branch at a time. Reviews for the same branch start in FIFO order, while
 reviews for different branches may run in parallel. A queued sync flow has no active review request
-or review deadline, so queue waiting time does not count toward its 10 minute review timeout. The
+or review deadline, so queue waiting time does not count toward its 2 hour review timeout. The
 deadline starts when the review actually begins.
 
 Approval, rejection, timeout, or cancellation invalidates the target-branch slot. If a prompt
