@@ -264,6 +264,7 @@ function accessibleDirectories(
     ...new Set([
       ...(fileAccess?.readableDirectories ?? []),
       ...(fileAccess?.writableDirectories ?? []),
+      ...(fileAccess?.sandboxWritableDirectories ?? []),
       ...(promptAccess?.writableDirectories ?? []),
     ]),
   ];

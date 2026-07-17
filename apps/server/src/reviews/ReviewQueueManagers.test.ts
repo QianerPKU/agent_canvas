@@ -45,6 +45,18 @@ class FakeRunner {
     this.nextSteerBlock = undefined;
     if (block) await block;
   }
+
+  async deliver(text: string): Promise<void> {
+    if (this.status === "running") {
+      await this.steer(text);
+      return;
+    }
+    if (this.status === "waiting_input") {
+      this.send(text);
+      return;
+    }
+    throw new Error(`runner is not active (${this.status})`);
+  }
 }
 
 class FakeHost implements PullRequestAgentHost, SyncFlowAgentHost {

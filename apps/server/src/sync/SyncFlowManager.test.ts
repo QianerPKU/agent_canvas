@@ -6,6 +6,7 @@ class FakeRunner {
   readonly sent: string[] = [];
   readonly steered: string[] = [];
   private nextSteerBlock?: Promise<void>;
+  private deliveryError?: Error;
 
   constructor(private status: string) {}
 
@@ -21,16 +22,28 @@ class FakeRunner {
     this.nextSteerBlock = promise;
   }
 
-  send(text: string): void {
+  failDelivery(message: string): void {
+    this.deliveryError = new Error(message);
+  }
+
+  async send(text: string): Promise<void> {
+    if (this.deliveryError) throw this.deliveryError;
     this.sent.push(text);
     this.status = "running";
   }
 
   async steer(text: string): Promise<void> {
+    if (this.deliveryError) throw this.deliveryError;
     this.steered.push(text);
     const block = this.nextSteerBlock;
     this.nextSteerBlock = undefined;
     if (block) await block;
+  }
+
+  async deliver(text: string): Promise<void> {
+    if (this.status === "running") return await this.steer(text);
+    if (this.status === "waiting_input") return await this.send(text);
+    throw new Error(`agent is not active (${this.status})`);
   }
 }
 
@@ -98,6 +111,30 @@ afterEach(() => {
 });
 
 describe("SyncFlowManager", () => {
+  it("awaits direct send and steer validation failures before completing review delivery", async () => {
+    const host = new FakeHost();
+    const waiting = host.addAgent("agent_waiting", "feature/current", "waiting_input");
+    const running = host.addAgent("agent_running", "feature/current", "running");
+    waiting.failDelivery("documentation mount was replaced");
+    running.failDelivery("documentation mount was replaced");
+    const manager = new SyncFlowManager({ host });
+
+    const flow = await manager.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_waiting",
+      sourceBranch: "main",
+      targetBranch: "feature/current",
+      summary: "Catch up with main",
+      reason: "Need shared fixes",
+      files: ["src/example.ts"],
+    });
+
+    expect(flow.status).toBe("review_failed");
+    expect(flow.failureReason).toContain("Failed to deliver sync review request");
+    expect(waiting.sent).toEqual([]);
+    expect(running.steered).toEqual([]);
+  });
+
   it("authorizes and records an applied cherry-pick after current-branch approvals", async () => {
     let now = 1000;
     const host = new FakeHost();
@@ -286,6 +323,7 @@ describe("SyncFlowManager", () => {
       files: ["src/first.ts"],
     });
     await waitForMicrotasks(() => proposer.steered.length === 1);
+    expect(manager.hasPendingOperations()).toBe(true);
     const first = manager.list()[0]!;
     const second = await manager.create({
       kind: "branch_pull",
@@ -308,8 +346,10 @@ describe("SyncFlowManager", () => {
     releaseDelivery();
     await firstCreation;
     await waitForMicrotasks(() => manager.get(second.id)?.status === "review_collecting");
+    await waitForMicrotasks(() => !manager.hasPendingOperations());
 
     expect(manager.get(second.id)?.status).toBe("review_collecting");
+    expect(manager.hasPendingOperations()).toBe(false);
     expect(proposer.steered).toHaveLength(2);
     expect(proposer.steered[1]).toContain(`flowId: ${second.id}`);
   });
@@ -340,6 +380,7 @@ describe("SyncFlowManager", () => {
       files: ["src/timeout.ts"],
     });
     await waitForMicrotasks(() => proposer.steered.length === 1);
+    expect(manager.hasPendingOperations()).toBe(true);
     const first = manager.list()[0]!;
     const second = await manager.create({
       kind: "branch_pull",
@@ -361,8 +402,10 @@ describe("SyncFlowManager", () => {
     releaseDelivery();
     await firstCreation;
     await waitForMicrotasks(() => manager.get(second.id)?.status === "review_collecting");
+    await waitForMicrotasks(() => !manager.hasPendingOperations());
 
     expect(manager.get(second.id)?.status).toBe("review_collecting");
+    expect(manager.hasPendingOperations()).toBe(false);
     expect(proposer.steered).toHaveLength(2);
     expect(proposer.steered[1]).toContain(`flowId: ${second.id}`);
   });
@@ -387,6 +430,125 @@ describe("SyncFlowManager", () => {
     expect(flow.failureReason).toContain("waiting for an active reviewer on branch main");
     expect(proposer.sent).toEqual([]);
     expect(proposer.steered).toEqual([]);
+  });
+
+  it("rebuilds future timers and immediately expires overdue flows on import", async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    const host = new FakeHost();
+    host.addAgent("agent_1", "feature/current", "waiting_input");
+    const original = new SyncFlowManager({
+      host,
+      now: () => now,
+      reviewTimeoutMs: 10,
+    });
+    let flow = await original.create({
+      kind: "cherry_pick",
+      proposerAgentId: "agent_1",
+      commitSha: "abcdef123456",
+      summary: "Persisted timeout",
+      reason: "Exercise import",
+      files: ["src/import-timeout.ts"],
+    });
+    now = 1;
+    host.runners.get("agent_1")?.setStatus("waiting_input");
+    host.assistant("agent_1", reviewJson(flow, "approve"), now);
+    await original.handleAgentEvent(host.result("agent_1", now));
+    flow = original.get(flow.id)!;
+    expect(flow.status).toBe("apply_authorized");
+    const state = original.exportState();
+    original.importState(undefined);
+
+    now = 5;
+    const restored = new SyncFlowManager({ host, now: () => now });
+    restored.importState(state);
+    expect(restored.hasOpenFlows()).toBe(true);
+    now = 11;
+    vi.advanceTimersByTime(6);
+    expect(restored.get(flow.id)?.status).toBe("timed_out");
+    expect(restored.hasOpenFlows()).toBe(false);
+
+    now = 20;
+    const overdue = new SyncFlowManager({ host, now: () => now });
+    overdue.importState(state);
+    expect(overdue.get(flow.id)?.status).toBe("timed_out");
+    expect(overdue.hasPendingOperations()).toBe(false);
+  });
+
+  it("defers imported timeout activation until the caller publishes authoritative state", async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    const host = new FakeHost();
+    host.addAgent("agent_1", "feature/current", "waiting_input");
+    const original = new SyncFlowManager({
+      host,
+      now: () => now,
+      reviewTimeoutMs: 10,
+    });
+    let flow = await original.create({
+      kind: "cherry_pick",
+      proposerAgentId: "agent_1",
+      commitSha: "abcdef123456",
+      summary: "Deferred imported timeout",
+      reason: "Publish workspace first",
+      files: ["src/deferred-import.ts"],
+    });
+    now = 1;
+    host.runners.get("agent_1")?.setStatus("waiting_input");
+    host.assistant("agent_1", reviewJson(flow, "approve"), now);
+    await original.handleAgentEvent(host.result("agent_1", now));
+    flow = original.get(flow.id)!;
+    expect(flow.status).toBe("apply_authorized");
+    const state = original.exportState();
+    original.importState(undefined);
+    now = 20;
+
+    const restored = new SyncFlowManager({ host, now: () => now });
+    const observed: SyncFlowSnapshot[] = [];
+    restored.onFlow((next) => observed.push(next));
+    restored.importState(state, { deferActivation: true });
+    vi.advanceTimersByTime(100);
+
+    expect(restored.get(flow.id)?.status).toBe("apply_authorized");
+    expect(observed).toEqual([]);
+    restored.activateImportedState();
+    expect(restored.get(flow.id)?.status).toBe("timed_out");
+    expect(observed.map((next) => next.status)).toEqual(["timed_out"]);
+    restored.activateImportedState();
+    expect(observed).toHaveLength(1);
+  });
+
+  it("ignores a stale timeout callback after importing replacement state", async () => {
+    let now = 0;
+    const callbacks: Array<() => void> = [];
+    const host = new FakeHost();
+    host.addAgent("agent_1", "feature/current", "waiting_input");
+    const manager = new SyncFlowManager({
+      host,
+      now: () => now,
+      reviewTimeoutMs: 10,
+      setTimer: (callback) => {
+        callbacks.push(callback);
+        return callback;
+      },
+      clearTimer: () => undefined,
+    });
+    await manager.create({
+      kind: "cherry_pick",
+      proposerAgentId: "agent_1",
+      commitSha: "abcdef123456",
+      summary: "Stale callback",
+      reason: "Exercise generation guard",
+      files: ["src/stale-timeout.ts"],
+    });
+    const staleCallback = callbacks[0]!;
+
+    manager.importState(undefined);
+    now = 11;
+    staleCallback();
+
+    expect(manager.list()).toEqual([]);
+    expect(manager.hasPendingOperations()).toBe(false);
   });
 });
 

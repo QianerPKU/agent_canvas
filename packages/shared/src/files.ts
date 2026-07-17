@@ -76,6 +76,8 @@ export interface AgentFileAccess {
   readableFiles: AgentFileReference[];
   readableDirectories?: string[];
   writableFiles: AgentFileReference[];
+  /** Extra provider sandbox roots that must not disable normal approval prompts. */
+  sandboxWritableDirectories?: string[];
   writableDirectories: string[];
   sharedResources?: AgentSharedResourceReference[];
 }
@@ -85,6 +87,7 @@ export function emptyAgentFileAccess(): AgentFileAccess {
     readableFiles: [],
     readableDirectories: [],
     writableFiles: [],
+    sandboxWritableDirectories: [],
     writableDirectories: [],
     sharedResources: [],
   };

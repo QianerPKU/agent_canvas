@@ -287,6 +287,94 @@ describe("AgentManager fork", () => {
     expect(mgr.appSettings().fullPermissionMode).toBe(true);
   });
 
+  it("persists work documentation settings and defaults legacy state to disabled", async () => {
+    const { query } = makeQuery();
+    const manager = new AgentManager({ query });
+    expect(manager.appSettings()).toEqual({
+      fullPermissionMode: false,
+      workDocumentationEnabled: false,
+    });
+
+    manager.updateAppSettings({ workDocumentationEnabled: true });
+    const state = manager.exportState();
+    const restored = new AgentManager({ query });
+    await restored.importState(state);
+    expect(restored.appSettings()).toEqual({
+      fullPermissionMode: false,
+      workDocumentationEnabled: true,
+    });
+
+    await restored.importState({
+      ...state,
+      appSettings: { fullPermissionMode: true } as typeof state.appSettings,
+    });
+    expect(restored.appSettings()).toEqual({
+      fullPermissionMode: true,
+      workDocumentationEnabled: false,
+    });
+  });
+
+  it("waits for old runners to terminate while suppressing their final events", async () => {
+    const output = new AsyncMessageQueue<SdkMessage>();
+    let markTerminationStarted!: () => void;
+    let releaseTermination!: () => void;
+    const terminationStarted = new Promise<void>((resolve) => {
+      markTerminationStarted = resolve;
+    });
+    const terminationRelease = new Promise<void>((resolve) => {
+      releaseTermination = resolve;
+    });
+    const query: QueryFn = () => ({
+      [Symbol.asyncIterator]: () => output[Symbol.asyncIterator](),
+      terminate: async () => {
+        markTerminationStarted();
+        await terminationRelease;
+        output.close();
+      },
+    });
+    const manager = new AgentManager({ query });
+    const oldRunner = manager.create({ systemPrompt: "old project" });
+    await manager.startAgent(oldRunner.id, { prompt: "keep running" });
+    await flush();
+
+    const replacement = new AgentManager({ query: makeQuery().query });
+    replacement.create({ systemPrompt: "new project first" });
+    replacement.create({ systemPrompt: "new project second" });
+    const replacementState = replacement.exportState();
+    const observed: SdkMessage[] = [];
+    manager.onEvent((envelope) => observed.push(envelope.event as unknown as SdkMessage));
+
+    const importing = manager.importState(replacementState);
+    await terminationStarted;
+    expect(manager.list()).toHaveLength(1);
+    expect(manager.list()[0]?.config.systemPrompt).toBe("old project");
+    expect(observed).toEqual([]);
+
+    releaseTermination();
+    await importing;
+    expect(manager.list().map((agent) => agent.config.systemPrompt)).toEqual([
+      "new project first",
+      "new project second",
+    ]);
+    expect(observed).toEqual([]);
+  });
+
+  it("clear resets all application settings", async () => {
+    const { query } = makeQuery();
+    const manager = new AgentManager({ query });
+    manager.updateAppSettings({
+      fullPermissionMode: true,
+      workDocumentationEnabled: true,
+    });
+
+    await manager.clear();
+
+    expect(manager.appSettings()).toEqual({
+      fullPermissionMode: false,
+      workDocumentationEnabled: false,
+    });
+  });
+
   it("currentTurnIndex follows completed result turns", async () => {
     const { query, out } = makeWaitingQuery();
     const mgr = new AgentManager({ query });
@@ -395,7 +483,7 @@ describe("AgentManager fork", () => {
     await flush();
 
     const persisted = mgr.exportState();
-    mgr.importState(persisted);
+    await mgr.importState(persisted);
     const historyLengthAfterRestore = mgr.historyOf(original.id).length;
     const forwardedAfterRestore = forwarded.length;
 
@@ -414,5 +502,51 @@ describe("AgentManager fork", () => {
     expect(forwarded).toHaveLength(forwardedAfterRestore);
     expect(mgr.get(original.id)).not.toBe(original);
     expect(mgr.get(original.id)?.getStatus()).toBe("stopped");
+  });
+
+  it("drops a delayed turn context after project state replaces the runner identity", async () => {
+    let resolveOldContext!: (metadata: {
+      branch?: string;
+      cwd?: string;
+      baseCommitSha?: string;
+    }) => void;
+    const oldContext = new Promise<{
+      branch?: string;
+      cwd?: string;
+      baseCommitSha?: string;
+    }>((resolve) => {
+      resolveOldContext = resolve;
+    });
+    const { query } = makeQuery("old-session");
+    const manager = new AgentManager({
+      query,
+      resolveTurnContext: async () => await oldContext,
+    });
+    const oldRunner = manager.create({ branch: "old", cwd: "/old" });
+    await manager.startAgent(oldRunner.id, {
+      prompt: "resolve metadata later",
+      branch: "old",
+      cwd: "/old",
+    });
+
+    const replacement = new AgentManager({ query: makeQuery("new-session").query });
+    replacement.create({ branch: "new", cwd: "/new" });
+    await manager.importState(replacement.exportState());
+
+    resolveOldContext({
+      branch: "old",
+      cwd: "/old",
+      baseCommitSha: "abcdef1234567890",
+    });
+    await flush();
+    await flush();
+
+    expect(manager.snapshot(oldRunner.id)?.config).toMatchObject({
+      branch: "new",
+      cwd: "/new",
+    });
+    expect(
+      manager.historyOf(oldRunner.id).some((entry) => entry.event.kind === "turn_context"),
+    ).toBe(false);
   });
 });

@@ -32,42 +32,47 @@ describe("branch review queue project reload", () => {
   const cleanup: Array<() => Promise<void>> = [];
 
   afterEach(async () => {
-    for (const dispose of cleanup.splice(0)) await dispose();
+    for (const dispose of cleanup.splice(0).reverse()) await dispose();
   });
 
   it("requeues a collecting review across a real project reload and resumes it after its reviewer restarts", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-review-reload-"));
-    const query = makeQueryHub();
-    const manager = new AgentManager({
-      query: query.query,
-      codexQuery: query.query,
+    cleanup.push(() => removeTempRoot(root));
+    const firstQuery = makeQueryHub();
+    const firstManager = new AgentManager({
+      query: firstQuery.query,
+      codexQuery: firstQuery.query,
       defaultCwd: root,
     });
-    const harness = await createHarness(root, manager);
-    cleanup.push(harness.dispose);
+    const firstHarness = await createHarness(root, firstManager);
+    cleanup.push(firstHarness.dispose);
 
-    const projectA = await request(harness.port, "POST", "/api/canvas-projects", {
+    const projectA = await request(firstHarness.port, "POST", "/api/canvas-projects", {
       name: "review-reload-a",
+      projectRoot: path.join(root, "review-reload-a"),
     });
     expect(projectA.status).toBe(201);
 
-    const reviewer = manager.create({
+    const reviewer = firstManager.create({
       provider: "codex",
       branch: "feature/reload-review",
       cwd: root,
     });
-    manager.startAgent(reviewer.id, {
-      provider: "codex",
-      branch: "feature/reload-review",
-      cwd: root,
-      prompt: "start reviewer",
-    });
-    const firstSession = query.sessions.at(-1);
+    void firstManager
+      .startAgent(reviewer.id, {
+        provider: "codex",
+        branch: "feature/reload-review",
+        cwd: root,
+        prompt: "start reviewer",
+      })
+      .catch(() => undefined);
+    await waitUntil(() => firstQuery.sessions.length === 1);
+    const firstSession = firstQuery.sessions.at(-1);
     if (!firstSession) throw new Error("expected the reviewer's first query session");
     firstSession.output.push(systemInit(reviewer.id, root));
     await waitUntil(() => reviewer.getStatus() === "running");
 
-    const created = await harness.syncFlowManager.create({
+    const created = await firstHarness.syncFlowManager.create({
       kind: "branch_pull",
       proposerAgentId: reviewer.id,
       sourceBranch: "main",
@@ -82,38 +87,60 @@ describe("branch review queue project reload", () => {
     const firstReviewRequestId = created.reviewRequest?.id;
     expect(firstReviewRequestId).toBeTruthy();
 
-    const projectB = await request(harness.port, "POST", "/api/canvas-projects", {
-      name: "review-reload-b",
+    const statePath = path.join(projectA.json.project.projectRoot, "canvas-state.json");
+    await waitUntilAsync(async () => {
+      try {
+        const persisted = JSON.parse(await readFile(statePath, "utf-8"));
+        return persisted.syncFlows?.[0]?.status === "review_collecting";
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
     });
-    expect(projectB.status).toBe(201);
-    expect(manager.list()).toEqual([]);
-    expect(harness.syncFlowManager.list()).toEqual([]);
+    await firstHarness.close();
 
-    const reopened = await request(harness.port, "POST", "/api/canvas-projects/open", {
+    const restartedQuery = makeQueryHub();
+    const restartedManager = new AgentManager({
+      query: restartedQuery.query,
+      codexQuery: restartedQuery.query,
+      defaultCwd: root,
+    });
+    const restartedHarness = await createHarness(root, restartedManager);
+    cleanup.push(restartedHarness.dispose);
+
+    const reopened = await request(restartedHarness.port, "POST", "/api/canvas-projects/open", {
       id: projectA.json.project.id,
     });
     expect(reopened.status).toBe(200);
-    await waitUntil(() => harness.syncFlowManager.get(created.id)?.status === "queued");
+    await waitUntil(() => restartedHarness.syncFlowManager.get(created.id)?.status === "queued");
 
-    const restoredReviewer = manager.get(reviewer.id);
+    const restoredReviewer = restartedManager.get(reviewer.id);
     if (!restoredReviewer) throw new Error("expected the reviewer to be restored");
     expect(restoredReviewer.getStatus()).toBe("stopped");
-    expect(harness.syncFlowManager.get(created.id)?.status).toBe("queued");
-    expect(harness.syncFlowManager.get(created.id)?.applyAuthorization).toBeUndefined();
-    expect(harness.syncFlowManager.get(created.id)?.reviewRequest?.responses).toEqual([]);
+    expect(restartedHarness.syncFlowManager.get(created.id)?.status).toBe("queued");
+    expect(
+      restartedHarness.syncFlowManager.get(created.id)?.applyAuthorization,
+    ).toBeUndefined();
+    expect(
+      restartedHarness.syncFlowManager.get(created.id)?.reviewRequest?.responses,
+    ).toEqual([]);
+    expect(restartedQuery.sessions).toEqual([]);
 
-    manager.startAgent(reviewer.id, { prompt: "restart restored reviewer" });
-    const restartedSession = query.sessions.at(-1);
-    if (!restartedSession || restartedSession === firstSession) {
+    void restartedManager
+      .startAgent(reviewer.id, { prompt: "restart restored reviewer" })
+      .catch(() => undefined);
+    await waitUntil(() => restartedQuery.sessions.length === 1);
+    const restartedSession = restartedQuery.sessions.at(-1);
+    if (!restartedSession) {
       throw new Error("expected a fresh query session for the restored reviewer");
     }
     restartedSession.output.push(systemInit(reviewer.id, root));
 
     await waitUntil(
-      () => harness.syncFlowManager.get(created.id)?.status === "review_collecting",
+      () => restartedHarness.syncFlowManager.get(created.id)?.status === "review_collecting",
     );
     await waitUntil(() => restartedSession.steered.length === 1);
-    const resumed = harness.syncFlowManager.get(created.id);
+    const resumed = restartedHarness.syncFlowManager.get(created.id);
     expect(resumed?.reviewRequest).toMatchObject({
       requestedAgentIds: [reviewer.id],
       pendingAgentIds: [reviewer.id],
@@ -121,41 +148,182 @@ describe("branch review queue project reload", () => {
     });
     expect(resumed?.reviewRequest?.id).not.toBe(firstReviewRequestId);
     expect(inputText(restartedSession.steered[0])).toContain(`flowId: ${created.id}`);
-  });
+  }, 15_000);
+
+  it("activates restored queues on the first mutation of an auto-open project before admitting a new same-branch review", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-review-auto-open-"));
+    cleanup.push(() => removeTempRoot(root));
+    const branch = "feature/auto-open-review";
+    const projectRoot = path.join(root, "auto-open-project");
+
+    const firstHost = new FakeReviewHost(branch);
+    const firstQueue = new BranchReviewQueue();
+    const firstPrManager = new PullRequestFlowManager({
+      host: firstHost,
+      reviewQueue: firstQueue,
+    });
+    const firstSyncManager = new SyncFlowManager({
+      host: firstHost,
+      reviewQueue: firstQueue,
+    });
+    const firstManager = new AgentManager({ query: emptyQuery, defaultCwd: root });
+    const firstHarness = await createHarness(root, firstManager, {
+      reviewQueue: firstQueue,
+      pullRequestFlowManager: firstPrManager,
+      syncFlowManager: firstSyncManager,
+    });
+    cleanup.push(firstHarness.dispose);
+
+    const project = await request(firstHarness.port, "POST", "/api/canvas-projects", {
+      name: "auto-open-review",
+      projectRoot,
+    });
+    expect(project.status).toBe(201);
+
+    const restoredPr = await firstPrManager.create({
+      proposerAgentId: firstHost.agentId,
+      targetBranch: "main",
+      title: "Persisted auto-open PR",
+      summary: "This restored review must retain the first branch reservation",
+      files: ["src/restored-pr.ts"],
+    });
+    const restoredSync = await firstSyncManager.create({
+      kind: "branch_pull",
+      proposerAgentId: firstHost.agentId,
+      sourceBranch: "main",
+      targetBranch: branch,
+      strategy: "merge",
+      summary: "Persisted auto-open sync",
+      reason: "This restored review must remain second in the shared FIFO",
+      files: ["src/restored-sync.ts"],
+    });
+    expect(restoredPr.status).toBe("source_review_collecting");
+    expect(restoredSync.status).toBe("queued");
+
+    const statePath = path.join(projectRoot, "canvas-state.json");
+    await waitUntilAsync(async () => {
+      try {
+        const persisted = JSON.parse(await readFile(statePath, "utf-8"));
+        return (
+          persisted.prFlows?.[0]?.id === restoredPr.id &&
+          persisted.syncFlows?.[0]?.id === restoredSync.id
+        );
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+    });
+    await firstHarness.close();
+
+    const restartedHost = new FakeReviewHost(branch);
+    const restartedQueue = new BranchReviewQueue();
+    const restartedPrManager = new PullRequestFlowManager({
+      host: restartedHost,
+      reviewQueue: restartedQueue,
+    });
+    const restartedSyncManager = new SyncFlowManager({
+      host: restartedHost,
+      reviewQueue: restartedQueue,
+    });
+    const restartedManager = new AgentManager({ query: emptyQuery, defaultCwd: root });
+    const restartedHarness = await createHarness(root, restartedManager, {
+      workspaceProjectRoot: projectRoot,
+      reviewQueue: restartedQueue,
+      pullRequestFlowManager: restartedPrManager,
+      syncFlowManager: restartedSyncManager,
+    });
+    cleanup.push(restartedHarness.dispose);
+
+    // The WorkspaceManager already considers this project open. A read establishes request
+    // revision headers but deliberately does not go through the explicit /canvas-projects/open
+    // restoration path.
+    const workspace = await request(restartedHarness.port, "GET", "/api/workspace");
+    expect(workspace.status).toBe(200);
+    expect(workspace.json.projectRoot).toBe(projectRoot);
+    expect(restartedPrManager.list()).toEqual([]);
+    expect(restartedSyncManager.list()).toEqual([]);
+
+    const fresh = await request(restartedHarness.port, "POST", "/api/sync-flows", {
+      kind: "branch_pull",
+      proposerAgentId: restartedHost.agentId,
+      sourceBranch: "release",
+      targetBranch: branch,
+      strategy: "merge",
+      summary: "Fresh review after auto-open reload",
+      reason: "It must not overtake either restored branch review",
+      files: ["src/fresh-sync.ts"],
+    });
+    expect(fresh.status, JSON.stringify(fresh.json)).toBe(201);
+    expect(fresh.json.flow.status).toBe("queued");
+
+    await waitUntil(
+      () => restartedPrManager.get(restoredPr.id)?.status === "source_review_collecting",
+    );
+    expect(restartedSyncManager.get(restoredSync.id)?.status).toBe("queued");
+    expect(restartedSyncManager.get(fresh.json.flow.id)?.status).toBe("queued");
+    expect(restartedHost.runner.sent).toHaveLength(1);
+    expect(restartedHost.runner.sent[0]).toContain(`flowId: ${restoredPr.id}`);
+
+    restartedPrManager.cancel(restoredPr.id);
+    await waitUntil(
+      () => restartedSyncManager.get(restoredSync.id)?.status === "review_collecting",
+    );
+    expect(restartedSyncManager.get(fresh.json.flow.id)?.status).toBe("queued");
+    expect(restartedHost.runner.sent).toHaveLength(2);
+    expect(restartedHost.runner.sent[1]).toContain(`flowId: ${restoredSync.id}`);
+
+    restartedSyncManager.cancel(restoredSync.id);
+    await waitUntil(
+      () => restartedSyncManager.get(fresh.json.flow.id)?.status === "review_collecting",
+    );
+    expect(restartedHost.runner.sent).toHaveLength(3);
+    expect(restartedHost.runner.sent[2]).toContain(`flowId: ${fresh.json.flow.id}`);
+  }, 15_000);
 
   it("waits for prompt and layout restoration before rebuilding or persisting PR and sync queues", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-review-barrier-"));
-    const promptManager = new BlockingPromptManager({
+    cleanup.push(() => removeTempRoot(root));
+    const firstPromptManager = new PromptManager({
       workspaceRoot: root,
       promptRoot: path.join(root, "prompts"),
     });
-    const host = new FakeReviewHost("feature/restore-barrier");
-    const reviewQueue = new BranchReviewQueue();
-    const pullRequestFlowManager = new PullRequestFlowManager({
-      host,
-      reviewQueue,
+    const firstHost = new FakeReviewHost("feature/restore-barrier");
+    const firstReviewQueue = new BranchReviewQueue();
+    const firstPullRequestFlowManager = new PullRequestFlowManager({
+      host: firstHost,
+      reviewQueue: firstReviewQueue,
     });
-    const syncFlowManager = new SyncFlowManager({ host, reviewQueue });
-    const manager = new AgentManager({ query: emptyQuery, defaultCwd: root });
-    const harness = await createHarness(root, manager, {
-      promptManager,
-      reviewQueue,
-      pullRequestFlowManager,
-      syncFlowManager,
+    const firstSyncFlowManager = new SyncFlowManager({
+      host: firstHost,
+      reviewQueue: firstReviewQueue,
     });
-    cleanup.push(harness.dispose);
+    const firstManager = new AgentManager({ query: emptyQuery, defaultCwd: root });
+    const firstHarness = await createHarness(root, firstManager, {
+      promptManager: firstPromptManager,
+      reviewQueue: firstReviewQueue,
+      pullRequestFlowManager: firstPullRequestFlowManager,
+      syncFlowManager: firstSyncFlowManager,
+    });
+    cleanup.push(firstHarness.dispose);
 
-    const projectA = await request(harness.port, "POST", "/api/canvas-projects", {
+    const projectA = await request(firstHarness.port, "POST", "/api/canvas-projects", {
       name: "restore-barrier-a",
+      projectRoot: path.join(root, "restore-barrier-a"),
     });
     expect(projectA.status).toBe(201);
-    const prompt = await request(harness.port, "POST", "/api/prompts", {
+    const restoredAgent = firstManager.create({
+      provider: "codex",
+      branch: "feature/restored-agent",
+      cwd: root,
+    });
+    const prompt = await request(firstHarness.port, "POST", "/api/prompts", {
       name: "restore-order",
       content: "prompts restore before review delivery",
       kind: "normal",
     });
     expect(prompt.status).toBe(201);
-    const layout = await request(harness.port, "PATCH", "/api/canvas-layout", {
+    const layout = await request(firstHarness.port, "PATCH", "/api/canvas-layout", {
+      canvasProjectId: projectA.json.project.id,
       nodes: [
         {
           id: "restore-order-node",
@@ -166,10 +334,10 @@ describe("branch review queue project reload", () => {
         },
       ],
     });
-    expect(layout.status).toBe(200);
+    expect(layout.status, JSON.stringify(layout.json)).toBe(200);
 
-    const prFlow = await pullRequestFlowManager.create({
-      proposerAgentId: host.agentId,
+    const prFlow = await firstPullRequestFlowManager.create({
+      proposerAgentId: firstHost.agentId,
       targetBranch: "main",
       title: "Restore queue ordering",
       summary: "Persist a collecting PR review",
@@ -178,9 +346,9 @@ describe("branch review queue project reload", () => {
     expect(prFlow.status).toBe("source_review_collecting");
     const oldPrRequestId = prFlow.reviewRequests.at(-1)?.id;
     expect(oldPrRequestId).toBeTruthy();
-    const syncFlow = await syncFlowManager.create({
+    const syncFlow = await firstSyncFlowManager.create({
       kind: "branch_pull",
-      proposerAgentId: host.agentId,
+      proposerAgentId: firstHost.agentId,
       sourceBranch: "main",
       targetBranch: "feature/restore-barrier",
       strategy: "merge",
@@ -190,20 +358,44 @@ describe("branch review queue project reload", () => {
     });
     expect(syncFlow.status).toBe("queued");
 
-    host.runner.setStatus("waiting_input");
-    const projectB = await request(harness.port, "POST", "/api/canvas-projects", {
-      name: "restore-barrier-b",
-    });
-    expect(projectB.status).toBe(201);
+    firstHost.runner.setStatus("waiting_input");
     const statePath = path.join(projectA.json.project.projectRoot, "canvas-state.json");
+    await waitUntilAsync(async () => {
+      const persisted = JSON.parse(await readFile(statePath, "utf-8"));
+      return (
+        persisted.prFlows?.[0]?.id === prFlow.id &&
+        persisted.syncFlows?.[0]?.id === syncFlow.id &&
+        persisted.layout?.nodes?.[0]?.id === "restore-order-node"
+      );
+    });
     const stateBeforeOpen = await readFile(statePath, "utf-8");
     expect(JSON.parse(stateBeforeOpen)).toMatchObject({
+      agents: {
+        agents: [expect.objectContaining({ id: restoredAgent.id })],
+      },
       prFlows: [expect.objectContaining({ id: prFlow.id })],
       syncFlows: [expect.objectContaining({ id: syncFlow.id })],
       layout: { nodes: [expect.objectContaining({ id: "restore-order-node" })] },
     });
+    await firstHarness.close();
 
-    host.runner.sent.length = 0;
+    const promptManager = new BlockingPromptManager({
+      workspaceRoot: root,
+      promptRoot: path.join(root, "prompts"),
+    });
+    const host = new FakeReviewHost("feature/restore-barrier");
+    const reviewQueue = new BranchReviewQueue();
+    const pullRequestFlowManager = new PullRequestFlowManager({ host, reviewQueue });
+    const syncFlowManager = new SyncFlowManager({ host, reviewQueue });
+    const manager = new AgentManager({ query: emptyQuery, defaultCwd: root });
+    const harness = await createHarness(root, manager, {
+      promptManager,
+      reviewQueue,
+      pullRequestFlowManager,
+      syncFlowManager,
+    });
+    cleanup.push(harness.dispose);
+
     const promptGate = promptManager.blockNextImport();
     const openPromise = request(harness.port, "POST", "/api/canvas-projects/open", {
       id: projectA.json.project.id,
@@ -213,24 +405,38 @@ describe("branch review queue project reload", () => {
     expect(pullRequestFlowManager.list()).toEqual([]);
     expect(syncFlowManager.list()).toEqual([]);
     expect(host.runner.sent).toEqual([]);
-    expect((await request(harness.port, "GET", "/api/canvas-layout")).json.nodes).toEqual([]);
+    expect(manager.list()).toEqual([
+      expect.objectContaining({ id: restoredAgent.id }),
+    ]);
 
-    const concurrentLayout = await request(harness.port, "PATCH", "/api/canvas-layout", {
-      nodes: [
-        {
-          id: "transient-during-restore",
-          type: "prompt",
-          position: { x: 1, y: 2 },
-        },
-      ],
+    const revision = harness.workspaceManager.captureProjectRevision();
+    let concurrentMutationSettled = false;
+    const concurrentPromptPromise = request(
+      harness.port,
+      "POST",
+      "/api/prompts",
+      {
+        name: "queued-during-restore",
+        content: "this mutation must wait for the project import transaction",
+        kind: "normal",
+      },
+      {
+        "X-Agent-Canvas-Project-Id": revision.projectId,
+        "X-Agent-Canvas-Project-Revision": String(revision.generation),
+      },
+    ).then((response) => {
+      concurrentMutationSettled = true;
+      return response;
     });
-    expect(concurrentLayout.status).toBe(200);
     await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(concurrentMutationSettled).toBe(false);
     expect(await readFile(statePath, "utf-8")).toBe(stateBeforeOpen);
 
     promptGate.release();
     const reopened = await openPromise;
     expect(reopened.status).toBe(200);
+    const concurrentPrompt = await concurrentPromptPromise;
+    expect(concurrentPrompt.status).toBe(201);
     await waitUntil(
       () => pullRequestFlowManager.get(prFlow.id)?.status === "source_review_collecting",
     );
@@ -241,20 +447,34 @@ describe("branch review queue project reload", () => {
     expect(restoredPr?.reviewRequests.at(-1)?.id).not.toBe(oldPrRequestId);
     expect(syncFlowManager.get(syncFlow.id)?.status).toBe("queued");
     expect(host.runner.sent[0]).toContain(`flowId: ${prFlow.id}`);
-    expect((await request(harness.port, "GET", "/api/prompts")).json.prompts).toEqual([
-      expect.objectContaining({ id: prompt.json.prompt.id, content: prompt.json.prompt.content }),
-    ]);
+    expect((await request(harness.port, "GET", "/api/prompts")).json.prompts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: prompt.json.prompt.id, content: prompt.json.prompt.content }),
+        expect.objectContaining({
+          id: concurrentPrompt.json.prompt.id,
+          content: "this mutation must wait for the project import transaction",
+        }),
+      ]),
+    );
     expect((await request(harness.port, "GET", "/api/canvas-layout")).json.nodes).toEqual(
       layout.json.nodes,
     );
 
     await waitUntilAsync(async () => {
       const persisted = JSON.parse(await readFile(statePath, "utf-8"));
-      return persisted.prFlows?.[0]?.reviewRequests?.length === 2;
+      return (
+        persisted.prFlows?.[0]?.reviewRequests?.length === 2 &&
+        persisted.prompts?.prompts?.some(
+          (item: { id?: string }) => item.id === concurrentPrompt.json.prompt.id,
+        )
+      );
     });
     expect(JSON.parse(await readFile(statePath, "utf-8"))).toMatchObject({
       prompts: {
-        prompts: [expect.objectContaining({ id: prompt.json.prompt.id })],
+        prompts: expect.arrayContaining([
+          expect.objectContaining({ id: prompt.json.prompt.id }),
+          expect.objectContaining({ id: concurrentPrompt.json.prompt.id }),
+        ]),
       },
       prFlows: [
         expect.objectContaining({
@@ -266,7 +486,7 @@ describe("branch review queue project reload", () => {
       syncFlows: [expect.objectContaining({ id: syncFlow.id, status: "queued" })],
       layout: { nodes: [expect.objectContaining({ id: "restore-order-node" })] },
     });
-  });
+  }, 15_000);
 });
 
 interface Resp {
@@ -286,6 +506,7 @@ interface HarnessOptions {
   reviewQueue?: BranchReviewQueue;
   pullRequestFlowManager?: PullRequestFlowManager;
   syncFlowManager?: SyncFlowManager;
+  workspaceProjectRoot?: string;
 }
 
 async function createHarness(
@@ -295,9 +516,11 @@ async function createHarness(
 ): Promise<{
   port: number;
   syncFlowManager: SyncFlowManager;
+  workspaceManager: WorkspaceManager;
+  close: () => Promise<void>;
   dispose: () => Promise<void>;
 }> {
-  const projectRoot = path.join(root, "projects");
+  const projectRoot = options.workspaceProjectRoot ?? path.join(root, "projects");
   const workspaceManager = new WorkspaceManager({
     defaultSourcePath: root,
     projectRoot,
@@ -331,13 +554,23 @@ async function createHarness(
   });
   await new Promise<void>((resolve) => result.httpServer.listen(0, resolve));
   const port = (result.httpServer.address() as AddressInfo).port;
+  let closed = false;
+  const close = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    requestWorkspaceContexts.delete(port);
+    await new Promise<void>((resolve, reject) =>
+      result.httpServer.close((error) => (error ? reject(error) : resolve())),
+    );
+  };
   return {
     port,
     syncFlowManager: result.syncFlowManager,
+    workspaceManager,
+    close,
     dispose: async () => {
       await manager.clear();
-      await new Promise<void>((resolve) => result.httpServer.close(() => resolve()));
-      await removeTempRoot(root);
+      await close();
     },
   };
 }
@@ -400,6 +633,15 @@ class FakeReviewRunner {
 
   async steer(text: string): Promise<void> {
     this.sent.push(text);
+  }
+
+  async deliver(text: string): Promise<void> {
+    if (this.status === "running") return await this.steer(text);
+    if (this.status === "waiting_input") {
+      this.send(text);
+      return;
+    }
+    throw new Error(`agent is not active (${this.status})`);
   }
 }
 
@@ -490,7 +732,54 @@ const fakeGitRunner: GitRunner = async (args, options) => {
   return "";
 };
 
-function request(port: number, method: string, route: string, body?: unknown): Promise<Resp> {
+const requestWorkspaceContexts = new Map<
+  number,
+  { canvasProjectId: string; revision: number }
+>();
+
+async function request(
+  port: number,
+  method: string,
+  route: string,
+  body?: unknown,
+  extraHeaders: Record<string, string> = {},
+): Promise<Resp> {
+  const context = requestWorkspaceContexts.get(port);
+  const projectHeaders: Record<string, string> =
+    requiresTestProjectContext(method, route) &&
+    !extraHeaders["X-Agent-Canvas-Project-Id"] &&
+    context
+      ? {
+          "X-Agent-Canvas-Project-Id": context.canvasProjectId,
+          "X-Agent-Canvas-Project-Revision": String(context.revision),
+        }
+      : {};
+  const response = await rawRequest(port, method, route, body, {
+    ...projectHeaders,
+    ...extraHeaders,
+  });
+  const workspace = response.json?.workspace?.canvasProject
+    ? response.json.workspace
+    : response.json;
+  if (
+    typeof workspace?.canvasProject?.id === "string" &&
+    Number.isSafeInteger(workspace?.revision)
+  ) {
+    requestWorkspaceContexts.set(port, {
+      canvasProjectId: workspace.canvasProject.id,
+      revision: workspace.revision,
+    });
+  }
+  return response;
+}
+
+function rawRequest(
+  port: number,
+  method: string,
+  route: string,
+  body?: unknown,
+  extraHeaders: Record<string, string> = {},
+): Promise<Resp> {
   return new Promise((resolve, reject) => {
     const data = body === undefined ? undefined : JSON.stringify(body);
     const req = http.request(
@@ -499,9 +788,12 @@ function request(port: number, method: string, route: string, body?: unknown): P
         port,
         method,
         path: route,
-        headers: data
-          ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) }
-          : {},
+        headers: {
+          ...extraHeaders,
+          ...(data
+            ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) }
+            : {}),
+        },
       },
       (res) => {
         const chunks: Buffer[] = [];
@@ -516,6 +808,12 @@ function request(port: number, method: string, route: string, body?: unknown): P
     if (data) req.write(data);
     req.end();
   });
+}
+
+function requiresTestProjectContext(method: string, route: string): boolean {
+  if (["GET", "HEAD", "OPTIONS"].includes(method)) return false;
+  const pathname = new URL(route, "http://localhost").pathname;
+  return pathname.startsWith("/api/") && !pathname.startsWith("/api/canvas-projects");
 }
 
 function systemInit(agentId: string, cwd: string): SdkMessage {

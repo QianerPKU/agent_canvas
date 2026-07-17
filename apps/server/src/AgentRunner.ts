@@ -39,8 +39,11 @@ export interface AgentRunnerDeps {
   codexQuery?: QueryFn;
   now?: () => number;
   resolveFileAccess?: (agentId: string) => AgentFileAccess;
+  /** Revalidate workspace invariants immediately before every provider input dispatch. */
+  prepareFileAccess?: (agentId: string) => Promise<void> | void;
   resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
   fullPermissionMode?: () => boolean;
+  workDocumentationEnabled?: () => boolean;
 }
 
 export interface StartExtra {
@@ -70,8 +73,10 @@ export class AgentRunner {
   private readonly queries: Record<AgentProvider, QueryFn>;
   private readonly now: () => number;
   private readonly resolveFileAccess?: (agentId: string) => AgentFileAccess;
+  private readonly prepareFileAccess?: (agentId: string) => Promise<void> | void;
   private readonly resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
   private readonly fullPermissionMode: () => boolean;
+  private readonly workDocumentationEnabled: () => boolean;
   private readonly listeners = new Set<AgentEventListener>();
 
   private status: AgentStatus = "idle";
@@ -89,6 +94,7 @@ export class AgentRunner {
   private policyPromptInjectionPending = false;
   private pendingInjectedPrompts: AgentPromptReference[] = [];
   private pendingQueuedInputs: string[] = [];
+  private inputTransitionTail: Promise<void> = Promise.resolve();
   private readonly pendingQuestions = new Map<string, PendingQuestion>();
   private readonly pendingApprovals = new Map<string, PendingApproval>();
   private questionCounter = 0;
@@ -96,6 +102,7 @@ export class AgentRunner {
   private interruptedTurnPending = false;
   private suppressAbortStatus = false;
   private suppressNaturalEndStatus = false;
+  private lifecycleGeneration = 0;
   private createdAt: number;
 
   constructor(id: string, deps: AgentRunnerDeps) {
@@ -106,8 +113,10 @@ export class AgentRunner {
     };
     this.now = deps.now ?? Date.now;
     this.resolveFileAccess = deps.resolveFileAccess;
+    this.prepareFileAccess = deps.prepareFileAccess;
     this.resolvePromptAccess = deps.resolvePromptAccess;
     this.fullPermissionMode = deps.fullPermissionMode ?? (() => false);
+    this.workDocumentationEnabled = deps.workDocumentationEnabled ?? (() => false);
     this.createdAt = this.now();
   }
 
@@ -134,6 +143,7 @@ export class AgentRunner {
   }
 
   restore(snapshot: AgentSnapshot): void {
+    this.advanceLifecycleGeneration();
     this.inputQueue?.close();
     this.abortController?.abort();
     void this.handle?.terminate?.();
@@ -153,6 +163,8 @@ export class AgentRunner {
     this.pendingInjectedPrompts = [];
     this.pendingQueuedInputs = [];
     this.interruptedTurnPending = false;
+    this.suppressAbortStatus = false;
+    this.suppressNaturalEndStatus = false;
     this.cancelPendingQuestions("cancel");
     this.cancelPendingApprovals("cancel");
     if (this.status === "waiting_input" && this.sessionId && !this.config.resume) {
@@ -206,13 +218,43 @@ export class AgentRunner {
     }
   }
 
+  refreshPolicyPrompt(
+    pendingPrompt?: AgentPromptReference,
+    clearPendingPromptId?: string,
+  ): void {
+    if (clearPendingPromptId) {
+      this.pendingInjectedPrompts = this.pendingInjectedPrompts.filter(
+        (prompt) => prompt.id !== clearPendingPromptId,
+      );
+    }
+    if (this.status === "idle") return;
+    if (pendingPrompt) {
+      this.pendingInjectedPrompts = [
+        ...this.pendingInjectedPrompts.filter((prompt) => prompt.id !== pendingPrompt.id),
+        pendingPrompt,
+      ];
+    }
+    this.policyPromptInjectionPending = true;
+  }
+
   // ---- 生命周期 ----
 
   /** 启动（或以 resumeSessionId 续接）一次会话。 */
-  start(config: AgentStartConfig, extra: StartExtra = {}): void {
+  start(config: AgentStartConfig, extra: StartExtra = {}): Promise<void> {
+    return this.startSession(config, extra, false);
+  }
+
+  private startSession(
+    config: AgentStartConfig,
+    extra: StartExtra,
+    preserveLifecycleGeneration: boolean,
+  ): Promise<void> {
     if (this.status === "starting" || this.status === "running" || this.status === "waiting_input") {
       throw new Error(`agent ${this.id} 已在运行（${this.status}），不能重复 start`);
     }
+    const startGeneration = preserveLifecycleGeneration
+      ? this.lifecycleGeneration
+      : this.advanceLifecycleGeneration();
     const provider = normalizeProvider(config.provider);
     this.activeProvider = provider;
     this.config = { ...config, provider };
@@ -225,50 +267,68 @@ export class AgentRunner {
     this.policyPromptInjectionPending = true;
     this.pendingQueuedInputs = [];
     this.interruptedTurnPending = false;
+    this.suppressAbortStatus = false;
+    this.suppressNaturalEndStatus = false;
     this.cancelPendingQuestions("cancel");
     this.cancelPendingApprovals("cancel");
 
+    const previousHandle = this.handle;
+    this.handle = undefined;
+    this.inputQueue?.close();
+    this.inputQueue = undefined;
+    void previousHandle?.terminate?.()?.catch(() => undefined);
     this.abortController = new AbortController();
-    this.inputQueue = new AsyncMessageQueue<SdkUserInput>();
-    // 首条任务作为第一条用户消息
-    const fileAccess = this.resolveFileAccess?.(this.id);
-    const promptAccess = this.promptAccessForNextInput();
-    this.inputQueue.push(toUserInput(config.prompt, fileAccess, promptAccess));
-
     this.setStatus("starting");
-    this.emit({ kind: "user_input", text: config.prompt });
+    const abortController = this.abortController;
+    return this.prepareForFileAccessDispatch(
+      () => {
+        if (
+          startGeneration !== this.lifecycleGeneration ||
+          this.status !== "starting" ||
+          this.abortController !== abortController ||
+          this.handle
+        ) {
+          throw new Error(`agent ${this.id} start was cancelled before dispatch`);
+        }
+        this.inputQueue = new AsyncMessageQueue<SdkUserInput>();
+        // 首条任务同样携带文件访问；实时校验完成后才解析并授予访问。
+        const fileAccess = this.resolveFileAccess?.(this.id);
+        const promptAccess = this.promptAccessForNextInput();
+        this.inputQueue.push(toUserInput(config.prompt, fileAccess, promptAccess));
+        this.emit({ kind: "user_input", text: config.prompt });
 
-    const options: QueryOptions = {
-      cwd: config.cwd,
-      model: config.model,
-      reasoningEffort: config.reasoningEffort,
-      allowedTools: config.allowedTools,
-      permissionMode: config.permissionMode,
-      maxTurns: config.maxTurns,
-      resume: config.resume ?? extra.resumeSessionId,
-      resumeSessionAt: config.resumeSessionAt,
-      forkSession: config.forkSession,
-      abortController: this.abortController,
-      fileAccess,
-      promptAccess,
-      requestUserInput: (request) => this.requestUserInput(request),
-      requestApproval: (request) => this.requestApproval(request),
-    };
+        const options: QueryOptions = {
+          cwd: config.cwd,
+          model: config.model,
+          reasoningEffort: config.reasoningEffort,
+          allowedTools: config.allowedTools,
+          permissionMode: config.permissionMode,
+          maxTurns: config.maxTurns,
+          resume: config.resume ?? extra.resumeSessionId,
+          resumeSessionAt: config.resumeSessionAt,
+          forkSession: config.forkSession,
+          abortController,
+          fileAccess,
+          promptAccess,
+          requestUserInput: (request) => this.requestUserInput(request),
+          requestApproval: (request) => this.requestApproval(request),
+        };
 
-    this.handle = this.queries[provider]({ prompt: this.inputQueue, options });
-    // 后台消费消息流（不阻塞调用方）
-    void this.consume(this.handle);
+        this.handle = this.queries[provider]({ prompt: this.inputQueue!, options });
+        // 后台消费消息流（不阻塞调用方）
+        void this.consume(this.handle);
+      },
+      { generation: startGeneration, abortController },
+    );
   }
 
   /** 运行中追加一条指令（流式输入干预）。 */
-  send(text: string): void {
+  send(text: string): Promise<void> {
     if (this.status === "stopped") {
-      this.sendAfterStopped(text);
-      return;
+      return this.sendAfterStopped(text);
     }
     if (this.status === "terminated") {
-      this.restartAfterClosedTurn(text);
-      return;
+      return this.restartAfterClosedTurn(text);
     }
     if (
       this.status === "waiting_input" &&
@@ -276,8 +336,7 @@ export class AgentRunner {
       this.config?.resume
     ) {
       this.status = "idle";
-      this.start({ ...this.config, prompt: text });
-      return;
+      return this.start({ ...this.config, prompt: text });
     }
     if (!this.inputQueue || this.inputQueue.isClosed || isTerminalStatus(this.status)) {
       throw new Error(`agent ${this.id} 当前不可接收输入（${this.status}）`);
@@ -286,17 +345,139 @@ export class AgentRunner {
     if (isQueuedInput) {
       this.pendingQueuedInputs.push(text);
       this.emit({ kind: "user_input", text, mode: "queued" });
-      return;
+      return Promise.resolve();
     }
-    this.inputQueue.push(
-      toUserInput(
-        text,
-        this.resolveFileAccess?.(this.id),
-        this.promptAccessForNextInput(),
-      ),
-    );
-    this.setStatus("running");
-    this.emit({ kind: "user_input", text });
+    const inputQueue = this.inputQueue;
+    return this.prepareForFileAccessDispatch(() => {
+      if (
+        inputQueue !== this.inputQueue ||
+        inputQueue.isClosed ||
+        this.status !== "waiting_input"
+      ) {
+        throw new Error(`agent ${this.id} input target changed before dispatch`);
+      }
+      inputQueue.push(
+        toUserInput(
+          text,
+          this.resolveFileAccess?.(this.id),
+          this.promptAccessForNextInput(),
+        ),
+      );
+      this.setStatus("running");
+      this.emit({ kind: "user_input", text });
+    });
+  }
+
+  /**
+   * Deliver an automation message without taking a stale status snapshot. Path
+   * preparation runs first; the final send/steer/queue decision is serialized
+   * with result transitions and uses the provider's live steer capability.
+   */
+  async deliver(text: string): Promise<void> {
+    const generation = this.lifecycleGeneration;
+    return await this.runInputTransition(async () => {
+      if (generation !== this.lifecycleGeneration) {
+        throw new Error(`agent ${this.id} delivery target changed before dispatch`);
+      }
+      await this.prepareFileAccess?.(this.id);
+      if (generation !== this.lifecycleGeneration) {
+        throw new Error(`agent ${this.id} delivery target changed before dispatch`);
+      }
+      const inputQueue = this.inputQueue;
+      const handle = this.handle;
+      if (isTerminalStatus(this.status)) {
+        throw new Error(`agent ${this.id} is not active (${this.status})`);
+      }
+      if (this.status === "starting") {
+        this.pendingQueuedInputs.push(text);
+        this.emit({ kind: "user_input", text, mode: "queued" });
+        return;
+      }
+      if (this.status === "waiting_input") {
+        if ((!inputQueue || inputQueue.isClosed) && this.config?.resume) {
+          this.status = "idle";
+          await this.restartAfterClosedTurn(text, true);
+          return;
+        }
+        if (!inputQueue || inputQueue.isClosed) {
+          throw new Error(`agent ${this.id} is not active (${this.status})`);
+        }
+        inputQueue.push(
+          toUserInput(
+            text,
+            this.resolveFileAccess?.(this.id),
+            this.promptAccessForNextInput(),
+          ),
+        );
+        this.setStatus("running");
+        this.emit({ kind: "user_input", text });
+        return;
+      }
+      if (this.status !== "running") {
+        throw new Error(`agent ${this.id} is not active (${this.status})`);
+      }
+      if (!inputQueue || inputQueue.isClosed) {
+        throw new Error(`agent ${this.id} is not active (${this.status})`);
+      }
+      if (handle?.steer && (handle.canSteerNow?.() ?? true)) {
+        let steered = false;
+        try {
+          await handle.steer(
+            toUserInput(
+              text,
+              this.resolveFileAccess?.(this.id),
+              this.promptAccessWithoutReadablePrompts(),
+            ),
+          );
+          steered = true;
+        } catch (error) {
+          if (
+            generation !== this.lifecycleGeneration ||
+            inputQueue !== this.inputQueue ||
+            inputQueue.isClosed ||
+            handle !== this.handle ||
+            this.status !== "running"
+          ) {
+            throw new Error(`agent ${this.id} delivery target changed during dispatch`);
+          }
+          // The turn can complete between canSteerNow() and the RPC. Only
+          // downgrade when the provider confirms that the turn is no longer
+          // steerable; unrelated RPC failures remain visible to the caller.
+          if (handle.canSteerNow?.() ?? true) throw error;
+        }
+        if (
+          generation !== this.lifecycleGeneration ||
+          inputQueue !== this.inputQueue ||
+          inputQueue.isClosed ||
+          handle !== this.handle ||
+          this.status !== "running"
+        ) {
+          throw new Error(`agent ${this.id} delivery target changed during dispatch`);
+        }
+        if (steered) {
+          this.emit({ kind: "user_input", text, mode: "steer" });
+          return;
+        }
+      }
+
+      // Codex clears its turn id before yielding result, and a newly queued
+      // turn is not steerable until turn/start completes. Preserve delivery
+      // order through that gap instead of steering a stale/nonexistent turn.
+      this.pendingQueuedInputs.push(text);
+      if (!handle?.steer) {
+        await handle?.interrupt?.().catch(() => undefined);
+        if (
+          generation !== this.lifecycleGeneration ||
+          inputQueue !== this.inputQueue ||
+          inputQueue.isClosed ||
+          handle !== this.handle ||
+          this.status !== "running"
+        ) {
+          throw new Error(`agent ${this.id} delivery target changed during dispatch`);
+        }
+      }
+      this.emit({ kind: "user_input", text, mode: "queued" });
+    });
   }
 
   /** 尽快把输入追加到当前正在运行的一轮；Codex 使用 turn/steer，Claude 回退到流式输入通道。 */
@@ -309,38 +490,62 @@ export class AgentRunner {
     ) {
       throw new Error(`agent ${this.id} 当前不可引导（${this.status}）`);
     }
-    const input = toUserInput(
-      text,
-      this.resolveFileAccess?.(this.id),
-      this.promptAccessWithoutReadablePrompts(),
-    );
-    if (this.handle?.steer) {
-      await this.handle.steer(input);
-    } else if (this.handle?.interrupt) {
-      this.pendingQueuedInputs.unshift(text);
-      await this.handle.interrupt().catch(() => undefined);
-    } else {
-      this.inputQueue.push(input);
-    }
+    const inputQueue = this.inputQueue;
+    const handle = this.handle;
+    await this.prepareForFileAccessDispatch(async () => {
+      if (
+        inputQueue !== this.inputQueue ||
+        inputQueue.isClosed ||
+        handle !== this.handle ||
+        this.status !== "running"
+      ) {
+        throw new Error(`agent ${this.id} steer target changed before dispatch`);
+      }
+      const input = toUserInput(
+        text,
+        this.resolveFileAccess?.(this.id),
+        this.promptAccessWithoutReadablePrompts(),
+      );
+      if (handle?.steer && (handle.canSteerNow?.() ?? true)) {
+        await handle.steer(input);
+      } else if (handle?.steer) {
+        this.pendingQueuedInputs.unshift(text);
+      } else if (handle?.interrupt) {
+        this.pendingQueuedInputs.unshift(text);
+        await handle.interrupt().catch(() => undefined);
+      } else {
+        inputQueue.push(input);
+      }
+    });
     this.emit({ kind: "user_input", text, mode: "steer" });
   }
 
   /** 手动压缩当前会话上下文；压缩本身作为独立一轮。 */
-  compact(): void {
+  compact(): Promise<void> {
     if (!this.inputQueue || this.inputQueue.isClosed || this.status !== "waiting_input") {
       throw new Error(`agent ${this.id} 当前不可 compact（${this.status}）`);
     }
-    this.inputQueue.push(toUserInput("/compact"));
-    this.compactPending = true;
-    this.setStatus("running");
-    this.emit({ kind: "user_input", text: "/compact" });
+    const inputQueue = this.inputQueue;
+    return this.prepareForFileAccessDispatch(() => {
+      if (
+        inputQueue !== this.inputQueue ||
+        inputQueue.isClosed ||
+        this.status !== "waiting_input"
+      ) {
+        throw new Error(`agent ${this.id} compact target changed before dispatch`);
+      }
+      inputQueue.push(toUserInput("/compact"));
+      this.compactPending = true;
+      this.setStatus("running");
+      this.emit({ kind: "user_input", text: "/compact" });
+    });
   }
 
   /** 中止会话。 */
   async stop(): Promise<void> {
     if (isTerminalStatus(this.status) || this.status === "idle") return;
+    this.advanceLifecycleGeneration();
     this.compactPending = false;
-    this.policyPromptInjectionPending = false;
     this.pendingQueuedInputs = [];
     this.interruptedTurnPending = true;
     this.cancelPendingQuestions("cancel");
@@ -356,6 +561,7 @@ export class AgentRunner {
   /** 关闭底层 CLI / Query 进程。 */
   async terminate(): Promise<void> {
     if (this.status === "terminated") return;
+    this.advanceLifecycleGeneration();
     this.inputQueue?.close();
     this.inputQueue = undefined;
     this.compactPending = false;
@@ -429,7 +635,7 @@ export class AgentRunner {
       for await (const msg of handle) {
         if (handle !== this.handle) return;
         for (const event of mapSdkMessage(msg)) {
-          this.applyEvent(event);
+          await this.applyEvent(event, handle);
         }
       }
       if (handle !== this.handle) return;
@@ -537,7 +743,7 @@ export class AgentRunner {
     this.pendingApprovals.clear();
   }
 
-  private applyEvent(event: AgentEvent): void {
+  private async applyEvent(event: AgentEvent, sourceHandle?: QueryHandle): Promise<void> {
     if (this.interruptedTurnPending) {
       if (event.kind === "result") this.interruptedTurnPending = false;
       return;
@@ -567,36 +773,12 @@ export class AgentRunner {
         }
         break;
       case "result": {
-        if (event.costUsd !== undefined) this.totalCostUsd = event.costUsd;
-        if (event.usage) this.usage = event.usage;
-        // 用本轮最后一条 assistant 消息 uuid 作为 fork 锚点
-        const enriched: AgentEvent = {
-          ...event,
-          anchorUuid: event.anchorUuid ?? this.lastAssistantUuid,
+        const expected = {
+          generation: this.lifecycleGeneration,
+          inputQueue: this.inputQueue,
+          handle: sourceHandle ?? this.handle,
         };
-        this.lastAssistantUuid = undefined; // 下一轮重新累积
-        this.emit(enriched);
-        // 一轮结束：输入流仍开则等待下一条指令，否则完成
-        const inputQueue = this.inputQueue;
-        if (!inputQueue || inputQueue.isClosed) {
-          this.pendingQueuedInputs = [];
-          this.setStatus("done");
-        } else {
-          const queuedInput = this.pendingQueuedInputs.shift();
-          if (queuedInput) {
-            inputQueue.push(
-              toUserInput(
-                queuedInput,
-                this.resolveFileAccess?.(this.id),
-                this.promptAccessForNextInput(),
-              ),
-            );
-            this.emit({ kind: "user_input", text: queuedInput });
-            this.setStatus("running");
-          } else {
-            this.setStatus("waiting_input");
-          }
-        }
+        await this.runInputTransition(() => this.applyResultEvent(event, expected));
         break;
       }
       case "error":
@@ -612,6 +794,110 @@ export class AgentRunner {
         this.emit(event);
         break;
     }
+  }
+
+  private async applyResultEvent(
+    event: Extract<AgentEvent, { kind: "result" }>,
+    expected: {
+      generation: number;
+      inputQueue: AsyncMessageQueue<SdkUserInput> | undefined;
+      handle: QueryHandle | undefined;
+    },
+  ): Promise<void> {
+    if (!this.matchesInputTransition(expected)) return;
+    if (event.costUsd !== undefined) this.totalCostUsd = event.costUsd;
+    if (event.usage) this.usage = event.usage;
+    const enriched: AgentEvent = {
+      ...event,
+      anchorUuid: event.anchorUuid ?? this.lastAssistantUuid,
+    };
+    this.lastAssistantUuid = undefined;
+
+    const inputQueue = expected.inputQueue;
+    const handle = expected.handle;
+    const generation = expected.generation;
+    let queuedInput: string | undefined;
+    let nextStatus: AgentStatus | undefined;
+    if (!inputQueue || inputQueue.isClosed) {
+      this.pendingQueuedInputs = [];
+      nextStatus = "done";
+    } else {
+      queuedInput = this.pendingQueuedInputs.shift();
+      if (queuedInput) {
+        try {
+          await this.prepareFileAccess?.(this.id);
+        } catch (error) {
+          if (
+            generation !== this.lifecycleGeneration ||
+            inputQueue !== this.inputQueue ||
+            handle !== this.handle ||
+            isTerminalStatus(this.status)
+          ) {
+            return;
+          }
+          this.pendingQueuedInputs = [];
+          inputQueue.close();
+          await handle?.terminate?.().catch(() => undefined);
+          throw error;
+        }
+        if (
+          generation !== this.lifecycleGeneration ||
+          inputQueue !== this.inputQueue ||
+          inputQueue.isClosed ||
+          handle !== this.handle ||
+          isTerminalStatus(this.status)
+        ) {
+          return;
+        }
+        inputQueue.push(
+          toUserInput(
+            queuedInput,
+            this.resolveFileAccess?.(this.id),
+            this.promptAccessForNextInput(),
+          ),
+        );
+        nextStatus = "running";
+      } else {
+        nextStatus = "waiting_input";
+      }
+    }
+
+    // Publish result only after the post-turn state and queued dispatch have
+    // been committed. Listeners can synchronously inspect the correct state,
+    // while the public event order remains result -> input/status.
+    const statusChanged = nextStatus !== undefined && this.status !== nextStatus;
+    if (nextStatus !== undefined) this.status = nextStatus;
+    this.emit(enriched);
+    if (queuedInput) this.emit({ kind: "user_input", text: queuedInput });
+    if (statusChanged && nextStatus !== undefined) {
+      this.emit({ kind: "status", status: nextStatus });
+    }
+  }
+
+  private runInputTransition<T>(operation: () => Promise<T> | T): Promise<T> {
+    const result = this.inputTransitionTail.then(operation);
+    this.inputTransitionTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private matchesInputTransition(expected: {
+    generation: number;
+    inputQueue: AsyncMessageQueue<SdkUserInput> | undefined;
+    handle: QueryHandle | undefined;
+  }): boolean {
+    return (
+      expected.generation === this.lifecycleGeneration &&
+      expected.inputQueue === this.inputQueue &&
+      expected.handle === this.handle
+    );
+  }
+
+  private advanceLifecycleGeneration(): number {
+    this.inputTransitionTail = Promise.resolve();
+    return ++this.lifecycleGeneration;
   }
 
   private setStatus(status: AgentStatus): void {
@@ -667,7 +953,9 @@ export class AgentRunner {
       readablePrompts.unshift({
         id: AGENT_CANVAS_POLICY_PROMPT_ID,
         name: AGENT_CANVAS_POLICY_PROMPT_NAME,
-        content: agentCanvasPolicyPrompt(this.id),
+        content: agentCanvasPolicyPrompt(this.id, {
+          workDocumentationEnabled: this.workDocumentationEnabled(),
+        }),
         kind: "shared",
       });
     }
@@ -687,6 +975,7 @@ export class AgentRunner {
   }
 
   private detachIdleSessionForNextStart(): void {
+    this.advanceLifecycleGeneration();
     const resume = this.sessionId;
     this.inputQueue?.close();
     this.inputQueue = undefined;
@@ -707,28 +996,42 @@ export class AgentRunner {
     this.setStatus("waiting_input");
   }
 
-  private sendAfterStopped(text: string): void {
+  private sendAfterStopped(text: string): Promise<void> {
     if (this.interruptedTurnPending) {
       this.closeDetachedHandle();
-      this.restartAfterClosedTurn(text);
-      return;
+      return this.restartAfterClosedTurn(text);
     }
     if (this.inputQueue && !this.inputQueue.isClosed && this.handle) {
-      this.inputQueue.push(
-        toUserInput(
-          text,
-          this.resolveFileAccess?.(this.id),
-          this.promptAccessForNextInput(),
-        ),
-      );
-      this.setStatus("running");
-      this.emit({ kind: "user_input", text });
-      return;
+      const inputQueue = this.inputQueue;
+      const handle = this.handle;
+      return this.prepareForFileAccessDispatch(() => {
+        if (
+          inputQueue !== this.inputQueue ||
+          inputQueue.isClosed ||
+          handle !== this.handle ||
+          this.status !== "stopped" ||
+          this.interruptedTurnPending
+        ) {
+          throw new Error(`agent ${this.id} stopped input target changed before dispatch`);
+        }
+        inputQueue.push(
+          toUserInput(
+            text,
+            this.resolveFileAccess?.(this.id),
+            this.promptAccessForNextInput(),
+          ),
+        );
+        this.setStatus("running");
+        this.emit({ kind: "user_input", text });
+      });
     }
-    this.restartAfterClosedTurn(text);
+    return this.restartAfterClosedTurn(text);
   }
 
-  private restartAfterClosedTurn(text: string): void {
+  private restartAfterClosedTurn(
+    text: string,
+    preserveLifecycleGeneration = false,
+  ): Promise<void> {
     const hasCurrentSession = !!this.sessionId;
     const resume = this.sessionId ?? this.config?.resume;
     const next: AgentStartConfig = {
@@ -741,7 +1044,38 @@ export class AgentRunner {
       delete next.resumeSessionAt;
       delete next.forkSession;
     }
-    this.start(next);
+    return this.startSession(next, {}, preserveLifecycleGeneration);
+  }
+
+  private prepareForFileAccessDispatch(
+    dispatch: () => Promise<void> | void,
+    pendingStart?: { generation: number; abortController: AbortController },
+  ): Promise<void> {
+    const onError = (error: unknown): never => {
+      if (
+        pendingStart &&
+        pendingStart.generation === this.lifecycleGeneration &&
+        pendingStart.abortController === this.abortController &&
+        this.status === "starting" &&
+        !this.handle
+      ) {
+        this.inputQueue?.close();
+        this.inputQueue = undefined;
+        this.abortController?.abort();
+        this.emit({ kind: "error", message: errorMessage(error) });
+        this.setStatus("error");
+      }
+      throw error;
+    };
+    try {
+      const preparation = this.prepareFileAccess?.(this.id);
+      if (isPromiseLike(preparation)) {
+        return Promise.resolve(preparation).then(dispatch).catch(onError);
+      }
+      return Promise.resolve(dispatch()).catch(onError);
+    } catch (error) {
+      return Promise.resolve().then(() => onError(error));
+    }
   }
 
   private closeDetachedHandle(): void {
@@ -756,6 +1090,14 @@ export class AgentRunner {
 
 function normalizeProvider(provider: AgentProvider | undefined): AgentProvider {
   return provider ?? "claude";
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<void> {
+  return (
+    (typeof value === "object" || typeof value === "function") &&
+    value !== null &&
+    typeof (value as PromiseLike<void>).then === "function"
+  );
 }
 
 function restorableStatus(status: AgentStatus): AgentStatus {

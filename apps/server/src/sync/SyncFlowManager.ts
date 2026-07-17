@@ -18,9 +18,7 @@ import {
 } from "../reviews/BranchReviewQueue.js";
 
 type DeliverableRunner = {
-  getStatus(): string;
-  send(text: string): void;
-  steer(text: string): Promise<void>;
+  deliver(text: string): Promise<void>;
 };
 
 export interface SyncFlowAgentHost {
@@ -98,8 +96,10 @@ export class SyncFlowManager {
   private readonly flows = new Map<string, SyncFlowSnapshot>();
   private readonly timers = new Map<string, unknown>();
   private readonly listeners = new Set<FlowListener>();
+  private readonly pendingOperations = new Set<symbol>();
   private counter = 0;
-  private stateEpoch = 0;
+  private importedStateActivated = true;
+  private stateGeneration = 0;
 
   constructor(options: SyncFlowManagerOptions) {
     this.host = options.host;
@@ -126,9 +126,24 @@ export class SyncFlowManager {
     return this.list();
   }
 
-  importState(flows: SyncFlowSnapshot[] | undefined): void {
-    this.stateEpoch += 1;
+  hasOpenFlows(): boolean {
+    return this.list().some((flow) => !CLOSED_STATUSES.includes(flow.status));
+  }
+
+  hasPendingOperations(): boolean {
+    return this.pendingOperations.size > 0;
+  }
+
+  importState(
+    flows: SyncFlowSnapshot[] | undefined,
+    options: { deferActivation?: boolean } = {},
+  ): void {
+    this.stateGeneration += 1;
     for (const flowId of this.timers.keys()) this.closeTimer(flowId);
+    // Retire live reservations immediately. An in-flight lease keeps its branch occupied until
+    // delivery settles, while deferred activation prevents restored prompts from being sent
+    // before the rest of the project state is authoritative.
+    this.reviewQueue.replaceOwner(REVIEW_QUEUE_OWNER, []);
     this.flows.clear();
     for (const flow of flows ?? []) {
       this.flows.set(
@@ -145,27 +160,25 @@ export class SyncFlowManager {
       );
     }
     this.counter = maxNumericSuffix([...this.flows.keys()]);
+    this.importedStateActivated = false;
+    if (!options.deferActivation) this.activateImportedState();
+  }
+
+  activateImportedState(): void {
+    if (this.importedStateActivated) return;
+    this.importedStateActivated = true;
+    const generation = this.stateGeneration;
     const reviewJobs = this.list().flatMap((flow) => {
-      if (flow.status !== "queued" && flow.status !== "review_collecting") return [];
-      return [this.reviewJob(flow, flow.status === "queued" ? "queued" : "active")];
+      if (flow.status !== "queued") return [];
+      return [this.reviewJob(flow, "queued")];
     });
-    const restoredStates = this.reviewQueue.replaceOwner(
-      REVIEW_QUEUE_OWNER,
-      reviewJobs,
-    );
-    for (const flow of this.flows.values()) {
-      if (flow.status !== "review_collecting") continue;
-      if (restoredStates.get(reviewJobId(flow.id)) !== "queued") continue;
-      this.flows.set(flow.id, {
-        ...flow,
-        status: "queued",
-        deadlineAt: undefined,
-        reviewRequest: undefined,
-      });
-    }
-    for (const flow of this.flows.values()) {
-      if (!CLOSED_STATUSES.includes(flow.status) && flow.deadlineAt !== undefined) {
-        this.resetTimer(flow.id, flow.deadlineAt);
+    this.reviewQueue.replaceOwner(REVIEW_QUEUE_OWNER, reviewJobs);
+    for (const flow of [...this.flows.values()]) {
+      if (CLOSED_STATUSES.includes(flow.status) || flow.deadlineAt === undefined) continue;
+      if (flow.deadlineAt <= this.now()) {
+        this.timeoutFlow(flow.id, generation);
+      } else {
+        this.resetTimer(flow.id, flow.deadlineAt, generation);
       }
     }
   }
@@ -179,7 +192,7 @@ export class SyncFlowManager {
   }
 
   async create(input: CreateSyncFlowInput): Promise<SyncFlowSnapshot> {
-    const epoch = this.stateEpoch;
+    const epoch = this.stateGeneration;
     if (!input?.proposerAgentId) throw new Error("missing proposerAgentId");
     if (!input.summary?.trim()) throw new Error("missing summary");
     if (!input.reason?.trim()) throw new Error("missing reason");
@@ -292,11 +305,11 @@ export class SyncFlowManager {
 
   async handleAgentEvent(envelope: AgentEventEnvelope): Promise<void> {
     if (envelope.event.kind !== "result") return;
-    const epoch = this.stateEpoch;
+    const epoch = this.stateGeneration;
     await Promise.resolve();
-    if (epoch !== this.stateEpoch) return;
+    if (epoch !== this.stateGeneration) return;
     await this.captureReviewResult(envelope, epoch);
-    if (epoch !== this.stateEpoch) return;
+    if (epoch !== this.stateGeneration) return;
     await this.captureAgentSyncEvent(envelope, epoch);
   }
 
@@ -304,14 +317,17 @@ export class SyncFlowManager {
     flow: SyncFlowSnapshot,
     state: BranchReviewJob["state"],
   ): BranchReviewJob {
-    const epoch = this.stateEpoch;
+    const epoch = this.stateGeneration;
     return {
       id: reviewJobId(flow.id),
       owner: REVIEW_QUEUE_OWNER,
       branch: flow.targetBranch,
       order: flow.reviewRequest?.requestedAt ?? flow.createdAt,
       state,
-      start: async () => await this.activateQueuedReview(flow.id, epoch),
+      start: async () =>
+        await this.trackPendingOperation(
+          async () => await this.activateQueuedReview(flow.id, epoch),
+        ),
     };
   }
 
@@ -319,7 +335,7 @@ export class SyncFlowManager {
     flowId: string,
     epoch: number,
   ): Promise<BranchReviewStartResult> {
-    if (epoch !== this.stateEpoch) return "started";
+    if (epoch !== this.stateGeneration) return "started";
     const flow = this.requireFlow(flowId);
     if (flow.status !== "queued") return "started";
     const reviewers = this.activeReviewersFor(flow);
@@ -346,7 +362,7 @@ export class SyncFlowManager {
     reviewers: AgentSnapshot[],
     epoch: number,
   ): Promise<void> {
-    if (epoch !== this.stateEpoch) return;
+    if (epoch !== this.stateGeneration) return;
     const flow = this.requireFlow(flowId);
     const request: SyncFlowReviewRequest = {
       id: nextReviewRequestId(flow),
@@ -406,7 +422,7 @@ export class SyncFlowManager {
       if (!parsed) {
         if (hasRecognizedAgentCanvasOutput(rawText)) continue;
         await this.handleInvalidReview(flow.id, agentId, epoch);
-        if (epoch !== this.stateEpoch) return;
+        if (epoch !== this.stateGeneration) return;
         continue;
       }
       this.recordReviewResponse(flow.id, {
@@ -420,7 +436,7 @@ export class SyncFlowManager {
         receivedAt: this.now(),
       });
       await this.finishReviewIfComplete(flow.id, epoch);
-      if (epoch !== this.stateEpoch) return;
+      if (epoch !== this.stateGeneration) return;
     }
   }
 
@@ -436,7 +452,7 @@ export class SyncFlowManager {
       );
       if (!parsed || parsed.flowId !== flow.id) continue;
       this.recordApplied(flow.id, parsed, agentId);
-      if (epoch !== this.stateEpoch) return;
+      if (epoch !== this.stateGeneration) return;
     }
   }
 
@@ -445,7 +461,7 @@ export class SyncFlowManager {
     agentId: string,
     epoch: number,
   ): Promise<void> {
-    if (epoch !== this.stateEpoch) return;
+    if (epoch !== this.stateGeneration) return;
     const flow = this.requireFlow(flowId);
     const request = flow.reviewRequest;
     if (!request || !request.pendingAgentIds.includes(agentId)) return;
@@ -474,12 +490,12 @@ export class SyncFlowManager {
       retryCount,
       receivedAt: this.now(),
     });
-    if (epoch !== this.stateEpoch) return;
+    if (epoch !== this.stateGeneration) return;
     await this.finishReviewIfComplete(flowId, epoch);
   }
 
   private async finishReviewIfComplete(flowId: string, epoch: number): Promise<void> {
-    if (epoch !== this.stateEpoch) return;
+    if (epoch !== this.stateGeneration) return;
     const flow = this.requireFlow(flowId);
     if (flow.status !== "review_collecting") return;
     const request = flow.reviewRequest;
@@ -541,7 +557,7 @@ export class SyncFlowManager {
     try {
       await this.deliverToAgent(flow.proposerAgentId, text);
     } catch (error) {
-      if (epoch !== this.stateEpoch) return;
+      if (epoch !== this.stateGeneration) return;
       if (!CLOSED_STATUSES.includes(flow.status)) {
         this.failFlow(flow, "blocked", `Failed to deliver proposer signal: ${errorMessage(error)}`);
       }
@@ -570,16 +586,7 @@ export class SyncFlowManager {
   private async deliverToAgent(agentId: string, text: string): Promise<void> {
     const runner = this.host.get(agentId);
     if (!runner) throw new Error(`unknown agent: ${agentId}`);
-    const status = runner.getStatus();
-    if (status === "running") {
-      await runner.steer(text);
-      return;
-    }
-    if (status === "waiting_input") {
-      runner.send(text);
-      return;
-    }
-    throw new Error(`agent ${agentId} is not active (${status})`);
+    await runner.deliver(text);
   }
 
   private recordSyntheticResponse(
@@ -626,27 +633,50 @@ export class SyncFlowManager {
     );
   }
 
-  private resetTimer(flowId: string, deadlineAt: number): void {
+  private resetTimer(
+    flowId: string,
+    deadlineAt: number,
+    generation = this.stateGeneration,
+  ): void {
     this.closeTimer(flowId);
     const delay = Math.max(0, deadlineAt - this.now());
     this.timers.set(
       flowId,
       this.setTimer(() => {
-        const flow = this.flows.get(flowId);
-        if (!flow || CLOSED_STATUSES.includes(flow.status)) return;
-        this.save({
-          ...flow,
-          status: "timed_out",
-          updatedAt: this.now(),
-          closedAt: this.now(),
-          failureReason: "Sync flow timed out before the required agent responses arrived.",
-        });
-        this.closeTimer(flowId);
-        if (flow.status === "queued" || flow.status === "review_collecting") {
-          this.reviewQueue.complete(reviewJobId(flowId));
-        }
+        this.timeoutFlow(flowId, generation);
       }, delay),
     );
+  }
+
+  private timeoutFlow(flowId: string, generation: number): void {
+    if (!this.isCurrentGeneration(generation)) return;
+    const token = Symbol("sync-timeout");
+    this.pendingOperations.add(token);
+    try {
+      const flow = this.flows.get(flowId);
+      if (!flow || CLOSED_STATUSES.includes(flow.status)) return;
+      if (flow.deadlineAt !== undefined && flow.deadlineAt > this.now()) {
+        this.resetTimer(flowId, flow.deadlineAt, generation);
+        return;
+      }
+      this.save({
+        ...flow,
+        status: "timed_out",
+        updatedAt: this.now(),
+        closedAt: this.now(),
+        failureReason: "Sync flow timed out before the required agent responses arrived.",
+      });
+      this.closeTimer(flowId);
+      if (flow.status === "queued" || flow.status === "review_collecting") {
+        this.reviewQueue.complete(reviewJobId(flowId));
+      }
+    } finally {
+      this.pendingOperations.delete(token);
+    }
+  }
+
+  private isCurrentGeneration(generation: number): boolean {
+    return generation === this.stateGeneration;
   }
 
   private closeTimer(flowId: string): void {
@@ -656,7 +686,7 @@ export class SyncFlowManager {
   }
 
   private isCurrentReview(flowId: string, requestId: string, epoch: number): boolean {
-    if (epoch !== this.stateEpoch) return false;
+    if (epoch !== this.stateGeneration) return false;
     const flow = this.flows.get(flowId);
     return (
       flow?.status === "review_collecting" &&
@@ -665,8 +695,18 @@ export class SyncFlowManager {
   }
 
   private assertCurrentEpoch(epoch: number): void {
-    if (epoch !== this.stateEpoch) {
+    if (epoch !== this.stateGeneration) {
       throw new Error("Sync flow state changed while the operation was in progress");
+    }
+  }
+
+  private async trackPendingOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const token = Symbol("sync-review-operation");
+    this.pendingOperations.add(token);
+    try {
+      return await operation();
+    } finally {
+      this.pendingOperations.delete(token);
     }
   }
 

@@ -86,6 +86,7 @@ describe("realQuery file access", () => {
           { name: "second.csv", path: "C:/shared/second.csv", previewKind: "csv" },
         ],
         writableFiles: [],
+        sandboxWritableDirectories: ["C:/agent-docs"],
         writableDirectories: [],
       },
       promptAccess: {
@@ -104,7 +105,7 @@ describe("realQuery file access", () => {
       },
     });
     expect(sdk.applyFlagSettings).toHaveBeenNthCalledWith(2, {
-      permissions: { additionalDirectories: [] },
+      permissions: { additionalDirectories: ["C:/agent-docs"] },
     });
   });
 

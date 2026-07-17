@@ -18,7 +18,7 @@
 | `UserInputMode` | 运行中输入模式：`queued` 表示排到下一轮，`steer` 表示引导当前 in-flight turn；未设置表示普通轮次输入 |
 | `AgentQuestionRequest` / `AgentQuestionResponse` | 底层 CLI/SDK 在执行中主动询问用户时的统一问题与回答载体，覆盖 Claude `AskUserQuestion`、Codex `requestUserInput` 和 MCP elicitation |
 | `AgentApprovalRequest` / `AgentApprovalResponse` | 底层 CLI/SDK 在执行中请求授权时的统一审批载体，覆盖命令执行、文件变更、权限扩展和 Claude 工具审批 |
-| `AgentCanvasSettings` | 程序级运行时设置；当前包含 `fullPermissionMode` 完全权限模式 |
+| `AgentCanvasSettings` | 当前 Canvas 项目的运行时设置；包含 `fullPermissionMode` 完全权限模式与 `workDocumentationEnabled` 工作文档维护开关 |
 | `AgentEvent` | 归一化事件的可辨识联合（判别字段 `kind`）：`status / user_input / user_question / user_question_result / user_approval / user_approval_result / compact / system_init / thinking / assistant_text / tool_use / tool_result / result / error` |
 | `AgentEventEnvelope` | 传输信封：`{ agentId, seq, at, event }`，带单调序号便于回放/补齐 |
 | `AgentStartConfig` | 启动 agent 的配置（provider、prompt、branch workspace/cwd、model、权限模式、`zoneId` 占位等） |
@@ -61,7 +61,7 @@ npm test --workspace packages/shared        # vitest
 
 `BranchOption.hasWorkspace=false` 表示远端已有但本地尚未创建专属 worktree；后端在创建 Agent 或切换 Agent branch 时才懒创建该 workspace。
 
-`AgentFileAccess` 额外包含 `readableDirectories` 和 `sharedResources`。`readOnly` 共享资源只进入可读目录和上下文说明；`readWrite` 共享资源才加入 `writableDirectories`。
+`AgentFileAccess` 额外包含 `readableDirectories`、`writableDirectories`、`sandboxWritableDirectories` 和 `sharedResources`。`readOnly` 共享资源只进入可读目录和上下文说明；`readWrite` 共享资源才加入会被视为显式写授权的 `writableDirectories`。`sandboxWritableDirectories` 只扩展 provider sandbox roots，不关闭正常审批。开启工作文档维护时，WorkspaceManager 会临时加入两份固定 Markdown 索引引用，并只开放 branch 隔离文档与当前 branch 共享概要子目录；它们不是画布文件节点。
 
 ## PR 流程模型
 

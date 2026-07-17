@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentSettings, BranchWorkspace } from "@agent-canvas/shared";
 import { AgentManager } from "../AgentManager.js";
 import { AsyncMessageQueue } from "../util/AsyncMessageQueue.js";
 import { WorkspaceManager } from "../workspaces/WorkspaceManager.js";
+import { SyncFlowManager } from "../sync/SyncFlowManager.js";
 import type {
   QueryFn,
   QueryHandle,
@@ -24,12 +25,14 @@ describe("PullRequestFlowManager integration", () => {
     const source = path.join(root, "source-repo");
     const remote = path.join(root, "remote.git");
     const projectRoot = path.join(root, "project");
+    const documentationMounts: string[] = [];
 
     try {
       await createTempRepo(source, remote);
       const workspaceManager = new WorkspaceManager({
         defaultSourcePath: source,
         projectRoot,
+        projectsRoot: path.join(root, "projects"),
       });
       const project = await workspaceManager.connect({
         remoteUrl: remote,
@@ -40,6 +43,11 @@ describe("PullRequestFlowManager integration", () => {
       if (!main) throw new Error("expected main branch workspace");
       const sourceBranch = await workspaceManager.createBranch({ branch: "feature/pr-flow" });
       const otherBranch = await workspaceManager.createBranch({ branch: "feature/other" });
+      documentationMounts.push(
+        path.join(main.worktreePath, ".agent-shared-docs"),
+        path.join(sourceBranch.worktreePath, ".agent-shared-docs"),
+        path.join(otherBranch.worktreePath, ".agent-shared-docs"),
+      );
 
       const query = makeQueryHub();
       let now = 1_000;
@@ -52,6 +60,18 @@ describe("PullRequestFlowManager integration", () => {
           branch: config?.branch,
           cwd: config?.cwd,
         }),
+      });
+      agentManager.setFileAccessResolver((agentId) =>
+        workspaceManager.accessForAgent(agentManager.configOf(agentId), {
+          workDocumentationEnabled: true,
+        }),
+      );
+      agentManager.setFileAccessPreparer(async (agentId) => {
+        await workspaceManager.prepareAgentWorkspace(
+          agentId,
+          agentManager.configOf(agentId),
+          { workDocumentationEnabled: true },
+        );
       });
       const prManager = new PullRequestFlowManager({
         host: agentManager,
@@ -104,6 +124,11 @@ describe("PullRequestFlowManager integration", () => {
       await approve(prManager, query, sourceRunning, flow.id, "source_preflight");
 
       await waitUntil(() => prManager.get(flow.id)?.status === "create_pr_authorized");
+      await waitUntil(() =>
+        inputText(proposer.session.inputs.at(-1)).includes(
+          "authorized to prepare and create the PR",
+        ),
+      );
       expect(inputText(proposer.session.inputs.at(-1))).toContain(
         "authorized to prepare and create the PR",
       );
@@ -142,6 +167,9 @@ describe("PullRequestFlowManager integration", () => {
       await approve(prManager, query, targetRunning, flow.id, "target_merge");
 
       await waitUntil(() => prManager.get(flow.id)?.status === "merge_authorized");
+      await waitUntil(() =>
+        inputText(proposer.session.inputs.at(-1)).includes("authorized to merge the PR"),
+      );
       expect(inputText(proposer.session.inputs.at(-1))).toContain(
         "authorized to merge the PR",
       );
@@ -157,10 +185,149 @@ describe("PullRequestFlowManager integration", () => {
         prNumber: 42,
         prUrl: "local://pull/42",
       });
+
+      // Keep one source agent running so the next PR review exercises native steer,
+      // while the other source agents exercise direct waiting-input send.
+      await agentManager.get(sourceRunning.id)?.send("keep this source agent running");
+      const proposerInputCount = proposer.session.inputs.length;
+      const waitingInputCount = sourceWaiting.session.inputs.length;
+      const runningSteerCount = sourceRunning.session.steered.length;
+
+      const sharedMount = path.join(sourceBranch.worktreePath, ".agent-shared-docs");
+      const outside = path.join(root, "tampered-shared-docs");
+      await mkdir(outside, { recursive: true });
+      await rm(sharedMount, { force: true });
+      await symlink(outside, sharedMount, process.platform === "win32" ? "junction" : "dir");
+
+      const blocked = await prManager.create({
+        proposerAgentId: proposer.id,
+        targetBranch: "main",
+        summary: "Tampered documentation mount must block direct automation dispatch",
+        title: "Blocked PR",
+      });
+
+      expect(blocked.status).toBe("source_review_failed");
+      expect(blocked.failureReason).toContain("Failed to deliver review request");
+      expect(proposer.session.inputs).toHaveLength(proposerInputCount);
+      expect(sourceWaiting.session.inputs).toHaveLength(waitingInputCount);
+      expect(sourceRunning.session.steered).toHaveLength(runningSteerCount);
+      await agentManager.clear();
+      await rm(sharedMount, { force: true });
     } finally {
+      for (const mount of documentationMounts) {
+        await rm(mount, { force: true }).catch(() => undefined);
+      }
       await rm(root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it("delivers concurrent PR and sync authorizations across Codex turn transitions", async () => {
+    const query = makeQueryHub();
+    let now = 10_000;
+    const agentManager = new AgentManager({
+      query: query.query,
+      codexQuery: query.query,
+      now: () => ++now,
+    });
+    const prManager = new PullRequestFlowManager({ host: agentManager, now: () => ++now });
+    const syncManager = new SyncFlowManager({ host: agentManager, now: () => ++now });
+    agentManager.onEvent((envelope) => {
+      if (envelope.event.kind === "result") {
+        void Promise.all([
+          prManager.handleAgentEvent(envelope),
+          syncManager.handleAgentEvent(envelope),
+        ]);
+      }
+    });
+
+    const runner = agentManager.create({
+      provider: "codex",
+      branch: "feature/atomic-delivery",
+      cwd: process.cwd(),
+    });
+    await agentManager.startAgent(runner.id, { prompt: "start review agent" });
+    const session = query.sessions.at(-1);
+    if (!session) throw new Error("expected query session");
+    session.output.push(systemInit(runner.id, process.cwd()));
+    await waitUntil(() => runner.getStatus() === "running");
+    await waitUntil(() => session.turnActive);
+
+    const prFlow = await prManager.create({
+      proposerAgentId: runner.id,
+      targetBranch: "main",
+      title: "Atomic delivery",
+      summary: "Exercise result-time authorization delivery",
+      files: ["src/pr.ts"],
+    });
+    const syncFlow = await syncManager.create({
+      kind: "branch_pull",
+      proposerAgentId: runner.id,
+      sourceBranch: "main",
+      targetBranch: "feature/atomic-delivery",
+      summary: "Catch up with main",
+      reason: "Exercise concurrent authorization delivery",
+      files: ["src/sync.ts"],
+    });
+    expect(session.steered).toHaveLength(2);
+
+    await runner.send("ordinary queued input");
+    session.pauseTurnActivation = true;
+    session.output.push({
+      type: "assistant",
+      session_id: `session-${runner.id}`,
+      uuid: "combined-review",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: [
+              JSON.stringify({
+                agentCanvasPrReview: true,
+                flowId: prFlow.id,
+                stage: "source_preflight",
+                decision: "approve",
+                summary: "PR approved",
+                risks: [],
+                filesReviewed: ["src/pr.ts"],
+                requiredChanges: [],
+              }),
+              JSON.stringify({
+                agentCanvasSyncReview: true,
+                flowId: syncFlow.id,
+                decision: "approve",
+                summary: "Sync approved",
+                risks: [],
+                filesReviewed: ["src/sync.ts"],
+                requiredChanges: [],
+              }),
+            ].join("\n"),
+          },
+        ],
+      },
+    });
+    completeTurn(session);
+
+    await waitUntil(() => prManager.get(prFlow.id)?.status === "create_pr_authorized");
+    await waitUntil(() => syncManager.get(syncFlow.id)?.status === "apply_authorized");
+    expect(session.steered).toHaveLength(2);
+    expect(session.inputs.map(inputText)).toEqual(["start review agent", "ordinary queued input"]);
+
+    completeTurn(session);
+    await waitUntil(() => session.inputs.length === 3);
+    completeTurn(session);
+    await waitUntil(() => session.inputs.length === 4);
+    const delivered = session.inputs.map(inputText);
+    expect(delivered.filter((text) => text.includes("authorized to prepare and create the PR"))).toHaveLength(1);
+    expect(
+      delivered.filter((text) =>
+        text.includes("authorized to pull/merge the requested source branch"),
+      ),
+    ).toHaveLength(1);
+    expect(prManager.get(prFlow.id)?.failureReason).toBeUndefined();
+    expect(syncManager.get(syncFlow.id)?.failureReason).toBeUndefined();
+    await agentManager.clear();
+  });
 });
 
 interface QuerySession {
@@ -168,6 +335,8 @@ interface QuerySession {
   output: AsyncMessageQueue<SdkMessage>;
   inputs: SdkUserInput[];
   steered: SdkUserInput[];
+  turnActive: boolean;
+  pauseTurnActivation: boolean;
 }
 
 interface AgentHandle {
@@ -183,18 +352,25 @@ function makeQueryHub(): { query: QueryFn; sessions: QuerySession[] } {
       output: new AsyncMessageQueue<SdkMessage>(),
       inputs: [],
       steered: [],
+      turnActive: false,
+      pauseTurnActivation: false,
     };
     sessions.push(session);
     if (typeof prompt !== "string") {
       void (async () => {
-        for await (const input of prompt) session.inputs.push(input);
+        for await (const input of prompt) {
+          session.inputs.push(input);
+          if (!session.pauseTurnActivation) session.turnActive = true;
+        }
       })();
     }
     const handle: QueryHandle = {
       [Symbol.asyncIterator]: () => session.output[Symbol.asyncIterator](),
       steer: async (input) => {
+        if (!session.turnActive) throw new Error("Codex turn is not active");
         session.steered.push(input);
       },
+      canSteerNow: () => session.turnActive,
       interrupt: async () => {
         session.output.close();
       },
@@ -220,11 +396,11 @@ async function startAgent(
     cwd: branch.worktreePath,
   };
   const runner = agentManager.create(settings);
-  agentManager.startAgent(runner.id, { prompt: `start ${runner.id}` });
+  await agentManager.startAgent(runner.id, { prompt: `start ${runner.id}` });
   const session = query.sessions.at(-1);
   if (!session) throw new Error("expected query session");
   session.output.push(systemInit(runner.id, branch.worktreePath));
-  if (status === "waiting_input") session.output.push(resultMsg());
+  if (status === "waiting_input") completeTurn(session);
   await flush();
   await waitUntil(() => runner.getStatus() === status);
   return { id: runner.id, session };
@@ -266,8 +442,13 @@ async function emitAssistantResult(
     uuid: `message-${agent.id}-${Date.now()}`,
     message: { role: "assistant", content: [{ type: "text", text }] },
   });
-  agent.session.output.push(resultMsg());
+  completeTurn(agent.session);
   await flush();
+}
+
+function completeTurn(session: QuerySession): void {
+  session.turnActive = false;
+  session.output.push(resultMsg());
 }
 
 function inputText(input: SdkUserInput | undefined): string {
