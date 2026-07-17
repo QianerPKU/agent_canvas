@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import {
   cp,
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -18,7 +19,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { WorkspaceManager, type GitRunner } from "./WorkspaceManager.js";
-import { sharedBranchDirectory } from "./workDocumentation.js";
+import { sharedBranchDirectory, sharedDocumentationIndex } from "./workDocumentation.js";
 
 const CASE_DISTINCT_TEST_FILESYSTEM = testFilesystemPreservesCaseDistinctDirectories();
 
@@ -78,6 +79,40 @@ describe("WorkspaceManager", () => {
       await expect(manager.openCanvasProject({ id: created.id })).resolves.toMatchObject({
         projectRoot: customProjectRoot,
       });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("allows the selected project root itself to be a trusted directory junction", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-project-root-link-"));
+    const actualProjectRoot = path.join(root, "actual-project");
+    const linkedProjectRoot = path.join(root, "linked-project");
+    try {
+      const creator = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot: path.join(root, "creator-index"),
+        autoOpenDefault: false,
+      });
+      await creator.createCanvasProject({
+        name: "Linked project",
+        projectRoot: actualProjectRoot,
+      });
+      await symlink(
+        actualProjectRoot,
+        linkedProjectRoot,
+        process.platform === "win32" ? "junction" : "dir",
+      );
+
+      const loader = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot: path.join(root, "loader-index"),
+        autoOpenDefault: false,
+      });
+      const opened = await loader.openCanvasProject({ projectRoot: linkedProjectRoot });
+
+      expect(opened.projectRoot).toBe(path.resolve(linkedProjectRoot));
+      await expect(realpath(opened.projectRoot)).resolves.toBe(await realpath(actualProjectRoot));
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -566,6 +601,99 @@ describe("WorkspaceManager", () => {
     }
   });
 
+  it("rejects a pre-existing repository junction before cloning into it", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-repo-junction-"));
+    const source = path.join(root, "source-repo");
+    const projectRoot = path.join(root, "project");
+    const repositoryPath = path.join(projectRoot, "repos", "repo_1", "repo");
+    const outside = path.join(root, "outside-repository");
+    let cloneCalls = 0;
+    await Promise.all([mkdir(source, { recursive: true }), mkdir(outside, { recursive: true })]);
+    await writeFile(path.join(outside, "sentinel.txt"), "outside repository\n", "utf-8");
+    await mkdir(path.dirname(repositoryPath), { recursive: true });
+    await symlink(
+      outside,
+      repositoryPath,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const runGit: GitRunner = async (args) => {
+      if (args[0] === "remote") return "https://github.com/acme/repo-junction.git";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") cloneCalls += 1;
+      return "";
+    };
+
+    try {
+      const manager = new WorkspaceManager({ defaultSourcePath: source, projectRoot, runGit });
+      await expect(manager.connect({ localPath: source })).rejects.toThrow("不安全的映射");
+      expect(cloneCalls).toBe(0);
+      await expect(readFile(path.join(outside, "sentinel.txt"), "utf-8")).resolves.toBe(
+        "outside repository\n",
+      );
+      await expect(lstat(path.join(outside, ".agent-tmp"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a pre-existing worktree junction before creating a branch", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-branch-junction-"));
+    const source = path.join(root, "source-repo");
+    const projectRoot = path.join(root, "project");
+    const outside = path.join(root, "outside-worktree");
+    let worktreeAdds = 0;
+    await Promise.all([mkdir(source, { recursive: true }), mkdir(outside, { recursive: true })]);
+    await writeFile(path.join(outside, "sentinel.txt"), "outside worktree\n", "utf-8");
+    const runGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return "https://github.com/acme/branch-junction.git";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "worktree" && args[1] === "add") {
+        worktreeAdds += 1;
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      return "";
+    };
+
+    try {
+      const manager = new WorkspaceManager({ defaultSourcePath: source, projectRoot, runGit });
+      await manager.connect({ localPath: source });
+      const worktreePath = path.join(
+        projectRoot,
+        "worktrees",
+        "repo_1",
+        "feature-external",
+      );
+      await mkdir(path.dirname(worktreePath), { recursive: true });
+      await symlink(
+        outside,
+        worktreePath,
+        process.platform === "win32" ? "junction" : "dir",
+      );
+
+      await expect(manager.createBranch({ branch: "feature/external" })).rejects.toThrow(
+        "不安全的映射",
+      );
+      expect(worktreeAdds).toBe(0);
+      await expect(readFile(path.join(outside, "sentinel.txt"), "utf-8")).resolves.toBe(
+        "outside worktree\n",
+      );
+      await expect(lstat(path.join(outside, ".agent-tmp"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("provisions isolated and shared work documentation without overwriting agent content", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-work-docs-"));
     const source = path.join(root, "source-repo");
@@ -699,6 +827,189 @@ describe("WorkspaceManager", () => {
     }
   });
 
+  it("rejects a hard-linked shared index without modifying its outside sentinel", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-shared-doc-hardlink-"));
+    const source = path.join(root, "source-repo");
+    const projectRoot = path.join(root, "project");
+    const outsideSentinel = path.join(root, "outside-shared-index.md");
+    const remoteUrl = "https://github.com/acme/shared-hardlink.git";
+    await mkdir(source, { recursive: true });
+    const runGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return remoteUrl;
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      return "";
+    };
+
+    try {
+      const manager = new WorkspaceManager({ defaultSourcePath: source, projectRoot, runGit });
+      const workspace = (await manager.connect({ localPath: source })).branches[0]!;
+      const repositoryKey = createHash("sha256")
+        .update(remoteUrl.toLowerCase())
+        .digest("hex")
+        .slice(0, 16);
+      const sharedSource = path.join(
+        projectRoot,
+        "shared",
+        "_agent-canvas",
+        repositoryKey,
+        "work-documentation",
+      );
+      const sentinelContent = sharedDocumentationIndex();
+      await mkdir(sharedSource, { recursive: true });
+      await writeFile(
+        path.join(sharedSource, ".agent-canvas-managed"),
+        "Agent Canvas managed shared work documentation. Do not commit or remove this marker.\n",
+        "utf-8",
+      );
+      await writeFile(outsideSentinel, sentinelContent, "utf-8");
+      await link(outsideSentinel, path.join(sharedSource, "index.md"));
+
+      await expect(manager.prepareWorkDocumentationForAllBranches()).rejects.toThrow("单链接");
+      await expect(readFile(outsideSentinel, "utf-8")).resolves.toBe(sentinelContent);
+      await expect(
+        lstat(path.join(workspace.worktreePath, ".agent-docs")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("atomically replaces the shared index when adding a branch entry", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-shared-doc-atomic-"));
+    const source = path.join(root, "source-repo");
+    const projectRoot = path.join(root, "project");
+    await mkdir(source, { recursive: true });
+    const runGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return "https://github.com/acme/shared-atomic.git";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "worktree" && args[1] === "add") {
+        await mkdir(path.join(String(args[4]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      return "";
+    };
+
+    try {
+      const manager = new WorkspaceManager({ defaultSourcePath: source, projectRoot, runGit });
+      const main = (await manager.connect({ localPath: source })).branches[0]!;
+      await manager.prepareWorkDocumentationForAllBranches();
+      const sharedIndexPath = path.join(main.worktreePath, ".agent-shared-docs", "index.md");
+      const before = await lstat(sharedIndexPath);
+
+      await manager.createBranch({ branch: "feature/atomic-index" });
+      await manager.prepareWorkDocumentationForAllBranches();
+      const after = await lstat(sharedIndexPath);
+
+      expect({ dev: after.dev, ino: after.ino }).not.toEqual({
+        dev: before.dev,
+        ino: before.ino,
+      });
+      expect(
+        (await readFile(sharedIndexPath, "utf-8")).match(/agent-canvas:branch:/gu),
+      ).toHaveLength(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a hard-linked isolated index before publishing document access", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-isolated-doc-hardlink-"));
+    const source = path.join(root, "source-repo");
+    const projectRoot = path.join(root, "project");
+    const outsideSentinel = path.join(root, "outside-isolated-index.md");
+    await mkdir(source, { recursive: true });
+    const runGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return "https://github.com/acme/isolated-hardlink.git";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      return "";
+    };
+
+    try {
+      const manager = new WorkspaceManager({ defaultSourcePath: source, projectRoot, runGit });
+      const workspace = (await manager.connect({ localPath: source })).branches[0]!;
+      const isolatedDirectory = path.join(workspace.worktreePath, ".agent-docs");
+      const sentinelContent = "# Outside sentinel\n";
+      await mkdir(isolatedDirectory, { recursive: true });
+      await writeFile(
+        path.join(isolatedDirectory, ".agent-canvas-managed"),
+        "Agent Canvas managed work documentation. Do not commit or remove this marker.\n",
+        "utf-8",
+      );
+      await writeFile(outsideSentinel, sentinelContent, "utf-8");
+      await link(outsideSentinel, path.join(isolatedDirectory, "index.md"));
+
+      const config = { branchWorkspaceId: workspace.id };
+      const options = { workDocumentationEnabled: true };
+      await expect(manager.prepareAgentWorkspace("agent_1", config, options)).rejects.toThrow(
+        "单链接",
+      );
+      await expect(readFile(outsideSentinel, "utf-8")).resolves.toBe(sentinelContent);
+      expect(manager.accessForAgent(config, options).readableFiles).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a hard-linked git exclude without modifying its outside sentinel", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-exclude-hardlink-"));
+    const source = path.join(root, "source-repo");
+    const projectRoot = path.join(root, "project");
+    const outsideSentinel = path.join(root, "outside-exclude");
+    await mkdir(source, { recursive: true });
+    const runGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return "https://github.com/acme/exclude-hardlink.git";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      return "";
+    };
+
+    try {
+      const manager = new WorkspaceManager({ defaultSourcePath: source, projectRoot, runGit });
+      const workspace = (await manager.connect({ localPath: source })).branches[0]!;
+      const excludePath = path.join(workspace.worktreePath, ".git", "info", "exclude");
+      const sentinelContent = "# Outside git exclude sentinel\n";
+      await writeFile(outsideSentinel, sentinelContent, "utf-8");
+      await rm(excludePath);
+      await link(outsideSentinel, excludePath);
+
+      await expect(manager.prepareWorkDocumentationForAllBranches()).rejects.toThrow("单链接");
+      await expect(readFile(outsideSentinel, "utf-8")).resolves.toBe(sentinelContent);
+      expect((await lstat(outsideSentinel)).nlink).toBe(2);
+      await expect(
+        lstat(path.join(workspace.worktreePath, ".agent-docs")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("revalidates cached work documentation before restoring agent access", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-work-docs-revalidate-"));
     const source = path.join(root, "source-repo");
@@ -784,6 +1095,125 @@ describe("WorkspaceManager", () => {
         manager.prepareAgentWorkspace("agent_1", config, options),
       ).resolves.toBeDefined();
       expect(manager.accessForAgent(config, options).readableFiles).toHaveLength(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["repository", "worktree"] as const)(
+    "rejects imported %s roots mapped through an external junction",
+    async (mappedRoot) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-import-root-map-"));
+      const projectRoot = path.join(root, "project");
+      const outside = path.join(root, "outside");
+      const projectsRoot = path.join(root, "projects-index");
+      try {
+        const creator = new WorkspaceManager({
+          defaultSourcePath: root,
+          projectsRoot,
+          autoOpenDefault: false,
+          now: () => 275,
+        });
+        await creator.createCanvasProject({ name: "Mapped import", projectRoot });
+        const workspacePath = path.join(projectRoot, "workspace.json");
+        const document = JSON.parse(await readFile(workspacePath, "utf-8"));
+        const repoPath = path.join(projectRoot, "repos", "repo_1", "repo");
+        const worktreePath = path.join(projectRoot, "worktrees", "repo_1", "feature-imported");
+        await mkdir(outside, { recursive: true });
+        document.repo = {
+          id: "repo_1",
+          remoteUrl: "https://github.com/acme/mapped-import.git",
+          defaultBranch: "main",
+          localRepoPath: repoPath,
+          connectedAt: 275,
+        };
+        document.branches =
+          mappedRoot === "worktree"
+            ? [
+                {
+                  id: "branch_1",
+                  repoId: "repo_1",
+                  branch: "feature/imported",
+                  baseBranch: "main",
+                  worktreePath,
+                  scratchRoot: path.join(worktreePath, ".agent-tmp"),
+                  isDefault: false,
+                  createdAt: 275,
+                },
+              ]
+            : [];
+        if (mappedRoot === "repository") {
+          await mkdir(path.dirname(repoPath), { recursive: true });
+          await symlink(outside, repoPath, process.platform === "win32" ? "junction" : "dir");
+        } else {
+          await mkdir(repoPath, { recursive: true });
+          await mkdir(path.dirname(worktreePath), { recursive: true });
+          await symlink(
+            outside,
+            worktreePath,
+            process.platform === "win32" ? "junction" : "dir",
+          );
+        }
+        await writeFile(workspacePath, `${JSON.stringify(document, undefined, 2)}\n`, "utf-8");
+
+        const loader = new WorkspaceManager({
+          defaultSourcePath: root,
+          projectsRoot: path.join(root, "loader-index"),
+          autoOpenDefault: false,
+        });
+        await expect(loader.inspectCanvasProject(projectRoot)).rejects.toThrow("不安全的映射");
+        await expect(loader.openCanvasProject({ projectRoot })).rejects.toThrow("不安全的映射");
+        await expect(lstat(path.join(outside, ".agent-docs"))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("rejects a worktree replaced by an outside junction before agent preparation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-worktree-root-swap-"));
+    const source = path.join(root, "source-repo");
+    const projectRoot = path.join(root, "project");
+    const outside = path.join(root, "outside-worktree");
+    await Promise.all([mkdir(source, { recursive: true }), mkdir(outside, { recursive: true })]);
+    const runGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return "https://github.com/acme/worktree-root-swap.git";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      return "";
+    };
+
+    try {
+      const manager = new WorkspaceManager({ defaultSourcePath: source, projectRoot, runGit });
+      const workspace = (await manager.connect({ localPath: source })).branches[0]!;
+      await rm(workspace.worktreePath, { recursive: true, force: true });
+      await symlink(
+        outside,
+        workspace.worktreePath,
+        process.platform === "win32" ? "junction" : "dir",
+      );
+
+      await expect(
+        manager.prepareAgentWorkspace(
+          "agent_1",
+          { branchWorkspaceId: workspace.id },
+          { workDocumentationEnabled: true },
+        ),
+      ).rejects.toThrow("不安全的映射");
+      await expect(lstat(path.join(outside, ".agent-tmp"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(lstat(path.join(outside, ".agent-docs"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

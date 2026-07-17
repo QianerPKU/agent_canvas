@@ -175,6 +175,7 @@ function createHandle(
         }),
       });
     },
+    canSteerNow: () => !!client && !!threadId && !!turnId,
     setModel: async (model) => {
       currentModel = model;
     },

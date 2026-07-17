@@ -52,6 +52,9 @@ function makeControllableQuery(handleOptions: { nativeSteer?: boolean } = {}) {
   const modelUpdates: Array<string | undefined> = [];
   let interrupted = false;
   let terminated = false;
+  let steerAvailable = handleOptions.nativeSteer !== false;
+  let steerDelay: Promise<void> | undefined;
+  let steerCalls = 0;
   let lastOptions: QueryOptions | undefined;
 
   const query: QueryFn = ({ prompt, options }) => {
@@ -75,8 +78,12 @@ function makeControllableQuery(handleOptions: { nativeSteer?: boolean } = {}) {
     };
     if (handleOptions.nativeSteer !== false) {
       handle.steer = async (input) => {
+        steerCalls += 1;
+        await steerDelay;
+        if (!steerAvailable) throw new Error("turn is not active");
         steeredInputs.push(input);
       };
+      handle.canSteerNow = () => steerAvailable;
     }
     handle.setModel = async (model) => {
       modelUpdates.push(model);
@@ -93,6 +100,13 @@ function makeControllableQuery(handleOptions: { nativeSteer?: boolean } = {}) {
     modelUpdates,
     wasInterrupted: () => interrupted,
     wasTerminated: () => terminated,
+    setSteerAvailable: (available: boolean) => {
+      steerAvailable = available;
+    },
+    setSteerDelay: (delay: Promise<void> | undefined) => {
+      steerDelay = delay;
+    },
+    steerCalls: () => steerCalls,
     getOptions: () => lastOptions,
   };
 }
@@ -230,6 +244,229 @@ describe("AgentRunner 生命周期", () => {
     });
     expect(ctl.wasTerminated()).toBe(true);
     expect(runner.getStatus()).toBe("error");
+  });
+
+  it("serializes concurrent automation delivery across a cleared turn and queued inputs", async () => {
+    const ctl = makeControllableQuery();
+    const queuedPreparation = deferred();
+    let preparationCall = 0;
+    const prepareFileAccess = vi.fn(() => {
+      preparationCall += 1;
+      return preparationCall === 2 ? queuedPreparation.promise : undefined;
+    });
+    const runner = new AgentRunner("serialized-delivery-agent", {
+      query: ctl.query,
+      prepareFileAccess,
+    });
+    const events: AgentEvent[] = [];
+    let delivery: Promise<void> | undefined;
+    let statusAtFirstResult: AgentStatus | undefined;
+    runner.on((event) => {
+      events.push(event);
+      if (event.kind === "result" && !delivery) {
+        statusAtFirstResult = runner.getStatus();
+        delivery = Promise.all([
+          runner.deliver("PR authorization"),
+          runner.deliver("sync authorization"),
+        ]).then(() => undefined);
+      }
+    });
+
+    await runner.start({ prompt: "first" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+    await runner.send("ordinary queued input");
+    ctl.setSteerAvailable(false);
+    ctl.emit(resultMsg());
+    await flush();
+    expect(delivery).toBeUndefined();
+
+    queuedPreparation.resolve();
+    await flush();
+    await delivery;
+
+    expect(statusAtFirstResult).toBe("running");
+    expect(ctl.steeredInputs).toEqual([]);
+    expect(
+      events.filter(
+        (event): event is Extract<AgentEvent, { kind: "user_input" }> =>
+          event.kind === "user_input" && event.mode === "queued",
+      ),
+    ).toEqual([
+      { kind: "user_input", text: "ordinary queued input", mode: "queued" },
+      { kind: "user_input", text: "PR authorization", mode: "queued" },
+      { kind: "user_input", text: "sync authorization", mode: "queued" },
+    ]);
+
+    ctl.emit(resultMsg());
+    await flush();
+    ctl.emit(resultMsg());
+    await flush();
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual([
+      "first",
+      "ordinary queued input",
+      "PR authorization",
+      "sync authorization",
+    ]);
+  });
+
+  it("queues safely when a turn completes during serialized path preparation", async () => {
+    const ctl = makeControllableQuery();
+    const deliveryPreparation = deferred();
+    let preparationCall = 0;
+    const runner = new AgentRunner("prepared-delivery-agent", {
+      query: ctl.query,
+      prepareFileAccess: () => {
+        preparationCall += 1;
+        return preparationCall === 2 ? deliveryPreparation.promise : undefined;
+      },
+    });
+
+    await runner.start({ prompt: "first" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+    const delivery = runner.deliver("after result");
+    ctl.setSteerAvailable(false);
+    ctl.emit(resultMsg());
+    await flush();
+    expect(runner.getStatus()).toBe("running");
+
+    deliveryPreparation.resolve();
+    await delivery;
+    await flush();
+
+    expect(ctl.steeredInputs).toEqual([]);
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual(["first", "after result"]);
+    expect(runner.getStatus()).toBe("running");
+  });
+
+  it("queues when the provider turn closes between steer selection and the steer RPC", async () => {
+    const ctl = makeControllableQuery();
+    const steerDelay = deferred();
+    const runner = new AgentRunner("steer-completion-race-agent", { query: ctl.query });
+
+    await runner.start({ prompt: "first" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+    ctl.setSteerDelay(steerDelay.promise);
+    const delivery = runner.deliver("authorization after turn completion");
+    await flush();
+    expect(ctl.steerCalls()).toBe(1);
+
+    ctl.setSteerAvailable(false);
+    ctl.emit(resultMsg());
+    steerDelay.resolve();
+    await delivery;
+    await flush();
+
+    expect(ctl.steeredInputs).toEqual([]);
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual([
+      "first",
+      "authorization after turn completion",
+    ]);
+    expect(runner.getStatus()).toBe("running");
+  });
+
+  it("preserves automation delivery order when the first preparation is slower", async () => {
+    const ctl = makeControllableQuery();
+    const firstDeliveryPreparation = deferred();
+    let preparationCall = 0;
+    const runner = new AgentRunner("ordered-delivery-agent", {
+      query: ctl.query,
+      prepareFileAccess: () => {
+        preparationCall += 1;
+        return preparationCall === 2 ? firstDeliveryPreparation.promise : undefined;
+      },
+    });
+
+    await runner.start({ prompt: "first" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+    const first = runner.deliver("first automation message");
+    const second = runner.deliver("second automation message");
+    await flush();
+    expect(preparationCall).toBe(2);
+    expect(ctl.steeredInputs).toEqual([]);
+
+    firstDeliveryPreparation.resolve();
+    await Promise.all([first, second]);
+
+    expect(ctl.steeredInputs.map((input) => input.message.content)).toEqual([
+      "first automation message",
+      "second automation message",
+    ]);
+  });
+
+  it("serializes concurrent automation deliveries while resuming a restored session", async () => {
+    const ctl = makeControllableQuery();
+    const runner = new AgentRunner("restored-delivery-agent", { query: ctl.query });
+    runner.restore({
+      id: "restored-delivery-agent",
+      status: "waiting_input",
+      sessionId: "restored-session",
+      config: { prompt: "old task", resume: "restored-session" },
+      createdAt: 1,
+      lastEventSeq: 0,
+    });
+
+    await Promise.all([
+      runner.deliver("first automation after restore"),
+      runner.deliver("second automation after restore"),
+    ]);
+    await flush();
+
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual([
+      "first automation after restore",
+    ]);
+    expect(ctl.getOptions()?.resume).toBe("restored-session");
+    expect(runner.getStatus()).toBe("starting");
+
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+    ctl.emit(resultMsg());
+    await flush();
+
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual([
+      "first automation after restore",
+      "second automation after restore",
+    ]);
+    expect(runner.getStatus()).toBe("running");
+  });
+
+  it("does not let delayed delivery or an old result mutate a restarted lifecycle", async () => {
+    const ctl = makeControllableQuery();
+    const steerDelay = deferred();
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("delivery-restart-race-agent", { query: ctl.query });
+    runner.on((event) => events.push(event));
+
+    await runner.start({ prompt: "start A" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+    ctl.setSteerDelay(steerDelay.promise);
+    const delivery = runner.deliver("stale authorization");
+    await flush();
+    expect(ctl.steerCalls()).toBe(1);
+    ctl.emit(resultMsg());
+    await flush();
+
+    await runner.stop();
+    ctl.setSteerDelay(undefined);
+    await runner.start({ prompt: "start B" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+    steerDelay.resolve();
+    await expect(delivery).rejects.toThrow("delivery target changed during dispatch");
+    await flush();
+
+    expect(runner.getStatus()).toBe("running");
+    expect(
+      events.filter(
+        (event): event is Extract<AgentEvent, { kind: "user_input" }> =>
+          event.kind === "user_input" && event.text === "stale authorization",
+      ),
+    ).toEqual([]);
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual(["start A", "start B"]);
   });
 
   it("validates live paths before initial start resolves file access or starts the provider", async () => {
@@ -995,6 +1232,86 @@ describe("AgentRunner 生命周期", () => {
       agentCanvasPolicyPrompt("branch-switch-agent"),
       "从 main 切换到 feature/a\n- M src/app.ts",
     ]);
+  });
+
+  it.each([
+    { ending: "error", expectedStatus: "error" },
+    { ending: "finish", expectedStatus: "done" },
+  ] as const)(
+    "does not suppress the resumed handle's $ending state after settings detach",
+    async ({ ending, expectedStatus }) => {
+      const firstOutput = new AsyncMessageQueue<SdkMessage>();
+      let queryCalls = 0;
+      const events: AgentEvent[] = [];
+      const query: QueryFn = ({ options }) => {
+        queryCalls += 1;
+        if (queryCalls === 1) {
+          options?.abortController?.signal.addEventListener("abort", () => firstOutput.close());
+          return {
+            [Symbol.asyncIterator]: () => firstOutput[Symbol.asyncIterator](),
+            terminate: async () => firstOutput.close(),
+          };
+        }
+        return {
+          // eslint-disable-next-line require-yield
+          async *[Symbol.asyncIterator]() {
+            if (ending === "error") throw new Error("resumed provider failed");
+          },
+        };
+      };
+      const runner = new AgentRunner(`detached-${ending}-agent`, { query });
+      runner.on((event) => events.push(event));
+
+      await runner.start({ prompt: "first", branch: "main", cwd: "/repo-main" });
+      firstOutput.push(SYSTEM_INIT);
+      firstOutput.push(resultMsg());
+      await flush();
+      expect(runner.getStatus()).toBe("waiting_input");
+
+      runner.updateSettings({
+        branchWorkspaceId: "branch_2",
+        branch: "feature/a",
+        cwd: "/repo-feature-a",
+      });
+      await runner.send("resume after branch switch");
+      await flush();
+
+      expect(queryCalls).toBe(2);
+      expect(runner.getStatus()).toBe(expectedStatus);
+      expect(events.some((event) => event.kind === "error")).toBe(ending === "error");
+    },
+  );
+
+  it("invalidates a delayed automation delivery when settings detach the idle session", async () => {
+    const ctl = makeControllableQuery();
+    const deliveryPreparation = deferred();
+    let delayPreparation = false;
+    const runner = new AgentRunner("detached-delivery-agent", {
+      query: ctl.query,
+      prepareFileAccess: () =>
+        delayPreparation ? deliveryPreparation.promise : undefined,
+    });
+
+    await runner.start({ prompt: "first", branch: "main", cwd: "/repo-main" });
+    ctl.emit(SYSTEM_INIT);
+    ctl.emit(resultMsg());
+    await flush();
+    expect(runner.getStatus()).toBe("waiting_input");
+
+    delayPreparation = true;
+    const delivery = runner.deliver("stale automation delivery");
+    await flush();
+    runner.updateSettings({
+      branchWorkspaceId: "branch_2",
+      branch: "feature/a",
+      cwd: "/repo-feature-a",
+    });
+    deliveryPreparation.resolve();
+
+    await expect(delivery).rejects.toThrow("delivery target changed before dispatch");
+    await flush();
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual(["first"]);
+    expect(runner.getStatus()).toBe("waiting_input");
   });
 
   it("waiting_input branch switch resumes next send with the new cwd", async () => {

@@ -14,9 +14,7 @@ import type {
 } from "@agent-canvas/shared";
 
 type DeliverableRunner = {
-  getStatus(): string;
-  send(text: string): Promise<void> | void;
-  steer(text: string): Promise<void>;
+  deliver(text: string): Promise<void>;
 };
 
 export interface PullRequestAgentHost {
@@ -691,16 +689,7 @@ export class PullRequestFlowManager {
   private async deliverToAgent(agentId: string, text: string): Promise<void> {
     const runner = this.host.get(agentId);
     if (!runner) throw new Error(`unknown agent: ${agentId}`);
-    const status = runner.getStatus();
-    if (status === "running") {
-      await runner.steer(text);
-      return;
-    }
-    if (status === "waiting_input") {
-      await runner.send(text);
-      return;
-    }
-    throw new Error(`agent ${agentId} is not active (${status})`);
+    await runner.deliver(text);
   }
 
   private recordSyntheticResponse(

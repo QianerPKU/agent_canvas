@@ -52,6 +52,15 @@ class FakeSyncRunner {
   async steer(text: string): Promise<void> {
     this.sent.push(text);
   }
+
+  async deliver(text: string): Promise<void> {
+    if (this.status === "running") return await this.steer(text);
+    if (this.status === "waiting_input") {
+      this.send(text);
+      return;
+    }
+    throw new Error(`agent is not active (${this.status})`);
+  }
 }
 
 class FakeSyncHost implements SyncFlowAgentHost {

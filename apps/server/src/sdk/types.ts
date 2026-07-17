@@ -165,6 +165,8 @@ export interface QueryHandle extends AsyncIterable<SdkMessage> {
   interrupt?(): Promise<void>;
   /** 追加输入到当前正在运行的一轮；provider 不支持时由 AgentRunner 回退到流式输入队列。 */
   steer?(input: SdkUserInput): Promise<void>;
+  /** Whether a native steer can be accepted at this exact moment. */
+  canSteerNow?(): boolean;
   /** Change the model used by later provider responses when the transport supports it. */
   setModel?(model?: string): Promise<void>;
   /** Change Codex reasoning effort used by later provider responses when supported. */

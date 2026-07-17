@@ -34,9 +34,10 @@ Linux:   ~/.local/share/agent_canvas/projects/index.json
 
 - `workDocumentationEnabled` 是随当前 Canvas 项目保存的开关，默认关闭；旧项目缺少该字段时按关闭处理。
 - 后端硬编码两个导航入口：`.agent-docs/index.md` 保存当前 branch 的详细状态、活动记录和文档索引；`.agent-shared-docs/index.md` 由后端维护同一仓库所有 branch 的只读导航条目，并链接由 Agent 实时维护的各 branch 共享概要页。
-- 两个索引只在不存在时初始化，不覆盖 Agent 已维护的内容。WorkspaceManager 会串行执行初始化，并使用原子文件创建避免多个 Agent 同时启动时截断模板。
+- 两个索引只在不存在时初始化，不覆盖 Agent 已维护的内容。WorkspaceManager 会串行执行初始化；共享导航发生后端更新时使用同目录、已验证的临时文件原子替换，不会原地截断既有索引。
 - 初始化先执行无副作用的 tracked-path、marker、mount 与路径边界预检，再先安装 Git exclude，最后创建文件；成功的 project/repo/branch 上下文会在进程内缓存，避免 Agent 已获得概要写权后后端重复触碰文档路径。
-- `.agent-docs/` 与内置共享源目录都使用 `.agent-canvas-managed` 标记。启用前会通过 `git ls-files` 检查仓库路径，并拒绝未托管目录、symlink/junction、非普通索引文件或越出项目真实路径边界的共享源，避免复用、覆盖业务文件或扩大写入范围。
+- `.agent-docs/` 与内置共享源目录都使用 `.agent-canvas-managed` 标记。启用前会通过 `git ls-files` 检查仓库路径，并拒绝未托管目录、symlink/junction、硬链接数不为 1 的托管文件、非普通索引文件或越出项目真实路径边界的共享源，避免复用、覆盖业务文件或扩大写入范围。
+- 导入、打开和每次 Agent 输入准备都会重新验证 repo/worktree/scratch 与内部共享源的真实路径；项目根目录本身可以是用户明确选择的映射，但其后代 repo/worktree 映射不得逃逸到项目真实根之外。
 - 开启后，两份索引通过 `AgentFileAccess.readableFiles` 随每次业务输入作为文件引用传给 provider；索引内容不会作为提示词节点全文拼接。`sandboxWritableDirectories` 只开放 branch 隔离文档目录和当前 branch 的共享概要子目录，不开放共享总索引或其他 branch 概要；这些文件不是 `CanvasFileNode`，不会出现在画布文件节点中。
 - `sandboxWritableDirectories` 不会像用户明确授权的文件/提示词写目标那样把 Codex `approvalPolicy` 改为 `never`；文档开关不会顺带取消普通代码修改的审批。
 - `.agent-shared-docs/` 的真实目录使用仓库 remote URL 哈希隔离，避免用户共享资源同名冲突，也避免同一 Canvas 重新连接其他仓库时复用旧概要；Git exclude 使用根锚定且无尾斜杠的条目，POSIX symlink 和 Windows junction 本身都不会进入状态列表。

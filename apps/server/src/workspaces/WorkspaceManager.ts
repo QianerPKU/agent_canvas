@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { constants, type Dirent } from "node:fs";
+import { constants, type Dirent, type Stats } from "node:fs";
 import {
   access,
   lstat,
@@ -9,6 +9,7 @@ import {
   readdir,
   readFile,
   realpath,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -312,6 +313,7 @@ export class WorkspaceManager {
       requireExternalTrust: !registered,
       trustedExternalResourcePaths: input.trustedExternalResourcePaths,
     });
+    await validateRelocatedWorkspaceRoots(resolvedRoot, relocated.state);
     let project = { ...relocated.project, id: registered?.id ?? relocated.project.id };
     if (
       !registered &&
@@ -335,6 +337,7 @@ export class WorkspaceManager {
     const relocated = relocateWorkspace(document, resolvedRoot, {
       requireExternalTrust: false,
     });
+    await validateRelocatedWorkspaceRoots(resolvedRoot, relocated.state);
     return {
       project: relocated.project,
       externalSharedResources: relocated.externalSharedResources,
@@ -409,7 +412,15 @@ export class WorkspaceManager {
     const defaultBranch =
       input.defaultBranch?.trim() || (await this.currentBranch(source)) || "main";
     const localRepoPath = this.localRepoPath(DEFAULT_REPO_ID);
+    await ensureDirectoryWithinRoot(projectRoot, localRepoPath, {
+      allowRootMapping: true,
+      createMissing: false,
+    });
     await ensureCloned(this.runGit, cloneSource, localRepoPath);
+    await ensureDirectoryWithinRoot(projectRoot, localRepoPath, {
+      allowRootMapping: true,
+      createMissing: false,
+    });
     const repo = parseGitHubConnection({
       id: DEFAULT_REPO_ID,
       remoteUrl,
@@ -471,6 +482,7 @@ export class WorkspaceManager {
     await this.ensureProjectOpen();
     await this.loadStateIfNeeded();
     const repo = this.requireRepo();
+    const projectRoot = this.requireProjectRoot();
     const branch = normalizeBranch(input.branch);
     const existing = this.state.branches.find((candidate) => candidate.branch === branch);
     if (existing) return existing;
@@ -480,6 +492,14 @@ export class WorkspaceManager {
     const worktreePath = useBaseClone
       ? repo.localRepoPath
       : this.branchWorktreePath(repo.id, branch);
+    await ensureDirectoryWithinRoot(projectRoot, repo.localRepoPath, {
+      allowRootMapping: true,
+      createMissing: false,
+    });
+    await ensureDirectoryWithinRoot(projectRoot, worktreePath, {
+      allowRootMapping: true,
+      createMissing: false,
+    });
     if (!useBaseClone) await mkdir(path.dirname(worktreePath), { recursive: true });
     if (!useBaseClone && !(await exists(worktreePath))) {
       const startPoint = await this.branchStartPoint(repo, branch, baseBranch);
@@ -487,8 +507,16 @@ export class WorkspaceManager {
         cwd: repo.localRepoPath,
       });
     }
+    await ensureDirectoryWithinRoot(projectRoot, worktreePath, {
+      allowRootMapping: true,
+      createMissing: false,
+    });
     const scratchRoot = path.join(worktreePath, ".agent-tmp");
     await mkdir(scratchRoot, { recursive: true });
+    await ensureDirectoryWithinRoot(projectRoot, scratchRoot, {
+      allowRootMapping: true,
+      createMissing: false,
+    });
     const workspace: BranchWorkspace = {
       id,
       repoId: repo.id,
@@ -525,7 +553,19 @@ export class WorkspaceManager {
     const sourcePath = path.resolve(
       input.sourcePath?.trim() || path.join(projectRoot, "shared", repo.id, safePathPart(name)),
     );
+    if (isPathWithin(sourcePath, projectRoot)) {
+      await ensureDirectoryWithinRoot(projectRoot, sourcePath, {
+        allowRootMapping: true,
+        createMissing: false,
+      });
+    }
     await mkdir(sourcePath, { recursive: true });
+    if (isPathWithin(sourcePath, projectRoot)) {
+      await ensureDirectoryWithinRoot(projectRoot, sourcePath, {
+        allowRootMapping: true,
+        createMissing: false,
+      });
+    }
     const resource: SharedResourceMount = {
       id,
       repoId: repo.id,
@@ -686,6 +726,8 @@ export class WorkspaceManager {
     // reused branch id to a different project before it enters the mutation chain.
     const workspaceContext = this.captureWorkDocumentationContext(workspace);
     return await this.queueProjectMutation(async () => {
+      this.assertWorkDocumentationContextCurrent(workspaceContext);
+      await this.validateWorkspaceRootMapping(workspaceContext);
       this.assertWorkDocumentationContextCurrent(workspaceContext);
       await mkdir(scratchDirectory, { recursive: true });
       await this.ensureIgnored(workspace, [".agent-tmp/"]);
@@ -856,7 +898,10 @@ export class WorkspaceManager {
   }
 
   private async loadStateIfNeeded(): Promise<void> {
-    if (this.stateLoaded) return;
+    if (this.stateLoaded) {
+      await validateRelocatedWorkspaceRoots(this.requireProjectRoot(), this.state);
+      return;
+    }
     if (!(await exists(this.statePath()))) {
       this.state = { project: this.currentProject, branches: [], sharedResources: [] };
       this.branchCounter = 0;
@@ -871,6 +916,7 @@ export class WorkspaceManager {
         requireExternalTrust:
           normalizedRootKey(document.project.projectRoot) !== normalizedRootKey(projectRoot),
       });
+      await validateRelocatedWorkspaceRoots(projectRoot, relocated.state);
       this.currentProject = relocated.project;
       this.state = relocated.state;
       this.branchCounter = maxNumericSuffix(this.state.branches.map((branch) => branch.id));
@@ -1080,7 +1126,6 @@ export class WorkspaceManager {
     await ensureDirectoryWithinRoot(
       workspace.worktreePath,
       documentation.isolatedDirectory,
-      { allowRootMapping: true },
     );
     const isolatedMarker = path.join(
       documentation.isolatedDirectory,
@@ -1145,7 +1190,7 @@ export class WorkspaceManager {
       documentation.branchDirectory,
     );
     if (nextSharedIndex !== sharedIndex) {
-      await writeRegularFile(documentation.sharedSourceIndex, nextSharedIndex);
+      await replaceRegularFileAtomically(documentation.sharedSourceIndex, nextSharedIndex);
     }
     this.assertWorkDocumentationContextCurrent(context);
     await this.validatePreparedWorkDocumentation(context, documentation);
@@ -1153,11 +1198,17 @@ export class WorkspaceManager {
     this.preparedWorkDocumentation.add(preparationKey);
   }
 
+  private async validateWorkspaceRootMapping(context: WorkDocumentationContext): Promise<void> {
+    await validateRelocatedWorkspaceRoots(context.projectRoot, this.state);
+  }
+
   private async preflightWorkDocumentation(
     context: WorkDocumentationContext,
     documentation: ReturnType<WorkspaceManager["workDocumentationPaths"]>,
   ): Promise<void> {
     const { workspace } = context;
+    this.assertWorkDocumentationContextCurrent(context);
+    await this.validateWorkspaceRootMapping(context);
     this.assertWorkDocumentationContextCurrent(context);
     await this.assertWorkDocumentationUntracked(workspace);
     this.assertWorkDocumentationContextCurrent(context);
@@ -1224,6 +1275,8 @@ export class WorkspaceManager {
   ): Promise<void> {
     const { workspace } = context;
     this.assertWorkDocumentationContextCurrent(context);
+    await this.validateWorkspaceRootMapping(context);
+    this.assertWorkDocumentationContextCurrent(context);
     await this.assertWorkDocumentationUntracked(workspace);
     this.assertWorkDocumentationContextCurrent(context);
 
@@ -1232,7 +1285,6 @@ export class WorkspaceManager {
       `${WORK_DOCUMENTATION_PATHS.isolatedDirectory}/ 必须是普通目录`,
     );
     await ensureDirectoryWithinRoot(workspace.worktreePath, documentation.isolatedDirectory, {
-      allowRootMapping: true,
       createMissing: false,
     });
     await assertRegularFile(
@@ -1367,14 +1419,28 @@ export class WorkspaceManager {
 
   private async ensureIgnored(workspace: BranchWorkspace, patterns: string[]): Promise<void> {
     const excludePath = await gitPath(this.runGit, workspace.worktreePath, "info/exclude");
+    const projectRoot = this.requireProjectRoot();
     const normalized = patterns.map((pattern) => normalizeIgnorePattern(pattern));
     const key = process.platform === "win32"
       ? path.resolve(excludePath).toLowerCase()
       : path.resolve(excludePath);
     const previous = this.ignoreWriteChains.get(key) ?? Promise.resolve();
+    const append = async () => {
+      const parent = path.dirname(excludePath);
+      await ensureDirectoryWithinRoot(projectRoot, parent, {
+        allowRootMapping: true,
+        createMissing: false,
+      });
+      await mkdir(parent, { recursive: true });
+      await ensureDirectoryWithinRoot(projectRoot, parent, {
+        allowRootMapping: true,
+        createMissing: false,
+      });
+      await appendUniqueLines(excludePath, normalized);
+    };
     const result = previous.then(
-      () => appendUniqueLines(excludePath, normalized),
-      () => appendUniqueLines(excludePath, normalized),
+      append,
+      append,
     );
     const settled = result.then(
       () => undefined,
@@ -1469,6 +1535,7 @@ export class WorkspaceManager {
       requireExternalTrust:
         normalizedRootKey(document.project.projectRoot) !== normalizedRootKey(resolvedRoot),
     });
+    await validateRelocatedWorkspaceRoots(resolvedRoot, relocated.state);
     const project = relocated.project;
     return fallback && normalizedRootKey(fallback.projectRoot) === normalizedRootKey(resolvedRoot)
       ? { ...project, id: fallback.id }
@@ -1617,10 +1684,57 @@ function sameFileSystemPath(left: string, right: string): boolean {
 
 async function ensureFile(filePath: string, content: string): Promise<void> {
   await mkdir(path.dirname(filePath), { recursive: true });
+  const noFollow = process.platform === "win32" ? 0 : constants.O_NOFOLLOW;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    await writeFile(filePath, content, { encoding: "utf-8", flag: "wx" });
+    handle = await open(
+      filePath,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | noFollow,
+      0o600,
+    );
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    await assertRegularFile(filePath, `工作文档托管文件必须是单链接普通文件: ${filePath}`);
+    return;
+  }
+  try {
+    const stat = await handle.stat();
+    assertSingleLinkRegularFile(
+      stat,
+      `工作文档托管文件必须是单链接普通文件: ${filePath}`,
+    );
+    await handle.writeFile(content, { encoding: "utf-8" });
+    await handle.sync();
+    const pathStat = await lstatIfExists(filePath);
+    assertSingleLinkRegularFile(
+      pathStat,
+      `工作文档托管文件必须是单链接普通文件: ${filePath}`,
+    );
+    if (!sameFileIdentity(stat, pathStat!)) {
+      throw new Error(`工作文档托管文件在创建期间发生变化: ${filePath}`);
+    }
+  } finally {
+    await handle.close();
+  }
+  await assertRegularFile(filePath, `工作文档托管文件必须是单链接普通文件: ${filePath}`);
+}
+
+async function validateRelocatedWorkspaceRoots(
+  projectRoot: string,
+  state: WorkspaceState,
+): Promise<void> {
+  const candidates = [
+    ...(state.repo ? [state.repo.localRepoPath] : []),
+    ...state.branches.flatMap((branch) => [branch.worktreePath, branch.scratchRoot]),
+    ...state.sharedResources
+      .filter((resource) => isPathWithin(resource.sourcePath, projectRoot))
+      .map((resource) => resource.sourcePath),
+  ];
+  for (const candidate of new Set(candidates.map((entry) => path.resolve(entry)))) {
+    await ensureDirectoryWithinRoot(projectRoot, candidate, {
+      allowRootMapping: true,
+      createMissing: false,
+    });
   }
 }
 
@@ -1670,7 +1784,7 @@ async function ensureDirectoryWithinRoot(
 
 async function assertRegularFile(filePath: string, message: string): Promise<void> {
   const stat = await lstatIfExists(filePath);
-  if (!stat?.isFile() || stat.isSymbolicLink()) throw new Error(message);
+  assertSingleLinkRegularFile(stat, message);
 }
 
 async function assertOrdinaryDirectory(directoryPath: string, message: string): Promise<void> {
@@ -1680,32 +1794,105 @@ async function assertOrdinaryDirectory(directoryPath: string, message: string): 
 
 async function assertRegularFileIfExists(filePath: string, message: string): Promise<void> {
   const stat = await lstatIfExists(filePath);
-  if (stat && (!stat.isFile() || stat.isSymbolicLink())) throw new Error(message);
+  if (stat) assertSingleLinkRegularFile(stat, message);
 }
 
 async function readRegularFile(filePath: string): Promise<string> {
   const noFollow = process.platform === "win32" ? 0 : constants.O_NOFOLLOW;
+  const pathStat = await lstatIfExists(filePath);
+  assertSingleLinkRegularFile(
+    pathStat,
+    `工作文档索引必须是单链接普通文件: ${filePath}`,
+  );
   const handle = await open(filePath, constants.O_RDONLY | noFollow);
   try {
     const stat = await handle.stat();
-    if (!stat.isFile()) throw new Error(`工作文档索引必须是普通文件: ${filePath}`);
-    return await handle.readFile({ encoding: "utf-8" });
+    assertSingleLinkRegularFile(stat, `工作文档索引必须是单链接普通文件: ${filePath}`);
+    if (!sameFileIdentity(pathStat!, stat)) {
+      throw new Error(`工作文档索引在读取前发生变化: ${filePath}`);
+    }
+    const content = await handle.readFile({ encoding: "utf-8" });
+    const after = await lstatIfExists(filePath);
+    assertSingleLinkRegularFile(after, `工作文档索引必须是单链接普通文件: ${filePath}`);
+    if (!sameFileIdentity(stat, after!)) {
+      throw new Error(`工作文档索引在读取期间发生变化: ${filePath}`);
+    }
+    return content;
   } finally {
     await handle.close();
   }
 }
 
-async function writeRegularFile(filePath: string, content: string): Promise<void> {
+async function replaceRegularFileAtomically(filePath: string, content: string): Promise<void> {
   const noFollow = process.platform === "win32" ? 0 : constants.O_NOFOLLOW;
-  const handle = await open(filePath, constants.O_WRONLY | noFollow);
+  const original = await lstatIfExists(filePath);
+  assertSingleLinkRegularFile(
+    original,
+    `工作文档索引必须是单链接普通文件: ${filePath}`,
+  );
+  const temporaryPath = path.join(
+    path.dirname(filePath),
+    `.${path.basename(filePath)}.agent-canvas-${randomUUID()}.tmp`,
+  );
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    const stat = await handle.stat();
-    if (!stat.isFile()) throw new Error(`工作文档索引必须是普通文件: ${filePath}`);
-    await handle.truncate(0);
+    handle = await open(
+      temporaryPath,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | noFollow,
+      original!.mode & 0o777,
+    );
+    const temporary = await handle.stat();
+    assertSingleLinkRegularFile(
+      temporary,
+      `工作文档临时索引必须是单链接普通文件: ${temporaryPath}`,
+    );
     await handle.writeFile(content, { encoding: "utf-8" });
-  } finally {
+    await handle.sync();
     await handle.close();
+    handle = undefined;
+
+    const temporaryPathStat = await lstatIfExists(temporaryPath);
+    assertSingleLinkRegularFile(
+      temporaryPathStat,
+      `工作文档临时索引必须是单链接普通文件: ${temporaryPath}`,
+    );
+    if (!sameFileIdentity(temporary, temporaryPathStat!)) {
+      throw new Error(`工作文档临时索引在写入期间发生变化: ${temporaryPath}`);
+    }
+    const current = await lstatIfExists(filePath);
+    assertSingleLinkRegularFile(
+      current,
+      `工作文档索引必须是单链接普通文件: ${filePath}`,
+    );
+    if (!sameFileIdentity(original!, current!)) {
+      throw new Error(`工作文档索引在替换前发生变化: ${filePath}`);
+    }
+    await rename(temporaryPath, filePath);
+    const replaced = await lstatIfExists(filePath);
+    assertSingleLinkRegularFile(
+      replaced,
+      `工作文档索引必须是单链接普通文件: ${filePath}`,
+    );
+    if (!sameFileIdentity(temporary, replaced!)) {
+      throw new Error(`工作文档索引原子替换校验失败: ${filePath}`);
+    }
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await rm(temporaryPath, { force: true }).catch(() => undefined);
   }
+}
+
+function assertSingleLinkRegularFile(
+  stat: Stats | undefined,
+  message: string,
+): asserts stat is Stats {
+  if (!stat?.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+    throw new Error(`${message}（必须是单链接普通文件）`);
+  }
+}
+
+function sameFileIdentity(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
 }
 
 async function lstatIfExists(filePath: string) {
@@ -1718,18 +1905,16 @@ async function lstatIfExists(filePath: string) {
 }
 
 async function appendUniqueLines(filePath: string, lines: string[]): Promise<void> {
-  await mkdir(path.dirname(filePath), { recursive: true });
-  let content = "";
-  try {
-    content = await readFile(filePath, "utf-8");
-  } catch {
-    // ignore missing exclude file
-  }
+  await ensureFile(filePath, "");
+  const content = await readRegularFile(filePath);
   const existing = new Set(content.split(/\r?\n/u).filter(Boolean));
   const next = lines.filter((line) => !existing.has(line));
   if (next.length === 0) return;
   const prefix = content && !content.endsWith("\n") ? "\n" : "";
-  await writeFile(filePath, `${content}${prefix}${next.join("\n")}\n`, "utf-8");
+  await replaceRegularFileAtomically(
+    filePath,
+    `${content}${prefix}${next.join("\n")}\n`,
+  );
 }
 
 async function exists(filePath: string): Promise<boolean> {

@@ -31,6 +31,15 @@ class FakeRunner {
   async steer(text: string): Promise<void> {
     this.steered.push(text);
   }
+
+  async deliver(text: string): Promise<void> {
+    if (this.status === "running") return await this.steer(text);
+    if (this.status === "waiting_input") {
+      this.send(text);
+      return;
+    }
+    throw new Error(`agent is not active (${this.status})`);
+  }
 }
 
 class FakeHost implements PullRequestAgentHost {

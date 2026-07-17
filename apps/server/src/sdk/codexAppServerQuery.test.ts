@@ -241,6 +241,11 @@ function makeFakeSpawn(
     effectiveTurnSecurity,
     securityUpdates,
     proc,
+    completeTurn: (turnId = "turn-1") =>
+      write({
+        method: "turn/completed",
+        params: { threadId: "thread-1", turn: { id: turnId, status: "completed" } },
+      }),
   };
 }
 
@@ -847,6 +852,7 @@ describe("Codex app-server query", () => {
     void pendingTurn.catch(() => undefined);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
+    expect(handle.canSteerNow?.()).toBe(true);
     await handle.steer?.(userInput("请优先检查失败测试"));
 
     const steer = fake.messages.find((message) => message.method === "turn/steer");
@@ -861,6 +867,10 @@ describe("Codex app-server query", () => {
         },
       ],
     });
+
+    fake.completeTurn();
+    await pendingTurn;
+    expect(handle.canSteerNow?.()).toBe(false);
 
     await handle.terminate?.();
   });
