@@ -13,7 +13,8 @@ import { createServer } from "./server.js";
 import { FileManager } from "./files/FileManager.js";
 import type { OpenInVscodeOptions } from "./files/VscodeFileOpener.js";
 import { PromptManager } from "./prompts/PromptManager.js";
-import type { PullRequestFlowManager } from "./pullRequests/PullRequestFlowManager.js";
+import { PullRequestFlowManager } from "./pullRequests/PullRequestFlowManager.js";
+import { BranchReviewQueue } from "./reviews/BranchReviewQueue.js";
 import { CodexAuthManager } from "./sdk/CodexAuthManager.js";
 import { SyncFlowManager, type SyncFlowAgentHost } from "./sync/SyncFlowManager.js";
 import type { QueryFn } from "./sdk/types.js";
@@ -684,6 +685,176 @@ describe("HTTP server", () => {
       cwd: feature.json.branch.worktreePath,
       systemPrompt: "switchable",
     });
+  });
+
+  it("retries deferred PR and sync reviews when waiting agents switch to their destination branches", async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-branch-retry-"));
+    const isolatedProjectRoot = path.join(isolatedRoot, "project");
+    const isolatedRunGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return "https://github.com/acme/branch-retry.git";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        await writeFile(path.join(String(args[2]), ".gitkeep"), "");
+        return "";
+      }
+      if (args[0] === "worktree" && args[1] === "add") {
+        await mkdir(path.join(String(args[4]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "worktree" && args[1] === "move") {
+        await rename(String(args[2]), String(args[3]));
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        if (args[1] === "--verify") return "a".repeat(40);
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      return "";
+    };
+    const isolatedWorkspaceManager = new WorkspaceManager({
+      defaultSourcePath: isolatedRoot,
+      projectRoot: isolatedProjectRoot,
+      projectsRoot: path.join(isolatedRoot, "projects-index"),
+      runGit: isolatedRunGit,
+    });
+    const isolatedProject = await isolatedWorkspaceManager.connect({
+      localPath: isolatedRoot,
+    });
+    const mainBranch = isolatedProject.branches[0]!;
+    const destinationBranch = await isolatedWorkspaceManager.createBranch({
+      branch: "feature/branch-retry",
+    });
+    const isolatedQuery: QueryFn = () => {
+      let close!: () => void;
+      const closed = new Promise<void>((resolve) => {
+        close = resolve;
+      });
+      return {
+        async *[Symbol.asyncIterator]() {
+          yield {
+            type: "system" as const,
+            subtype: "init" as const,
+            session_id: "session-branch-retry",
+            model: "codex-test",
+            cwd: destinationBranch.worktreePath,
+            tools: [],
+          };
+          await closed;
+        },
+        terminate: async () => close(),
+      };
+    };
+    const isolatedManager = new AgentManager({ query: isolatedQuery });
+    const isolatedReviewQueue = new BranchReviewQueue();
+    const isolatedPrManager = new PullRequestFlowManager({
+      host: isolatedManager,
+      reviewQueue: isolatedReviewQueue,
+    });
+    const isolatedSyncManager = new SyncFlowManager({
+      host: isolatedManager,
+      reviewQueue: isolatedReviewQueue,
+    });
+    const { httpServer: isolatedServer } = createServer(isolatedManager, undefined, {
+      defaultCwd: isolatedRoot,
+      workspaceManager: isolatedWorkspaceManager,
+      reviewQueue: isolatedReviewQueue,
+      pullRequestFlowManager: isolatedPrManager,
+      syncFlowManager: isolatedSyncManager,
+    });
+
+    try {
+      await new Promise<void>((resolve) => isolatedServer.listen(0, resolve));
+      const isolatedPort = (isolatedServer.address() as AddressInfo).port;
+      const workspace = await rawRequest(isolatedPort, "GET", "/api/workspace");
+      const projectHeaders = {
+        "X-Agent-Canvas-Project-Id": workspace.json.canvasProject.id as string,
+        "X-Agent-Canvas-Project-Revision": String(workspace.json.revision),
+      };
+      const createdReviewer = await rawRequest(
+        isolatedPort,
+        "POST",
+        "/api/agents",
+        { branchWorkspaceId: mainBranch.id },
+        projectHeaders,
+      );
+      expect(createdReviewer.status).toBe(201);
+      const reviewerId = createdReviewer.json.id as string;
+      const reviewerSnapshot = isolatedManager.snapshot(reviewerId)!;
+      isolatedManager.get(reviewerId)!.restore({
+        ...reviewerSnapshot,
+        status: "waiting_input",
+        sessionId: `session-${reviewerId}`,
+        config: {
+          ...reviewerSnapshot.config,
+          resume: `session-${reviewerId}`,
+        },
+      });
+      const prFlow = await isolatedPrManager.create({
+        proposerAgentId: reviewerId,
+        sourceBranch: destinationBranch.branch,
+        targetBranch: "main",
+        summary: "Wait for the reviewer to switch to the PR source branch",
+        files: ["src/pr.ts"],
+      });
+      const syncFlow = await isolatedSyncManager.create({
+        kind: "branch_pull",
+        proposerAgentId: reviewerId,
+        sourceBranch: "main",
+        targetBranch: destinationBranch.branch,
+        strategy: "merge",
+        summary: "Wait for the reviewer to switch to the pull target branch",
+        reason: "Exercise destination-branch retry",
+        files: ["src/sync.ts"],
+      });
+
+      expect(isolatedPrManager.get(prFlow.id)).toMatchObject({
+        status: "queued",
+        failureReason: expect.stringContaining("active reviewer"),
+      });
+      expect(isolatedSyncManager.get(syncFlow.id)).toMatchObject({
+        status: "queued",
+      });
+      expect(isolatedSyncManager.get(syncFlow.id)?.reviewRequest).toBeUndefined();
+
+      const prSwitch = await rawRequest(
+        isolatedPort,
+        "PATCH",
+        `/api/agents/${reviewerId}/settings`,
+        { branchWorkspaceId: destinationBranch.id },
+        projectHeaders,
+      );
+      expect(prSwitch.status).toBe(200);
+      expect(isolatedPrManager.get(prFlow.id)).toMatchObject({
+        status: "source_review_collecting",
+        currentStage: "source_preflight",
+      });
+      expect(isolatedPrManager.get(prFlow.id)?.reviewRequests.at(-1)?.requestedAgentIds).toEqual([
+        reviewerId,
+      ]);
+      expect(isolatedSyncManager.get(syncFlow.id)?.status).toBe("queued");
+
+      await vi.waitFor(() => {
+        expect(isolatedManager.snapshot(reviewerId)?.status).toBe("running");
+      });
+      isolatedPrManager.cancel(prFlow.id);
+      await vi.waitFor(() => {
+        expect(isolatedSyncManager.get(syncFlow.id)?.status).toBe("review_collecting");
+      });
+      expect(isolatedSyncManager.get(syncFlow.id)).toMatchObject({
+        status: "review_collecting",
+      });
+      expect(isolatedSyncManager.get(syncFlow.id)?.reviewRequest?.requestedAgentIds).toEqual([
+        reviewerId,
+      ]);
+
+      isolatedSyncManager.cancel(syncFlow.id);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    } finally {
+      await new Promise<void>((resolve) => isolatedServer.close(() => resolve()));
+      await isolatedManager.clear();
+      await removeTempRoot(isolatedRoot);
+    }
   });
 
   it("POST /api/agents 新建，GET /api/agents 能列出", async () => {

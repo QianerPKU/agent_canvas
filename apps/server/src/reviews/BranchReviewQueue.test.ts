@@ -338,6 +338,50 @@ describe("BranchReviewQueue", () => {
     expect(queue.stateOf("pr-queued")).toBe("queued");
   });
 
+  it("restores equal-order jobs by their persistent queue-wide sequence", async () => {
+    const queue = new BranchReviewQueue();
+    const starts: string[] = [];
+
+    // Import the later PR owner first to prove owner import order is not the tie-breaker.
+    queue.replaceOwner("pull_request", [
+      job(
+        "pr-later",
+        "main",
+        1000,
+        () => {
+          starts.push("pr");
+          return "started";
+        },
+        "queued",
+        "pull_request",
+        2,
+      ),
+    ]);
+    queue.replaceOwner("sync", [
+      job(
+        "sync-earlier",
+        "main",
+        1000,
+        () => {
+          starts.push("sync");
+          return "started";
+        },
+        "queued",
+        "sync",
+        1,
+      ),
+    ]);
+    await flushMicrotasks();
+
+    expect(starts).toEqual(["sync"]);
+    expect(queue.stateOf("pr-later")).toBe("queued");
+
+    queue.complete("sync-earlier");
+    await flushMicrotasks();
+    expect(starts).toEqual(["sync", "pr"]);
+    expect(queue.reserveSequence()).toBe(3);
+  });
+
   it("clears all reservations and invalidates already scheduled restore drains", async () => {
     const queue = new BranchReviewQueue();
     let starts = 0;
@@ -387,8 +431,9 @@ function job(
   start: BranchReviewJob["start"],
   state?: BranchReviewJob["state"],
   owner = "test",
+  sequence?: number,
 ): BranchReviewJob {
-  return { id, owner, branch, order, state, start };
+  return { id, owner, branch, order, sequence, state, start };
 }
 
 function deferred<T>(): {

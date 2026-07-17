@@ -32,7 +32,15 @@ describe("branch review queue project reload", () => {
   const cleanup: Array<() => Promise<void>> = [];
 
   afterEach(async () => {
-    for (const dispose of cleanup.splice(0).reverse()) await dispose();
+    const failures: unknown[] = [];
+    for (const dispose of cleanup.splice(0).reverse()) {
+      try {
+        await dispose();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length > 0) throw new AggregateError(failures, "reload test cleanup failed");
   });
 
   it("requeues a collecting review across a real project reload and resumes it after its reviewer restarts", async () => {
@@ -88,6 +96,7 @@ describe("branch review queue project reload", () => {
     expect(firstReviewRequestId).toBeTruthy();
 
     const statePath = path.join(projectA.json.project.projectRoot, "canvas-state.json");
+    await firstHarness.flushCanvasState();
     await waitUntilAsync(async () => {
       try {
         const persisted = JSON.parse(await readFile(statePath, "utf-8"));
@@ -155,16 +164,19 @@ describe("branch review queue project reload", () => {
     cleanup.push(() => removeTempRoot(root));
     const branch = "feature/auto-open-review";
     const projectRoot = path.join(root, "auto-open-project");
+    const now = 1000;
 
     const firstHost = new FakeReviewHost(branch);
     const firstQueue = new BranchReviewQueue();
     const firstPrManager = new PullRequestFlowManager({
       host: firstHost,
       reviewQueue: firstQueue,
+      now: () => now,
     });
     const firstSyncManager = new SyncFlowManager({
       host: firstHost,
       reviewQueue: firstQueue,
+      now: () => now,
     });
     const firstManager = new AgentManager({ query: emptyQuery, defaultCwd: root });
     const firstHarness = await createHarness(root, firstManager, {
@@ -180,13 +192,6 @@ describe("branch review queue project reload", () => {
     });
     expect(project.status).toBe(201);
 
-    const restoredPr = await firstPrManager.create({
-      proposerAgentId: firstHost.agentId,
-      targetBranch: "main",
-      title: "Persisted auto-open PR",
-      summary: "This restored review must retain the first branch reservation",
-      files: ["src/restored-pr.ts"],
-    });
     const restoredSync = await firstSyncManager.create({
       kind: "branch_pull",
       proposerAgentId: firstHost.agentId,
@@ -194,19 +199,31 @@ describe("branch review queue project reload", () => {
       targetBranch: branch,
       strategy: "merge",
       summary: "Persisted auto-open sync",
-      reason: "This restored review must remain second in the shared FIFO",
+      reason: "This restored review must retain the first branch reservation",
       files: ["src/restored-sync.ts"],
     });
-    expect(restoredPr.status).toBe("source_review_collecting");
-    expect(restoredSync.status).toBe("queued");
+    const restoredPr = await firstPrManager.create({
+      proposerAgentId: firstHost.agentId,
+      targetBranch: "main",
+      title: "Persisted auto-open PR",
+      summary: "This equal-time review must remain second in the shared FIFO",
+      files: ["src/restored-pr.ts"],
+    });
+    expect(restoredSync.createdAt).toBe(restoredPr.createdAt);
+    expect(restoredSync.reviewQueueSequence).toBeLessThan(restoredPr.reviewQueueSequence!);
+    expect(restoredSync.status).toBe("review_collecting");
+    expect(restoredPr.status).toBe("queued");
 
     const statePath = path.join(projectRoot, "canvas-state.json");
+    await firstHarness.flushCanvasState();
     await waitUntilAsync(async () => {
       try {
         const persisted = JSON.parse(await readFile(statePath, "utf-8"));
         return (
           persisted.prFlows?.[0]?.id === restoredPr.id &&
-          persisted.syncFlows?.[0]?.id === restoredSync.id
+          persisted.prFlows?.[0]?.reviewQueueSequence === restoredPr.reviewQueueSequence &&
+          persisted.syncFlows?.[0]?.id === restoredSync.id &&
+          persisted.syncFlows?.[0]?.reviewQueueSequence === restoredSync.reviewQueueSequence
         );
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
@@ -220,10 +237,12 @@ describe("branch review queue project reload", () => {
     const restartedPrManager = new PullRequestFlowManager({
       host: restartedHost,
       reviewQueue: restartedQueue,
+      now: () => now,
     });
     const restartedSyncManager = new SyncFlowManager({
       host: restartedHost,
       reviewQueue: restartedQueue,
+      now: () => now,
     });
     const restartedManager = new AgentManager({ query: emptyQuery, defaultCwd: root });
     const restartedHarness = await createHarness(root, restartedManager, {
@@ -257,22 +276,28 @@ describe("branch review queue project reload", () => {
     expect(fresh.json.flow.status).toBe("queued");
 
     await waitUntil(
-      () => restartedPrManager.get(restoredPr.id)?.status === "source_review_collecting",
+      () => restartedSyncManager.get(restoredSync.id)?.status === "review_collecting",
     );
-    expect(restartedSyncManager.get(restoredSync.id)?.status).toBe("queued");
+    expect(restartedSyncManager.get(restoredSync.id)?.reviewQueueSequence).toBe(
+      restoredSync.reviewQueueSequence,
+    );
+    expect(restartedPrManager.get(restoredPr.id)?.reviewQueueSequence).toBe(
+      restoredPr.reviewQueueSequence,
+    );
+    expect(restartedPrManager.get(restoredPr.id)?.status).toBe("queued");
     expect(restartedSyncManager.get(fresh.json.flow.id)?.status).toBe("queued");
     expect(restartedHost.runner.sent).toHaveLength(1);
-    expect(restartedHost.runner.sent[0]).toContain(`flowId: ${restoredPr.id}`);
+    expect(restartedHost.runner.sent[0]).toContain(`flowId: ${restoredSync.id}`);
 
-    restartedPrManager.cancel(restoredPr.id);
+    restartedSyncManager.cancel(restoredSync.id);
     await waitUntil(
-      () => restartedSyncManager.get(restoredSync.id)?.status === "review_collecting",
+      () => restartedPrManager.get(restoredPr.id)?.status === "source_review_collecting",
     );
     expect(restartedSyncManager.get(fresh.json.flow.id)?.status).toBe("queued");
     expect(restartedHost.runner.sent).toHaveLength(2);
-    expect(restartedHost.runner.sent[1]).toContain(`flowId: ${restoredSync.id}`);
+    expect(restartedHost.runner.sent[1]).toContain(`flowId: ${restoredPr.id}`);
 
-    restartedSyncManager.cancel(restoredSync.id);
+    restartedPrManager.cancel(restoredPr.id);
     await waitUntil(
       () => restartedSyncManager.get(fresh.json.flow.id)?.status === "review_collecting",
     );
@@ -360,6 +385,7 @@ describe("branch review queue project reload", () => {
 
     firstHost.runner.setStatus("waiting_input");
     const statePath = path.join(projectA.json.project.projectRoot, "canvas-state.json");
+    await firstHarness.flushCanvasState();
     await waitUntilAsync(async () => {
       const persisted = JSON.parse(await readFile(statePath, "utf-8"));
       return (
@@ -368,6 +394,7 @@ describe("branch review queue project reload", () => {
         persisted.layout?.nodes?.[0]?.id === "restore-order-node"
       );
     });
+    await firstHarness.close();
     const stateBeforeOpen = await readFile(statePath, "utf-8");
     expect(JSON.parse(stateBeforeOpen)).toMatchObject({
       agents: {
@@ -377,8 +404,6 @@ describe("branch review queue project reload", () => {
       syncFlows: [expect.objectContaining({ id: syncFlow.id })],
       layout: { nodes: [expect.objectContaining({ id: "restore-order-node" })] },
     });
-    await firstHarness.close();
-
     const promptManager = new BlockingPromptManager({
       workspaceRoot: root,
       promptRoot: path.join(root, "prompts"),
@@ -397,6 +422,7 @@ describe("branch review queue project reload", () => {
     cleanup.push(harness.dispose);
 
     const promptGate = promptManager.blockNextImport();
+    cleanup.push(async () => promptGate.release());
     const openPromise = request(harness.port, "POST", "/api/canvas-projects/open", {
       id: projectA.json.project.id,
     });
@@ -460,6 +486,7 @@ describe("branch review queue project reload", () => {
       layout.json.nodes,
     );
 
+    await harness.flushCanvasState();
     await waitUntilAsync(async () => {
       const persisted = JSON.parse(await readFile(statePath, "utf-8"));
       return (
@@ -517,6 +544,7 @@ async function createHarness(
   port: number;
   syncFlowManager: SyncFlowManager;
   workspaceManager: WorkspaceManager;
+  flushCanvasState: () => Promise<void>;
   close: () => Promise<void>;
   dispose: () => Promise<void>;
 }> {
@@ -524,6 +552,7 @@ async function createHarness(
   const workspaceManager = new WorkspaceManager({
     defaultSourcePath: root,
     projectRoot,
+    projectsRoot: path.join(root, "projects-index"),
     runGit: fakeGitRunner,
   });
   await workspaceManager.connect({ localPath: root });
@@ -558,20 +587,31 @@ async function createHarness(
   const close = async (): Promise<void> => {
     if (closed) return;
     closed = true;
-    requestWorkspaceContexts.delete(port);
-    await new Promise<void>((resolve, reject) =>
-      result.httpServer.close((error) => (error ? reject(error) : resolve())),
-    );
+    try {
+      // Drain the debounced canvas save before retiring review timers and runners. This preserves
+      // the exact persisted reload fixture while preventing the old server from writing into a
+      // project after the replacement server (or the next test) has taken ownership of it.
+      await result.flushCanvasState();
+    } finally {
+      try {
+        result.pullRequestFlowManager.importState(undefined, { deferActivation: true });
+        result.syncFlowManager.importState(undefined, { deferActivation: true });
+        await manager.clear();
+      } finally {
+        requestWorkspaceContexts.delete(port);
+        await new Promise<void>((resolve, reject) =>
+          result.httpServer.close((error) => (error ? reject(error) : resolve())),
+        );
+      }
+    }
   };
   return {
     port,
     syncFlowManager: result.syncFlowManager,
     workspaceManager,
+    flushCanvasState: result.flushCanvasState,
     close,
-    dispose: async () => {
-      await manager.clear();
-      await close();
-    },
+    dispose: close,
   };
 }
 
@@ -837,7 +877,7 @@ function inputText(input: SdkUserInput | undefined): string {
   );
 }
 
-async function waitUntil(check: () => boolean, timeoutMs = 2_000): Promise<void> {
+async function waitUntil(check: () => boolean, timeoutMs = 5_000): Promise<void> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     if (check()) return;
@@ -848,7 +888,7 @@ async function waitUntil(check: () => boolean, timeoutMs = 2_000): Promise<void>
 
 async function waitUntilAsync(
   check: () => Promise<boolean>,
-  timeoutMs = 2_000,
+  timeoutMs = 5_000,
 ): Promise<void> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {

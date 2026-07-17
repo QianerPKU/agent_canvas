@@ -11,6 +11,14 @@ export interface BranchReviewJob {
   owner: string;
   branch: string;
   order: number;
+  /**
+   * Persistent, queue-wide tie-breaker for jobs with the same `order`.
+   *
+   * Managers that share a queue should reserve this value when a review stage is created and
+   * persist it with their flow snapshot. Jobs without a sequence remain supported for backwards
+   * compatibility and receive one when they are stored.
+   */
+  sequence?: number;
   state?: BranchReviewJobState;
   start: () => BranchReviewStartResult | Promise<BranchReviewStartResult>;
 }
@@ -42,6 +50,11 @@ export class BranchReviewQueue {
   private readonly scheduledBranches = new Set<string>();
   private sequence = 0;
   private generation = 0;
+
+  /** Reserves the next queue-wide sequence for a job whose ordering must survive persistence. */
+  reserveSequence(): number {
+    return ++this.sequence;
+  }
 
   async enqueue(job: BranchReviewJob): Promise<BranchReviewJobState> {
     this.assertJob(job);
@@ -294,10 +307,12 @@ export class BranchReviewQueue {
   }
 
   private store(job: BranchReviewJob, state: BranchReviewJobState): StoredBranchReviewJob {
+    const sequence = job.sequence ?? this.reserveSequence();
+    this.sequence = Math.max(this.sequence, sequence);
     const stored: StoredBranchReviewJob = {
       ...job,
       state,
-      sequence: ++this.sequence,
+      sequence,
       deferred: false,
       startPending: false,
       inFlightLeases: 0,
@@ -312,10 +327,20 @@ export class BranchReviewQueue {
     if (!job.owner.trim()) throw new Error(`missing branch review owner for ${job.id}`);
     if (!job.branch.trim()) throw new Error(`missing branch for review job ${job.id}`);
     if (!Number.isFinite(job.order)) throw new Error(`invalid order for review job ${job.id}`);
+    if (
+      job.sequence !== undefined &&
+      (!Number.isSafeInteger(job.sequence) || job.sequence <= 0)
+    ) {
+      throw new Error(`invalid sequence for review job ${job.id}`);
+    }
     if (typeof job.start !== "function") throw new Error(`missing start callback for ${job.id}`);
   }
 }
 
 function compareJobs(a: StoredBranchReviewJob, b: StoredBranchReviewJob): number {
-  return a.order - b.order || a.sequence - b.sequence;
+  return a.order - b.order || a.sequence - b.sequence || compareJobIds(a.id, b.id);
+}
+
+function compareJobIds(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }

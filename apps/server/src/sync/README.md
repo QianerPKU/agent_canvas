@@ -30,10 +30,13 @@ when apply authorization is issued; the queue does not wait for the proposer to 
 operation or report `applied`.
 
 When persisted canvas state is restored, an in-progress sync review is requeued and its old deadline
-is discarded. Agents, prompts, and layout are restored before the shared PR/sync queue is rebuilt and
-drained. The head starts with a fresh request and deadline only when the target branch has an active
-agent; otherwise it remains queued and is retried automatically when an agent becomes active. This
-prevents zero-reviewer auto-approval and premature prompt delivery during project reload.
+is discarded. A queue-wide sequence is persisted with each current PR or sync review stage, preserving
+their total FIFO order even when timestamps match and the managers are imported in a different order;
+legacy snapshots without it are still accepted. Agents, prompts, and layout are restored before the
+shared PR/sync queue is rebuilt and drained. The head starts with a fresh request and deadline only
+when the target branch has an active agent; otherwise it remains queued and is retried automatically
+when an agent becomes active or a waiting agent switches onto that branch. This prevents zero-reviewer
+auto-approval and premature prompt delivery during project reload.
 
 ## Review Contract
 

@@ -146,18 +146,23 @@ export class SyncFlowManager {
     this.reviewQueue.replaceOwner(REVIEW_QUEUE_OWNER, []);
     this.flows.clear();
     for (const flow of flows ?? []) {
-      this.flows.set(
-        flow.id,
+      let restored =
         flow.status === "review_collecting"
           ? {
               ...flow,
-              status: "queued",
+              status: "queued" as const,
               deadlineAt: undefined,
               failureReason:
                 "Review was requeued because its previous delivery cannot survive reload.",
             }
-          : flow,
-      );
+          : flow;
+      if (restored.status === "queued" && restored.reviewQueueSequence === undefined) {
+        restored = {
+          ...restored,
+          reviewQueueSequence: this.reviewQueue.reserveSequence(),
+        };
+      }
+      this.flows.set(flow.id, restored);
     }
     this.counter = maxNumericSuffix([...this.flows.keys()]);
     this.importedStateActivated = false;
@@ -247,6 +252,7 @@ export class SyncFlowManager {
       status: "queued",
       createdAt,
       updatedAt: createdAt,
+      reviewQueueSequence: this.reviewQueue.reserveSequence(),
     };
     this.flows.set(flow.id, flow);
     this.save(flow);
@@ -323,6 +329,7 @@ export class SyncFlowManager {
       owner: REVIEW_QUEUE_OWNER,
       branch: flow.targetBranch,
       order: flow.reviewRequest?.requestedAt ?? flow.createdAt,
+      sequence: flow.reviewQueueSequence,
       state,
       start: async () =>
         await this.trackPendingOperation(
@@ -554,11 +561,15 @@ export class SyncFlowManager {
     text: string,
     epoch: number,
   ): Promise<void> {
+    if (!this.isCurrentGeneration(epoch)) return;
     try {
       await this.deliverToAgent(flow.proposerAgentId, text);
     } catch (error) {
-      if (epoch !== this.stateGeneration) return;
-      if (!CLOSED_STATUSES.includes(flow.status)) {
+      if (
+        this.isCurrentGeneration(epoch) &&
+        this.flows.get(flow.id) === flow &&
+        !CLOSED_STATUSES.includes(flow.status)
+      ) {
         this.failFlow(flow, "blocked", `Failed to deliver proposer signal: ${errorMessage(error)}`);
       }
     }

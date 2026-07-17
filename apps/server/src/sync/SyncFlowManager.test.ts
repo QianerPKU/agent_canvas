@@ -410,6 +410,64 @@ describe("SyncFlowManager", () => {
     expect(proposer.steered[1]).toContain(`flowId: ${second.id}`);
   });
 
+  it.each(["timed_out", "cancelled", "applied"] as const)(
+    "does not let a late proposer-delivery rejection overwrite %s state",
+    async (terminalStatus) => {
+      vi.useFakeTimers();
+      let now = 0;
+      const host = new FakeHost();
+      const proposer = host.addAgent("agent_1", "feature/current", "running");
+      const reviewer = host.addAgent("agent_2", "feature/current", "running");
+      const manager = new SyncFlowManager({
+        host,
+        now: () => now,
+        reviewTimeoutMs: 10,
+      });
+
+      const flow = await manager.create({
+        kind: "branch_pull",
+        proposerAgentId: "agent_1",
+        sourceBranch: "main",
+        summary: `Late rejection after ${terminalStatus}`,
+        reason: "Exercise stale proposer-delivery rejection handling",
+        files: ["src/late-delivery.ts"],
+      });
+
+      now = 1;
+      host.assistant("agent_1", reviewJson(flow, "approve"), now);
+      await manager.handleAgentEvent(host.result("agent_1", now));
+      proposer.setStatus("running");
+
+      let rejectDelivery!: (reason: Error) => void;
+      const blockedDelivery = new Promise<void>((_resolve, reject) => {
+        rejectDelivery = reject;
+      });
+      proposer.blockNextSteerUntil(blockedDelivery);
+
+      now = 2;
+      host.assistant("agent_2", reviewJson(flow, "approve"), now);
+      const finishReview = manager.handleAgentEvent(host.result("agent_2", now));
+      await waitForMicrotasks(
+        () => manager.get(flow.id)?.status === "apply_authorized" && proposer.steered.length === 2,
+      );
+
+      if (terminalStatus === "timed_out") {
+        now = 13;
+        vi.advanceTimersByTime(11);
+      } else if (terminalStatus === "cancelled") {
+        manager.cancel(flow.id);
+      } else {
+        manager.recordApplied(flow.id, { summary: "Sync applied before delivery settled" });
+      }
+      expect(manager.get(flow.id)?.status).toBe(terminalStatus);
+
+      rejectDelivery(new Error("late proposer delivery failed"));
+      await finishReview;
+
+      expect(manager.get(flow.id)?.status).toBe(terminalStatus);
+    },
+  );
+
   it("keeps a review queued when its target branch has no active reviewers", async () => {
     const host = new FakeHost();
     const proposer = host.addAgent("agent_1", "feature/current", "waiting_input");

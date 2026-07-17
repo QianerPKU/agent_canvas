@@ -427,6 +427,95 @@ describe("shared branch review queue across flow managers", () => {
     expect(reverseSync.get(pull.id)?.reviewRequest).toEqual(oldSyncRequest);
   });
 
+  it("preserves sync-before-PR total order across reload when timestamps are identical", async () => {
+    const now = 1000;
+    const originalHost = new FakeHost();
+    originalHost.addAgent("agent_current", "feature/current", "waiting_input");
+    const originalQueue = new BranchReviewQueue();
+    const originalPr = new PullRequestFlowManager({
+      host: originalHost,
+      reviewQueue: originalQueue,
+      now: () => now,
+    });
+    const originalSync = new SyncFlowManager({
+      host: originalHost,
+      reviewQueue: originalQueue,
+      now: () => now,
+    });
+
+    const sync = await originalSync.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_current",
+      sourceBranch: "main",
+      targetBranch: "feature/current",
+      summary: "Persist the first equal-time review",
+      reason: "Prove the shared sequence survives reload",
+      files: ["src/sync-first.ts"],
+    });
+    const pr = await originalPr.create({
+      proposerAgentId: "agent_current",
+      targetBranch: "main",
+      summary: "Persist the second equal-time review",
+      files: ["src/pr-second.ts"],
+    });
+
+    expect(sync.createdAt).toBe(pr.createdAt);
+    expect(sync.reviewQueueSequence).toBeLessThan(pr.reviewQueueSequence!);
+    expect(sync.status).toBe("review_collecting");
+    expect(pr.status).toBe("queued");
+    const syncState = originalSync.exportState();
+    const prState = originalPr.exportState();
+    originalSync.cancel(sync.id);
+    originalPr.cancel(pr.id);
+
+    const restoredHost = new FakeHost();
+    const restoredRunner = restoredHost.addAgent(
+      "agent_current",
+      "feature/current",
+      "waiting_input",
+    );
+    const restoredQueue = new BranchReviewQueue();
+    const restoredPr = new PullRequestFlowManager({
+      host: restoredHost,
+      reviewQueue: restoredQueue,
+      now: () => now,
+    });
+    const restoredSync = new SyncFlowManager({
+      host: restoredHost,
+      reviewQueue: restoredQueue,
+      now: () => now,
+    });
+
+    // Restore the later PR owner first: its import order must not overtake the earlier sync job.
+    restoredPr.importState(prState, { deferActivation: true });
+    restoredSync.importState(syncState, { deferActivation: true });
+    restoredPr.activateImportedState();
+    restoredSync.activateImportedState();
+    await waitUntil(() => restoredSync.get(sync.id)?.status === "review_collecting");
+
+    expect(restoredPr.get(pr.id)?.status).toBe("queued");
+    expect(
+      matchingDeliveries(restoredRunner, "Agent Canvas sync review request", sync.id),
+    ).toHaveLength(1);
+    expect(
+      matchingDeliveries(restoredRunner, "Agent Canvas PR review request", pr.id),
+    ).toHaveLength(0);
+
+    const restoredSyncFlow = restoredSync.get(sync.id);
+    if (!restoredSyncFlow) throw new Error("expected the restored sync flow");
+    restoredHost.assistant("agent_current", syncReviewJson(restoredSyncFlow), now + 1);
+    await dispatchResult(
+      restoredPr,
+      restoredSync,
+      restoredHost.result("agent_current", now + 1),
+    );
+    await waitUntil(() => restoredPr.get(pr.id)?.status === "source_review_collecting");
+
+    expect(
+      matchingDeliveries(restoredRunner, "Agent Canvas PR review request", pr.id),
+    ).toHaveLength(1);
+  });
+
   it("releases a completed review before a proposer notification finishes", async () => {
     let now = 5000;
     const host = new FakeHost();

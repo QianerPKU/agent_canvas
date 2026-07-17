@@ -159,7 +159,7 @@ export class PullRequestFlowManager {
           : flow.status === "target_review_collecting"
             ? "target_merge"
             : undefined;
-      const restored = collectingStage
+      let restored = collectingStage
         ? {
             ...flow,
             status: "queued" as const,
@@ -170,6 +170,12 @@ export class PullRequestFlowManager {
         : flow.status === "queued" && !flow.currentStage
           ? { ...flow, currentStage: "source_preflight" as const }
           : flow;
+      if (queuedOrCollectingStage(restored) && restored.reviewQueueSequence === undefined) {
+        restored = {
+          ...restored,
+          reviewQueueSequence: this.reviewQueue.reserveSequence(),
+        };
+      }
       this.flows.set(restored.id, restored);
     }
     this.counter = maxNumericSuffix([...this.flows.keys()]);
@@ -253,6 +259,7 @@ export class PullRequestFlowManager {
       status: "queued",
       createdAt,
       updatedAt: createdAt,
+      reviewQueueSequence: this.reviewQueue.reserveSequence(),
       currentStage: "source_preflight",
       reviewRequests: [],
     };
@@ -297,6 +304,7 @@ export class PullRequestFlowManager {
       deadlineAt: undefined,
       failureReason: undefined,
       updatedAt: queuedAt,
+      reviewQueueSequence: this.reviewQueue.reserveSequence(),
     };
     this.save(queued);
     await this.reviewQueue.enqueue(this.reviewJob(queued, "target_merge", "queued"));
@@ -370,6 +378,7 @@ export class PullRequestFlowManager {
       owner: REVIEW_QUEUE_OWNER,
       branch: stage === "source_preflight" ? flow.sourceBranch : flow.targetBranch,
       order: reviewJobOrder(flow, stage),
+      sequence: flow.reviewQueueSequence,
       state,
       start: async () =>
         await this.trackPendingOperation(async () =>

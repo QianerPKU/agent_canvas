@@ -76,6 +76,7 @@ export interface CreateServerResult {
   syncFlowManager: SyncFlowManager;
   commitManager: CommitManager;
   codexAuthManager: CodexAuthManager;
+  flushCanvasState(): Promise<void>;
 }
 
 type CodexModelDetectionInput =
@@ -255,6 +256,7 @@ export function createServer(
         workspaceManager,
         pullRequestFlowManager,
         syncFlowManager,
+        reviewQueue,
         commitManager,
         codexAuthManager,
         defaultCwd,
@@ -392,6 +394,7 @@ export function createServer(
     syncFlowManager,
     commitManager,
     codexAuthManager,
+    flushCanvasState: async () => await canvasState.saveNow(),
   };
 }
 
@@ -404,6 +407,7 @@ async function handleHttp(
   workspaceManager: WorkspaceManager,
   pullRequestFlowManager: PullRequestFlowManager,
   syncFlowManager: SyncFlowManager,
+  reviewQueue: BranchReviewQueue,
   commitManager: CommitManager,
   codexAuthManager: CodexAuthManager,
   defaultCwd: string,
@@ -1399,6 +1403,12 @@ async function handleHttp(
           const snapshot = manager.updateSettings(id, settings, {
             branchSwitchPrompt: branchChanged ? branchSwitchPrompt(diff) : undefined,
           });
+          if (branchChanged && snapshot.status === "waiting_input") {
+            const destinationBranch = snapshot.config?.branch?.trim();
+            if (destinationBranch) {
+              await reviewQueue.retryBranch(destinationBranch);
+            }
+          }
           canvasState.saveSoon();
           return sendJson(res, 200, snapshot);
         } catch (error) {
