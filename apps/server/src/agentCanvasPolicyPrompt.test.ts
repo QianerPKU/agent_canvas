@@ -60,6 +60,27 @@ describe("agentCanvasPolicyPrompt", () => {
     expect(prompt).toContain('"resultKind": "image"');
     expect(prompt).toContain('"sourcePath": ".agent-tmp/agent_42/accuracy-curve.png"');
     expect(prompt).toContain('"content": "## Metrics');
+    expect(prompt).not.toContain("工作文档维护（已开启）");
+    expect(prompt).not.toContain(".agent-docs/index.md");
+  });
+
+  it("conditionally injects the work documentation policy and git exceptions", () => {
+    const prompt = agentCanvasPolicyPrompt("agent_docs", {
+      workDocumentationEnabled: true,
+    });
+
+    expect(prompt).toContain("工作文档维护（已开启）");
+    expect(prompt).toContain(".agent-docs/index.md");
+    expect(prompt).toContain(".agent-shared-docs/index.md");
+    expect(prompt).toContain("不要等到任务结束才补写");
+    expect(prompt).toContain("任务信息不充分");
+    expect(prompt).toContain("已废弃");
+    expect(prompt).toContain("共享索引中的 branch 条目和链接由 Agent Canvas 后端维护");
+    expect(prompt).toContain("写入当前 branch 概要前重新读取最新内容");
+    expect(prompt).toContain("属于不提交的明确例外");
+    expect(prompt).toContain("即代表用户明确授权");
+    expect(prompt).toContain("必须排除在提交范围外");
+    expect(prompt).toContain("如果当前处于只读或 plan 模式");
   });
 
   it("uses AGENT_CANVAS_API when configured", () => {

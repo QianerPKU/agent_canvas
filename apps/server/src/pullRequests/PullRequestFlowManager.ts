@@ -14,9 +14,7 @@ import type {
 } from "@agent-canvas/shared";
 
 type DeliverableRunner = {
-  getStatus(): string;
-  send(text: string): void;
-  steer(text: string): Promise<void>;
+  deliver(text: string): Promise<void>;
 };
 
 export interface PullRequestAgentHost {
@@ -104,7 +102,10 @@ export class PullRequestFlowManager {
   private readonly flows = new Map<string, PullRequestFlowSnapshot>();
   private readonly timers = new Map<string, unknown>();
   private readonly listeners = new Set<FlowListener>();
+  private readonly pendingOperations = new Set<symbol>();
   private counter = 0;
+  private importedStateActivated = true;
+  private stateGeneration = 0;
 
   constructor(options: PullRequestFlowManagerOptions) {
     this.host = options.host;
@@ -130,13 +131,41 @@ export class PullRequestFlowManager {
     return this.list();
   }
 
-  importState(flows: PullRequestFlowSnapshot[] | undefined): void {
+  hasOpenFlows(): boolean {
+    return this.list().some((flow) => !CLOSED_STATUSES.includes(flow.status));
+  }
+
+  hasPendingOperations(): boolean {
+    return this.pendingOperations.size > 0;
+  }
+
+  importState(
+    flows: PullRequestFlowSnapshot[] | undefined,
+    options: { deferActivation?: boolean } = {},
+  ): void {
+    this.stateGeneration += 1;
     for (const flowId of this.timers.keys()) this.closeTimer(flowId);
     this.flows.clear();
     for (const flow of flows ?? []) {
       this.flows.set(flow.id, flow);
     }
     this.counter = maxNumericSuffix([...this.flows.keys()]);
+    this.importedStateActivated = false;
+    if (!options.deferActivation) this.activateImportedState();
+  }
+
+  activateImportedState(): void {
+    if (this.importedStateActivated) return;
+    this.importedStateActivated = true;
+    const generation = this.stateGeneration;
+    for (const flow of [...this.flows.values()]) {
+      if (CLOSED_STATUSES.includes(flow.status) || flow.deadlineAt === undefined) continue;
+      if (flow.deadlineAt <= this.now()) {
+        this.timeoutFlow(flow.id, generation);
+      } else {
+        this.resetTimer(flow.id, flow.deadlineAt, generation);
+      }
+    }
   }
 
   get(id: string): PullRequestFlowSnapshot | undefined {
@@ -249,7 +278,7 @@ export class PullRequestFlowManager {
       closedAt: this.now(),
     };
     this.save(next);
-    void this.startNextQueuedFlowAfter();
+    this.scheduleQueuedFlowDrain();
     return next;
   }
 
@@ -264,7 +293,7 @@ export class PullRequestFlowManager {
       closedAt: this.now(),
     };
     this.save(next);
-    void this.startNextQueuedFlowAfter();
+    this.scheduleQueuedFlowDrain();
     return next;
   }
 
@@ -287,7 +316,9 @@ export class PullRequestFlowManager {
   private async startReviewStage(
     flowId: string,
     stage: PullRequestReviewStage,
+    generation = this.stateGeneration,
   ): Promise<void> {
+    if (!this.isCurrentGeneration(generation)) return;
     const flow = this.requireFlow(flowId);
     const reviewers = this.activeReviewersFor(flow, stage);
     const request: PullRequestReviewRequest = {
@@ -307,17 +338,19 @@ export class PullRequestFlowManager {
       reviewRequests: [...flow.reviewRequests, request],
       updatedAt: this.now(),
     });
-    this.resetTimer(flowId, request.deadlineAt);
+    this.resetTimer(flowId, request.deadlineAt, generation);
 
     if (reviewers.length === 0) {
-      await this.finishStageIfComplete(flowId);
+      await this.finishStageIfComplete(flowId, generation);
       return;
     }
 
     for (const reviewer of reviewers) {
+      if (!this.isCurrentGeneration(generation)) return;
       try {
         await this.deliverToAgent(reviewer.id, reviewPrompt(this.requireFlow(flowId), stage));
       } catch (error) {
+        if (!this.isCurrentGeneration(generation)) return;
         this.recordSyntheticResponse(
           flowId,
           stage,
@@ -326,8 +359,9 @@ export class PullRequestFlowManager {
           `Failed to deliver review request: ${errorMessage(error)}`,
         );
       }
+      if (!this.isCurrentGeneration(generation)) return;
     }
-    await this.finishStageIfComplete(flowId);
+    await this.finishStageIfComplete(flowId, generation);
   }
 
   private async captureReviewResult(agentId: string): Promise<void> {
@@ -415,7 +449,11 @@ export class PullRequestFlowManager {
     await this.finishStageIfComplete(flowId);
   }
 
-  private async finishStageIfComplete(flowId: string): Promise<void> {
+  private async finishStageIfComplete(
+    flowId: string,
+    generation = this.stateGeneration,
+  ): Promise<void> {
+    if (!this.isCurrentGeneration(generation)) return;
     const flow = this.requireFlow(flowId);
     const request = currentRequest(flow, flow.currentStage);
     if (!request || request.pendingAgentIds.length > 0) return;
@@ -424,24 +462,26 @@ export class PullRequestFlowManager {
     if (request.stage === "source_preflight") {
       if (!allApproved) {
         const next = this.failFlow(flow, "source_review_failed", reviewSummary(request.responses));
-        await this.notifyProposer(next, sourceFailurePrompt(next, request.responses));
+        await this.notifyProposer(next, sourceFailurePrompt(next, request.responses), generation);
         return;
       }
-      await this.authorizeCreatePr(flow, request.responses);
+      await this.authorizeCreatePr(flow, request.responses, generation);
       return;
     }
     if (!allApproved) {
       const next = this.failFlow(flow, "target_review_failed", reviewSummary(request.responses));
-      await this.notifyProposer(next, targetFailurePrompt(next, request.responses));
+      await this.notifyProposer(next, targetFailurePrompt(next, request.responses), generation);
       return;
     }
-    await this.authorizeMerge(flow, request.responses);
+    await this.authorizeMerge(flow, request.responses, generation);
   }
 
   private async authorizeCreatePr(
     flow: PullRequestFlowSnapshot,
     responses: PullRequestReviewResponse[],
+    generation = this.stateGeneration,
   ): Promise<void> {
+    if (!this.isCurrentGeneration(generation)) return;
     const authorization = {
       agentId: flow.proposerAgentId,
       issuedAt: this.now(),
@@ -456,14 +496,16 @@ export class PullRequestFlowManager {
       updatedAt: this.now(),
     };
     this.save(next);
-    this.resetTimer(flow.id, authorization.expiresAt);
-    await this.notifyProposer(next, createPrAuthorizationPrompt(next, responses));
+    this.resetTimer(flow.id, authorization.expiresAt, generation);
+    await this.notifyProposer(next, createPrAuthorizationPrompt(next, responses), generation);
   }
 
   private async authorizeMerge(
     flow: PullRequestFlowSnapshot,
     responses: PullRequestReviewResponse[],
+    generation = this.stateGeneration,
   ): Promise<void> {
+    if (!this.isCurrentGeneration(generation)) return;
     const authorization = {
       agentId: flow.proposerAgentId,
       issuedAt: this.now(),
@@ -478,8 +520,8 @@ export class PullRequestFlowManager {
       updatedAt: this.now(),
     };
     this.save(next);
-    this.resetTimer(flow.id, authorization.expiresAt);
-    await this.notifyProposer(next, mergeAuthorizationPrompt(next, responses));
+    this.resetTimer(flow.id, authorization.expiresAt, generation);
+    await this.notifyProposer(next, mergeAuthorizationPrompt(next, responses), generation);
   }
 
   private failFlow(
@@ -497,15 +539,24 @@ export class PullRequestFlowManager {
       failureReason: reason,
     };
     this.save(next);
-    void this.startNextQueuedFlowAfter();
+    this.scheduleQueuedFlowDrain();
     return next;
   }
 
-  private async notifyProposer(flow: PullRequestFlowSnapshot, text: string): Promise<void> {
+  private async notifyProposer(
+    flow: PullRequestFlowSnapshot,
+    text: string,
+    generation = this.stateGeneration,
+  ): Promise<void> {
+    if (!this.isCurrentGeneration(generation)) return;
     try {
       await this.deliverToAgent(flow.proposerAgentId, text);
     } catch (error) {
-      if (!CLOSED_STATUSES.includes(flow.status)) {
+      if (
+        this.isCurrentGeneration(generation) &&
+        this.flows.get(flow.id) === flow &&
+        !CLOSED_STATUSES.includes(flow.status)
+      ) {
         this.failFlow(flow, "blocked", `Failed to deliver proposer signal: ${errorMessage(error)}`);
       }
     }
@@ -544,16 +595,40 @@ export class PullRequestFlowManager {
     );
   }
 
-  private async startNextQueuedFlowAfter(): Promise<void> {
+  private scheduleQueuedFlowDrain(generation = this.stateGeneration): void {
+    if (!this.isCurrentGeneration(generation)) return;
+    const token = Symbol("pr-queue-drain");
+    this.pendingOperations.add(token);
+    void this.startNextQueuedFlowAfter(generation)
+      .catch(() => undefined)
+      .finally(() => {
+        this.pendingOperations.delete(token);
+      });
+  }
+
+  private async startNextQueuedFlowAfter(generation: number): Promise<void> {
+    if (!this.isCurrentGeneration(generation)) return;
     const queued = this.list()
       .filter((candidate) => candidate.status === "queued")
       .sort((a, b) => a.createdAt - b.createdAt);
     for (const next of queued) {
-      await this.maybeStartQueuedFlow(next);
+      if (!this.isCurrentGeneration(generation)) return;
+      await this.maybeStartQueuedFlow(next, generation);
+      if (!this.isCurrentGeneration(generation)) return;
     }
   }
 
-  private async maybeStartQueuedFlow(next: PullRequestFlowSnapshot): Promise<void> {
+  private async maybeStartQueuedFlow(
+    next: PullRequestFlowSnapshot,
+    generation = this.stateGeneration,
+  ): Promise<void> {
+    if (
+      !this.isCurrentGeneration(generation) ||
+      this.flows.get(next.id) !== next ||
+      next.status !== "queued"
+    ) {
+      return;
+    }
     if (
       this.hasActiveBranchConflict(next.sourceBranch, next.targetBranch, {
         ignoredFlowId: next.id,
@@ -563,12 +638,14 @@ export class PullRequestFlowManager {
       return;
     }
     try {
+      if (!this.isCurrentGeneration(generation)) return;
       await this.ensureBranchesReady?.({
         proposerAgentId: next.proposerAgentId,
         sourceBranch: next.sourceBranch,
         targetBranch: next.targetBranch,
       });
     } catch (error) {
+      if (!this.isCurrentGeneration(generation) || this.flows.get(next.id) !== next) return;
       this.save({
         ...next,
         failureReason: `Queued PR flow is waiting for branch sync: ${errorMessage(error)}`,
@@ -576,13 +653,24 @@ export class PullRequestFlowManager {
       });
       return;
     }
-    this.save({
+    if (
+      !this.isCurrentGeneration(generation) ||
+      this.flows.get(next.id) !== next ||
+      this.hasActiveBranchConflict(next.sourceBranch, next.targetBranch, {
+        ignoredFlowId: next.id,
+        queuedBefore: next.createdAt,
+      })
+    ) {
+      return;
+    }
+    const started = {
       ...next,
       status: "source_review_collecting",
       failureReason: undefined,
       updatedAt: this.now(),
-    });
-    await this.startReviewStage(next.id, "source_preflight");
+    } as PullRequestFlowSnapshot;
+    this.save(started);
+    await this.startReviewStage(next.id, "source_preflight", generation);
   }
 
   private async changedFilesFor(
@@ -601,16 +689,7 @@ export class PullRequestFlowManager {
   private async deliverToAgent(agentId: string, text: string): Promise<void> {
     const runner = this.host.get(agentId);
     if (!runner) throw new Error(`unknown agent: ${agentId}`);
-    const status = runner.getStatus();
-    if (status === "running") {
-      await runner.steer(text);
-      return;
-    }
-    if (status === "waiting_input") {
-      runner.send(text);
-      return;
-    }
-    throw new Error(`agent ${agentId} is not active (${status})`);
+    await runner.deliver(text);
   }
 
   private recordSyntheticResponse(
@@ -673,27 +752,44 @@ export class PullRequestFlowManager {
     return result;
   }
 
-  private resetTimer(flowId: string, deadlineAt: number): void {
+  private resetTimer(
+    flowId: string,
+    deadlineAt: number,
+    generation = this.stateGeneration,
+  ): void {
     this.closeTimer(flowId);
     const delay = Math.max(0, deadlineAt - this.now());
     this.timers.set(
       flowId,
       this.setTimer(() => {
-        const flow = this.flows.get(flowId);
-        if (!flow || CLOSED_STATUSES.includes(flow.status)) return;
-        const next = {
-          ...flow,
-          status: "timed_out",
-          currentStage: undefined,
-          updatedAt: this.now(),
-          closedAt: this.now(),
-          failureReason: "PR flow timed out before all required agent responses arrived.",
-        } as PullRequestFlowSnapshot;
-        this.save(next);
-        this.closeTimer(flowId);
-        void this.startNextQueuedFlowAfter();
+        this.timeoutFlow(flowId, generation);
       }, delay),
     );
+  }
+
+  private timeoutFlow(flowId: string, generation: number): void {
+    if (!this.isCurrentGeneration(generation)) return;
+    const flow = this.flows.get(flowId);
+    if (!flow || CLOSED_STATUSES.includes(flow.status)) return;
+    if (flow.deadlineAt !== undefined && flow.deadlineAt > this.now()) {
+      this.resetTimer(flowId, flow.deadlineAt, generation);
+      return;
+    }
+    const next = {
+      ...flow,
+      status: "timed_out",
+      currentStage: undefined,
+      updatedAt: this.now(),
+      closedAt: this.now(),
+      failureReason: "PR flow timed out before all required agent responses arrived.",
+    } as PullRequestFlowSnapshot;
+    this.save(next);
+    this.closeTimer(flowId);
+    this.scheduleQueuedFlowDrain(generation);
+  }
+
+  private isCurrentGeneration(generation: number): boolean {
+    return generation === this.stateGeneration;
   }
 
   private closeTimer(flowId: string): void {

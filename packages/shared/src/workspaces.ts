@@ -81,6 +81,7 @@ export interface SharedResourceMount {
 
 export interface WorkspaceProject {
   canvasProject?: CanvasProjectSummary;
+  revision?: number;
   projectRoot: string;
   repo?: GitHubConnection;
   branches: BranchWorkspace[];

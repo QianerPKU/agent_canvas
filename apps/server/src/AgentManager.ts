@@ -18,6 +18,10 @@ import type {
 import { execFile } from "node:child_process";
 import { AgentRunner } from "./AgentRunner.js";
 import type { QueryFn } from "./sdk/types.js";
+import {
+  WORK_DOCUMENTATION_DISABLED_PROMPT_ID,
+  workDocumentationDisabledPrompt,
+} from "./workspaces/workDocumentation.js";
 
 export type EnvelopeListener = (envelope: AgentEventEnvelope) => void;
 
@@ -34,6 +38,11 @@ export interface AgentTurnContextRequest {
   config: Pick<AgentStartConfig, "cwd" | "branch"> | undefined;
 }
 
+interface PendingAgentTurnContextRequest extends AgentTurnContextRequest {
+  managerGeneration: number;
+  runner: AgentRunner;
+}
+
 export interface AgentManagerDeps {
   query: QueryFn;
   codexQuery?: QueryFn;
@@ -43,6 +52,7 @@ export interface AgentManagerDeps {
     config: Pick<AgentStartConfig, "cwd" | "branch"> | undefined,
   ) => Promise<AgentTurnContextMetadata>;
   resolveFileAccess?: (agentId: string) => AgentFileAccess;
+  prepareFileAccess?: (agentId: string) => Promise<void> | void;
   resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
 }
 
@@ -60,7 +70,10 @@ export class AgentManager {
   private readonly forkOrigins = new Map<string, ForkOrigin>();
   private readonly forkConfigs = new Map<string, Partial<AgentStartConfig>>();
   private readonly draftConfigs = new Map<string, Partial<AgentStartConfig>>();
-  private readonly appSettingsState: AgentCanvasSettings = { fullPermissionMode: false };
+  private readonly appSettingsState: AgentCanvasSettings = {
+    fullPermissionMode: false,
+    workDocumentationEnabled: false,
+  };
   private readonly query: QueryFn;
   private readonly codexQuery?: QueryFn;
   private readonly defaultCwd: string;
@@ -69,9 +82,11 @@ export class AgentManager {
     config: Pick<AgentStartConfig, "cwd" | "branch"> | undefined,
   ) => Promise<AgentTurnContextMetadata>;
   private resolveFileAccess?: (agentId: string) => AgentFileAccess;
+  private prepareFileAccess?: (agentId: string) => Promise<void> | void;
   private resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
   private counter = 0;
   private suppressEvents = false;
+  private stateGeneration = 0;
 
   constructor(deps: AgentManagerDeps) {
     this.query = deps.query;
@@ -80,6 +95,7 @@ export class AgentManager {
     this.now = deps.now ?? Date.now;
     this.resolveTurnContext = deps.resolveTurnContext ?? defaultResolveTurnContext;
     this.resolveFileAccess = deps.resolveFileAccess;
+    this.prepareFileAccess = deps.prepareFileAccess;
     this.resolvePromptAccess = deps.resolvePromptAccess;
   }
 
@@ -103,51 +119,63 @@ export class AgentManager {
     };
   }
 
-  importState(state: PersistedAgentState | undefined): void {
-    this.suppressEvents = true;
-    for (const runner of this.runners.values()) {
-      void runner.terminate();
-    }
-    this.runners.clear();
-    this.seqs.clear();
-    this.history.clear();
-    this.forkOrigins.clear();
-    this.forkConfigs.clear();
-    this.draftConfigs.clear();
-    this.appSettingsState.fullPermissionMode = state?.appSettings?.fullPermissionMode ?? false;
-    this.counter = 0;
+  invalidatePendingTurnContexts(): void {
+    this.stateGeneration += 1;
+  }
 
-    const agents = state?.agents ?? [];
-    for (const snapshot of agents) {
-      const restoredSnapshot = { ...snapshot, status: restorableStatus(snapshot.status) };
-      const runner = this.createRunner(snapshot.id, snapshot.config);
-      runner.restore(restoredSnapshot);
-      if (snapshot.forkOrigin) this.forkOrigins.set(snapshot.id, snapshot.forkOrigin);
-      const history = [...(state?.histories[snapshot.id] ?? [])].sort(
-        (left, right) => left.seq - right.seq,
-      );
-      let lastSeq = Math.max(
-        snapshot.lastEventSeq,
-        ...history.map((envelope) => envelope.seq),
-        0,
-      );
-      if (restoredSnapshot.status !== snapshot.status) {
-        lastSeq++;
-        history.push({
-          agentId: snapshot.id,
-          seq: lastSeq,
-          at: this.now(),
-          event: { kind: "status", status: restoredSnapshot.status },
-        });
+  async importState(state: PersistedAgentState | undefined): Promise<void> {
+    this.invalidatePendingTurnContexts();
+    this.suppressEvents = true;
+    try {
+      // A project switch must not leave an old runner alive long enough to emit into a
+      // replacement agent that happens to reuse the same id. Keep event suppression active
+      // until every transport has finished terminating and the replacement state is complete.
+      await Promise.all([...this.runners.values()].map((runner) => runner.terminate()));
+      this.runners.clear();
+      this.seqs.clear();
+      this.history.clear();
+      this.forkOrigins.clear();
+      this.forkConfigs.clear();
+      this.draftConfigs.clear();
+      this.appSettingsState.fullPermissionMode = state?.appSettings?.fullPermissionMode === true;
+      this.appSettingsState.workDocumentationEnabled =
+        state?.appSettings?.workDocumentationEnabled === true;
+      this.counter = 0;
+
+      const agents = state?.agents ?? [];
+      for (const snapshot of agents) {
+        const restoredSnapshot = { ...snapshot, status: restorableStatus(snapshot.status) };
+        const runner = this.createRunner(snapshot.id, snapshot.config);
+        runner.restore(restoredSnapshot);
+        if (snapshot.forkOrigin) this.forkOrigins.set(snapshot.id, snapshot.forkOrigin);
+        const history = [...(state?.histories[snapshot.id] ?? [])].sort(
+          (left, right) => left.seq - right.seq,
+        );
+        let lastSeq = Math.max(
+          snapshot.lastEventSeq,
+          ...history.map((envelope) => envelope.seq),
+          0,
+        );
+        if (restoredSnapshot.status !== snapshot.status) {
+          lastSeq++;
+          history.push({
+            agentId: snapshot.id,
+            seq: lastSeq,
+            at: this.now(),
+            event: { kind: "status", status: restoredSnapshot.status },
+          });
+        }
+        this.history.set(snapshot.id, history);
+        this.seqs.set(snapshot.id, lastSeq);
       }
-      this.history.set(snapshot.id, history);
-      this.seqs.set(snapshot.id, lastSeq);
+      this.counter = maxNumericSuffix(agents.map((agent) => agent.id));
+    } finally {
+      this.suppressEvents = false;
     }
-    this.counter = maxNumericSuffix(agents.map((agent) => agent.id));
-    this.suppressEvents = false;
   }
 
   async clear(): Promise<void> {
+    this.invalidatePendingTurnContexts();
     this.suppressEvents = true;
     try {
       await Promise.all([...this.runners.values()].map((runner) => runner.terminate()));
@@ -158,6 +186,7 @@ export class AgentManager {
       this.forkConfigs.clear();
       this.draftConfigs.clear();
       this.appSettingsState.fullPermissionMode = false;
+      this.appSettingsState.workDocumentationEnabled = false;
       this.counter = 0;
     } finally {
       this.suppressEvents = false;
@@ -173,6 +202,9 @@ export class AgentManager {
       codexQuery: this.codexQuery,
       now: this.now,
       fullPermissionMode: () => this.appSettingsState.fullPermissionMode,
+      workDocumentationEnabled: () =>
+        this.appSettingsState.workDocumentationEnabled &&
+        !!this.configOf(id)?.branchWorkspaceId,
       resolveFileAccess: (agentId) =>
         this.resolveFileAccess?.(agentId) ?? {
           readableFiles: [],
@@ -181,6 +213,7 @@ export class AgentManager {
           writableDirectories: [],
           sharedResources: [],
         },
+      prepareFileAccess: (agentId) => this.prepareFileAccess?.(agentId),
       resolvePromptAccess: (agentId) =>
         this.resolvePromptAccess?.(agentId) ?? {
           readablePrompts: [],
@@ -202,6 +235,10 @@ export class AgentManager {
 
   setFileAccessResolver(resolveFileAccess: (agentId: string) => AgentFileAccess): void {
     this.resolveFileAccess = resolveFileAccess;
+  }
+
+  setFileAccessPreparer(prepareFileAccess: (agentId: string) => Promise<void> | void): void {
+    this.prepareFileAccess = prepareFileAccess;
   }
 
   setPromptAccessResolver(resolvePromptAccess: (agentId: string) => AgentPromptAccess): void {
@@ -282,14 +319,14 @@ export class AgentManager {
   }
 
   /** 启动一个 agent；若它是 fork 产生的，合并其 fork 配置。 */
-  startAgent(id: string, config: AgentStartConfig): void {
+  startAgent(id: string, config: AgentStartConfig): Promise<void> {
     const runner = this.runners.get(id);
     if (!runner) throw new Error(`未知 agent: ${id}`);
     const forkCfg = this.forkConfigs.get(id);
     const draftCfg = this.draftConfigs.get(id);
     const merged = mergeDefined(draftCfg, forkCfg, config);
     if (!merged?.prompt) throw new Error("缺少 prompt");
-    runner.start(merged as AgentStartConfig);
+    return runner.start(merged as AgentStartConfig);
   }
 
   answerQuestion(id: string, requestId: string, response: AgentQuestionResponse): void {
@@ -310,12 +347,32 @@ export class AgentManager {
 
   updateAppSettings(input: Partial<AgentCanvasSettings>): AgentCanvasSettings {
     const wasFullPermission = this.appSettingsState.fullPermissionMode;
+    const wasWorkDocumentation = this.appSettingsState.workDocumentationEnabled;
     if (input.fullPermissionMode !== undefined) {
       this.appSettingsState.fullPermissionMode = input.fullPermissionMode;
+    }
+    if (input.workDocumentationEnabled !== undefined) {
+      this.appSettingsState.workDocumentationEnabled = input.workDocumentationEnabled;
     }
     if (!wasFullPermission && this.appSettingsState.fullPermissionMode) {
       for (const runner of this.runners.values()) {
         runner.approvePendingApprovals();
+      }
+    }
+    if (wasWorkDocumentation !== this.appSettingsState.workDocumentationEnabled) {
+      const disabledPrompt = this.appSettingsState.workDocumentationEnabled
+        ? undefined
+        : {
+            id: WORK_DOCUMENTATION_DISABLED_PROMPT_ID,
+            name: "Agent Canvas 工作文档维护已关闭",
+            content: workDocumentationDisabledPrompt(),
+            kind: "shared" as const,
+          };
+      for (const [id, runner] of this.runners) {
+        runner.refreshPolicyPrompt(
+          this.configOf(id)?.branchWorkspaceId ? disabledPrompt : undefined,
+          WORK_DOCUMENTATION_DISABLED_PROMPT_ID,
+        );
       }
     }
     return this.appSettings();
@@ -367,19 +424,23 @@ export class AgentManager {
   private turnContextRequest(
     agentId: string,
     event: AgentEvent,
-  ): AgentTurnContextRequest | undefined {
+  ): PendingAgentTurnContextRequest | undefined {
     if (event.kind !== "user_input" || event.mode) return undefined;
-    if (!this.runners.has(agentId)) return undefined;
+    const runner = this.runners.get(agentId);
+    if (!runner) return undefined;
     return {
       agentId,
       turnIndex: this.currentTurnIndex(agentId),
       config: this.configOf(agentId),
+      managerGeneration: this.stateGeneration,
+      runner,
     };
   }
 
-  private async emitTurnContext(request: AgentTurnContextRequest): Promise<void> {
+  private async emitTurnContext(request: PendingAgentTurnContextRequest): Promise<void> {
     try {
       const metadata = await this.resolveTurnContext(request.config);
+      if (!this.isCurrentTurnContextRequest(request)) return;
       this.broadcast(request.agentId, {
         kind: "turn_context",
         context: {
@@ -393,6 +454,7 @@ export class AgentManager {
         },
       });
     } catch {
+      if (!this.isCurrentTurnContextRequest(request)) return;
       this.broadcast(request.agentId, {
         kind: "turn_context",
         context: {
@@ -402,6 +464,14 @@ export class AgentManager {
         },
       });
     }
+  }
+
+  private isCurrentTurnContextRequest(request: PendingAgentTurnContextRequest): boolean {
+    return (
+      !this.suppressEvents &&
+      request.managerGeneration === this.stateGeneration &&
+      this.runners.get(request.agentId) === request.runner
+    );
   }
 
   private snapshotOf(id: string): AgentSnapshot {

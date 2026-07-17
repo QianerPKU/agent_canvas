@@ -29,6 +29,7 @@ import type {
   UpdateCanvasFileInput,
   UpdateCanvasPromptInput,
   UpdateAgentSettingsInput,
+  WorkspaceProject,
 } from "@agent-canvas/shared";
 import { api } from "./api.js";
 import {
@@ -92,6 +93,10 @@ export interface UseAgentCanvas {
   prFlows: PullRequestFlowSnapshot[];
   syncFlows: SyncFlowSnapshot[];
   commits: AgentCommitSnapshot[];
+  workspaceUpdate?: WorkspaceUpdate;
+  currentWorkspaceEventGeneration: () => number;
+  currentWorkspaceEventIdentity: () => string | undefined;
+  invalidateWorkspaceRefresh: () => void;
   connected: boolean;
   refresh: () => Promise<void>;
   actions: AgentActions;
@@ -99,6 +104,17 @@ export interface UseAgentCanvas {
   promptActions: PromptActions;
   prActions: PullRequestActions;
   syncActions: SyncFlowActions;
+}
+
+export type WorkspaceUpdate = Omit<Extract<ServerFrame, { type: "workspace" }>, "type">;
+
+export function workspaceEventIdentity(workspace?: WorkspaceProject): string {
+  const revision = workspace?.revision;
+  const revisionSuffix = Number.isSafeInteger(revision) ? `@${revision}` : "";
+  const projectId = workspace?.canvasProject?.id?.trim();
+  if (projectId) return `project:${projectId}${revisionSuffix}`;
+  const projectRoot = workspace?.projectRoot?.trim();
+  return projectRoot ? `root:${projectRoot}${revisionSuffix}` : `workspace:none${revisionSuffix}`;
 }
 
 export interface FileActions {
@@ -151,13 +167,40 @@ export function useAgentCanvas(): UseAgentCanvas {
   const [prFlows, setPrFlows] = useState<PullRequestFlowSnapshot[]>([]);
   const [syncFlows, setSyncFlows] = useState<SyncFlowSnapshot[]>([]);
   const [commits, setCommits] = useState<AgentCommitSnapshot[]>([]);
+  const [workspaceUpdate, setWorkspaceUpdate] = useState<WorkspaceUpdate>();
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
+  const refreshGenerationRef = useRef(0);
+  const workspaceEventGenerationRef = useRef(0);
+  const workspaceEventIdentityRef = useRef<string>();
+  const latestWorkspaceVersionRef = useRef<{ projectId: string; revision: number }>();
+  const currentWorkspaceEventGeneration = useCallback(
+    () => workspaceEventGenerationRef.current,
+    [],
+  );
+  const currentWorkspaceEventIdentity = useCallback(
+    () => workspaceEventIdentityRef.current,
+    [],
+  );
+  const invalidateWorkspaceRefresh = useCallback(() => {
+    refreshGenerationRef.current += 1;
+  }, []);
+  const clearProjectScopedState = useCallback(() => {
+    setAgents(emptyMap);
+    setFiles([]);
+    setFileConnections([]);
+    setPrompts([]);
+    setPromptConnections([]);
+    setPrFlows([]);
+    setSyncFlows([]);
+    setCommits([]);
+  }, []);
   // 始终指向最新 agents，供 submit 判断 start/send（避免闭包过期）
   const agentsRef = useRef(agents);
   agentsRef.current = agents;
 
   const refresh = useCallback(async () => {
+    const generation = ++refreshGenerationRef.current;
     const [
       nextAgents,
       nextFiles,
@@ -180,6 +223,7 @@ export function useAgentCanvas(): UseAgentCanvas {
     const historyEntries = await Promise.all(
       nextAgents.map(async (agent) => [agent.id, await api.history(agent.id)] as const),
     );
+    if (generation !== refreshGenerationRef.current) return;
     setAgents(applyHello(nextAgents, Object.fromEntries(historyEntries)));
     setFiles(nextFiles);
     setFileConnections(nextConnections);
@@ -196,15 +240,34 @@ export function useAgentCanvas(): UseAgentCanvas {
     let promptTimer: number | undefined;
 
     const connect = () => {
+      // A reconnecting server sends hello before its asynchronous workspace frame. Clear the
+      // previous epoch now so that hello can never combine the current project's agents and
+      // flows with files, prompts, or connections cached from the project seen before disconnect.
+      api.setWorkspaceContext(undefined);
+      refreshGenerationRef.current += 1;
+      latestWorkspaceVersionRef.current = undefined;
+      clearProjectScopedState();
       const ws = new WebSocket(wsUrl());
       wsRef.current = ws;
-      ws.onopen = () => setConnected(true);
+      let acceptedWorkspaceInEpoch = false;
+      const isCurrentSocket = () => !closed && wsRef.current === ws;
+      ws.onopen = () => {
+        if (!isCurrentSocket()) return;
+        setConnected(true);
+      };
       ws.onclose = () => {
+        if (!isCurrentSocket()) return;
+        wsRef.current = null;
+        api.setWorkspaceContext(undefined);
         setConnected(false);
         scheduleConnect(1000);
       };
-      ws.onerror = () => ws.close();
+      ws.onerror = () => {
+        if (!isCurrentSocket()) return;
+        ws.close();
+      };
       ws.onmessage = (ev) => {
+        if (!isCurrentSocket()) return;
         let frame: ServerFrame;
         try {
           frame = JSON.parse(ev.data as string);
@@ -226,6 +289,38 @@ export function useAgentCanvas(): UseAgentCanvas {
           setCommits((prev) => upsertCommit(prev, frame.commit));
         } else if (frame.type === "file") {
           setFiles((prev) => upsertFile(prev, frame.file));
+        } else if (frame.type === "workspace") {
+          const projectId = frame.workspace?.canvasProject?.id;
+          const revision = frame.workspace?.revision;
+          const latestVersion = latestWorkspaceVersionRef.current;
+          if (
+            projectId &&
+            Number.isSafeInteger(revision) &&
+            latestVersion?.projectId === projectId &&
+            revision! < latestVersion.revision
+          ) {
+            return;
+          }
+          if (projectId && Number.isSafeInteger(revision)) {
+            latestWorkspaceVersionRef.current = { projectId, revision: revision! };
+          }
+          // Invalidate an old project's in-flight refresh before React schedules the App effect
+          // that starts the authoritative project's replacement refresh.
+          const nextUpdate: WorkspaceUpdate = {
+            workspace: frame.workspace,
+            partialSuccess: frame.partialSuccess,
+            workDocumentation: frame.workDocumentation,
+          };
+          const nextIdentity = workspaceEventIdentity(frame.workspace);
+          api.setWorkspaceContext(frame.workspace);
+          refreshGenerationRef.current += 1;
+          workspaceEventGenerationRef.current += 1;
+          workspaceEventIdentityRef.current = nextIdentity;
+          // The epoch was already cleared before its hello frame. Later workspace frames are
+          // live authoritative updates and must clear the prior project-scoped snapshot here.
+          if (acceptedWorkspaceInEpoch) clearProjectScopedState();
+          acceptedWorkspaceInEpoch = true;
+          setWorkspaceUpdate(nextUpdate);
         }
       };
     };
@@ -244,11 +339,17 @@ export function useAgentCanvas(): UseAgentCanvas {
     scheduleConnect(0);
     void refresh().catch(() => undefined);
     const refreshPrompts = () => {
+      const workspaceGeneration = workspaceEventGenerationRef.current;
       void api
         .listPrompts()
         .then(
           (nextPrompts) => {
-            if (!closed) setPrompts(nextPrompts);
+            if (
+              !closed &&
+              workspaceGeneration === workspaceEventGenerationRef.current
+            ) {
+              setPrompts(nextPrompts);
+            }
           },
           () => undefined,
         )
@@ -259,16 +360,22 @@ export function useAgentCanvas(): UseAgentCanvas {
     promptTimer = window.setTimeout(refreshPrompts, 2000);
     return () => {
       closed = true;
+      api.setWorkspaceContext(undefined);
+      latestWorkspaceVersionRef.current = undefined;
       if (promptTimer) window.clearTimeout(promptTimer);
       if (connectTimer) clearTimeout(connectTimer);
-      wsRef.current?.close();
+      const currentSocket = wsRef.current;
+      wsRef.current = null;
+      currentSocket?.close();
     };
-  }, [refresh]);
+  }, [clearProjectScopedState, refresh]);
 
   const actions = useMemo<AgentActions>(
     () => ({
       create: async (settings) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         const id = await api.create(settings);
+        if (workspaceGeneration !== workspaceEventGenerationRef.current) return id;
         // 后端 create 不发事件，乐观插入一个 idle 节点
         setAgents((prev) =>
           prev[id]
@@ -290,7 +397,9 @@ export function useAgentCanvas(): UseAgentCanvas {
         return id;
       },
       updateSettings: async (agentId, settings) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         const snapshot = await api.updateAgentSettings(agentId, settings);
+        if (workspaceGeneration !== workspaceEventGenerationRef.current) return;
         setAgents((prev) =>
           recordAgentSettings(prev, agentId, {
             provider: snapshot.config.provider,
@@ -347,12 +456,15 @@ export function useAgentCanvas(): UseAgentCanvas {
       terminate: (agentId) => api.terminate(agentId).then(() => undefined),
       openWorkspace: (agentId) => api.openAgentWorkspace(agentId).then(() => undefined),
       fork: async (agentId, anchorUuid, options = {}) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         const { id, origin } = await api.fork(agentId, anchorUuid, options);
+        if (workspaceGeneration !== workspaceEventGenerationRef.current) return;
         setAgents((prev) => insertForked(prev, id, origin, options));
         const [nextFileConnections, nextPromptConnections] = await Promise.all([
           api.listFileConnections(),
           api.listPromptConnections(),
         ]);
+        if (workspaceGeneration !== workspaceEventGenerationRef.current) return;
         setFileConnections(nextFileConnections);
         setPromptConnections(nextPromptConnections);
       },
@@ -363,16 +475,24 @@ export function useAgentCanvas(): UseAgentCanvas {
   const fileActions = useMemo<FileActions>(
     () => ({
       create: async (input) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         const file = await api.createFile(input);
-        setFiles((current) => upsertFile(current, file));
+        if (workspaceGeneration === workspaceEventGenerationRef.current) {
+          setFiles((current) => upsertFile(current, file));
+        }
         return file;
       },
       update: async (id, input) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         const file = await api.updateFile(id, input);
-        setFiles((current) => upsertFile(current, file));
+        if (workspaceGeneration === workspaceEventGenerationRef.current) {
+          setFiles((current) => upsertFile(current, file));
+        }
       },
       connect: async (fileId, agentId, access) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         const connection = await api.connectFile(fileId, agentId, access);
+        if (workspaceGeneration !== workspaceEventGenerationRef.current) return;
         setFileConnections((current) =>
           current.some((candidate) => candidate.id === connection.id)
             ? current
@@ -380,7 +500,9 @@ export function useAgentCanvas(): UseAgentCanvas {
         );
       },
       disconnect: async (connectionId) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         await api.disconnectFile(connectionId);
+        if (workspaceGeneration !== workspaceEventGenerationRef.current) return;
         setFileConnections((current) =>
           current.filter((connection) => connection.id !== connectionId),
         );
@@ -392,18 +514,25 @@ export function useAgentCanvas(): UseAgentCanvas {
   const promptActions = useMemo<PromptActions>(
     () => ({
       create: async (input) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         const prompt = await api.createPrompt(input);
-        setPrompts((current) => [...current, prompt]);
+        if (workspaceGeneration === workspaceEventGenerationRef.current) {
+          setPrompts((current) => [...current, prompt]);
+        }
         return prompt;
       },
       update: async (id, input) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         const prompt = await api.updatePrompt(id, input);
+        if (workspaceGeneration !== workspaceEventGenerationRef.current) return;
         setPrompts((current) =>
           current.map((candidate) => (candidate.id === id ? prompt : candidate)),
         );
       },
       connect: async (promptId, agentId, access) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         const connection = await api.connectPrompt(promptId, agentId, access);
+        if (workspaceGeneration !== workspaceEventGenerationRef.current) return;
         setPromptConnections((current) =>
           current.some((candidate) => candidate.id === connection.id)
             ? current
@@ -411,7 +540,9 @@ export function useAgentCanvas(): UseAgentCanvas {
         );
       },
       disconnect: async (connectionId) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         await api.disconnectPrompt(connectionId);
+        if (workspaceGeneration !== workspaceEventGenerationRef.current) return;
         setPromptConnections((current) =>
           current.filter((connection) => connection.id !== connectionId),
         );
@@ -423,24 +554,39 @@ export function useAgentCanvas(): UseAgentCanvas {
   const prActions = useMemo<PullRequestActions>(
     () => ({
       create: async (input) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         const flow = await api.createPullRequestFlow(input);
-        setPrFlows((current) => upsertFlow(current, flow));
+        if (workspaceGeneration === workspaceEventGenerationRef.current) {
+          setPrFlows((current) => upsertFlow(current, flow));
+        }
       },
       recordCreated: async (id, input) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         const flow = await api.recordPullRequestCreated(id, input);
-        setPrFlows((current) => upsertFlow(current, flow));
+        if (workspaceGeneration === workspaceEventGenerationRef.current) {
+          setPrFlows((current) => upsertFlow(current, flow));
+        }
       },
       recordMerged: async (id) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         const flow = await api.recordPullRequestMerged(id);
-        setPrFlows((current) => upsertFlow(current, flow));
+        if (workspaceGeneration === workspaceEventGenerationRef.current) {
+          setPrFlows((current) => upsertFlow(current, flow));
+        }
       },
       retry: async (id) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         const flow = await api.retryPullRequestFlow(id);
-        setPrFlows((current) => upsertFlow(current, flow));
+        if (workspaceGeneration === workspaceEventGenerationRef.current) {
+          setPrFlows((current) => upsertFlow(current, flow));
+        }
       },
       cancel: async (id) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         const flow = await api.cancelPullRequestFlow(id);
-        setPrFlows((current) => upsertFlow(current, flow));
+        if (workspaceGeneration === workspaceEventGenerationRef.current) {
+          setPrFlows((current) => upsertFlow(current, flow));
+        }
       },
     }),
     [],
@@ -449,16 +595,25 @@ export function useAgentCanvas(): UseAgentCanvas {
   const syncActions = useMemo<SyncFlowActions>(
     () => ({
       create: async (input) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         const flow = await api.createSyncFlow(input);
-        setSyncFlows((current) => upsertSyncFlow(current, flow));
+        if (workspaceGeneration === workspaceEventGenerationRef.current) {
+          setSyncFlows((current) => upsertSyncFlow(current, flow));
+        }
       },
       recordApplied: async (id, input) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         const flow = await api.recordSyncFlowApplied(id, input);
-        setSyncFlows((current) => upsertSyncFlow(current, flow));
+        if (workspaceGeneration === workspaceEventGenerationRef.current) {
+          setSyncFlows((current) => upsertSyncFlow(current, flow));
+        }
       },
       cancel: async (id) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
         const flow = await api.cancelSyncFlow(id);
-        setSyncFlows((current) => upsertSyncFlow(current, flow));
+        if (workspaceGeneration === workspaceEventGenerationRef.current) {
+          setSyncFlows((current) => upsertSyncFlow(current, flow));
+        }
       },
     }),
     [],
@@ -473,6 +628,10 @@ export function useAgentCanvas(): UseAgentCanvas {
     prFlows,
     syncFlows,
     commits,
+    workspaceUpdate,
+    currentWorkspaceEventGeneration,
+    currentWorkspaceEventIdentity,
+    invalidateWorkspaceRefresh,
     connected,
     refresh,
     actions,

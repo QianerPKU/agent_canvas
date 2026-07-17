@@ -140,6 +140,8 @@ export type AgentApprovalAction = "approve" | "deny" | "cancel";
 export interface AgentCanvasSettings {
   /** 开启后后端直接允许所有 provider 授权请求，不再等待前端审批。 */
   fullPermissionMode: boolean;
+  /** 开启后 agent 持续维护 branch 隔离文档与跨 branch 共享概要文档。 */
+  workDocumentationEnabled: boolean;
 }
 
 export interface AgentQuestionOption {

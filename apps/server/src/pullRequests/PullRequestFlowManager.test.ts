@@ -31,6 +31,15 @@ class FakeRunner {
   async steer(text: string): Promise<void> {
     this.steered.push(text);
   }
+
+  async deliver(text: string): Promise<void> {
+    if (this.status === "running") return await this.steer(text);
+    if (this.status === "waiting_input") {
+      this.send(text);
+      return;
+    }
+    throw new Error(`agent is not active (${this.status})`);
+  }
 }
 
 class FakeHost implements PullRequestAgentHost {
@@ -97,6 +106,18 @@ afterEach(() => {
 });
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+async function flushMicrotasks(): Promise<void> {
+  for (let index = 0; index < 8; index += 1) await Promise.resolve();
+}
 
 describe("PullRequestFlowManager", () => {
   it("authorizes create and merge after source and target approvals", async () => {
@@ -223,6 +244,108 @@ describe("PullRequestFlowManager", () => {
     expect(manager.get(flow.id)?.status).toBe("timed_out");
   });
 
+  it("rebuilds future timers and immediately expires overdue flows on import", async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    const host = new FakeHost();
+    host.addAgent("agent_1", "feature/a", "waiting_input");
+    const original = new PullRequestFlowManager({
+      host,
+      now: () => now,
+      reviewTimeoutMs: 10,
+    });
+    const flow = await original.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "main",
+      summary: "Persisted timeout flow",
+      files: ["src/import-timeout.ts"],
+    });
+    const state = original.exportState();
+    original.importState(undefined);
+
+    now = 5;
+    const restored = new PullRequestFlowManager({ host, now: () => now });
+    restored.importState(state);
+    expect(restored.hasOpenFlows()).toBe(true);
+    now = 11;
+    vi.advanceTimersByTime(6);
+    expect(restored.get(flow.id)?.status).toBe("timed_out");
+    expect(restored.hasOpenFlows()).toBe(false);
+
+    now = 20;
+    const overdue = new PullRequestFlowManager({ host, now: () => now });
+    overdue.importState(state);
+    expect(overdue.get(flow.id)?.status).toBe("timed_out");
+  });
+
+  it("defers imported timeout activation until the caller publishes authoritative state", async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    const host = new FakeHost();
+    host.addAgent("agent_1", "feature/a", "waiting_input");
+    const original = new PullRequestFlowManager({
+      host,
+      now: () => now,
+      reviewTimeoutMs: 10,
+    });
+    const flow = await original.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "main",
+      summary: "Deferred imported timeout",
+      files: ["src/deferred-import.ts"],
+    });
+    const state = original.exportState();
+    original.importState(undefined);
+    now = 20;
+
+    const restored = new PullRequestFlowManager({ host, now: () => now });
+    const observed: PullRequestFlowSnapshot[] = [];
+    restored.onFlow((next) => observed.push(next));
+    restored.importState(state, { deferActivation: true });
+    vi.advanceTimersByTime(100);
+
+    expect(restored.get(flow.id)?.status).toBe("source_review_collecting");
+    expect(observed).toEqual([]);
+    expect(restored.hasPendingOperations()).toBe(false);
+
+    restored.activateImportedState();
+    expect(restored.get(flow.id)?.status).toBe("timed_out");
+    expect(observed.map((next) => next.status)).toEqual(["timed_out"]);
+    restored.activateImportedState();
+    expect(observed).toHaveLength(1);
+  });
+
+  it("ignores a stale timeout callback after importing replacement state", async () => {
+    let now = 0;
+    const callbacks: Array<() => void> = [];
+    const host = new FakeHost();
+    host.addAgent("agent_1", "feature/a", "waiting_input");
+    const manager = new PullRequestFlowManager({
+      host,
+      now: () => now,
+      reviewTimeoutMs: 10,
+      setTimer: (callback) => {
+        callbacks.push(callback);
+        return callback;
+      },
+      clearTimer: () => undefined,
+    });
+    await manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "main",
+      summary: "Stale callback",
+      files: ["src/stale-timeout.ts"],
+    });
+    const staleCallback = callbacks[0]!;
+
+    manager.importState(undefined);
+    now = 11;
+    staleCallback();
+
+    expect(manager.list()).toEqual([]);
+    expect(manager.hasPendingOperations()).toBe(false);
+  });
+
   it("uses a two hour default timeout for PR reviews", async () => {
     let now = 5000;
     const host = new FakeHost();
@@ -324,6 +447,168 @@ describe("PullRequestFlowManager", () => {
     expect(startedSecond.status).toBe("source_review_collecting");
     expect(proposerB.sent).toHaveLength(1);
     expect(proposerB.sent[0]).toContain(`flowId: ${second.id}`);
+  });
+
+  it.each(["recordMerged", "cancel"] as const)(
+    "cancels a queued drain started by %s when replacement state is imported",
+    async (trigger) => {
+      let now = 6100;
+      let blockDrain = false;
+      const drainStarted = deferred();
+      const releaseDrain = deferred();
+      const host = new FakeHost();
+      host.addAgent("agent_a", "feature/a", "waiting_input");
+      host.addAgent("agent_b", "feature/b", "waiting_input");
+      const manager = new PullRequestFlowManager({
+        host,
+        now: () => now,
+        ensureBranchesReady: async ({ sourceBranch }) => {
+          if (blockDrain && sourceBranch === "feature/b") {
+            drainStarted.resolve();
+            await releaseDrain.promise;
+          }
+        },
+      });
+      const active = await manager.create({
+        proposerAgentId: "agent_a",
+        targetBranch: "main",
+        summary: "Active flow",
+        files: ["src/active.ts"],
+      });
+      await manager.create({
+        proposerAgentId: "agent_b",
+        targetBranch: "main",
+        summary: "Queued flow",
+        files: ["src/queued.ts"],
+      });
+      if (trigger === "recordMerged") {
+        const expiresAt = now + 1000;
+        manager.importState(
+          manager.exportState().map((flow) =>
+            flow.id === active.id
+              ? {
+                  ...flow,
+                  status: "merge_authorized",
+                  currentStage: undefined,
+                  deadlineAt: expiresAt,
+                  mergeAuthorization: {
+                    agentId: flow.proposerAgentId,
+                    issuedAt: now,
+                    expiresAt,
+                  },
+                }
+              : flow,
+          ),
+        );
+      }
+
+      blockDrain = true;
+      if (trigger === "recordMerged") manager.recordMerged(active.id);
+      else manager.cancel(active.id);
+      await drainStarted.promise;
+      expect(manager.hasPendingOperations()).toBe(true);
+
+      manager.importState(undefined);
+      releaseDrain.resolve();
+      await flush();
+
+      expect(manager.list()).toEqual([]);
+      expect(manager.hasPendingOperations()).toBe(false);
+    },
+  );
+
+  it("cancels a queued drain started by review failure when replacement state is imported", async () => {
+    let now = 6200;
+    let blockDrain = false;
+    const drainStarted = deferred();
+    const releaseDrain = deferred();
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_a", "feature/a", "waiting_input");
+    host.addAgent("agent_b", "feature/b", "waiting_input");
+    const manager = new PullRequestFlowManager({
+      host,
+      now: () => now,
+      ensureBranchesReady: async ({ sourceBranch }) => {
+        if (blockDrain && sourceBranch === "feature/b") {
+          drainStarted.resolve();
+          await releaseDrain.promise;
+        }
+      },
+    });
+    const active = await manager.create({
+      proposerAgentId: "agent_a",
+      targetBranch: "main",
+      summary: "Rejected flow",
+      files: ["src/rejected.ts"],
+    });
+    await manager.create({
+      proposerAgentId: "agent_b",
+      targetBranch: "main",
+      summary: "Queued after rejection",
+      files: ["src/queued.ts"],
+    });
+
+    blockDrain = true;
+    now += 1;
+    proposer.setStatus("waiting_input");
+    host.assistant("agent_a", reviewJson(active, "source_preflight", "reject"), now);
+    await manager.handleAgentEvent(host.result("agent_a", now));
+    await drainStarted.promise;
+    expect(manager.hasPendingOperations()).toBe(true);
+
+    manager.importState(undefined);
+    releaseDrain.resolve();
+    await flush();
+
+    expect(manager.list()).toEqual([]);
+    expect(manager.hasPendingOperations()).toBe(false);
+  });
+
+  it("cancels a queued drain started by timeout when replacement state is imported", async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    let blockDrain = false;
+    const drainStarted = deferred();
+    const releaseDrain = deferred();
+    const host = new FakeHost();
+    host.addAgent("agent_a", "feature/a", "waiting_input");
+    host.addAgent("agent_b", "feature/b", "waiting_input");
+    const manager = new PullRequestFlowManager({
+      host,
+      now: () => now,
+      reviewTimeoutMs: 10,
+      ensureBranchesReady: async ({ sourceBranch }) => {
+        if (blockDrain && sourceBranch === "feature/b") {
+          drainStarted.resolve();
+          await releaseDrain.promise;
+        }
+      },
+    });
+    await manager.create({
+      proposerAgentId: "agent_a",
+      targetBranch: "main",
+      summary: "Timed active flow",
+      files: ["src/timed.ts"],
+    });
+    await manager.create({
+      proposerAgentId: "agent_b",
+      targetBranch: "main",
+      summary: "Queued after timeout",
+      files: ["src/queued.ts"],
+    });
+
+    blockDrain = true;
+    now = 11;
+    vi.advanceTimersByTime(11);
+    await drainStarted.promise;
+    expect(manager.hasPendingOperations()).toBe(true);
+
+    manager.importState(undefined);
+    releaseDrain.resolve();
+    await flushMicrotasks();
+
+    expect(manager.list()).toEqual([]);
+    expect(manager.hasPendingOperations()).toBe(false);
   });
 
   it("rechecks queued PR branch readiness before starting source review", async () => {

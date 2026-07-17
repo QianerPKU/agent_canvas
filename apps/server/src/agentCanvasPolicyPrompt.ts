@@ -1,11 +1,32 @@
+import { workDocumentationPolicyPrompt } from "./workspaces/workDocumentation.js";
+
 export const AGENT_CANVAS_POLICY_PROMPT_ID = "agent-canvas:workspace-policy";
 export const AGENT_CANVAS_POLICY_PROMPT_NAME = "Agent Canvas 内置工作区规则";
 
-export function agentCanvasPolicyPrompt(agentId: string): string {
+export interface AgentCanvasPolicyPromptOptions {
+  workDocumentationEnabled?: boolean;
+}
+
+export function agentCanvasPolicyPrompt(
+  agentId: string,
+  options: AgentCanvasPolicyPromptOptions = {},
+): string {
   const scratchDirectory = `.agent-tmp/${agentId}`;
   const configuredApiBase = process.env.AGENT_CANVAS_API?.trim();
   const port = process.env.PORT?.trim() || "4317";
   const apiBase = configuredApiBase || `http://127.0.0.1:${port}/api`;
+  const documentationPolicy = options.workDocumentationEnabled
+    ? `\n\n${workDocumentationPolicyPrompt()}`
+    : "";
+  const documentationRepositoryException = options.workDocumentationEnabled
+    ? "\n- `.agent-docs/` 是工作文档开关管理的 branch 隔离目录，属于不提交的明确例外。"
+    : "";
+  const documentationSharedException = options.workDocumentationEnabled
+    ? "\n- `.agent-shared-docs/` 是工作文档开关管理的共享目录；开启开关即代表用户明确授权当前 agent 维护其中当前 branch 的概要。"
+    : "";
+  const documentationCommitException = options.workDocumentationEnabled
+    ? "\n- `.agent-docs/` 与 `.agent-shared-docs/` 必须排除在提交范围外，即使它们在 workspace 中可见。"
+    : "";
   return `# Agent Canvas 内置工作区规则
 
 你在 Agent Canvas 管理的 branch/workspace 中工作。这些规则是 Agent Canvas 注入的内置系统规则，优先级高于普通用户可编辑提示词。当前 agent id 是 ${agentId}。Agent Canvas API base 是 ${apiBase}，如果环境变量 AGENT_CANVAS_API 存在，以该变量为准。
@@ -14,19 +35,20 @@ export function agentCanvasPolicyPrompt(agentId: string): string {
 
 1. 需要 commit 的仓库文件
 - 普通代码、配置、测试、文档等都属于当前 branch 的仓库文件。
-- 除临时目录和共享资源外，你创建或修改的任何文件都默认是需要进入 git diff / git commit 的正式产物。
+- 除临时目录和共享资源外，你创建或修改的任何文件都默认是需要进入 git diff / git commit 的正式产物。${documentationRepositoryException}
 - 不要把临时脚本、草稿、日志或中间产物留在正式仓库路径里。
 
 2. 不需要 commit 的共享文件/目录
 - 共享文件/目录是 Agent Canvas 标记、挂载或映射到当前工作区的外部资源，例如数据集、模型权重、缓存和其他大体积核心资料。
 - 它们看起来可能像在当前文件夹内，但真实内容会被多个 branch/agent 共用，不属于当前 branch 的独立产物。
-- 除非用户明确授权你修改某个共享资源，否则只能读取，不能写入、删除、移动、重命名、格式化或覆盖。
+- 除非用户明确授权你修改某个共享资源，否则只能读取，不能写入、删除、移动、重命名、格式化或覆盖。${documentationSharedException}
 - 不要为了提交或加工而复制整份共享资源到仓库路径或临时目录；确实需要抽样时，只复制最小必要片段并说明原因。
 
 3. 不需要 commit 的当前 agent 临时文件
 - 当前 agent 的临时文件夹是 ${scratchDirectory}/。
 - 临时脚本、草稿、日志、实验输出和中间产物只能放进这个目录；目录不存在时可以创建。
 - 不要从这个目录提交文件。任务完成时，正式修改应落在仓库文件里，临时文件只作为可丢弃辅助产物存在。
+${documentationPolicy}
 
 ## Agent Canvas 后端工具协议
 
@@ -239,7 +261,7 @@ curl -sS -X POST "${apiBase}/sync-flows" \\
 - 实现新 feature 或修 bug 后，需要及时 git commit，commit message 要写清楚具体修改内容。
 
 提交范围：
-- 不在 ${scratchDirectory}/ 内、也不是共享资源的所有新增或修改文件，都应视为需要 commit 的正式改动。
+- 不在 ${scratchDirectory}/ 内、也不是共享资源的所有新增或修改文件，都应视为需要 commit 的正式改动。${documentationCommitException}
 - 当用户要求提交时，只提交正式仓库文件；不要提交共享资源或 agent 临时文件。
 - 如果某个文件分类不清楚，先按正式仓库文件谨慎处理，并在答复中说明不确定点。
 
