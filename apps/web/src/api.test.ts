@@ -57,6 +57,37 @@ describe("workspace partial-success responses", () => {
     });
   });
 
+  it("preserves authoritative partial state from a 207 project-create response", async () => {
+    const payload = {
+      project: { id: "project_created", name: "created", projectRoot: "/projects/created" },
+      workspace: {
+        projectRoot: "/projects/created",
+        canvasProject: { id: "project_created", name: "created" },
+        branches: [],
+      },
+      partialSuccess: true,
+      workDocumentation: { ready: false, error: "unsafe persisted state" },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify(payload), {
+          status: 207,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+
+    await expect(
+      api.createCanvasProject({ name: "created", projectRoot: "/projects/created" }),
+    ).resolves.toMatchObject({
+      project: { id: "project_created" },
+      workspace: { canvasProject: { id: "project_created" } },
+      partialSuccess: true,
+      workDocumentation: { ready: false, error: "unsafe persisted state" },
+    });
+  });
+
   it("preserves documentation failure metadata when unwrapping a created branch", async () => {
     const payload = {
       branch: { id: "branch_1", branch: "feature/docs", worktreePath: "/worktree" },

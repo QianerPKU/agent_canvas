@@ -119,7 +119,10 @@ export const api = {
   listCanvasProjects: () =>
     call<{ projects: CanvasProjectSummary[] }>("/canvas-projects").then((r) => r.projects),
   createCanvasProject: (input: CreateCanvasProjectInput) =>
-    call<{ project: CanvasProjectSummary; workspace: WorkspaceProject }>("/canvas-projects", {
+    call<{
+      project: CanvasProjectSummary;
+      workspace: WorkspaceProject;
+    } & WorkDocumentationMutationStatus>("/canvas-projects", {
       method: "POST",
       body: JSON.stringify(input),
     }),

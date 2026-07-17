@@ -32,6 +32,7 @@ describe("PullRequestFlowManager integration", () => {
       const workspaceManager = new WorkspaceManager({
         defaultSourcePath: source,
         projectRoot,
+        projectsRoot: path.join(root, "projects"),
       });
       const project = await workspaceManager.connect({
         remoteUrl: remote,

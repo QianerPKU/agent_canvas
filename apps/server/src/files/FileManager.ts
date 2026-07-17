@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { lstat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type {
@@ -13,18 +13,32 @@ import type {
   UpdateCanvasFileInput,
   PersistedFileState,
 } from "@agent-canvas/shared";
+import {
+  createManagedFileAtomically,
+  readManagedFileBufferSnapshot,
+  removeManagedFile,
+  type ManagedFileIdentity,
+  type ManagedTrustedRootBoundary,
+  validateManagedFile,
+  validateManagedFileSync,
+} from "../workspaces/safeManagedFile.js";
 
 export interface FileManagerOptions {
   workspaceRoot?: string;
   isolatedRoot?: string;
+  trustedRoot?: string;
+  trustedRootBoundary?: ManagedTrustedRootBoundary;
   now?: () => number;
 }
 
 export class FileManager {
   private readonly files = new Map<string, CanvasFileNode>();
   private readonly connections = new Map<string, CanvasFileConnection>();
+  private readonly fileIdentities = new Map<string, ManagedFileIdentity>();
   private readonly workspaceRoot: string;
   private isolatedRoot: string;
+  private trustedRoot: string | undefined;
+  private trustedRootBoundary: ManagedTrustedRootBoundary | undefined;
   private readonly now: () => number;
   private fileCounter = 0;
   private connectionCounter = 0;
@@ -34,6 +48,8 @@ export class FileManager {
     this.isolatedRoot = path.resolve(
       options.isolatedRoot ?? defaultIsolatedRoot(this.workspaceRoot),
     );
+    this.trustedRoot = options.trustedRoot ? path.resolve(options.trustedRoot) : undefined;
+    this.trustedRootBoundary = options.trustedRootBoundary;
     this.now = options.now ?? Date.now;
   }
 
@@ -41,8 +57,14 @@ export class FileManager {
     return [...this.files.values()].sort((a, b) => a.createdAt - b.createdAt);
   }
 
-  setIsolatedRoot(isolatedRoot: string): void {
+  setIsolatedRoot(
+    isolatedRoot: string,
+    trustedRoot?: string,
+    trustedRootBoundary?: ManagedTrustedRootBoundary,
+  ): void {
     this.isolatedRoot = path.resolve(isolatedRoot);
+    this.trustedRoot = trustedRoot ? path.resolve(trustedRoot) : undefined;
+    this.trustedRootBoundary = trustedRootBoundary;
   }
 
   exportState(): PersistedFileState {
@@ -52,17 +74,70 @@ export class FileManager {
     };
   }
 
-  importState(state: PersistedFileState | undefined): void {
-    this.files.clear();
-    this.connections.clear();
+  async importState(state: PersistedFileState | undefined): Promise<void> {
+    const nextFiles = new Map<string, CanvasFileNode>();
+    const nextConnections = new Map<string, CanvasFileConnection>();
+    const nextIdentities = new Map<string, ManagedFileIdentity>();
     for (const file of state?.files ?? []) {
-      this.files.set(file.id, file);
+      const id = persistedIdentifier(file.id, /^file_[1-9]\d*$/u, "file id");
+      const name = normalizeName(file.name);
+      const extension = normalizeExtension(file.extension);
+      const filename = makeFilename(name, extension);
+      const filePath = path.join(this.isolatedRoot, id, filename);
+      if (nextFiles.has(id)) throw new Error(`Duplicate persisted file id: ${id}`);
+      const identity = await validateManagedFile(filePath, {
+        label: `persisted file ${id}`,
+        trustedRoot: this.trustedRoot,
+        trustedRootBoundary: this.trustedRootBoundary,
+      });
+      if (file.storage !== "isolated") throw new Error(`Invalid persisted file storage: ${id}`);
+      if (file.kind !== "normal" && file.kind !== "shared") {
+        throw new Error(`Invalid persisted file kind: ${id}`);
+      }
+      if (typeof file.sharedRead !== "boolean" || typeof file.sharedWrite !== "boolean") {
+        throw new Error(`Invalid persisted file sharing flags: ${id}`);
+      }
+      nextFiles.set(id, {
+        ...file,
+        id,
+        name,
+        extension,
+        filename,
+        path: filePath,
+        storage: "isolated",
+        previewKind: previewKindForExtension(extension),
+        mimeType: mimeTypeForExtension(extension),
+      });
+      nextIdentities.set(id, identity);
     }
     for (const connection of state?.connections ?? []) {
-      if (this.files.has(connection.fileId)) this.connections.set(connection.id, connection);
+      const id = persistedIdentifier(
+        connection.id,
+        /^file_connection_[1-9]\d*$/u,
+        "file connection id",
+      );
+      if (nextConnections.has(id)) {
+        throw new Error(`Duplicate persisted file connection id: ${id}`);
+      }
+      if (!nextFiles.has(connection.fileId)) {
+        throw new Error(`Persisted file connection references an unknown file: ${id}`);
+      }
+      if (typeof connection.agentId !== "string" || !connection.agentId.trim()) {
+        throw new Error(`Invalid persisted file connection agent: ${id}`);
+      }
+      if (connection.access !== "read" && connection.access !== "write") {
+        throw new Error(`Invalid persisted file connection access: ${id}`);
+      }
+      nextConnections.set(id, { ...connection, id });
     }
-    this.fileCounter = maxNumericSuffix([...this.files.keys()]);
-    this.connectionCounter = maxNumericSuffix([...this.connections.keys()]);
+    this.files.clear();
+    this.connections.clear();
+    this.fileIdentities.clear();
+    for (const [id, file] of nextFiles) this.files.set(id, file);
+    for (const [id, connection] of nextConnections) this.connections.set(id, connection);
+    for (const [id, identity] of nextIdentities) this.fileIdentities.set(id, identity);
+    this.fileCounter = maxNumericSuffix([...nextFiles.keys()]);
+    this.connectionCounter = maxNumericSuffix([...nextConnections.keys()]);
   }
 
   get(id: string): CanvasFileNode | undefined {
@@ -78,15 +153,18 @@ export class FileManager {
     content: string | Buffer,
     options: { origin?: CanvasFileOrigin } = {},
   ): Promise<CanvasFileNode> {
-    const id = `file_${++this.fileCounter}`;
+    const nextFileCounter = this.fileCounter + 1;
+    const id = `file_${nextFileCounter}`;
     const name = normalizeName(input.name);
     const extension = normalizeExtension(input.extension);
     const filename = makeFilename(name, extension);
     const baseDirectory = this.storageDirectory(id, input);
-    await mkdir(baseDirectory, { recursive: true });
     const filePath = path.join(baseDirectory, filename);
-    await ensureMissing(filePath);
-    await writeFile(filePath, content);
+    const identity = await createManagedFileAtomically(filePath, content, {
+      label: `file node ${id}`,
+      trustedRoot: this.trustedRoot,
+      trustedRootBoundary: this.trustedRootBoundary,
+    });
 
     const at = this.now();
     const node: CanvasFileNode = {
@@ -106,11 +184,14 @@ export class FileManager {
       origin: options.origin,
     };
     this.files.set(id, node);
+    this.fileIdentities.set(id, identity);
+    this.fileCounter = nextFileCounter;
     return node;
   }
 
   async update(id: string, input: UpdateCanvasFileInput): Promise<CanvasFileNode> {
     const current = this.requireFile(id);
+    await this.validateCurrentFile(current);
     let name = current.name;
     let extension = current.extension;
     let filePath = current.path;
@@ -122,8 +203,43 @@ export class FileManager {
       const filename = makeFilename(name, extension);
       const nextPath = path.join(path.dirname(current.path), filename);
       if (nextPath !== current.path) {
-        await ensureMissing(nextPath);
-        await rename(current.path, nextPath);
+        const source = await readManagedFileBufferSnapshot(current.path, {
+          label: `file node ${id}`,
+          trustedRoot: this.trustedRoot,
+          trustedRootBoundary: this.trustedRootBoundary,
+        });
+        this.assertExpectedIdentity(id, source.identity);
+        const movedIdentity = await createManagedFileAtomically(nextPath, source.content, {
+          label: `file node ${id} rename target`,
+          trustedRoot: this.trustedRoot,
+          trustedRootBoundary: this.trustedRootBoundary,
+        });
+        try {
+          await removeManagedFile(current.path, {
+            label: `file node ${id} rename source`,
+            trustedRoot: this.trustedRoot,
+            trustedRootBoundary: this.trustedRootBoundary,
+            expectedContent: source.content.toString("utf-8"),
+            expectedIdentity: source.identity,
+          });
+        } catch (error) {
+          try {
+            await removeManagedFile(nextPath, {
+              label: `file node ${id} rename target rollback`,
+              trustedRoot: this.trustedRoot,
+              trustedRootBoundary: this.trustedRootBoundary,
+              expectedContent: source.content.toString("utf-8"),
+              expectedIdentity: movedIdentity,
+            });
+          } catch (rollbackError) {
+            throw new AggregateError(
+              [error, rollbackError],
+              `File node ${id} rename failed and target rollback was incomplete`,
+            );
+          }
+          throw error;
+        }
+        this.fileIdentities.set(id, movedIdentity);
         filePath = nextPath;
       }
     }
@@ -157,7 +273,7 @@ export class FileManager {
     maxBytes = 256 * 1024,
   ): Promise<{ content: string; truncated: boolean }> {
     const file = this.requireTextFile(id);
-    const buffer = await readFile(file.path);
+    const buffer = await this.readCurrentFile(file);
     return {
       content: buffer.subarray(0, maxBytes).toString("utf-8"),
       truncated: buffer.length > maxBytes,
@@ -166,15 +282,16 @@ export class FileManager {
 
   async readContent(id: string): Promise<{ content: string; truncated: false }> {
     const file = this.requireTextFile(id);
+    const buffer = await this.readCurrentFile(file);
     return {
-      content: await readFile(file.path, "utf-8"),
+      content: buffer.toString("utf-8"),
       truncated: false,
     };
   }
 
   async readRaw(id: string): Promise<{ file: CanvasFileNode; data: Buffer }> {
     const file = this.requireFile(id);
-    return { file, data: await readFile(file.path) };
+    return { file, data: await this.readCurrentFile(file) };
   }
 
   connect(
@@ -225,6 +342,7 @@ export class FileManager {
     const writable = new Map<string, CanvasFileNode>();
     const writableDirectories = new Set<string>();
     for (const file of this.files.values()) {
+      this.validateCurrentFileSync(file);
       if (file.kind === "shared" && file.sharedRead) readable.set(file.id, file);
       if (file.kind === "shared" && file.sharedWrite) {
         writable.set(file.id, file);
@@ -277,6 +395,41 @@ export class FileManager {
       throw new Error(`文件 ${file.filename} 不支持文本预览`);
     }
     return file;
+  }
+
+  private async validateCurrentFile(file: CanvasFileNode): Promise<void> {
+    const actual = await validateManagedFile(file.path, {
+      label: `file node ${file.id}`,
+      trustedRoot: this.trustedRoot,
+      trustedRootBoundary: this.trustedRootBoundary,
+    });
+    this.assertExpectedIdentity(file.id, actual);
+  }
+
+  private async readCurrentFile(file: CanvasFileNode): Promise<Buffer> {
+    const snapshot = await readManagedFileBufferSnapshot(file.path, {
+      label: `file node ${file.id}`,
+      trustedRoot: this.trustedRoot,
+      trustedRootBoundary: this.trustedRootBoundary,
+    });
+    this.assertExpectedIdentity(file.id, snapshot.identity);
+    return snapshot.content;
+  }
+
+  private validateCurrentFileSync(file: CanvasFileNode): void {
+    const actual = validateManagedFileSync(file.path, {
+      label: `file node ${file.id}`,
+      trustedRoot: this.trustedRoot,
+      trustedRootBoundary: this.trustedRootBoundary,
+    });
+    this.assertExpectedIdentity(file.id, actual);
+  }
+
+  private assertExpectedIdentity(id: string, actual: ManagedFileIdentity): void {
+    const expected = this.fileIdentities.get(id);
+    if (!expected || expected.dev !== actual.dev || expected.ino !== actual.ino) {
+      throw new Error(`File node identity changed: ${id}`);
+    }
   }
 }
 
@@ -369,7 +522,7 @@ function makeFilename(name: string, extension: string): string {
 
 async function ensureMissing(filePath: string): Promise<void> {
   try {
-    await stat(filePath);
+    await lstat(filePath);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
@@ -381,7 +534,7 @@ function defaultIsolatedRoot(workspaceRoot: string): string {
   const localDataRoot =
     process.env.LOCALAPPDATA ?? path.join(os.homedir(), ".local", "share");
   const workspaceKey = createHash("sha256")
-    .update(workspaceRoot.toLowerCase())
+    .update(process.platform === "win32" ? workspaceRoot.toLowerCase() : workspaceRoot)
     .digest("hex")
     .slice(0, 12);
   return path.join(localDataRoot, "agent_canvas", "files", workspaceKey);
@@ -394,4 +547,11 @@ function maxNumericSuffix(ids: string[]): number {
     if (match) max = Math.max(max, Number(match[1]));
   }
   return max;
+}
+
+function persistedIdentifier(value: unknown, pattern: RegExp, label: string): string {
+  if (typeof value !== "string" || !pattern.test(value)) {
+    throw new Error(`Invalid persisted ${label}`);
+  }
+  return value;
 }

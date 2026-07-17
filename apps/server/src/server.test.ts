@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import http from "node:http";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import WebSocket, { type RawData } from "ws";
@@ -354,7 +354,12 @@ describe("HTTP server", () => {
         await mkdir(path.join(String(args[4]), ".git", "info"), { recursive: true });
         return "";
       }
+      if (args[0] === "worktree" && args[1] === "move") {
+        await rename(String(args[2]), String(args[3]));
+        return "";
+      }
       if (args[0] === "rev-parse") {
+        if (args[1] === "--verify") return "a".repeat(40);
         return path.join(options?.cwd ?? "", ".git", "info", "exclude");
       }
       if (
@@ -370,6 +375,7 @@ describe("HTTP server", () => {
     workspaceManager = new WorkspaceManager({
       defaultSourcePath: root,
       projectRoot,
+      projectsRoot: path.join(root, "projects-index"),
       runGit,
     });
     await workspaceManager.connect({ localPath: root });
@@ -1005,7 +1011,7 @@ describe("HTTP server", () => {
     });
     expect(created.status).toBe(201);
     expect(created.json.file.path).toBe(
-      path.join(root, "isolated", created.json.file.id, "brief.md"),
+      path.join(projectRoot, "files", created.json.file.id, "brief.md"),
     );
     expect(created.json.file.storage).toBe("isolated");
 
@@ -1465,7 +1471,7 @@ describe("HTTP server", () => {
     socket.close();
   });
 
-  it("removes a failed project creation and restores the previous workspace", async () => {
+  it("keeps an adopted project root and reports authoritative partial success when state loading fails", async () => {
     const previous = await request(port, "POST", "/api/canvas-projects", {
       name: "create-rollback-previous",
     });
@@ -1480,40 +1486,55 @@ describe("HTTP server", () => {
     await once(socket, "open");
     await initialHello;
     await initialWorkspace;
-    const restoredWorkspace = nextWebSocketFrame(socket, "workspace");
+    const partialWorkspace = nextWebSocketFrame(socket, "workspace");
+    const adoptedRoot = path.join(root, "adopted-create-failure");
+    const sentinel = path.join(adoptedRoot, "user-sentinel.txt");
+    await mkdir(adoptedRoot);
     beforeNextProjectStatePromptImport = async () => {
+      await writeFile(sentinel, "preserve me", "utf-8");
       throw new Error("injected create import failure");
     };
 
     const failed = await request(port, "POST", "/api/canvas-projects", {
       name: "create-rollback-failed",
+      projectRoot: adoptedRoot,
     });
-    expect(failed.status).toBe(400);
-    expect(failed.json.error).toContain("injected create import failure");
-    await expect(restoredWorkspace).resolves.toMatchObject({
+    expect(failed.status).toBe(207);
+    expect(failed.json).toMatchObject({
+      project: { name: "create-rollback-failed", projectRoot: adoptedRoot },
+      workspace: { canvasProject: { name: "create-rollback-failed" } },
+      partialSuccess: true,
+      workDocumentation: {
+        ready: false,
+        error: expect.stringContaining("injected create import failure"),
+      },
+    });
+    await expect(partialWorkspace).resolves.toMatchObject({
       type: "workspace",
-      workspace: { canvasProject: { id: previous.json.project.id } },
+      workspace: { canvasProject: { name: "create-rollback-failed" } },
+      partialSuccess: true,
+      workDocumentation: { ready: false },
     });
-    expect((await request(port, "GET", "/api/workspace")).json.canvasProject.id).toBe(
-      previous.json.project.id,
+    expect((await request(port, "GET", "/api/workspace")).json.canvasProject.name).toBe(
+      "create-rollback-failed",
     );
-    expect((await request(port, "GET", "/api/files")).json.files).toEqual([
-      expect.objectContaining({ id: preservedFile.json.file.id }),
-    ]);
+    const rejectedMutation = await request(port, "POST", "/api/files", {
+      name: "must-not-be-created",
+      extension: "txt",
+      kind: "normal",
+    });
+    expect(rejectedMutation.status).toBe(409);
+    expect(rejectedMutation.json.error).toContain("read-only");
+    expect((await request(port, "GET", "/api/files")).json.files).toEqual([]);
+    await expect(readFile(sentinel, "utf-8")).resolves.toBe("preserve me");
     expect(
       (await request(port, "GET", "/api/canvas-projects")).json.projects.some(
         (project: { name: string }) => project.name === "create-rollback-failed",
       ),
-    ).toBe(false);
+    ).toBe(true);
     socket.close();
-
-    await request(
-      port,
-      "DELETE",
-      `/api/canvas-projects/${encodeURIComponent(previous.json.project.id)}`,
-      undefined,
-      { "X-Agent-Canvas-Intent": "delete-project" },
-    );
+    expect(preservedFile.status).toBe(201);
+    expect(previous.status).toBe(201);
   });
 
   it("canvas project 保存并恢复节点快照和布局", async () => {
@@ -1675,6 +1696,157 @@ describe("HTTP server", () => {
       expect.objectContaining({ id: prompt.json.prompt.id, content: "saved prompt" }),
     ]);
     expect(restoredLayout.json.nodes).toEqual(layout.json.nodes);
+  });
+
+  it("rejects a hard-linked canvas state without modifying its outside sentinel", async () => {
+    const created = await request(port, "POST", "/api/canvas-projects", {
+      name: "canvas-state-hardlink",
+    });
+    expect(created.status, JSON.stringify(created.json)).toBe(201);
+
+    const projectId = created.json.project.id as string;
+    const statePath = path.join(created.json.project.projectRoot, "canvas-state.json");
+    const initialSave = await request(port, "PATCH", "/api/canvas-layout", {
+      canvasProjectId: projectId,
+      nodes: [],
+    });
+    expect(initialSave.status, JSON.stringify(initialSave.json)).toBe(200);
+    const originalState = await readFile(statePath, "utf-8");
+    const outsideSentinel = path.join(root, "outside-canvas-state-sentinel.json");
+    const displacedState = `${statePath}.original`;
+    await writeFile(outsideSentinel, originalState, "utf-8");
+    await rename(statePath, displacedState);
+    await link(outsideSentinel, statePath);
+
+    try {
+      const rejected = await request(port, "PATCH", "/api/canvas-layout", {
+        canvasProjectId: projectId,
+        nodes: [
+          {
+            id: "must-not-persist",
+            type: "file",
+            position: { x: 10, y: 20 },
+          },
+        ],
+      });
+
+      expect(rejected.status).toBe(400);
+      expect(rejected.json.error).toContain("no-follow single-link regular file");
+      await expect(readFile(outsideSentinel, "utf-8")).resolves.toBe(originalState);
+      const inMemoryLayout = await request(port, "GET", "/api/canvas-layout");
+      expect(inMemoryLayout.status).toBe(200);
+      expect(inMemoryLayout.json.nodes).toEqual([]);
+    } finally {
+      await rm(statePath, { force: true });
+      await rename(displacedState, statePath);
+      await rm(outsideSentinel, { force: true });
+    }
+
+    const recovered = await request(port, "PATCH", "/api/canvas-layout", {
+      canvasProjectId: projectId,
+      nodes: [],
+    });
+    expect(recovered.status, JSON.stringify(recovered.json)).toBe(200);
+  });
+
+  it("rejects a live canvas-state inode replacement until the tracked file is restored", async () => {
+    const created = await request(port, "POST", "/api/canvas-projects", {
+      name: "canvas-state-live-replacement",
+    });
+    expect(created.status, JSON.stringify(created.json)).toBe(201);
+    const projectId = created.json.project.id as string;
+    const statePath = path.join(created.json.project.projectRoot, "canvas-state.json");
+    expect(
+      (
+        await request(port, "PATCH", "/api/canvas-layout", {
+          canvasProjectId: projectId,
+          nodes: [],
+        })
+      ).status,
+    ).toBe(200);
+    const originalState = await readFile(statePath, "utf-8");
+    const displacedState = `${statePath}.tracked`;
+    await rename(statePath, displacedState);
+    await writeFile(statePath, originalState, "utf-8");
+
+    try {
+      const rejected = await request(port, "PATCH", "/api/canvas-layout", {
+        canvasProjectId: projectId,
+        nodes: [{ id: "must-not-replace", type: "file", position: { x: 1, y: 2 } }],
+      });
+      expect(rejected.status).toBe(400);
+      expect(rejected.json.error).toContain("identity changed");
+      await expect(readFile(statePath, "utf-8")).resolves.toBe(originalState);
+      expect((await request(port, "GET", "/api/canvas-layout")).json.nodes).toEqual([]);
+    } finally {
+      await rm(statePath, { force: true });
+      await rename(displacedState, statePath);
+    }
+
+    expect(
+      (
+        await request(port, "PATCH", "/api/canvas-layout", {
+          canvasProjectId: projectId,
+          nodes: [],
+        })
+      ).status,
+    ).toBe(200);
+  });
+
+  it("rejects a live project-root junction swap before canvas-state persistence", async (context) => {
+    const created = await request(port, "POST", "/api/canvas-projects", {
+      name: "canvas-project-root-swap",
+    });
+    expect(created.status, JSON.stringify(created.json)).toBe(201);
+    const projectId = created.json.project.id as string;
+    const activeRoot = created.json.project.projectRoot as string;
+    const displacedRoot = `${activeRoot}.original`;
+    const outside = path.join(root, "outside-canvas-project-root");
+    const outsideState = path.join(outside, "canvas-state.json");
+    await mkdir(outside);
+    await writeFile(outsideState, "outside canvas sentinel", "utf-8");
+    await rename(activeRoot, displacedRoot);
+    let linked = false;
+    try {
+      try {
+        await symlink(
+          outside,
+          activeRoot,
+          process.platform === "win32" ? "junction" : "dir",
+        );
+        linked = true;
+      } catch (error) {
+        await rename(displacedRoot, activeRoot);
+        if (["EPERM", "EACCES", "UNKNOWN"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+          context.skip();
+          return;
+        }
+        throw error;
+      }
+
+      const rejected = await request(port, "PATCH", "/api/canvas-layout", {
+        canvasProjectId: projectId,
+        nodes: [{ id: "outside-write", type: "file", position: { x: 4, y: 5 } }],
+      });
+      expect(rejected.status).toBe(400);
+      await expect(readFile(outsideState, "utf-8")).resolves.toBe(
+        "outside canvas sentinel",
+      );
+    } finally {
+      if (linked) {
+        await rm(activeRoot, { force: true });
+        await rename(displacedRoot, activeRoot);
+      }
+    }
+
+    expect(
+      (
+        await request(port, "PATCH", "/api/canvas-layout", {
+          canvasProjectId: projectId,
+          nodes: [],
+        })
+      ).status,
+    ).toBe(200);
   });
 
   it("publishes the authoritative workspace and hello before activating overdue imported flows", async () => {

@@ -1496,10 +1496,12 @@ export default function App(): React.ReactElement {
       setProjectError(undefined);
       let expectedWorkspaceIdentity: string | undefined;
       try {
-        const { workspace: nextWorkspace } = await api.createCanvasProject({
+        const result = await api.createCanvasProject({
           name,
           projectRoot: projectRoot?.trim() || undefined,
         });
+        const nextWorkspace = result.workspace;
+        const warning = workDocumentationMutationWarning(result);
         expectedWorkspaceIdentity = workspaceEventIdentity(nextWorkspace);
         const isCurrent = () =>
           projectOperationIsCurrent(ownership, expectedWorkspaceIdentity);
@@ -1508,7 +1510,7 @@ export default function App(): React.ReactElement {
         clearProjectScopedUi();
         setWorkspace(nextWorkspace);
         setLayoutProjectId(nextWorkspace.canvasProject?.id);
-        setProjectError(undefined);
+        setProjectError(warning);
         const auxiliary = await resolveCurrentProjectOpenStep(
           Promise.all([api.canvasLayout(), api.settings(), refresh()]),
           isCurrent,

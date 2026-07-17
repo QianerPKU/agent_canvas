@@ -1,6 +1,6 @@
 import http from "node:http";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import type {
@@ -57,6 +57,12 @@ import {
   WorkspaceProjectChangedError,
   type WorkspaceProjectRevision,
 } from "./workspaces/WorkspaceManager.js";
+import {
+  type ManagedFileSnapshot,
+  type ManagedTrustedRootBoundary,
+  readManagedFileSnapshot,
+  writeManagedFileAtomically,
+} from "./workspaces/safeManagedFile.js";
 
 export interface CreateServerResult {
   httpServer: http.Server;
@@ -94,11 +100,17 @@ interface CanvasStateController {
   getLayout(): CanvasLayoutSnapshot;
   setLayout(layout: Partial<CanvasLayoutSnapshot>): Promise<CanvasLayoutSnapshot>;
   loadProjectState(): Promise<WorkDocumentationLoadStatus>;
+  resetProjectStateAfterFailedLoad(error: unknown): Promise<WorkDocumentationLoadStatus>;
+  assertProjectStateWritable(): Promise<void>;
   activateImportedFlowState(): void;
   unloadProjectState(): Promise<void>;
   runProjectTransaction<T>(
     operation: () => Promise<T>,
-    options?: { saveCurrent?: boolean; forceEnqueue?: boolean },
+    options?: {
+      saveCurrent?: boolean;
+      forceEnqueue?: boolean;
+      allowUnsafeCurrentState?: boolean;
+    },
   ): Promise<T>;
   currentWorkspaceFrame(): Promise<Extract<ServerFrame, { type: "workspace" }>>;
   recordWorkDocumentationStatus(status: WorkDocumentationLoadStatus): void;
@@ -204,10 +216,20 @@ export function createServer(
           } else if (expectedNoProject && workspaceManager.currentProjectId()) {
             throw new WorkspaceProjectChangedError();
           }
+          if (workspaceManager.currentProjectId()) {
+            await workspaceManager.validateCurrentProjectRoot();
+          }
         } catch (error) {
           return sendJson(res, workspaceErrorStatus(error), {
             error: "请求所属项目已切换；已拒绝迟到的项目操作",
           });
+        }
+      }
+      if (requiresWritableCanvasState(req)) {
+        try {
+          await canvasState.assertProjectStateWritable();
+        } catch (error) {
+          return sendJson(res, 409, { error: errMsg(error) });
         }
       }
       return await handleHttp(
@@ -231,8 +253,19 @@ export function createServer(
         allowedOrigins,
       );
     };
-    const invoke = () =>
-      projectScoped ? canvasState.runProjectTransaction(operation) : operation();
+    const invoke = async () => {
+      try {
+        return projectScoped ? await canvasState.runProjectTransaction(operation) : await operation();
+      } catch (error) {
+        // Project transactions validate the live project-root boundary before invoking the
+        // request operation. Route those queue-level preflight failures through the same status
+        // mapping as the in-operation revision/boundary check instead of leaking them as a 500.
+        if (projectScoped && !res.headersSent) {
+          return sendJson(res, workspaceErrorStatus(error), { error: errMsg(error) });
+        }
+        throw error;
+      }
+    };
     const result = shouldPreloadProjectRequestBody(req, allowedOrigins)
       ? preloadRequestJsonBody(req).then(invoke)
       : invoke();
@@ -521,14 +554,23 @@ async function handleHttp(
           canvasState.activateImportedFlowState();
           return { project, workspace };
         } catch (createError) {
-          const rollbackErrors: unknown[] = [];
           if (project) {
-            try {
-              await workspaceManager.deleteCanvasProject(project.id);
-            } catch (error) {
-              rollbackErrors.push(error);
-            }
+            // Project metadata has already committed. Keep that authoritative project open and
+            // reset its in-memory canvas state instead of deleting a possibly user-owned root.
+            const workDocumentation =
+              await canvasState.resetProjectStateAfterFailedLoad(createError);
+            const workspace = await workspaceManager.project();
+            broadcastFrame({
+              type: "workspace",
+              workspace,
+              partialSuccess: true,
+              workDocumentation,
+            });
+            broadcastHello();
+            canvasState.activateImportedFlowState();
+            return { project, workspace, partialSuccess: true, workDocumentation };
           }
+          const rollbackErrors: unknown[] = [];
           try {
             if (previousWorkspace?.canvasProject) {
               await workspaceManager.openCanvasProject({
@@ -564,8 +606,8 @@ async function handleHttp(
           }
           throw createError;
         }
-      }, { saveCurrent: true });
-      return sendJson(res, 201, created);
+      }, { saveCurrent: true, allowUnsafeCurrentState: true });
+      return sendJson(res, created.partialSuccess ? 207 : 201, created);
     } catch (error) {
       return sendJson(res, 400, { error: errMsg(error) });
     }
@@ -639,7 +681,7 @@ async function handleHttp(
           }
           throw openError;
         }
-      }, { saveCurrent: true });
+      }, { saveCurrent: true, allowUnsafeCurrentState: true });
       if (!opened.workDocumentation.ready) {
         return sendJson(res, 207, {
           workspace: opened.workspace,
@@ -691,7 +733,7 @@ async function handleHttp(
         }
         broadcastHello();
         return sendJson(res, 200, { project });
-      }, { saveCurrent: true });
+      }, { saveCurrent: true, allowUnsafeCurrentState: true });
     } catch (error) {
       return sendJson(res, 404, { error: errMsg(error) });
     }
@@ -1544,6 +1586,15 @@ function isProjectScopedHttpRequest(req: http.IncomingMessage): boolean {
   );
 }
 
+function requiresWritableCanvasState(req: http.IncomingMessage): boolean {
+  const method = req.method ?? "GET";
+  if (["GET", "HEAD", "OPTIONS"].includes(method) || !isProjectScopedHttpRequest(req)) {
+    return false;
+  }
+  const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+  return !pathname.startsWith("/api/canvas-projects");
+}
+
 function requiresExpectedProjectMutation(req: http.IncomingMessage): boolean {
   const method = req.method ?? "GET";
   if (method === "GET" || method === "HEAD" || method === "OPTIONS") return false;
@@ -1685,6 +1736,9 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   let projectOperationChain: Promise<void> = Promise.resolve();
   let workDocumentationStatus: WorkDocumentationLoadStatus = { ready: true };
+  let canvasStateProjectId: string | undefined;
+  let canvasStateSnapshot: ManagedFileSnapshot | undefined;
+  let canvasStateWritable = false;
   let pendingDerivedAgentEvents = 0;
   const projectOperationContext = new AsyncLocalStorage<{ active: boolean }>();
 
@@ -1703,19 +1757,38 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
     return result;
   };
 
-  const applyProjectStorageRoots = (projectRoot: string): void => {
-    deps.fileManager.setIsolatedRoot(path.join(projectRoot, "files"));
-    deps.promptManager.setPromptRoot(path.join(projectRoot, "prompts"));
+  const applyProjectStorageRoots = (
+    projectRoot: string,
+    trustedRootBoundary?: ManagedTrustedRootBoundary,
+  ): void => {
+    deps.fileManager.setIsolatedRoot(
+      path.join(projectRoot, "files"),
+      projectRoot,
+      trustedRootBoundary,
+    );
+    deps.promptManager.setPromptRoot(
+      path.join(projectRoot, "prompts"),
+      projectRoot,
+      trustedRootBoundary,
+    );
   };
 
+  if (deps.workspaceManager.currentProjectId()) {
+    applyProjectStorageRoots(
+      deps.workspaceManager.root(),
+      deps.workspaceManager.currentProjectRootBoundaryIfAvailable(),
+    );
+  }
+
   const saveCurrentProject = async (): Promise<void> => {
-    let project: Awaited<ReturnType<WorkspaceManager["project"]>>;
-    try {
-      project = await deps.workspaceManager.project();
-    } catch {
-      return;
+    if (!deps.workspaceManager.currentProjectId()) return;
+    const project = await deps.workspaceManager.project();
+    const projectId = project.canvasProject?.id;
+    if (!projectId || projectId !== canvasStateProjectId || !canvasStateWritable) {
+      throw new Error("Canvas project state was not safely loaded; refusing to overwrite it");
     }
-    applyProjectStorageRoots(project.projectRoot);
+    const trustedRootBoundary = deps.workspaceManager.currentProjectRootBoundary();
+    applyProjectStorageRoots(project.projectRoot, trustedRootBoundary);
     const state: CanvasProjectState = {
       version: 1,
       updatedAt: Date.now(),
@@ -1728,18 +1801,79 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
       layout,
     };
     const statePath = path.join(project.projectRoot, CANVAS_STATE_FILE);
-    await mkdir(path.dirname(statePath), { recursive: true });
-    await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf-8");
+    await deps.workspaceManager.validateCurrentProjectRoot();
+    canvasStateSnapshot = await writeManagedFileAtomically(
+      statePath,
+      `${JSON.stringify(state, null, 2)}\n`,
+      {
+        allowParentMapping: true,
+        label: "canvas state",
+        trustedRootBoundary,
+        expectedContent: canvasStateSnapshot?.content,
+        expectedIdentity: canvasStateSnapshot?.identity,
+      },
+    );
+  };
+
+  const loadProjectState = async (): Promise<WorkDocumentationLoadStatus> => {
+    const project = await deps.workspaceManager.project();
+    const trustedRootBoundary = deps.workspaceManager.currentProjectRootBoundary();
+    applyProjectStorageRoots(project.projectRoot, trustedRootBoundary);
+    canvasStateProjectId = project.canvasProject?.id;
+    canvasStateSnapshot = undefined;
+    canvasStateWritable = false;
+    await deps.workspaceManager.validateCurrentProjectRoot();
+    canvasStateSnapshot = await readManagedFileSnapshot(
+      path.join(project.projectRoot, CANVAS_STATE_FILE),
+      {
+        allowMissing: true,
+        allowParentMapping: true,
+        label: "canvas state",
+        trustedRootBoundary,
+      },
+    );
+    await deps.workspaceManager.validateCurrentProjectRoot();
+    const state = parseCanvasProjectState(canvasStateSnapshot?.content);
+    await deps.manager.importState(state?.agents);
+    await deps.workspaceManager.validateCurrentProjectRoot();
+    await deps.fileManager.importState(state?.files);
+    await deps.workspaceManager.validateCurrentProjectRoot();
+    await deps.promptManager.importState(state?.prompts);
+    await deps.workspaceManager.validateCurrentProjectRoot();
+    deps.commitManager.importState(state?.commits);
+    deps.pullRequestFlowManager.importState(state?.prFlows, { deferActivation: true });
+    deps.syncFlowManager.importState(state?.syncFlows, { deferActivation: true });
+    layout = sanitizeCanvasLayout(state?.layout);
+    canvasStateWritable = true;
+    if (deps.manager.appSettings().workDocumentationEnabled) {
+      try {
+        await deps.workspaceManager.prepareWorkDocumentationForAllBranches();
+      } catch (error) {
+        workDocumentationStatus = { ready: false, error: errMsg(error) };
+        return workDocumentationStatus;
+      }
+    }
+    workDocumentationStatus = { ready: true };
+    return workDocumentationStatus;
   };
 
   const runProjectTransaction = <T>(
     operation: () => Promise<T>,
-    options: { saveCurrent?: boolean; forceEnqueue?: boolean } = {},
+    options: {
+      saveCurrent?: boolean;
+      forceEnqueue?: boolean;
+      allowUnsafeCurrentState?: boolean;
+    } = {},
   ): Promise<T> => {
     const execute = async (): Promise<T> => {
+      if (deps.workspaceManager.currentProjectId()) {
+        await deps.workspaceManager.validateCurrentProjectRoot();
+      }
       if (options.saveCurrent) {
         clearSaveTimer();
-        await saveCurrentProject();
+        if (!options.allowUnsafeCurrentState || canvasStateWritable) {
+          await saveCurrentProject();
+        }
       }
       return await operation();
     };
@@ -1765,34 +1899,56 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
     });
 
   return {
+    assertProjectStateWritable: () =>
+      runProjectTransaction(async () => {
+        const projectId = deps.workspaceManager.currentProjectId();
+        // The server can be constructed around an already-open WorkspaceManager. Its first
+        // mutation must establish the same no-follow snapshot and imported state as an explicit
+        // project open, and it must do so inside the project queue so concurrent first writes
+        // cannot race duplicate imports. Once a load has started (successfully or otherwise),
+        // never retry it implicitly: a failed or partially imported state remains read-only until
+        // the user explicitly reopens or replaces it.
+        if (projectId && canvasStateProjectId === undefined) {
+          await loadProjectState();
+        }
+        if (!projectId || projectId !== canvasStateProjectId || !canvasStateWritable) {
+          throw new Error(
+            "Canvas project state is read-only because it was not safely loaded; reopen or replace the unsafe state file before making changes",
+          );
+        }
+      }),
     getLayout: () => layout,
     setLayout: (nextLayout) =>
       runProjectTransaction(async () => {
         clearSaveTimer();
+        const previousLayout = layout;
         layout = sanitizeCanvasLayout(nextLayout);
-        await saveCurrentProject();
-        return layout;
-      }),
-    loadProjectState: async () => {
-      const project = await deps.workspaceManager.project();
-      applyProjectStorageRoots(project.projectRoot);
-      const state = await readCanvasProjectState(path.join(project.projectRoot, CANVAS_STATE_FILE));
-      await deps.manager.importState(state?.agents);
-      deps.fileManager.importState(state?.files);
-      await deps.promptManager.importState(state?.prompts);
-      deps.commitManager.importState(state?.commits);
-      deps.pullRequestFlowManager.importState(state?.prFlows, { deferActivation: true });
-      deps.syncFlowManager.importState(state?.syncFlows, { deferActivation: true });
-      layout = sanitizeCanvasLayout(state?.layout);
-      if (deps.manager.appSettings().workDocumentationEnabled) {
         try {
-          await deps.workspaceManager.prepareWorkDocumentationForAllBranches();
+          await saveCurrentProject();
+          return layout;
         } catch (error) {
-          workDocumentationStatus = { ready: false, error: errMsg(error) };
-          return workDocumentationStatus;
+          layout = previousLayout;
+          throw error;
         }
-      }
-      workDocumentationStatus = { ready: true };
+      }),
+    loadProjectState,
+    resetProjectStateAfterFailedLoad: async (error) => {
+      clearSaveTimer();
+      await deps.manager.clear();
+      await deps.fileManager.importState(undefined);
+      await deps.promptManager.importState(undefined);
+      deps.commitManager.importState(undefined);
+      deps.pullRequestFlowManager.importState(undefined);
+      deps.syncFlowManager.importState(undefined);
+      layout = emptyCanvasLayout();
+      const project = await deps.workspaceManager.project();
+      applyProjectStorageRoots(
+        project.projectRoot,
+        deps.workspaceManager.currentProjectRootBoundary(),
+      );
+      canvasStateProjectId = project.canvasProject?.id;
+      canvasStateWritable = false;
+      workDocumentationStatus = { ready: false, error: errMsg(error) };
       return workDocumentationStatus;
     },
     activateImportedFlowState: () => {
@@ -1802,13 +1958,16 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
     unloadProjectState: async () => {
       clearSaveTimer();
       await deps.manager.clear();
-      deps.fileManager.importState(undefined);
+      await deps.fileManager.importState(undefined);
       await deps.promptManager.importState(undefined);
       deps.commitManager.importState(undefined);
       deps.pullRequestFlowManager.importState(undefined);
       deps.syncFlowManager.importState(undefined);
       layout = emptyCanvasLayout();
       workDocumentationStatus = { ready: true };
+      canvasStateProjectId = undefined;
+      canvasStateSnapshot = undefined;
+      canvasStateWritable = false;
       applyProjectStorageRoots(path.join(deps.workspaceManager.projectListRoot(), ".inactive"));
     },
     runProjectTransaction,
@@ -1855,17 +2014,11 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
   };
 }
 
-async function readCanvasProjectState(
-  statePath: string,
-): Promise<CanvasProjectState | undefined> {
-  try {
-    const parsed = JSON.parse(await readFile(statePath, "utf-8")) as CanvasProjectState;
-    if (parsed?.version !== 1) throw new Error("unsupported canvas state version");
-    return parsed;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw error;
-  }
+function parseCanvasProjectState(content: string | undefined): CanvasProjectState | undefined {
+  if (content === undefined) return undefined;
+  const parsed = JSON.parse(content) as CanvasProjectState;
+  if (parsed?.version !== 1) throw new Error("unsupported canvas state version");
+  return parsed;
 }
 
 function emptyCanvasLayout(): CanvasLayoutSnapshot {

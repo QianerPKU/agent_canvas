@@ -1,8 +1,9 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { PromptManager } from "./PromptManager.js";
+import { captureManagedTrustedRootBoundary } from "../workspaces/safeManagedFile.js";
 
 describe("PromptManager", () => {
   let root = "";
@@ -19,6 +20,38 @@ describe("PromptManager", () => {
 
   afterEach(async () => {
     await rm(root, { recursive: true, force: true });
+  });
+
+  it("rejects a persisted project-root swap before creating a prompt", async () => {
+    const actualRoot = path.join(root, "actual-project");
+    const outsideRoot = path.join(root, "outside-project");
+    const linkedRoot = path.join(root, "linked-project");
+    await mkdir(actualRoot);
+    await mkdir(outsideRoot);
+    await symlink(
+      actualRoot,
+      linkedRoot,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const boundary = await captureManagedTrustedRootBoundary(linkedRoot, "project root");
+    manager = new PromptManager({
+      promptRoot: path.join(linkedRoot, "prompts"),
+      trustedRoot: linkedRoot,
+      trustedRootBoundary: boundary,
+    });
+    await rm(linkedRoot);
+    await symlink(
+      outsideRoot,
+      linkedRoot,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    await expect(
+      manager.create({ name: "sentinel", content: "blocked", kind: "normal" }),
+    ).rejects.toThrow(/persisted trusted root/u);
+    await expect(lstat(path.join(outsideRoot, "prompts"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 
   it("创建、更新纯文本提示词，并同步外部写入", async () => {
