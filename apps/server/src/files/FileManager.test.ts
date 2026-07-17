@@ -12,7 +12,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FileManager } from "./FileManager.js";
-import { captureManagedTrustedRootBoundary } from "../workspaces/safeManagedFile.js";
+import {
+  captureManagedTrustedRootBoundary,
+  writeManagedFileAtomically,
+} from "../workspaces/safeManagedFile.js";
 
 describe("FileManager", () => {
   let root = "";
@@ -99,6 +102,47 @@ describe("FileManager", () => {
     expect(manager.get(file.id)?.path).toBe(file.path);
     await expect(readFile(file.path, "utf-8")).resolves.toBe("source content");
     await expect(readFile(targetPath, "utf-8")).resolves.toBe("concurrent target");
+  });
+
+  it("repins a safely validated file after an authorized atomic save", async () => {
+    const file = await manager.create({ name: "agent-output", extension: "txt", kind: "shared" });
+    await manager.update(file.id, { sharedRead: true, sharedWrite: true });
+
+    await writeManagedFileAtomically(file.path, "saved atomically", {
+      label: "authorized agent file save",
+      expectedContent: "",
+    });
+
+    expect(manager.accessFor("agent_1")).toMatchObject({
+      readableFiles: [expect.objectContaining({ path: file.path })],
+      writableFiles: [expect.objectContaining({ path: file.path })],
+      writableDirectories: [path.dirname(file.path)],
+    });
+    await expect(manager.readContent(file.id)).resolves.toEqual({
+      content: "saved atomically",
+      truncated: false,
+    });
+
+    const persisted = manager.exportState();
+    const reloaded = new FileManager({ isolatedRoot: path.join(root, "isolated") });
+    await reloaded.importState(persisted);
+    await expect(reloaded.readContent(file.id)).resolves.toEqual({
+      content: "saved atomically",
+      truncated: false,
+    });
+  });
+
+  it("preserves binary bytes when renaming a file node", async () => {
+    const binary = Buffer.from([0xff, 0xfe, 0x00, 0x80, 0x41]);
+    const file = await manager.createWithContent(
+      { name: "binary-source", extension: "bin", kind: "normal" },
+      binary,
+    );
+
+    const renamed = await manager.update(file.id, { name: "binary-target" });
+
+    await expect(readFile(renamed.path)).resolves.toEqual(binary);
+    await expect(lstat(file.path)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("文件节点固定创建在隔离目录中", async () => {

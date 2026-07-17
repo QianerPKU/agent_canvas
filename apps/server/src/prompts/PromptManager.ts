@@ -63,10 +63,6 @@ export interface PromptManagerOptions {
 export class PromptManager {
   private readonly prompts = new Map<string, StoredPrompt>();
   private readonly connections = new Map<string, CanvasPromptConnection>();
-  private readonly promptIdentities = new Map<
-    string,
-    { dev: number; ino: number }
-  >();
   private promptRoot: string;
   private trustedRoot: string | undefined;
   private trustedRootBoundary: ManagedTrustedRootBoundary | undefined;
@@ -116,11 +112,9 @@ export class PromptManager {
     for (const [id, prompt] of plan.prompts) this.prompts.set(id, prompt);
     this.connections.clear();
     for (const [id, connection] of plan.connections) this.connections.set(id, connection);
-    this.promptIdentities.clear();
     for (const [id, prompt] of plan.prompts) {
       const snapshot = committed.get(prompt.path);
       if (!snapshot) throw new Error(`Missing committed prompt identity: ${id}`);
-      this.promptIdentities.set(id, snapshot.identity);
     }
     this.promptCounter = maxNumericSuffix([...plan.prompts.keys()]);
     this.connectionCounter = maxNumericSuffix([...plan.connections.keys()]);
@@ -138,7 +132,7 @@ export class PromptManager {
     const content = normalizeContent(input.content);
     const directory = path.join(this.promptRoot, id);
     const promptPath = path.join(directory, "prompt.txt");
-    const written = await writeManagedFileAtomically(promptPath, content, {
+    await writeManagedFileAtomically(promptPath, content, {
       expectedContent: undefined,
       label: `prompt ${id}`,
       trustedRoot: this.trustedRoot,
@@ -157,7 +151,6 @@ export class PromptManager {
       updatedAt: at,
     };
     this.prompts.set(id, prompt);
-    this.promptIdentities.set(id, written.identity);
     this.promptCounter = nextPromptCounter;
     return publicPrompt(prompt);
   }
@@ -165,21 +158,23 @@ export class PromptManager {
   async update(id: string, input: UpdateCanvasPromptInput): Promise<CanvasPromptNode> {
     const current = this.requirePrompt(id);
     const name = input.name === undefined ? current.name : normalizeName(input.name);
-    const refreshed = this.refresh(current);
+    const refreshedFile = this.refreshFile(current);
+    const refreshed = refreshedFile.prompt;
     const content =
       input.content === undefined ? refreshed.content : normalizeContent(input.content);
+    let modifiedAt = refreshedFile.snapshot.modifiedAt;
     if (input.content !== undefined) {
       const written = await writeManagedFileAtomically(current.path, content, {
         label: `prompt ${id}`,
         trustedRoot: this.trustedRoot,
         trustedRootBoundary: this.trustedRootBoundary,
         expectedContent: refreshed.content,
-        expectedIdentity: this.promptIdentities.get(id),
+        expectedIdentity: refreshedFile.snapshot.identity,
       });
-      this.promptIdentities.set(id, written.identity);
+      modifiedAt = written.modifiedAt;
     }
     const updated: StoredPrompt = {
-      ...current,
+      ...refreshed,
       name,
       content,
       sharedRead:
@@ -190,7 +185,7 @@ export class PromptManager {
         current.kind === "shared" && input.sharedWrite !== undefined
           ? input.sharedWrite
           : current.sharedWrite,
-      updatedAt: this.now(),
+      updatedAt: Math.max(refreshed.updatedAt, modifiedAt, this.now()),
     };
     this.prompts.set(id, updated);
     return publicPrompt(updated);
@@ -287,22 +282,25 @@ export class PromptManager {
   }
 
   private refresh(prompt: StoredPrompt): StoredPrompt {
+    return this.refreshFile(prompt).prompt;
+  }
+
+  private refreshFile(prompt: StoredPrompt): {
+    prompt: StoredPrompt;
+    snapshot: ManagedFileSnapshot;
+  } {
     const snapshot = readManagedFileSnapshotSync(prompt.path, {
       label: `prompt ${prompt.id}`,
       trustedRoot: this.trustedRoot,
       trustedRootBoundary: this.trustedRootBoundary,
     });
-    const expected = this.promptIdentities.get(prompt.id);
-    if (
-      !expected ||
-      expected.dev !== snapshot.identity.dev ||
-      expected.ino !== snapshot.identity.ino
-    ) {
-      throw new Error(`Prompt file identity changed: ${prompt.id}`);
-    }
-    const refreshed = { ...prompt, content: snapshot.content };
+    const refreshed = {
+      ...prompt,
+      content: snapshot.content,
+      updatedAt: Math.max(prompt.updatedAt, snapshot.modifiedAt),
+    };
     this.prompts.set(prompt.id, refreshed);
-    return refreshed;
+    return { prompt: refreshed, snapshot };
   }
 
   private async planImport(state: PersistedPromptState | undefined): Promise<PromptImportPlan> {
@@ -526,11 +524,10 @@ export class PromptManager {
       return committed;
     } catch (error) {
       const rollbackErrors: unknown[] = [];
-      const restoredIdentities = new Map<string, { dev: number; ino: number }>();
       for (const write of writes.reverse()) {
         try {
           if (write.plan.original) {
-            const restored = await writeManagedFileAtomically(
+            await writeManagedFileAtomically(
               write.plan.path,
               write.plan.original.content,
               {
@@ -541,7 +538,6 @@ export class PromptManager {
               trustedRootBoundary: this.trustedRootBoundary,
               },
             );
-            restoredIdentities.set(write.plan.path, restored.identity);
           } else {
             await removeManagedFile(write.plan.path, {
               expectedContent: write.written.content,
@@ -577,10 +573,6 @@ export class PromptManager {
           [error, ...rollbackErrors],
           "Prompt import failed and could not be fully rolled back",
         );
-      }
-      for (const prompt of this.prompts.values()) {
-        const restored = restoredIdentities.get(prompt.path);
-        if (restored) this.promptIdentities.set(prompt.id, restored);
       }
       throw error;
     }

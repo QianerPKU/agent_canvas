@@ -18,6 +18,7 @@ import { CodexAuthManager } from "./sdk/CodexAuthManager.js";
 import { SyncFlowManager, type SyncFlowAgentHost } from "./sync/SyncFlowManager.js";
 import type { QueryFn } from "./sdk/types.js";
 import { WorkspaceManager, type GitRunner } from "./workspaces/WorkspaceManager.js";
+import { writeManagedFileAtomically } from "./workspaces/safeManagedFile.js";
 
 /** 立即结束消息流的假 query：足以测 HTTP 路由，不触达模型。 */
 const emptyQuery: QueryFn = () => ({
@@ -1566,6 +1567,30 @@ describe("HTTP server", () => {
     expect(file.status).toBe(201);
     expect(prompt.status).toBe(201);
 
+    await writeManagedFileAtomically(file.json.file.path, "saved file atomically", {
+      label: "authorized file save",
+      expectedContent: "",
+    });
+    const promptPath = path.join(
+      projectA.json.project.projectRoot,
+      "prompts",
+      prompt.json.prompt.id,
+      "prompt.txt",
+    );
+    await writeManagedFileAtomically(promptPath, "saved prompt atomically", {
+      label: "authorized prompt save",
+      expectedContent: "saved prompt",
+    });
+    expect(
+      (await request(port, "GET", `/api/files/${file.json.file.id}/content?full=1`)).json,
+    ).toEqual({ content: "saved file atomically", truncated: false });
+    expect((await request(port, "GET", "/api/prompts")).json.prompts).toContainEqual(
+      expect.objectContaining({
+        id: prompt.json.prompt.id,
+        content: "saved prompt atomically",
+      }),
+    );
+
     const layout = await request(port, "PATCH", "/api/canvas-layout", {
       canvasProjectId: projectA.json.project.id,
       nodes: [
@@ -1693,8 +1718,11 @@ describe("HTTP server", () => {
       expect.objectContaining({ id: file.json.file.id, name: "persisted-file" }),
     ]);
     expect(restoredPrompts.json.prompts).toEqual([
-      expect.objectContaining({ id: prompt.json.prompt.id, content: "saved prompt" }),
+      expect.objectContaining({ id: prompt.json.prompt.id, content: "saved prompt atomically" }),
     ]);
+    expect(
+      (await request(port, "GET", `/api/files/${file.json.file.id}/content?full=1`)).json,
+    ).toEqual({ content: "saved file atomically", truncated: false });
     expect(restoredLayout.json.nodes).toEqual(layout.json.nodes);
   });
 

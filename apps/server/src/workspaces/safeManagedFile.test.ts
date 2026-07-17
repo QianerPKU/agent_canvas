@@ -305,6 +305,60 @@ describe("safeManagedFile", () => {
     }
   });
 
+  it("compares binary removal guards byte-for-byte", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-managed-binary-remove-"));
+    const managedFile = path.join(root, "payload.bin");
+    const original = Buffer.from([0x80]);
+    const utf8Collision = Buffer.from([0x81]);
+    try {
+      await writeFile(managedFile, original);
+
+      await expect(
+        removeManagedFile(managedFile, {
+          expectedContent: utf8Collision,
+          label: "binary payload",
+        }),
+      ).rejects.toThrow("binary payload content changed before removal");
+      await expect(readFile(managedFile)).resolves.toEqual(original);
+
+      await removeManagedFile(managedFile, {
+        expectedContent: original,
+        label: "binary payload",
+      });
+      await expect(lstat(managedFile)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("restores an in-place binary mutation made immediately before quarantine", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-managed-binary-race-"));
+    const managedFile = path.join(root, "payload.bin");
+    const original = Buffer.from([0x80]);
+    const utf8Collision = Buffer.from([0x81]);
+    try {
+      await writeFile(managedFile, original);
+      const identity = await lstat(managedFile);
+      fileSystemHooks.beforeRemovalRename = async () => {
+        await writeFile(managedFile, utf8Collision);
+      };
+
+      await expect(
+        removeManagedFile(managedFile, {
+          expectedContent: original,
+          expectedIdentity: { dev: identity.dev, ino: identity.ino },
+          label: "binary payload",
+        }),
+      ).rejects.toThrow("binary payload content changed while being quarantined");
+
+      await expect(readFile(managedFile)).resolves.toEqual(utf8Collision);
+      expect(await readdir(root)).toEqual(["payload.bin"]);
+    } finally {
+      fileSystemHooks.beforeRemovalRename = undefined;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("does not remove a managed file modified in place before unlink", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-managed-remove-race-"));
     const managedFile = path.join(root, "state.json");

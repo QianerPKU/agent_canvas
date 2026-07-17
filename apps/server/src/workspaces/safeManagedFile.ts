@@ -37,11 +37,13 @@ export interface ManagedFileIdentity {
 export interface ManagedFileSnapshot {
   content: string;
   identity: ManagedFileIdentity;
+  modifiedAt: number;
 }
 
 export interface ManagedFileBufferSnapshot {
   content: Buffer;
   identity: ManagedFileIdentity;
+  modifiedAt: number;
 }
 
 export interface ManagedTrustedRootBoundary {
@@ -150,6 +152,7 @@ export async function readManagedFileSnapshot(
     return {
       content,
       identity: { dev: openedStat.dev, ino: openedStat.ino },
+      modifiedAt: after.mtimeMs,
     };
   } catch (error) {
     if (isMissingFileError(error)) {
@@ -229,6 +232,7 @@ export async function readManagedFileBufferSnapshot(
     return {
       content,
       identity: { dev: openedStat.dev, ino: openedStat.ino },
+      modifiedAt: after.mtimeMs,
     };
   } finally {
     await handle?.close();
@@ -273,6 +277,7 @@ export function readManagedFileSnapshotSync(
     return {
       content,
       identity: { dev: openedStat.dev, ino: openedStat.ino },
+      modifiedAt: after.mtimeMs,
     };
   } finally {
     closeSync(descriptor);
@@ -491,6 +496,7 @@ export async function writeManagedFileAtomically(
           return {
             content,
             identity: { dev: temporaryPathStat.dev, ino: temporaryPathStat.ino },
+            modifiedAt: temporaryPathStat.mtimeMs,
           };
         }
         try {
@@ -511,6 +517,7 @@ export async function writeManagedFileAtomically(
     return {
       content,
       identity: { dev: temporaryPathStat.dev, ino: temporaryPathStat.ino },
+      modifiedAt: temporaryPathStat.mtimeMs,
     };
   } finally {
     await handle?.close().catch(() => undefined);
@@ -780,7 +787,7 @@ async function publishedCreationIsCommitted(
 export async function removeManagedFile(
   filePath: string,
   options: ManagedPathOptions & {
-    expectedContent: string;
+    expectedContent: string | Uint8Array;
     expectedIdentity?: ManagedFileIdentity;
   },
 ): Promise<void> {
@@ -796,8 +803,9 @@ export async function removeManagedFile(
     trustedRoot,
   );
   filePath = path.join(parentIdentity.realPath, path.basename(filePath));
-  const original = await snapshotManagedTarget(filePath, label);
-  if (!original || original.content !== options.expectedContent) {
+  const expectedContent = contentBuffer(options.expectedContent);
+  const original = await snapshotManagedBufferTarget(filePath, label);
+  if (!original || !original.content.equals(expectedContent)) {
     throw new ManagedFileSafetyError(`${label} content changed before removal: ${filePath}`);
   }
   if (
@@ -809,7 +817,7 @@ export async function removeManagedFile(
   }
   await assertManagedParentIdentity(parent, parentIdentity, label);
   await assertOperationTrustedRootBoundary(options, label);
-  const current = await snapshotManagedTarget(filePath, label);
+  const current = await snapshotManagedBufferTarget(filePath, label);
   if (!current) {
     throw new ManagedFileSafetyError(`${label} disappeared before removal: ${filePath}`);
   }
@@ -819,7 +827,7 @@ export async function removeManagedFile(
     filePath,
     `${label} changed before removal`,
   );
-  if (current.content !== original.content) {
+  if (!current.content.equals(original.content)) {
     throw new ManagedFileSafetyError(`${label} content changed before removal: ${filePath}`);
   }
   await assertManagedParentIdentity(parent, parentIdentity, label);
@@ -846,8 +854,32 @@ export async function removeManagedFile(
     tombstoneAfter.dev === original.stat.dev &&
     tombstoneAfter.ino === original.stat.ino
   ) {
+    const quarantined = await snapshotManagedBufferTarget(
+      tombstonePath,
+      `${label} quarantined file`,
+    );
+    if (
+      !quarantined ||
+      quarantined.stat.dev !== original.stat.dev ||
+      quarantined.stat.ino !== original.stat.ino ||
+      !quarantined.content.equals(original.content)
+    ) {
+      if (quarantined) {
+        await restoreQuarantinedForeignFile(
+          tombstonePath,
+          filePath,
+          quarantined.stat,
+          label,
+        );
+      }
+      throw new ManagedFileSafetyError(
+        `${label} content changed while being quarantined: ${filePath}`,
+      );
+    }
     // Moving the caller-owned inode to an unpredictable sibling is the logical
-    // removal commit point. Cleanup is best-effort and cannot turn success into failure.
+    // removal commit point. Re-reading it after quarantine closes the check/rename
+    // window without decoding binary bytes. Cleanup is best-effort once ownership
+    // and content have both been re-established.
     await rm(tombstonePath).catch(() => undefined);
     return;
   }
@@ -888,6 +920,16 @@ async function snapshotManagedTarget(
   filePath: string,
   label: string,
 ): Promise<{ stat: Stats; content: string } | undefined> {
+  const snapshot = await snapshotManagedBufferTarget(filePath, label);
+  return snapshot
+    ? { stat: snapshot.stat, content: snapshot.content.toString("utf-8") }
+    : undefined;
+}
+
+async function snapshotManagedBufferTarget(
+  filePath: string,
+  label: string,
+): Promise<{ stat: Stats; content: Buffer } | undefined> {
   const pathStat = await lstatIfExists(filePath);
   if (!pathStat) return undefined;
   assertSingleLinkRegularFile(pathStat, filePath, label);
@@ -902,7 +944,7 @@ async function snapshotManagedTarget(
       filePath,
       `${label} changed during persistence preflight`,
     );
-    const content = await handle.readFile({ encoding: "utf-8" });
+    const content = await handle.readFile();
     const after = await lstat(filePath);
     assertSingleLinkRegularFile(after, filePath, label);
     assertSameIdentity(
@@ -922,6 +964,12 @@ async function snapshotManagedTarget(
   } finally {
     await handle?.close();
   }
+}
+
+function contentBuffer(content: string | Uint8Array): Buffer {
+  return typeof content === "string"
+    ? Buffer.from(content, "utf-8")
+    : Buffer.from(content);
 }
 
 interface ManagedParentSnapshot {

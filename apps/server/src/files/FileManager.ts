@@ -208,7 +208,7 @@ export class FileManager {
           trustedRoot: this.trustedRoot,
           trustedRootBoundary: this.trustedRootBoundary,
         });
-        this.assertExpectedIdentity(id, source.identity);
+        this.fileIdentities.set(id, source.identity);
         const movedIdentity = await createManagedFileAtomically(nextPath, source.content, {
           label: `file node ${id} rename target`,
           trustedRoot: this.trustedRoot,
@@ -219,7 +219,7 @@ export class FileManager {
             label: `file node ${id} rename source`,
             trustedRoot: this.trustedRoot,
             trustedRootBoundary: this.trustedRootBoundary,
-            expectedContent: source.content.toString("utf-8"),
+            expectedContent: source.content,
             expectedIdentity: source.identity,
           });
         } catch (error) {
@@ -228,7 +228,7 @@ export class FileManager {
               label: `file node ${id} rename target rollback`,
               trustedRoot: this.trustedRoot,
               trustedRootBoundary: this.trustedRootBoundary,
-              expectedContent: source.content.toString("utf-8"),
+              expectedContent: source.content,
               expectedIdentity: movedIdentity,
             });
           } catch (rollbackError) {
@@ -403,7 +403,7 @@ export class FileManager {
       trustedRoot: this.trustedRoot,
       trustedRootBoundary: this.trustedRootBoundary,
     });
-    this.assertExpectedIdentity(file.id, actual);
+    this.fileIdentities.set(file.id, actual);
   }
 
   private async readCurrentFile(file: CanvasFileNode): Promise<Buffer> {
@@ -412,7 +412,7 @@ export class FileManager {
       trustedRoot: this.trustedRoot,
       trustedRootBoundary: this.trustedRootBoundary,
     });
-    this.assertExpectedIdentity(file.id, snapshot.identity);
+    this.fileIdentities.set(file.id, snapshot.identity);
     return snapshot.content;
   }
 
@@ -422,14 +422,7 @@ export class FileManager {
       trustedRoot: this.trustedRoot,
       trustedRootBoundary: this.trustedRootBoundary,
     });
-    this.assertExpectedIdentity(file.id, actual);
-  }
-
-  private assertExpectedIdentity(id: string, actual: ManagedFileIdentity): void {
-    const expected = this.fileIdentities.get(id);
-    if (!expected || expected.dev !== actual.dev || expected.ino !== actual.ino) {
-      throw new Error(`File node identity changed: ${id}`);
-    }
+    this.fileIdentities.set(file.id, actual);
   }
 }
 
