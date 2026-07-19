@@ -47,6 +47,7 @@ class CodexUsageClient {
   private readonly spawnFn: typeof spawn;
   private readonly timeoutMs: number;
   private child?: ChildProcessWithoutNullStreams;
+  private reader?: readline.Interface;
   private nextId = 1;
   private readonly pending = new Map<
     number,
@@ -70,7 +71,11 @@ class CodexUsageClient {
     this.child.once("exit", () => {
       this.rejectPending(new Error("Codex app-server exited before usage response"));
     });
-    readline.createInterface({ input: this.child.stdout }).on("line", (line) => {
+    this.child.stdin.on("error", (error) => {
+      this.rejectPending(error instanceof Error ? error : new Error("Codex app-server stdin failed"));
+    });
+    this.reader = readline.createInterface({ input: this.child.stdout });
+    this.reader.on("line", (line) => {
       this.handleLine(line);
     });
     await new Promise<void>((resolve, reject) => {
@@ -123,16 +128,33 @@ class CodexUsageClient {
     const promise = new Promise<unknown>((resolve, reject) => {
       this.pending.set(id, { resolve, reject, timer });
     });
-    this.write({ jsonrpc: "2.0", id, method, params });
+    try {
+      this.write({ id, method, params });
+    } catch (error) {
+      const pending = this.pending.get(id);
+      if (pending) {
+        this.pending.delete(id);
+        clearTimeout(pending.timer);
+        pending.reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    }
     return promise;
   }
 
   notify(method: string, params?: unknown): void {
     if (!this.child) throw new Error("Codex usage client is not started");
-    this.write({ jsonrpc: "2.0", method, params });
+    this.write({ method, params });
   }
 
   close(): void {
+    this.reader?.close();
+    this.reader = undefined;
+    this.rejectPending(new Error("Codex usage client closed"));
+    try {
+      this.child?.stdin.end();
+    } catch {
+      // The process may already have closed its stdin.
+    }
     this.child?.kill();
     this.child = undefined;
   }
@@ -165,7 +187,8 @@ class CodexUsageClient {
   }
 
   private write(message: unknown): void {
-    this.child?.stdin.write(`${JSON.stringify(message)}\n`);
+    if (!this.child?.stdin.writable) throw new Error("Codex app-server is not writable");
+    this.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 }
 
