@@ -1237,6 +1237,39 @@ describe("WorkspaceManager", () => {
       access = manager.accessForAgent({ branchWorkspaceId: feature.id });
       expect(access.writableDirectories).toEqual([weights.sourcePath]);
 
+      access = manager.accessForAgent({
+        branchWorkspaceId: feature.id,
+        allowSharedResourceWrites: true,
+      });
+      expect(access.writableDirectories).toEqual([weights.sourcePath]);
+      expect(access.sandboxWritableDirectories).toEqual([dataset.sourcePath]);
+      expect(access.sharedResources).toEqual([
+        {
+          name: "dataset",
+          mountPath: path.join(feature.worktreePath, "data/raw"),
+          sourcePath: dataset.sourcePath,
+          access: "readWrite",
+        },
+        {
+          name: "weights",
+          mountPath: path.join(feature.worktreePath, "models/weights"),
+          sourcePath: weights.sourcePath,
+          access: "readWrite",
+        },
+      ]);
+
+      await manager.createSharedResource({
+        name: "project-shared-root",
+        mountPath: "shared-root",
+        sourcePath: path.join(projectRoot, "shared"),
+      });
+      expect(() =>
+        manager.accessForAgent({
+          branchWorkspaceId: feature.id,
+          allowSharedResourceWrites: true,
+        }),
+      ).toThrow("too broad for Agent-level write access");
+
       const scratch = await manager.prepareAgentWorkspace("agent_1", {
         branchWorkspaceId: feature.id,
       });

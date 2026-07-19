@@ -1541,7 +1541,9 @@ export class WorkspaceManager {
   }
 
   accessForAgent(
-    config: Pick<AgentStartConfig, "branchWorkspaceId"> | undefined,
+    config:
+      | Pick<AgentStartConfig, "branchWorkspaceId" | "allowSharedResourceWrites">
+      | undefined,
     options: WorkDocumentationOptions = {},
   ): AgentFileAccess {
     const workspace = this.branchOf(config?.branchWorkspaceId);
@@ -1557,11 +1559,21 @@ export class WorkspaceManager {
     const resources = this.state.sharedResources.filter(
       (resource) => resource.repoId === workspace.repoId,
     );
+    const allowSharedResourceWrites = config?.allowSharedResourceWrites === true;
+    const agentAuthorizedResources = allowSharedResourceWrites
+      ? resources.filter((resource) => resource.access === "readOnly")
+      : [];
+    for (const resource of agentAuthorizedResources) {
+      this.assertAgentSharedWriteScope(resource, workspace);
+    }
+    const agentAuthorizedSharedDirectories = agentAuthorizedResources.map(
+      (resource) => resource.sourcePath,
+    );
     const sharedResources: AgentSharedResourceReference[] = resources.map((resource) => ({
       name: resource.name,
       mountPath: path.join(workspace.worktreePath, resource.mountPath),
       sourcePath: resource.sourcePath,
-      access: resource.access,
+      access: allowSharedResourceWrites ? "readWrite" : resource.access,
     }));
     const documentationContext = options.workDocumentationEnabled
       ? this.captureWorkDocumentationContext(workspace)
@@ -1611,8 +1623,9 @@ export class WorkspaceManager {
             documentation.isolatedDirectory,
             documentation.branchSourceDirectory,
             documentation.branchMountDirectory,
+            ...agentAuthorizedSharedDirectories,
           ]
-        : [],
+        : agentAuthorizedSharedDirectories,
       writableDirectories: [
         ...resources
           .filter((resource) => resource.access === "readWrite")
@@ -1620,6 +1633,35 @@ export class WorkspaceManager {
       ],
       sharedResources,
     };
+  }
+
+  private assertAgentSharedWriteScope(
+    resource: SharedResourceMount,
+    workspace: BranchWorkspace,
+  ): void {
+    const projectRoot = this.requireProjectRoot();
+    const sourcePath = path.resolve(resource.sourcePath);
+    const repoSharedRoot = path.join(projectRoot, "shared", workspace.repoId);
+    const sourceIsInsideProject = isPathWithin(sourcePath, projectRoot);
+    if (
+      (sourceIsInsideProject && !isPathWithin(sourcePath, repoSharedRoot)) ||
+      isPathWithin(projectRoot, sourcePath)
+    ) {
+      throw new Error(
+        `Shared resource is too broad for Agent-level write access: ${resource.sourcePath}`,
+      );
+    }
+    const overlappingOtherRepoResource = this.state.sharedResources.find(
+      (candidate) =>
+        candidate.repoId !== workspace.repoId &&
+        (isPathWithin(candidate.sourcePath, sourcePath) ||
+          isPathWithin(sourcePath, candidate.sourcePath)),
+    );
+    if (overlappingOtherRepoResource) {
+      throw new Error(
+        `Shared resource contains another repo resource and cannot be Agent-writable: ${resource.sourcePath}`,
+      );
+    }
   }
 
   resolveAgentSettings<T extends { branchWorkspaceId?: string; cwd?: string; branch?: string }>(

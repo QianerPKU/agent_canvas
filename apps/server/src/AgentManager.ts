@@ -267,9 +267,16 @@ export class AgentManager {
   ): AgentSnapshot {
     const runner = this.runners.get(id);
     if (!runner) throw new Error(`未知 agent: ${id}`);
+    const status = runner.getStatus();
     const changesBranch = input.branchWorkspaceId !== undefined || input.branch !== undefined;
-    if (changesBranch && runner.getStatus() !== "idle" && runner.getStatus() !== "waiting_input") {
+    if (changesBranch && status !== "idle" && status !== "waiting_input") {
       throw new Error("只有待输入或尚未启动的活跃 agent 可以切换 branch");
+    }
+    const changesSharedResourceWrites =
+      input.allowSharedResourceWrites !== undefined &&
+      input.allowSharedResourceWrites !== (this.configOf(id)?.allowSharedResourceWrites === true);
+    if (changesSharedResourceWrites && (status === "starting" || status === "running")) {
+      throw new Error("Agent 正在执行当前轮次，暂时不能修改共享目录写权限");
     }
     const draft = this.draftConfigs.get(id) ?? {};
     const next = applySettings(draft, input);
@@ -301,6 +308,8 @@ export class AgentManager {
     const parentBranchWorkspaceId = parentSnapshot.config?.branchWorkspaceId;
     const parentBranch = parentSnapshot.config?.branch;
     const parentSystemPrompt = parentSnapshot.config?.systemPrompt;
+    const parentAllowSharedResourceWrites =
+      parentSnapshot.config?.allowSharedResourceWrites;
 
     const runner = this.create();
     const origin: ForkOrigin = { parentAgentId: parentId, anchorUuid };
@@ -314,6 +323,8 @@ export class AgentManager {
       branch: forkOptions.branch ?? parentBranch,
       scratchDirectory: forkOptions.scratchDirectory,
       systemPrompt: parentSystemPrompt,
+      allowSharedResourceWrites:
+        forkOptions.allowSharedResourceWrites ?? parentAllowSharedResourceWrites,
       resume: parentSession,
       resumeSessionAt: anchorUuid,
       forkSession: true,
@@ -538,6 +549,7 @@ function normalizeSettings(
     cwd: settings.cwd?.trim() || defaultCwd,
     scratchDirectory: settings.scratchDirectory,
     systemPrompt: settings.systemPrompt ?? "",
+    allowSharedResourceWrites: settings.allowSharedResourceWrites === true,
   };
 }
 
@@ -559,6 +571,9 @@ function applySettings(
   if (input.branch !== undefined) next.branch = input.branch;
   if (input.cwd !== undefined) next.cwd = input.cwd;
   if (input.scratchDirectory !== undefined) next.scratchDirectory = input.scratchDirectory;
+  if (input.allowSharedResourceWrites !== undefined) {
+    next.allowSharedResourceWrites = input.allowSharedResourceWrites;
+  }
   return next;
 }
 

@@ -1072,6 +1072,12 @@ async function handleHttp(
 
   if (method === "POST" && path === "/api/agents") {
     const body = await readJson<CreateAgentInput>(req);
+    if (
+      body?.allowSharedResourceWrites !== undefined &&
+      typeof body.allowSharedResourceWrites !== "boolean"
+    ) {
+      return sendJson(res, 400, { error: "共享目录写权限设置必须是 boolean" });
+    }
     return await canvasState.runProjectTransaction(async () => {
       try {
         const settings = normalizeAgentSettings(
@@ -1370,6 +1376,12 @@ async function handleHttp(
     }
     if (method === "PATCH" && action === "settings") {
       const body = await readJson<UpdateAgentSettingsInput>(req);
+      if (
+        body?.allowSharedResourceWrites !== undefined &&
+        typeof body.allowSharedResourceWrites !== "boolean"
+      ) {
+        return sendJson(res, 400, { error: "共享目录写权限设置必须是 boolean" });
+      }
       return await canvasState.runProjectTransaction(async () => {
         try {
           const currentConfig = manager.configOf(id);
@@ -1432,6 +1444,11 @@ async function handleHttp(
     if (method === "POST" && action === "start") {
       const body = await readJson<AgentStartConfig>(req);
       if (!body?.prompt) return sendJson(res, 400, { error: "缺少 prompt" });
+      if (body.allowSharedResourceWrites !== undefined) {
+        return sendJson(res, 400, {
+          error: "共享目录写权限只能通过 Agent 设置修改",
+        });
+      }
       await workspaceManager.prepareAgentWorkspace(
         id,
         {
@@ -1448,6 +1465,12 @@ async function handleHttp(
     if (method === "POST" && action === "fork") {
       const body = await readJson<Partial<ForkAgentInput>>(req);
       if (!body?.anchorUuid) return sendJson(res, 400, { error: "缺少 anchorUuid" });
+      if (
+        body.allowSharedResourceWrites !== undefined &&
+        typeof body.allowSharedResourceWrites !== "boolean"
+      ) {
+        return sendJson(res, 400, { error: "共享目录写权限设置必须是 boolean" });
+      }
       try {
         const branchChanged =
           body.branchWorkspaceId !== undefined || body.branch !== undefined;
@@ -1472,6 +1495,7 @@ async function handleHttp(
           branch: branchSettings?.branch,
           cwd: branchSettings?.cwd,
           scratchDirectory: branchSettings?.scratchDirectory,
+          allowSharedResourceWrites: body.allowSharedResourceWrites,
         });
         if (!forked) return sendJson(res, 409, { error: "源会话尚未建立，无法 fork" });
         fileManager.copyAgentConnections(id, forked.id);
@@ -2197,6 +2221,10 @@ function normalizeAgentSettings(
     cwd: input?.cwd?.trim() || defaultCwd,
     scratchDirectory: input?.scratchDirectory,
     systemPrompt: input?.systemPrompt ?? "",
+    allowSharedResourceWrites: optionalBooleanSetting(
+      input?.allowSharedResourceWrites,
+      "共享目录写权限设置",
+    ) ?? false,
   };
 }
 
@@ -2216,7 +2244,15 @@ function settingsForWorkspaceResolution(
     cwd: input?.cwd ?? currentConfig?.cwd,
     scratchDirectory: input?.scratchDirectory ?? currentConfig?.scratchDirectory,
     systemPrompt: input?.systemPrompt ?? currentConfig?.systemPrompt,
+    allowSharedResourceWrites:
+      input?.allowSharedResourceWrites ?? currentConfig?.allowSharedResourceWrites,
   };
+}
+
+function optionalBooleanSetting(value: unknown, label: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw new Error(`${label}必须是 boolean`);
+  return value;
 }
 
 async function createAgentResultFile(

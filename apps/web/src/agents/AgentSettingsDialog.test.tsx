@@ -63,6 +63,7 @@ describe("AgentSettingsDialog", () => {
         branchWorkspaceId: "branch_1",
         branch: "main",
         cwd: "E:\\project\\repo",
+        allowSharedResourceWrites: false,
         systemPrompt: "只修改测试相关文件",
       }),
     );
@@ -232,6 +233,7 @@ describe("AgentSettingsDialog", () => {
       expect(onUpdate).toHaveBeenCalledWith("agent_1", {
         systemPrompt: "new prompt",
         model: null,
+        allowSharedResourceWrites: false,
       }),
     );
   });
@@ -267,6 +269,7 @@ describe("AgentSettingsDialog", () => {
       expect(onUpdate).toHaveBeenCalledWith("agent_1", {
         systemPrompt: "old",
         model: "opus",
+        allowSharedResourceWrites: false,
       }),
     );
   });
@@ -302,6 +305,7 @@ describe("AgentSettingsDialog", () => {
       expect(onUpdate).toHaveBeenCalledWith("agent_1", {
         systemPrompt: "old",
         model: "gpt-5.4-mini",
+        allowSharedResourceWrites: false,
       }),
     );
   });
@@ -346,10 +350,75 @@ describe("AgentSettingsDialog", () => {
       expect(onUpdate).toHaveBeenCalledWith("agent_1", {
         systemPrompt: "old",
         model: null,
+        allowSharedResourceWrites: false,
         branchWorkspaceId: "branch_2",
         branch: "feature/a",
         cwd: "E:\\project\\feature-a",
       }),
+    );
+  });
+
+  it("allows explicitly granting shared resource write access", async () => {
+    const onCreate = vi.fn().mockResolvedValue(undefined);
+    render(
+      <AgentSettingsDialog
+        mode="create"
+        branches={branches}
+        onCreateBranch={vi.fn()}
+        onCreate={onCreate}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const toggle = screen.getByRole("checkbox", { name: "允许写入只读共享目录" });
+    expect((toggle as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByText("创建"));
+
+    await waitFor(() =>
+      expect(onCreate).toHaveBeenCalledWith(
+        expect.objectContaining({ allowSharedResourceWrites: true }),
+      ),
+    );
+  });
+
+  it("keeps an edited shared write setting across same-agent updates and can revoke it", async () => {
+    const onUpdate = vi.fn().mockResolvedValue(undefined);
+    const agent = newAgentView("agent_1", {
+      provider: "claude",
+      branchWorkspaceId: "branch_1",
+      branch: "main",
+      cwd: "E:\\repo",
+      status: "waiting_input",
+      allowSharedResourceWrites: true,
+    });
+    const dialog = (
+      currentAgent: typeof agent,
+    ) => (
+      <AgentSettingsDialog
+        mode="edit"
+        agent={currentAgent}
+        branches={branches}
+        canChangeBranch={false}
+        onCreateBranch={vi.fn()}
+        onUpdate={onUpdate}
+        onClose={vi.fn()}
+      />
+    );
+    const { rerender } = render(dialog(agent));
+
+    const toggle = screen.getByRole("checkbox", { name: "允许写入只读共享目录" });
+    expect((toggle as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(toggle);
+    rerender(dialog({ ...agent }));
+    expect((toggle as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(screen.getByText("保存"));
+
+    await waitFor(() =>
+      expect(onUpdate).toHaveBeenCalledWith(
+        "agent_1",
+        expect.objectContaining({ allowSharedResourceWrites: false }),
+      ),
     );
   });
 });

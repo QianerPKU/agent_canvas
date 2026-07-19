@@ -893,6 +893,7 @@ describe("HTTP server", () => {
       model: "gpt-5.4-mini",
       cwd: path.join(root, "agent-work"),
       systemPrompt: "private rules",
+      allowSharedResourceWrites: true,
     });
     expect(created.status).toBe(201);
 
@@ -905,14 +906,56 @@ describe("HTTP server", () => {
       model: "gpt-5.4-mini",
       cwd: path.join(projectRoot, "repos", "repo_1", "repo"),
       systemPrompt: "private rules",
+      allowSharedResourceWrites: true,
     });
 
     const updated = await request(port, "PATCH", `/api/agents/${created.json.id}/settings`, {
       systemPrompt: "updated private rules",
+      allowSharedResourceWrites: false,
     });
     expect(updated.status).toBe(200);
     expect(updated.json.config.systemPrompt).toBe("updated private rules");
+    expect(updated.json.config.allowSharedResourceWrites).toBe(false);
     expect(updated.json.config.cwd).toBe(path.join(projectRoot, "repos", "repo_1", "repo"));
+  });
+
+  it("rejects non-boolean shared resource write settings", async () => {
+    const invalidBranch = "feature/invalid-shared-write-setting";
+    const created = await request(port, "POST", "/api/agents", {
+      branch: invalidBranch,
+      allowSharedResourceWrites: "yes",
+    });
+    expect(created.status).toBe(400);
+    const workspace = await request(port, "GET", "/api/workspace");
+    expect(
+      workspace.json.branches.some(
+        (branch: { branch: string }) => branch.branch === invalidBranch,
+      ),
+    ).toBe(false);
+
+    const valid = await request(port, "POST", "/api/agents");
+    const updated = await request(port, "PATCH", `/api/agents/${valid.json.id}/settings`, {
+      allowSharedResourceWrites: 1,
+    });
+    expect(updated.status).toBe(400);
+
+    const forked = await request(port, "POST", `/api/agents/${valid.json.id}/fork`, {
+      anchorUuid: "u",
+      allowSharedResourceWrites: "yes",
+    });
+    expect(forked.status).toBe(400);
+  });
+
+  it("does not allow start requests to override shared resource permission", async () => {
+    const created = await request(port, "POST", "/api/agents");
+    const started = await request(port, "POST", `/api/agents/${created.json.id}/start`, {
+      prompt: "run",
+      allowSharedResourceWrites: true,
+    });
+    expect(started.status).toBe(400);
+
+    const snapshot = await request(port, "GET", `/api/agents/${created.json.id}`);
+    expect(snapshot.json.config.allowSharedResourceWrites).toBe(false);
   });
 
   it("对未知 agent start → 404", async () => {
@@ -1168,6 +1211,25 @@ describe("HTTP server", () => {
     const c = await request(port, "POST", "/api/agents");
     const r = await request(port, "POST", `/api/agents/${c.json.id}/fork`, { anchorUuid: "u" });
     expect(r.status).toBe(409);
+  });
+
+  it("passes an explicit shared write override to the fork manager", async () => {
+    const parent = await request(port, "POST", "/api/agents");
+    const forkCall = vi.spyOn(manager, "fork");
+    try {
+      const forked = await request(port, "POST", `/api/agents/${parent.json.id}/fork`, {
+        anchorUuid: "u",
+        allowSharedResourceWrites: false,
+      });
+      expect(forked.status).toBe(409);
+      expect(forkCall).toHaveBeenCalledWith(
+        parent.json.id,
+        "u",
+        expect.objectContaining({ allowSharedResourceWrites: false }),
+      );
+    } finally {
+      forkCall.mockRestore();
+    }
   });
 
   it("未知路由 → 404", async () => {

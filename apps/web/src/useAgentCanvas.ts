@@ -391,6 +391,7 @@ export function useAgentCanvas(): UseAgentCanvas {
                   cwd: settings.cwd,
                   scratchDirectory: settings.scratchDirectory,
                   systemPrompt: settings.systemPrompt,
+                  allowSharedResourceWrites: settings.allowSharedResourceWrites,
                 }),
               },
         );
@@ -410,6 +411,7 @@ export function useAgentCanvas(): UseAgentCanvas {
             cwd: snapshot.config.cwd,
             scratchDirectory: snapshot.config.scratchDirectory,
             systemPrompt: snapshot.config.systemPrompt,
+            allowSharedResourceWrites: snapshot.config.allowSharedResourceWrites,
           }),
         );
       },

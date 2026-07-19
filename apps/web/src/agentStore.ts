@@ -81,6 +81,7 @@ export interface AgentView {
   cwd?: string;
   scratchDirectory?: string;
   systemPrompt?: string;
+  allowSharedResourceWrites?: boolean;
   status: AgentStatus;
   turns: Turn[];
   forkOrigin?: ForkOrigin;
@@ -122,6 +123,7 @@ export function applyHello(
       cwd: a.config.cwd,
       scratchDirectory: a.config.scratchDirectory,
       systemPrompt: a.config.systemPrompt,
+      allowSharedResourceWrites: a.config.allowSharedResourceWrites,
       forkOrigin: a.forkOrigin,
       createdAt: a.createdAt,
       lastSeq: histories[a.id]?.length ? 0 : a.lastEventSeq,
@@ -142,6 +144,7 @@ export function applyHello(
       cwd: a.config.cwd,
       scratchDirectory: a.config.scratchDirectory,
       systemPrompt: a.config.systemPrompt,
+      allowSharedResourceWrites: a.config.allowSharedResourceWrites,
       forkOrigin: a.forkOrigin,
       createdAt: a.createdAt,
       lastSeq: a.lastEventSeq,
@@ -170,6 +173,8 @@ export function insertForked(
       cwd: options.cwd ?? parent?.cwd,
       scratchDirectory: options.scratchDirectory ?? parent?.scratchDirectory,
       systemPrompt: parent?.systemPrompt,
+      allowSharedResourceWrites:
+        options.allowSharedResourceWrites ?? parent?.allowSharedResourceWrites,
       forkOrigin: origin,
     }),
   };
@@ -197,6 +202,8 @@ export function recordAgentSettings(
       cwd: settings.cwd ?? prev.cwd,
       scratchDirectory: settings.scratchDirectory ?? prev.scratchDirectory,
       systemPrompt: settings.systemPrompt ?? prev.systemPrompt,
+      allowSharedResourceWrites:
+        settings.allowSharedResourceWrites ?? prev.allowSharedResourceWrites,
     },
   };
 }
