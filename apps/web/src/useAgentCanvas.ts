@@ -98,6 +98,8 @@ export interface UseAgentCanvas {
   /** 同一 project/revision 的 branch/shared-resource 等元数据更新。 */
   workspaceMetadataUpdate?: WorkspaceUpdate;
   currentWorkspaceEventGeneration: () => number;
+  /** 每个已接受 workspace 帧递增，用于丢弃早于最新快照的异步结果。 */
+  currentWorkspaceSnapshotGeneration: () => number;
   currentWorkspaceEventIdentity: () => string | undefined;
   invalidateWorkspaceRefresh: () => void;
   connected: boolean;
@@ -176,11 +178,16 @@ export function useAgentCanvas(): UseAgentCanvas {
   const wsRef = useRef<WebSocket | null>(null);
   const refreshGenerationRef = useRef(0);
   const workspaceEventGenerationRef = useRef(0);
+  const workspaceSnapshotGenerationRef = useRef(0);
   const workspaceEventIdentityRef = useRef<string>();
   const workspaceProjectRootRef = useRef<string>();
   const latestWorkspaceVersionRef = useRef<{ projectId: string; revision: number }>();
   const currentWorkspaceEventGeneration = useCallback(
     () => workspaceEventGenerationRef.current,
+    [],
+  );
+  const currentWorkspaceSnapshotGeneration = useCallback(
+    () => workspaceSnapshotGenerationRef.current,
     [],
   );
   const currentWorkspaceEventIdentity = useCallback(
@@ -308,6 +315,10 @@ export function useAgentCanvas(): UseAgentCanvas {
           ) {
             return;
           }
+          // This ref advances synchronously in the socket callback, before React effects run.
+          // Consumers can therefore reject an older REST response even in the narrow window
+          // between accepting newer workspace metadata and committing it to component state.
+          workspaceSnapshotGenerationRef.current += 1;
           if (projectId && Number.isSafeInteger(revision)) {
             latestWorkspaceVersionRef.current = { projectId, revision: revision! };
           }
@@ -658,6 +669,7 @@ export function useAgentCanvas(): UseAgentCanvas {
     workspaceUpdate,
     workspaceMetadataUpdate,
     currentWorkspaceEventGeneration,
+    currentWorkspaceSnapshotGeneration,
     currentWorkspaceEventIdentity,
     invalidateWorkspaceRefresh,
     connected,

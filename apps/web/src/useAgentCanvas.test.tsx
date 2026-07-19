@@ -173,6 +173,7 @@ describe("useAgentCanvas", () => {
       sendWorkspaceFrame(socket, "project_old");
     });
     const firstGeneration = result.current.currentWorkspaceEventGeneration();
+    const firstSnapshotGeneration = result.current.currentWorkspaceSnapshotGeneration();
     const replacementUpdate = result.current.workspaceUpdate;
     const createdBranch: BranchWorkspace = {
       id: "branch_2",
@@ -196,6 +197,9 @@ describe("useAgentCanvas", () => {
     );
 
     expect(result.current.currentWorkspaceEventGeneration()).toBe(firstGeneration);
+    expect(result.current.currentWorkspaceSnapshotGeneration()).toBe(
+      firstSnapshotGeneration + 1,
+    );
     expect(result.current.workspaceUpdate).toBe(replacementUpdate);
     expect(result.current.workspaceMetadataUpdate).toMatchObject({
       workspace: { branches: [createdBranch] },
@@ -209,8 +213,13 @@ describe("useAgentCanvas", () => {
       }, 2),
     );
     expect(result.current.currentWorkspaceEventGeneration()).toBe(firstGeneration + 1);
+    expect(result.current.currentWorkspaceSnapshotGeneration()).toBe(
+      firstSnapshotGeneration + 2,
+    );
     expect(result.current.currentWorkspaceEventIdentity()).toBe("project:project_old@2");
     const highRevisionGeneration = result.current.currentWorkspaceEventGeneration();
+    const highRevisionSnapshotGeneration =
+      result.current.currentWorkspaceSnapshotGeneration();
     const highRevisionUpdate = result.current.workspaceUpdate;
     expect(result.current.workspaceMetadataUpdate).toBeUndefined();
     expect(result.current.agents).toEqual({});
@@ -222,6 +231,9 @@ describe("useAgentCanvas", () => {
       }, 1),
     );
     expect(result.current.currentWorkspaceEventGeneration()).toBe(highRevisionGeneration);
+    expect(result.current.currentWorkspaceSnapshotGeneration()).toBe(
+      highRevisionSnapshotGeneration,
+    );
     expect(result.current.workspaceUpdate).toBe(highRevisionUpdate);
     expect(result.current.currentWorkspaceEventIdentity()).toBe("project:project_old@2");
     unmount();

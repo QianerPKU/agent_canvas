@@ -226,6 +226,11 @@ export function reconcileWorkspaceBranchOptions(
   return next.sort((left, right) => left.branch.localeCompare(right.branch));
 }
 
+interface LoadedBranchOptions {
+  options: BranchOption[];
+  workspaceSnapshotGeneration: number;
+}
+
 export function adoptDeletedCurrentProject(
   deletedProjectId: string,
   currentWorkspace: WorkspaceProject | undefined,
@@ -1085,6 +1090,7 @@ export default function App(): React.ReactElement {
     workspaceUpdate,
     workspaceMetadataUpdate,
     currentWorkspaceEventGeneration,
+    currentWorkspaceSnapshotGeneration,
     currentWorkspaceEventIdentity,
     invalidateWorkspaceRefresh,
     connected,
@@ -1286,15 +1292,42 @@ export default function App(): React.ReactElement {
     if (showingSettings) void refreshCodexUsage();
   }, [refreshCodexUsage, showingSettings]);
 
+  const loadBranchOptions = useCallback(
+    async (enabled = true): Promise<LoadedBranchOptions> => {
+      const workspaceSnapshotGeneration = currentWorkspaceSnapshotGeneration();
+      const options = enabled ? await api.listBranchOptions() : [];
+      return { options, workspaceSnapshotGeneration };
+    },
+    [currentWorkspaceSnapshotGeneration],
+  );
+
+  const commitBranchOptions = useCallback(
+    (loaded: LoadedBranchOptions): boolean => {
+      if (
+        loaded.workspaceSnapshotGeneration !== currentWorkspaceSnapshotGeneration()
+      ) {
+        return false;
+      }
+      setBranches(loaded.options);
+      return true;
+    },
+    [currentWorkspaceSnapshotGeneration],
+  );
+
   const refreshBranchOptions = useCallback(async () => {
     const ownership = captureProjectOperation();
     const expectedWorkspaceIdentity = workspaceEventIdentity(workspaceRef.current);
-    const nextBranches = await api.listBranchOptions();
+    const nextBranches = await loadBranchOptions();
     if (projectOperationIsCurrent(ownership, expectedWorkspaceIdentity)) {
-      setBranches(nextBranches);
+      commitBranchOptions(nextBranches);
     }
-    return nextBranches;
-  }, [captureProjectOperation, projectOperationIsCurrent]);
+    return nextBranches.options;
+  }, [
+    captureProjectOperation,
+    commitBranchOptions,
+    loadBranchOptions,
+    projectOperationIsCurrent,
+  ]);
 
   useEffect(() => {
     if (
@@ -1356,7 +1389,7 @@ export default function App(): React.ReactElement {
       api.canvasLayout(),
       api.settings(),
       api.listCanvasProjects(),
-      nextWorkspace.repo ? api.listBranchOptions() : Promise.resolve([]),
+      loadBranchOptions(Boolean(nextWorkspace.repo)),
       refresh(),
     ]).then(
       ([nextLayout, nextSettings, nextProjects, nextBranches]) => {
@@ -1364,7 +1397,7 @@ export default function App(): React.ReactElement {
         setSavedLayout(nextLayout);
         setAppSettings(nextSettings);
         setProjects(nextProjects);
-        setBranches(nextBranches);
+        commitBranchOptions(nextBranches);
         updateLayoutReadyProjectId(nextWorkspace.canvasProject?.id);
       },
       (error) => {
@@ -1379,7 +1412,9 @@ export default function App(): React.ReactElement {
   }, [
     captureProjectOperation,
     clearProjectScopedUi,
+    commitBranchOptions,
     currentWorkspaceEventIdentity,
+    loadBranchOptions,
     projectOperationIsCurrent,
     refresh,
     updateLayoutReadyProjectId,
@@ -1448,13 +1483,13 @@ export default function App(): React.ReactElement {
         const projectLists = await resolveCurrentProjectOpenStep(
           Promise.all([
             api.listCanvasProjects(),
-            nextWorkspace.repo ? api.listBranchOptions() : Promise.resolve([]),
+            loadBranchOptions(Boolean(nextWorkspace.repo)),
           ]),
           isCurrent,
         );
         if (!projectLists) return;
         setProjects(projectLists[0]);
-        setBranches(projectLists[1]);
+        commitBranchOptions(projectLists[1]);
       } catch (error) {
         if (projectOperationIsCurrent(ownership, expectedWorkspaceIdentity)) {
           setProjectError(error instanceof Error ? error.message : String(error));
@@ -1464,6 +1499,8 @@ export default function App(): React.ReactElement {
     [
       beginProjectOperation,
       clearProjectScopedUi,
+      commitBranchOptions,
+      loadBranchOptions,
       projectOperationIsCurrent,
       refresh,
       updateLayoutReadyProjectId,
@@ -1621,11 +1658,11 @@ export default function App(): React.ReactElement {
         api.setWorkspaceContext(nextWorkspace);
         setWorkspace(nextWorkspace);
         const nextBranches = await resolveCurrentProjectOpenStep(
-          api.listBranchOptions(),
+          loadBranchOptions(),
           isCurrent,
         );
         if (!nextBranches) return;
-        setBranches(nextBranches);
+        commitBranchOptions(nextBranches);
         setProjectError(warning);
       } catch (error) {
         if (projectOperationIsCurrent(ownership, expectedWorkspaceIdentity)) {
@@ -1633,7 +1670,12 @@ export default function App(): React.ReactElement {
         }
       }
     },
-    [beginProjectOperation, projectOperationIsCurrent],
+    [
+      beginProjectOperation,
+      commitBranchOptions,
+      loadBranchOptions,
+      projectOperationIsCurrent,
+    ],
   );
 
   const openFileEditor = useCallback((fileId: string) => {
@@ -1672,11 +1714,11 @@ export default function App(): React.ReactElement {
       const warning = workDocumentationMutationWarning(result);
       if (!warning) {
         const nextBranches = await resolveCurrentProjectOpenStep(
-          api.listBranchOptions(),
+          loadBranchOptions(),
           isCurrent,
         );
         if (!nextBranches) throw new Error("项目已切换；已忽略旧项目的分支列表");
-        setBranches(nextBranches);
+        commitBranchOptions(nextBranches);
         return result;
       }
 
@@ -1686,11 +1728,11 @@ export default function App(): React.ReactElement {
       }
       setWorkspace(currentWorkspace);
       const nextBranches = await resolveCurrentProjectOpenStep(
-        api.listBranchOptions(),
+        loadBranchOptions(),
         isCurrent,
       );
       if (!nextBranches) throw new Error("项目已切换；已忽略旧项目的分支列表");
-      setBranches(nextBranches);
+      commitBranchOptions(nextBranches);
       setProjectError(warning);
       const currentBranch = currentWorkspace.branches.find((candidate) =>
         isSameBranchWorkspace(candidate, result),
@@ -1700,7 +1742,12 @@ export default function App(): React.ReactElement {
       }
       return currentBranch;
     },
-    [captureProjectOperation, projectOperationIsCurrent],
+    [
+      captureProjectOperation,
+      commitBranchOptions,
+      loadBranchOptions,
+      projectOperationIsCurrent,
+    ],
   );
 
   useEffect(() => {

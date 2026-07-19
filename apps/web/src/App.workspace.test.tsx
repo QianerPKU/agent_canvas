@@ -167,6 +167,55 @@ afterEach(() => {
 });
 
 describe("App workspace metadata updates", () => {
+  it("does not let an older branch-options response overwrite newer workspace metadata", async () => {
+    let resolveStaleOptions!: (options: BranchOption[]) => void;
+    const staleOptions = new Promise<BranchOption[]>((resolve) => {
+      resolveStaleOptions = resolve;
+    });
+    vi.mocked(api.listBranchOptions).mockReturnValueOnce(staleOptions);
+
+    render(<App />);
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const socket = FakeWebSocket.instances[0]!;
+    act(() => {
+      send(socket, {
+        type: "hello",
+        agents: [
+          {
+            id: "agent_1",
+            status: "idle",
+            config: { prompt: "" },
+            createdAt: 1,
+            lastEventSeq: 0,
+          },
+        ],
+        histories: {},
+        prFlows: [],
+        syncFlows: [],
+        commits: [],
+      });
+      send(socket, workspaceFrame([mainWorkspace]));
+    });
+    await waitFor(() => expect(api.listBranchOptions).toHaveBeenCalledTimes(1));
+
+    act(() => send(socket, workspaceFrame([mainWorkspace, featureWorkspace])));
+    fireEvent.click(screen.getByText("新建 Agent"));
+    const branchValues = () =>
+      Array.from(
+        (screen.getByLabelText("Agent branch") as HTMLSelectElement).options,
+        (option) => option.value,
+      );
+    await waitFor(() => expect(branchValues()).toContain(featureWorkspace.branch));
+
+    await act(async () => {
+      resolveStaleOptions([mainOption]);
+      await staleOptions;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(branchValues()).toContain(featureWorkspace.branch);
+  });
+
   it("keeps the graph and Agent dialog mounted when a branch broadcast precedes HTTP 201", async () => {
     let resolveBranch!: (branch: BranchWorkspace) => void;
     vi.spyOn(api, "createBranch").mockReturnValue(
