@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ExternalLink, GitBranch, LogIn, Plus, RefreshCw, Settings, X } from "lucide-react";
 import {
   CODEX_MODELS,
@@ -50,6 +50,7 @@ type AgentSettingsDialogProps =
 export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.ReactElement {
   const isCreate = props.mode === "create";
   const agent = props.mode === "edit" ? props.agent : undefined;
+  const initializedAgentIdRef = useRef<string | undefined>(undefined);
   const codexModels = props.codexModels?.length ? props.codexModels : CODEX_MODELS;
   const defaultCodexModel = props.defaultCodexModel ?? DEFAULT_CODEX_MODEL;
   const codexReasoningEfforts = props.codexReasoningEfforts?.length
@@ -73,6 +74,9 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
     agent?.branch ?? (props.mode === "create" ? props.branches[0]?.branch ?? "" : ""),
   );
   const [systemPrompt, setSystemPrompt] = useState(agent?.systemPrompt ?? "");
+  const [allowSharedResourceWrites, setAllowSharedResourceWrites] = useState(
+    agent?.allowSharedResourceWrites ?? false,
+  );
   const [error, setError] = useState("");
   const [codexAuth, setCodexAuth] = useState<CodexAuthStatus | undefined>();
   const [codexLogin, setCodexLogin] = useState<CodexLoginSession | null>(null);
@@ -80,6 +84,8 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
   const [submitting, setSubmitting] = useState(false);
   const [creatingBranch, setCreatingBranch] = useState(false);
   const canChangeBranch = props.mode === "create" || props.canChangeBranch;
+  const sharedResourceWriteLocked =
+    agent?.status === "starting" || agent?.status === "running";
   const branches = mergeBranchOptions(props.branches, extraBranches);
   const selectedBranch = branches.find((branch) => branch.branch === branchName);
   const reasoningEffortOptions = reasoningEffortsForModel(
@@ -89,16 +95,23 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
   );
 
   useEffect(() => {
-    if (!isCreate && agent) {
-      setProvider(agent.provider ?? "claude");
-      setCodexModelValue(codexModel(agent.model, codexModels, defaultCodexModel));
-      setReasoningEffort(agent.reasoningEffort ?? "");
-      setClaudeModel(agent.provider === "claude" ? agent.model ?? "" : "");
-      setBranchName(agent.branch ?? "");
-      setNewBranchBase(agent.branch ?? "");
-      setSystemPrompt(agent.systemPrompt ?? "");
-    }
+    if (isCreate || !agent || initializedAgentIdRef.current === agent.id) return;
+    initializedAgentIdRef.current = agent.id;
+    setProvider(agent.provider ?? "claude");
+    setCodexModelValue(codexModel(agent.model, codexModels, defaultCodexModel));
+    setReasoningEffort(agent.reasoningEffort ?? "");
+    setClaudeModel(agent.provider === "claude" ? agent.model ?? "" : "");
+    setBranchName(agent.branch ?? "");
+    setNewBranchBase(agent.branch ?? "");
+    setSystemPrompt(agent.systemPrompt ?? "");
+    setAllowSharedResourceWrites(agent.allowSharedResourceWrites ?? false);
   }, [agent, codexModels, defaultCodexModel, isCreate]);
+
+  useEffect(() => {
+    if (sharedResourceWriteLocked && agent) {
+      setAllowSharedResourceWrites(agent.allowSharedResourceWrites ?? false);
+    }
+  }, [agent?.allowSharedResourceWrites, sharedResourceWriteLocked]);
 
   useEffect(() => {
     if (props.mode === "create" && !branchName && props.branches[0]) {
@@ -185,10 +198,12 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
           branch: selectedBranch?.branch,
           cwd: selectedBranch?.worktreePath,
           systemPrompt,
+          allowSharedResourceWrites,
         });
       } else {
         await props.onUpdate(props.agent.id, {
           systemPrompt,
+          allowSharedResourceWrites,
           model: selectedModel(provider, codexModelValue, claudeModel),
           ...(reasoningEffortUpdate !== undefined
             ? { reasoningEffort: reasoningEffortUpdate }
@@ -368,6 +383,29 @@ export function AgentSettingsDialog(props: AgentSettingsDialogProps): React.Reac
               <Plus size={15} />
             </button>
           </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>权限</legend>
+          <label className="settings-toggle">
+            <input
+              type="checkbox"
+              aria-label="允许写入只读共享目录"
+              aria-describedby="shared-resource-write-description"
+              checked={allowSharedResourceWrites}
+              disabled={sharedResourceWriteLocked}
+              title={sharedResourceWriteLocked ? "当前轮次结束后可修改" : undefined}
+              onChange={(event) => setAllowSharedResourceWrites(event.target.checked)}
+            />
+            <span>
+              <strong>允许写入只读共享目录</strong>
+              <small id="shared-resource-write-description">
+                开启后，该 Agent 可修改当前 repo 已映射且标记为只读的共享资源；原本可写的共享资源不受此开关影响。
+                这是高风险权限，并在下一次完整业务输入时生效。
+                {sharedResourceWriteLocked ? " 当前轮次结束后可修改。" : ""}
+              </small>
+            </span>
+          </label>
         </fieldset>
 
         <label className="file-dialog__field">

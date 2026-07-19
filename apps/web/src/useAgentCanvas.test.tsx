@@ -234,6 +234,7 @@ describe("useAgentCanvas", () => {
       branch: "main",
       cwd: "C:\\repo\\main",
       systemPrompt: "review main",
+      allowSharedResourceWrites: true,
     };
     let pending!: Promise<string>;
     act(() => {
@@ -316,6 +317,7 @@ describe("useAgentCanvas", () => {
       branch: "main",
       cwd: "C:\\repo\\main",
       systemPrompt: "review main",
+      allowSharedResourceWrites: true,
       lastSeq: 3,
     });
     unmount();
@@ -355,6 +357,7 @@ describe("useAgentCanvas", () => {
       branch: "main",
       cwd: "C:\\repo\\main",
       scratchDirectory: "C:\\repo\\main\\.agent-tmp\\agent_1",
+      allowSharedResourceWrites: false,
     };
     let pendingUpdate!: Promise<void>;
     act(() => {
@@ -383,6 +386,7 @@ describe("useAgentCanvas", () => {
           provider: "codex",
           ...update,
           systemPrompt: "keep this policy",
+          allowSharedResourceWrites: false,
         },
         createdAt: 1,
         lastEventSeq: 0,
@@ -401,6 +405,7 @@ describe("useAgentCanvas", () => {
       cwd: "C:\\repo\\main",
       scratchDirectory: "C:\\repo\\main\\.agent-tmp\\agent_1",
       systemPrompt: "keep this policy",
+      allowSharedResourceWrites: false,
     });
     expect(result.current.agents.agent_1?.turns[0]?.lines).toContainEqual({
       kind: "system",

@@ -165,6 +165,7 @@ describe("AgentManager fork", () => {
       model: "gpt-5.4-mini",
       cwd: "/work",
       systemPrompt: "private",
+      allowSharedResourceWrites: true,
     });
 
     expect(mgr.snapshot(agent.id)?.config).toMatchObject({
@@ -172,11 +173,29 @@ describe("AgentManager fork", () => {
       model: "gpt-5.4-mini",
       cwd: "/work",
       systemPrompt: "private",
+      allowSharedResourceWrites: true,
       prompt: "",
     });
   });
 
-  it("updateSettings only changes the private system prompt", () => {
+  it("persists shared resource write permission in agent snapshots", async () => {
+    const { query } = makeQuery();
+    const manager = new AgentManager({ query });
+    const agent = manager.create({ allowSharedResourceWrites: true });
+
+    const restored = new AgentManager({ query });
+    await restored.importState(manager.exportState());
+
+    expect(restored.snapshot(agent.id)?.config.allowSharedResourceWrites).toBe(true);
+
+    const legacyState = manager.exportState();
+    delete legacyState.agents[0]!.config.allowSharedResourceWrites;
+    const legacyRestored = new AgentManager({ query });
+    await legacyRestored.importState(legacyState);
+    expect(legacyRestored.snapshot(agent.id)?.config.allowSharedResourceWrites ?? false).toBe(false);
+  });
+
+  it("updateSettings changes mutable agent settings", () => {
     const { query } = makeQuery();
     const mgr = new AgentManager({ query, defaultCwd: "/repo" });
     const agent = mgr.create({
@@ -184,15 +203,41 @@ describe("AgentManager fork", () => {
       model: "gpt-5.4",
       cwd: "/work",
       systemPrompt: "old",
+      allowSharedResourceWrites: true,
     });
 
-    const updated = mgr.updateSettings(agent.id, { systemPrompt: "new" });
+    const updated = mgr.updateSettings(agent.id, {
+      systemPrompt: "new",
+      allowSharedResourceWrites: false,
+    });
     expect(updated.config).toMatchObject({
       provider: "codex",
       model: "gpt-5.4",
       cwd: "/work",
       systemPrompt: "new",
+      allowSharedResourceWrites: false,
     });
+  });
+
+  it("rejects shared resource permission changes during an active turn", async () => {
+    const control = makeWaitingQuery();
+    const manager = new AgentManager({ query: control.query });
+    const agent = manager.create({ allowSharedResourceWrites: false });
+    manager.startAgent(agent.id, { prompt: "run" });
+    control.out.push({
+      type: "system",
+      subtype: "init",
+      session_id: "sess-running-permission",
+      model: "m",
+      cwd: "/repo",
+      tools: [],
+    });
+    await flush();
+
+    expect(() =>
+      manager.updateSettings(agent.id, { allowSharedResourceWrites: true }),
+    ).toThrow("暂时不能修改共享目录写权限");
+    expect(manager.snapshot(agent.id)?.config.allowSharedResourceWrites).toBe(false);
   });
 
   it("updateSettings can switch and clear the agent model", () => {
@@ -218,6 +263,7 @@ describe("AgentManager fork", () => {
     const parent = mgr.create({
       cwd: "/parent-work",
       systemPrompt: "parent private prompt",
+      allowSharedResourceWrites: true,
     });
     mgr.startAgent(parent.id, { prompt: "p" });
     await flush();
@@ -227,7 +273,13 @@ describe("AgentManager fork", () => {
     expect(mgr.snapshot(forked!.id)?.config).toMatchObject({
       cwd: "/parent-work",
       systemPrompt: "parent private prompt",
+      allowSharedResourceWrites: true,
     });
+
+    const revoked = mgr.fork(parent.id, "u-revoked", {
+      allowSharedResourceWrites: false,
+    });
+    expect(mgr.snapshot(revoked!.id)?.config.allowSharedResourceWrites).toBe(false);
   });
 
   it("fork can override the child branch workspace", async () => {

@@ -5,6 +5,7 @@ import {
   applyHello,
   insertForked,
   newAgentView,
+  recordAgentSettings,
   recordCompact,
   recordInput,
   type AgentMap,
@@ -467,7 +468,11 @@ describe("agentStore 轮次模型", () => {
 
   it("insertForked 插入带 forkOrigin 与模型的新 agent", () => {
     let map: AgentMap = {
-      a1: newAgentView("a1", { provider: "codex", model: "gpt-5.4" }),
+      a1: newAgentView("a1", {
+        provider: "codex",
+        model: "gpt-5.4",
+        allowSharedResourceWrites: true,
+      }),
     };
     map = insertForked(
       map,
@@ -479,6 +484,7 @@ describe("agentStore 轮次模型", () => {
     expect(v.forkOrigin).toEqual({ parentAgentId: "a1", anchorUuid: "u1" });
     expect(v.provider).toBe("codex");
     expect(v.model).toBe("gpt-5.5");
+    expect(v.allowSharedResourceWrites).toBe(true);
     expect(v.turns).toHaveLength(1);
     expect(v.turns[0]!.status).toBe("idle");
   });
@@ -529,17 +535,20 @@ describe("agentStore 轮次模型", () => {
         branchWorkspaceId: "branch_1",
         branch: "main",
         cwd: "E:\\repo\\main",
+        allowSharedResourceWrites: true,
       }),
     };
     map = insertForked(map, "a2", { parentAgentId: "a1", anchorUuid: "u1" }, {
       branchWorkspaceId: "branch_2",
       branch: "feature/a",
       cwd: "E:\\repo\\feature-a",
+      allowSharedResourceWrites: false,
     });
     const v = get(map, "a2");
     expect(v.branchWorkspaceId).toBe("branch_2");
     expect(v.branch).toBe("feature/a");
     expect(v.cwd).toBe("E:\\repo\\feature-a");
+    expect(v.allowSharedResourceWrites).toBe(false);
   });
 
   it("insertForked 为早到的 live fork 节点补元数据和锚点 usage 而不覆盖运行态", () => {
@@ -560,6 +569,7 @@ describe("agentStore 轮次模型", () => {
         cwd: "E:\\repo\\main",
         scratchDirectory: "E:\\repo\\main\\.agent-tmp\\a1",
         systemPrompt: "parent policy",
+        allowSharedResourceWrites: true,
         latestUsage: { contextTokens: 8192, contextWindow: 128000 },
         turns: [
           {
@@ -581,6 +591,7 @@ describe("agentStore 轮次模型", () => {
         status: "running",
         sessionId: "session-a2",
         model: "runtime-model",
+        allowSharedResourceWrites: true,
         turns: liveTurns,
         lastSeq: 3,
       }),
@@ -593,6 +604,7 @@ describe("agentStore 轮次模型", () => {
       branch: "feature/a",
       cwd: "E:\\repo\\feature-a",
       scratchDirectory: "E:\\repo\\feature-a\\.agent-tmp\\a2",
+      allowSharedResourceWrites: false,
     });
 
     expect(get(map, "a2")).toMatchObject({
@@ -607,6 +619,7 @@ describe("agentStore 轮次模型", () => {
       cwd: "E:\\repo\\feature-a",
       scratchDirectory: "E:\\repo\\feature-a\\.agent-tmp\\a2",
       systemPrompt: "parent policy",
+      allowSharedResourceWrites: false,
       latestUsage: { contextTokens: 2048, contextWindow: 128000 },
       forkOrigin: { parentAgentId: "a1", anchorUuid: "u1" },
     });
@@ -702,7 +715,12 @@ describe("agentStore 轮次模型", () => {
       {
         id: "a2",
         status: "idle",
-        config: { prompt: "", provider: "codex", model: "gpt-5.4-mini" },
+        config: {
+          prompt: "",
+          provider: "codex",
+          model: "gpt-5.4-mini",
+          allowSharedResourceWrites: true,
+        },
         createdAt: 1,
         lastEventSeq: 0,
         forkOrigin: { parentAgentId: "a1", anchorUuid: "u1" },
@@ -710,6 +728,15 @@ describe("agentStore 轮次模型", () => {
     ]);
     expect(get(map, "a2").forkOrigin).toEqual({ parentAgentId: "a1", anchorUuid: "u1" });
     expect(get(map, "a2").model).toBe("gpt-5.4-mini");
+    expect(get(map, "a2").allowSharedResourceWrites).toBe(true);
+  });
+
+  it("recordAgentSettings can disable shared resource writes", () => {
+    let map: AgentMap = {
+      a1: newAgentView("a1", { allowSharedResourceWrites: true }),
+    };
+    map = recordAgentSettings(map, "a1", { allowSharedResourceWrites: false });
+    expect(get(map).allowSharedResourceWrites).toBe(false);
   });
 
   it("applyHello 携带 histories 时恢复多轮对话节点", () => {

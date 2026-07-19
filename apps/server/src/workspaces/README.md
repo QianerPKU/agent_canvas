@@ -69,6 +69,15 @@ Linux:   ~/.local/share/agent_canvas/projects/index.json
 - junction/symlink 本身不是跨平台硬只读边界；因此内置工作区规则提示词会要求 Agent 未经用户明确授权不得修改 `readOnly` 资源。
 - 这里的共享资源不同于文件节点的共享开关。文件节点始终位于画布隔离文件夹，`sharedRead/sharedWrite` 只是把该隔离文件引用授权给全部 Agent，不做 branch 间重映射。
 
+### Agent 级写权限覆盖
+
+- `AgentSettings.allowSharedResourceWrites` 默认关闭；旧快照缺少该字段时也按关闭处理。
+- 开启后，仅当前 repo 已登记的共享资源会对该 Agent 以 `readWrite` 暴露，包括原本标记为 `readOnly` 的资源。项目内部资源必须位于 `shared/<repoId>/`；项目根、`shared/` 总根、内置工作文档和包含其他 repo 资源的宽泛路径会被拒绝。外部资源的授权范围是登记目录及其全部后代，因此不应登记过宽的祖先目录。
+- 共享资源创建和每次可写授权都会重新检查 canonical realpath、完整祖先映射、目录 dev/ino 身份与 branch mount 目标；授权前若发现 junction/symlink、路径 namespace 或映射目标已替换，会拒绝把该目录加入可写范围。
+- Windows 上，外部 UNC 或与项目可信卷不同的资源不能创建为 `readWrite`，也不能由 Agent 开关提升为可写；Linux 上，所有可写资源必须与项目位于同一 mount，且登记根目录下不能包含子 mount。`readOnly` 登记仍受各平台 junction/symlink 能力约束。这些限制是在 Node 无法可靠统一盘符、SMB admin share、映射盘与 bind mount 身份时采用的 fail-closed 边界。
+- 原本项目级 `readWrite` 资源继续进入 `writableDirectories`。由 Agent 开关提升的资源只进入 `sandboxWritableDirectories`；当本轮没有其他 `writableDirectories` 时，该开关本身不会把 Codex 审批策略改成 `never`。Codex 审批策略是整轮级别：若项目级可写资源、可写文件或可写提示词已经触发 `never`，该轮中的提升资源也会处于同一策略，UI 因此将此开关标为高风险权限。
+- 设置在下一次完整业务输入时重新解析并生效；`starting`/`running` 状态禁止改变该设置，避免当前 turn 的沙箱与界面状态不一致。fork 子 Agent 默认继承父 Agent 的设置，也可在 fork 请求中显式覆盖。
+
 ## 测试覆盖
 
 - `WorkspaceManager.test.ts` 包含一个 fake git 单测，用来快速验证路径、权限和 API 返回结构。
