@@ -1176,6 +1176,8 @@ async function handleHttp(
           defaultCwd,
         );
         const runner = manager.create(settings);
+        const branch = manager.configOf(runner.id)?.branch?.trim();
+        if (branch) await reviewQueue.retryBranch(branch);
         canvasState.saveSoon();
         return sendJson(res, 201, { id: runner.id });
       } catch (error) {
@@ -1501,7 +1503,10 @@ async function handleHttp(
           const snapshot = manager.updateSettings(id, settings, {
             branchSwitchPrompt: branchChanged ? branchSwitchPrompt(diff) : undefined,
           });
-          if (branchChanged && snapshot.status === "waiting_input") {
+          if (
+            branchChanged &&
+            (snapshot.status === "idle" || snapshot.status === "waiting_input")
+          ) {
             branchToRetry = snapshot.config?.branch?.trim() || undefined;
           }
           canvasState.saveSoon();
@@ -1510,7 +1515,7 @@ async function handleHttp(
         const currentSnapshot = manager.snapshot(id);
         if (
           branchToRetry &&
-          currentSnapshot?.status === "waiting_input" &&
+          (currentSnapshot?.status === "idle" || currentSnapshot?.status === "waiting_input") &&
           currentSnapshot.config?.branch?.trim() === branchToRetry
         ) {
           // Do not await activation from the project-scoped HTTP transaction. Its delivery can
@@ -1584,6 +1589,8 @@ async function handleHttp(
         if (!forked) return sendJson(res, 409, { error: "源会话尚未建立，无法 fork" });
         fileManager.copyAgentConnections(id, forked.id);
         promptManager.copyAgentConnections(id, forked.id);
+        const branch = manager.configOf(forked.id)?.branch?.trim();
+        if (branch) await reviewQueue.retryBranch(branch);
         canvasState.saveSoon();
         return sendJson(res, 201, { id: forked.id, origin: forked.origin });
       } catch (error) {

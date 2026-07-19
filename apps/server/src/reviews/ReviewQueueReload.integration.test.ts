@@ -7,6 +7,7 @@ import path from "node:path";
 import type {
   AgentEventEnvelope,
   AgentSnapshot,
+  AgentStartConfig,
   PersistedPromptState,
 } from "@agent-canvas/shared";
 import { AgentManager } from "../AgentManager.js";
@@ -742,6 +743,12 @@ class FakeReviewHost implements SyncFlowAgentHost {
 
   get(id: string): FakeReviewRunner | undefined {
     return id === this.agentId ? this.runner : undefined;
+  }
+
+  async startAgent(id: string, config: AgentStartConfig): Promise<void> {
+    const runner = this.get(id);
+    if (!runner) throw new Error(`unknown agent: ${id}`);
+    runner.send(config.prompt);
   }
 
   historyOf(_id: string): AgentEventEnvelope[] {

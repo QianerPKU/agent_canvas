@@ -240,6 +240,97 @@ describe("PullRequestFlowManager integration", () => {
     }
   }, 30_000);
 
+  it("auto-starts only the oldest idle target reviewer and does not redeliver on running", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-idle-pr-review-"));
+    const sourceBranch: BranchWorkspace = {
+      id: "branch_source",
+      repoId: "repo_1",
+      branch: "feature/idle-review",
+      worktreePath: root,
+      scratchRoot: path.join(root, ".agent-tmp"),
+      isDefault: false,
+      createdAt: 1,
+    };
+    const targetBranch: BranchWorkspace = {
+      id: "branch_main",
+      repoId: "repo_1",
+      branch: "main",
+      worktreePath: root,
+      scratchRoot: path.join(root, ".agent-tmp"),
+      isDefault: true,
+      createdAt: 2,
+    };
+    const query = makeQueryHub();
+    const agentManager = new AgentManager({
+      query: query.query,
+      codexQuery: query.query,
+      defaultCwd: root,
+    });
+    const prManager = new PullRequestFlowManager({ host: agentManager });
+    agentManager.onEvent((envelope) => {
+      void prManager.handleAgentEvent(envelope);
+      if (
+        envelope.event.kind === "status" &&
+        (envelope.event.status === "running" || envelope.event.status === "waiting_input")
+      ) {
+        const branch = agentManager.configOf(envelope.agentId)?.branch;
+        if (branch) void prManager.getReviewQueue().retryBranch(branch);
+      }
+    });
+
+    try {
+      const proposer = await startAgent(agentManager, query, sourceBranch, "running");
+      const oldestIdle = agentManager.create({
+        provider: "codex",
+        branchWorkspaceId: targetBranch.id,
+        branch: targetBranch.branch,
+        cwd: targetBranch.worktreePath,
+      });
+      const laterIdle = agentManager.create({
+        provider: "codex",
+        branchWorkspaceId: targetBranch.id,
+        branch: targetBranch.branch,
+        cwd: targetBranch.worktreePath,
+      });
+      const flow = await prManager.create({
+        proposerAgentId: proposer.id,
+        targetBranch: targetBranch.branch,
+        summary: "Start an idle target reviewer",
+        files: ["src/idle.ts"],
+      });
+      await waitUntil(() => proposer.session.steered.length === 1);
+      await approve(prManager, query, proposer, flow.id, "source_preflight");
+      await waitUntil(() => prManager.get(flow.id)?.status === "create_pr_authorized");
+
+      await prManager.recordPrCreated(flow.id, { prNumber: 43, prUrl: "local://pull/43" });
+      await waitUntil(() => query.sessions.length === 2);
+      const idleSession = query.sessions[1];
+      if (!idleSession) throw new Error("expected an auto-started idle reviewer session");
+      await waitUntil(() => idleSession.inputs.length === 1);
+
+      expect(prManager.get(flow.id)).toMatchObject({
+        status: "target_review_collecting",
+        currentStage: "target_merge",
+      });
+      expect(prManager.get(flow.id)?.reviewRequests.at(-1)?.requestedAgentIds).toEqual([
+        oldestIdle.id,
+      ]);
+      expect(inputText(idleSession.inputs[0])).toContain('"stage": "target_merge"');
+      expect(oldestIdle.getStatus()).toBe("starting");
+      expect(laterIdle.getStatus()).toBe("idle");
+
+      idleSession.output.push(systemInit(oldestIdle.id, root));
+      await waitUntil(() => oldestIdle.getStatus() === "running");
+      await flush();
+      expect(query.sessions).toHaveLength(2);
+      expect(idleSession.inputs).toHaveLength(1);
+      prManager.cancel(flow.id);
+    } finally {
+      await agentManager.clear();
+      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  });
+
   it("delivers concurrent PR and sync authorizations across Codex turn transitions", async () => {
     const query = makeQueryHub();
     let now = 10_000;

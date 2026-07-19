@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type {
   AgentEventEnvelope,
   AgentSnapshot,
+  AgentStartConfig,
   PullRequestChangedFile,
   PullRequestCreatedInput,
   PullRequestCreatedInfo,
@@ -21,6 +22,7 @@ import {
 import { DEFAULT_BRANCH_REVIEW_TIMEOUT_MS } from "../reviews/reviewDefaults.js";
 
 type DeliverableRunner = {
+  getStatus(): string;
   deliver(
     text: string,
     options?: { automationKey?: string; replaceQueued?: boolean },
@@ -30,6 +32,7 @@ type DeliverableRunner = {
 export interface PullRequestAgentHost {
   list(): AgentSnapshot[];
   get(id: string): DeliverableRunner | undefined;
+  startAgent(id: string, config: AgentStartConfig): Promise<void>;
   historyOf(id: string): AgentEventEnvelope[];
   currentTurnIndex?(id: string): number;
 }
@@ -679,7 +682,7 @@ export class PullRequestFlowManager {
     if (!this.isCurrentGeneration(generation)) return "started";
     flow = this.requireFlow(flowId);
     if (flow.status !== "queued" || flow.currentStage !== stage) return "started";
-    const reviewers = this.activeReviewersFor(flow, stage);
+    const reviewers = this.reviewersFor(flow, stage);
     if (reviewers.length === 0) {
       const branch = stage === "source_preflight" ? flow.sourceBranch : flow.targetBranch;
       this.save({
@@ -752,7 +755,10 @@ export class PullRequestFlowManager {
                 reviewer.id,
                 reviewTokens.get(reviewer.id)!,
               ),
-              { automationKey: prFlowAutomationKey(flow.id) },
+              {
+                automationKey: prFlowAutomationKey(flow.id),
+                startIfIdle: true,
+              },
             ),
         );
         if (delivery.status === "invalidated") return;
@@ -885,7 +891,10 @@ export class PullRequestFlowManager {
               agentId,
               this.requireReviewCapability(flow.id, request.id, stage, agentId).token,
             ),
-            { automationKey: prFlowAutomationKey(flow.id) },
+            {
+              automationKey: prFlowAutomationKey(flow.id),
+              startIfIdle: true,
+            },
           ),
       );
       if (delivery.status === "invalidated") return;
@@ -1047,14 +1056,18 @@ export class PullRequestFlowManager {
     }
   }
 
-  private activeReviewersFor(
+  private reviewersFor(
     flow: PullRequestFlowSnapshot,
     stage: PullRequestReviewStage,
   ): AgentSnapshot[] {
     const branch = stage === "source_preflight" ? flow.sourceBranch : flow.targetBranch;
-    return this.host
-      .list()
-      .filter((agent) => agent.config.branch === branch && isActiveAgentStatus(agent.status));
+    const branchAgents = this.host.list().filter((agent) => agent.config.branch === branch);
+    const activeReviewers = branchAgents.filter((agent) => isActiveAgentStatus(agent.status));
+    if (activeReviewers.length > 0) return activeReviewers;
+    const idleReviewers = branchAgents
+      .filter((agent) => agent.status === "idle")
+      .sort(compareAgentCreationOrder);
+    return idleReviewers.slice(0, 1);
   }
 
   private async trackPendingOperation<T>(
@@ -1110,11 +1123,26 @@ export class PullRequestFlowManager {
   private async deliverToAgent(
     agentId: string,
     text: string,
-    options?: { automationKey?: string; replaceQueued?: boolean },
+    options: {
+      automationKey?: string;
+      replaceQueued?: boolean;
+      startIfIdle?: boolean;
+    } = {},
   ): Promise<void> {
     const runner = this.host.get(agentId);
     if (!runner) throw new Error(`unknown agent: ${agentId}`);
-    await runner.deliver(text, options);
+    if (options.startIfIdle && runner.getStatus() === "idle") {
+      await this.host.startAgent(agentId, { prompt: text });
+      return;
+    }
+    await runner.deliver(text, {
+      ...(options.automationKey !== undefined
+        ? { automationKey: options.automationKey }
+        : {}),
+      ...(options.replaceQueued !== undefined
+        ? { replaceQueued: options.replaceQueued }
+        : {}),
+    });
   }
 
   private issueReviewCapability(
@@ -1600,6 +1628,35 @@ function reviewJobOrder(flow: PullRequestFlowSnapshot, stage: PullRequestReviewS
 
 function isActiveAgentStatus(status: string): boolean {
   return status === "running" || status === "waiting_input";
+}
+
+function compareAgentCreationOrder(left: AgentSnapshot, right: AgentSnapshot): number {
+  if (left.createdAt !== right.createdAt) return left.createdAt - right.createdAt;
+  return compareNaturalIds(left.id, right.id);
+}
+
+function compareNaturalIds(left: string, right: string): number {
+  const leftParts = /^(.*?)(\d+)$/u.exec(left);
+  const rightParts = /^(.*?)(\d+)$/u.exec(right);
+  if (leftParts && rightParts && leftParts[1] === rightParts[1]) {
+    const numeric = compareDecimalStrings(leftParts[2]!, rightParts[2]!);
+    if (numeric !== 0) return numeric;
+  }
+  return compareStrings(left, right);
+}
+
+function compareDecimalStrings(left: string, right: string): number {
+  const normalizedLeft = left.replace(/^0+(?=\d)/u, "");
+  const normalizedRight = right.replace(/^0+(?=\d)/u, "");
+  return (
+    normalizedLeft.length - normalizedRight.length ||
+    compareStrings(normalizedLeft, normalizedRight) ||
+    compareStrings(left, right)
+  );
+}
+
+function compareStrings(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function currentRequest(
