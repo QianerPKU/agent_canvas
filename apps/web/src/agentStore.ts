@@ -124,6 +124,8 @@ export function applyHello(
   const agentsWithSessionChange = new Set<string>();
   for (const a of agents) {
     const history = histories[a.id]?.slice().sort((left, right) => left.seq - right.seq) ?? [];
+    const historyMaxSeq = history.at(-1)?.seq ?? 0;
+    const historyIsNewer = historyMaxSeq > a.lastEventSeq;
     if (
       a.usage !== undefined ||
       history.some(
@@ -163,23 +165,30 @@ export function applyHello(
     }
     const replayed = map[a.id]!;
     const candidateUsage = a.usage ?? replayed.latestUsage;
-    const lastInitializedSessionId = a.sessionId ?? replayed.lastInitializedSessionId;
+    const snapshotLastInitializedSessionId =
+      a.sessionId ?? replayed.lastInitializedSessionId;
     const snapshotSessionChanged =
       a.usage === undefined &&
       !!a.sessionId &&
       !!replayed.lastInitializedSessionId &&
       a.sessionId !== replayed.lastInitializedSessionId;
-    const latestUsage = snapshotSessionChanged ? undefined : candidateUsage;
-    const restored = latestUsage
-      ? withLastTurn(replayed, (turn) => ({ ...turn, usage: latestUsage }))
+    const latestUsage = historyIsNewer
+      ? replayed.latestUsage
       : snapshotSessionChanged
-        ? withLastTurn(replayed, (turn) => ({ ...turn, usage: undefined }))
-        : replayed;
+        ? undefined
+        : candidateUsage;
+    const restored = historyIsNewer
+      ? replayed
+      : latestUsage
+        ? withLastTurn(replayed, (turn) => ({ ...turn, usage: latestUsage }))
+        : snapshotSessionChanged
+          ? withLastTurn(replayed, (turn) => ({ ...turn, usage: undefined }))
+          : replayed;
     map[a.id] = {
       ...restored,
       provider: a.provider ?? a.config.provider ?? map[a.id]!.provider,
-      status: a.status,
-      sessionId: a.sessionId,
+      status: historyIsNewer ? replayed.status : a.status,
+      sessionId: historyIsNewer ? replayed.sessionId : a.sessionId,
       model: a.config.model,
       reasoningEffort: a.config.reasoningEffort,
       branchWorkspaceId: a.config.branchWorkspaceId,
@@ -190,8 +199,10 @@ export function applyHello(
       forkOrigin: a.forkOrigin,
       createdAt: a.createdAt,
       latestUsage,
-      lastInitializedSessionId,
-      lastSeq: a.lastEventSeq,
+      lastInitializedSessionId: historyIsNewer
+        ? replayed.lastInitializedSessionId
+        : snapshotLastInitializedSessionId,
+      lastSeq: historyIsNewer ? replayed.lastSeq : a.lastEventSeq,
     };
   }
   // Fork snapshots can precede their parent in `agents`. Resolve inherited

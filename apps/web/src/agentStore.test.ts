@@ -641,6 +641,65 @@ describe("agentStore 轮次模型", () => {
     });
   });
 
+  it("applyHello keeps newer history state over a stale snapshot", () => {
+    seq = 0;
+    const history = [
+      env("a1", { kind: "user_input", text: "old session" }),
+      env("a1", {
+        kind: "system_init",
+        sessionId: "s1",
+        model: "gpt-5.5",
+        cwd: "/tmp",
+        tools: [],
+      }),
+      env("a1", {
+        kind: "usage",
+        usage: { contextTokens: 4096, contextWindow: 128000 },
+      }),
+      env("a1", { kind: "result", subtype: "success", isError: false }),
+      env("a1", { kind: "user_input", text: "new session" }),
+      env("a1", {
+        kind: "system_init",
+        sessionId: "s2",
+        model: "gpt-5.5",
+        cwd: "/tmp",
+        tools: [],
+      }),
+      env("a1", {
+        kind: "usage",
+        usage: { contextTokens: 8192, contextWindow: 128000 },
+      }),
+      env("a1", { kind: "status", status: "running" }),
+    ];
+
+    const map = applyHello(
+      [
+        {
+          id: "a1",
+          status: "waiting_input",
+          sessionId: "s1",
+          config: { prompt: "", provider: "codex" },
+          createdAt: 1,
+          lastEventSeq: 4,
+          usage: { contextTokens: 4096, contextWindow: 128000 },
+        },
+      ],
+      { a1: history },
+    );
+
+    expect(get(map)).toMatchObject({
+      status: "running",
+      sessionId: "s2",
+      lastInitializedSessionId: "s2",
+      latestUsage: { contextTokens: 8192, contextWindow: 128000 },
+      lastSeq: history.at(-1)!.seq,
+    });
+    expect(get(map).turns.at(-1)!.usage).toEqual({
+      contextTokens: 8192,
+      contextWindow: 128000,
+    });
+  });
+
   it("applyHello 在所有 history 回放后从父锚点恢复 fork usage", () => {
     seq = 0;
     const parentHistory = [

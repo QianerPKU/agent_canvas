@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { StrictMode, type PropsWithChildren } from "react";
 import { act, renderHook } from "@testing-library/react";
+import type { AgentEventEnvelope } from "@agent-canvas/shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "./api.js";
 import { useAgentCanvas } from "./useAgentCanvas.js";
@@ -331,6 +332,151 @@ describe("useAgentCanvas", () => {
     });
     expect(Object.keys(result.current.agents)).toEqual([]);
     expect(result.current.files).toEqual([]);
+    unmount();
+  });
+
+  it("keeps newer live history when a delayed refresh started from a stale snapshot", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+
+    const history: AgentEventEnvelope[] = [
+      {
+        agentId: "a1",
+        seq: 1,
+        at: 1,
+        event: { kind: "user_input", text: "old session" },
+      },
+      {
+        agentId: "a1",
+        seq: 2,
+        at: 2,
+        event: {
+          kind: "system_init",
+          sessionId: "s1",
+          model: "gpt-5.5",
+          cwd: "/tmp",
+          tools: [],
+        },
+      },
+      {
+        agentId: "a1",
+        seq: 3,
+        at: 3,
+        event: {
+          kind: "usage",
+          usage: { contextTokens: 4096, contextWindow: 128000 },
+        },
+      },
+      {
+        agentId: "a1",
+        seq: 4,
+        at: 4,
+        event: { kind: "result", subtype: "success", isError: false },
+      },
+      {
+        agentId: "a1",
+        seq: 5,
+        at: 5,
+        event: { kind: "user_input", text: "new session" },
+      },
+      {
+        agentId: "a1",
+        seq: 6,
+        at: 6,
+        event: {
+          kind: "system_init",
+          sessionId: "s2",
+          model: "gpt-5.5",
+          cwd: "/tmp",
+          tools: [],
+        },
+      },
+      {
+        agentId: "a1",
+        seq: 7,
+        at: 7,
+        event: {
+          kind: "usage",
+          usage: { contextTokens: 8192, contextWindow: 128000 },
+        },
+      },
+      {
+        agentId: "a1",
+        seq: 8,
+        at: 8,
+        event: { kind: "status", status: "running" },
+      },
+    ];
+    let resolveHistory!: (history: AgentEventEnvelope[]) => void;
+    const delayedHistory = new Promise<AgentEventEnvelope[]>((resolve) => {
+      resolveHistory = resolve;
+    });
+    vi.mocked(api.list)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        {
+          id: "a1",
+          status: "waiting_input",
+          sessionId: "s1",
+          config: { prompt: "", provider: "codex" },
+          createdAt: 1,
+          lastEventSeq: 4,
+          usage: { contextTokens: 4096, contextWindow: 128000 },
+        },
+      ]);
+    vi.mocked(api.history).mockReturnValueOnce(delayedHistory);
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    await act(async () => {
+      vi.advanceTimersByTime(0);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    let pendingRefresh!: Promise<void>;
+    act(() => {
+      pendingRefresh = result.current.refresh();
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(api.history).toHaveBeenCalledWith("a1");
+
+    act(() => {
+      for (const envelope of history) {
+        socket.onmessage?.call(
+          socket as unknown as WebSocket,
+          {
+            data: JSON.stringify({ type: "event", envelope }),
+          } as MessageEvent,
+        );
+      }
+    });
+    expect(result.current.agents.a1).toMatchObject({
+      status: "running",
+      sessionId: "s2",
+      latestUsage: { contextTokens: 8192, contextWindow: 128000 },
+      lastSeq: 8,
+    });
+
+    await act(async () => {
+      resolveHistory(history);
+      await pendingRefresh;
+    });
+
+    expect(result.current.agents.a1).toMatchObject({
+      status: "running",
+      sessionId: "s2",
+      lastInitializedSessionId: "s2",
+      latestUsage: { contextTokens: 8192, contextWindow: 128000 },
+      lastSeq: 8,
+    });
+    expect(result.current.agents.a1!.turns.at(-1)!.usage).toEqual({
+      contextTokens: 8192,
+      contextWindow: 128000,
+    });
     unmount();
   });
 
