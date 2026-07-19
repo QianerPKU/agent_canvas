@@ -260,11 +260,7 @@ export class AgentManager {
     return this.runners.has(id) ? this.snapshotOf(id) : undefined;
   }
 
-  updateSettings(
-    id: string,
-    input: UpdateAgentSettingsInput,
-    options: { branchSwitchPrompt?: AgentPromptReference } = {},
-  ): AgentSnapshot {
+  validateSettingsUpdate(id: string, input: UpdateAgentSettingsInput): void {
     const runner = this.runners.get(id);
     if (!runner) throw new Error(`未知 agent: ${id}`);
     const status = runner.getStatus();
@@ -278,6 +274,15 @@ export class AgentManager {
     if (changesSharedResourceWrites && (status === "starting" || status === "running")) {
       throw new Error("Agent 正在执行当前轮次，暂时不能修改共享目录写权限");
     }
+  }
+
+  updateSettings(
+    id: string,
+    input: UpdateAgentSettingsInput,
+    options: { branchSwitchPrompt?: AgentPromptReference } = {},
+  ): AgentSnapshot {
+    this.validateSettingsUpdate(id, input);
+    const runner = this.runners.get(id)!;
     const draft = this.draftConfigs.get(id) ?? {};
     const next = applySettings(draft, input);
     this.draftConfigs.set(id, next);
@@ -292,6 +297,13 @@ export class AgentManager {
    * 记录其来源与启动时要合并的 fork 配置（model/resume/resumeSessionAt/forkSession）。
    * 父会话尚未建立（无 sessionId）时返回 undefined。
    */
+  validateFork(parentId: string, anchorUuid: string): void {
+    const parent = this.runners.get(parentId);
+    if (!parent) throw new Error(`未知 agent: ${parentId}`);
+    if (!anchorUuid.trim()) throw new Error("缺少 anchorUuid");
+    if (!parent.snapshot().sessionId) throw new Error("源会话尚未建立，无法 fork");
+  }
+
   fork(
     parentId: string,
     anchorUuid: string,
@@ -299,6 +311,11 @@ export class AgentManager {
   ): { id: string; origin: ForkOrigin } | undefined {
     const parent = this.runners.get(parentId);
     if (!parent) return undefined;
+    try {
+      this.validateFork(parentId, anchorUuid);
+    } catch {
+      return undefined;
+    }
     const forkOptions = typeof options === "string" ? { model: options } : options ?? {};
     const parentSnapshot = parent.snapshot();
     const parentSession = parentSnapshot.sessionId;

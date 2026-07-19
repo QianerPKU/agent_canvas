@@ -133,6 +133,13 @@ class WorkspaceManager extends BaseWorkspaceManager {
 
 const CASE_DISTINCT_TEST_FILESYSTEM = testFilesystemPreservesCaseDistinctDirectories();
 const FILE_SYMLINK_TEST_SUPPORTED = testFilesystemSupportsFileSymlinks();
+const DIRECTORY_SYMLINK_TEST_SUPPORTED = testFilesystemSupportsDirectoryLink("dir");
+const DIRECTORY_JUNCTION_TEST_SUPPORTED =
+  process.platform === "win32" && testFilesystemSupportsDirectoryLink("junction");
+const DIRECTORY_MAPPING_TEST_SUPPORTED =
+  process.platform === "win32"
+    ? DIRECTORY_JUNCTION_TEST_SUPPORTED
+    : DIRECTORY_SYMLINK_TEST_SUPPORTED;
 
 describe("WorkspaceManager", () => {
   it("rejects an external projects-root junction before creating its index", async () => {
@@ -288,10 +295,405 @@ describe("WorkspaceManager", () => {
 
       expect(opened.projectRoot).toBe(path.resolve(linkedProjectRoot));
       await expect(realpath(opened.projectRoot)).resolves.toBe(await realpath(actualProjectRoot));
+      const mutableState = (loader as unknown as {
+        state: {
+          repo?: {
+            id: string;
+            remoteUrl: string;
+            defaultBranch: string;
+            localRepoPath: string;
+            connectedAt: number;
+          };
+          branches: Array<{
+            id: string;
+            repoId: string;
+            branch: string;
+            worktreePath: string;
+            scratchRoot: string;
+            isDefault: boolean;
+            createdAt: number;
+          }>;
+        };
+      }).state;
+      const localRepoPath = path.join(linkedProjectRoot, "repos", "repo_1", "repo");
+      await mkdir(localRepoPath, { recursive: true });
+      mutableState.repo = {
+        id: "repo_1",
+        remoteUrl: "https://github.com/acme/linked-project.git",
+        defaultBranch: "main",
+        localRepoPath,
+        connectedAt: 1,
+      };
+      const resource = await loader.createSharedResource({
+        name: "linked-dataset",
+        mountPath: "resources/linked-dataset",
+      });
+      const worktreePath = path.join(linkedProjectRoot, "worktrees", "repo_1", "main");
+      const mountPath = path.join(worktreePath, "resources", "linked-dataset");
+      await mkdir(path.dirname(mountPath), { recursive: true });
+      await symlink(
+        resource.sourcePath,
+        mountPath,
+        process.platform === "win32" ? "junction" : "dir",
+      );
+      const currentBranches = (loader as unknown as {
+        state: { branches: typeof mutableState.branches };
+      }).state.branches;
+      currentBranches.push({
+        id: "branch_1",
+        repoId: "repo_1",
+        branch: "main",
+        worktreePath,
+        scratchRoot: path.join(worktreePath, ".agent-tmp"),
+        isDefault: true,
+        createdAt: 1,
+      });
+
+      expect(
+        loader.accessForAgent({
+          branchWorkspaceId: "branch_1",
+          allowSharedResourceWrites: true,
+        }).sandboxWritableDirectories,
+      ).toEqual([await realpath(resource.sourcePath)]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it.skipIf(process.platform !== "linux")(
+    "rejects a bind-mounted alias of a trusted project root's real parent",
+    async (context) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-project-bind-alias-"));
+      const realParent = path.join(root, "real-parent");
+      const actualProjectRoot = path.join(realParent, "actual-project");
+      const linkedProjectRoot = path.join(root, "linked-project");
+      const bindAlias = path.join(root, "bind-parent");
+      let mounted = false;
+      try {
+        await mkdir(realParent);
+        const creator = new WorkspaceManager({
+          defaultSourcePath: root,
+          projectsRoot: path.join(root, "creator-index"),
+          autoOpenDefault: false,
+        });
+        await creator.createCanvasProject({
+          name: "Bind alias project",
+          projectRoot: actualProjectRoot,
+        });
+        await symlink(actualProjectRoot, linkedProjectRoot, "dir");
+
+        const loader = new WorkspaceManager({
+          defaultSourcePath: root,
+          projectsRoot: path.join(root, "loader-index"),
+          autoOpenDefault: false,
+        });
+        await loader.openCanvasProject({ projectRoot: linkedProjectRoot });
+        const mutableState = (loader as unknown as {
+          state: {
+            repo?: {
+              id: string;
+              remoteUrl: string;
+              defaultBranch: string;
+              localRepoPath: string;
+              connectedAt: number;
+            };
+          };
+        }).state;
+        mutableState.repo = {
+          id: "repo_1",
+          remoteUrl: "https://github.com/acme/bind-alias-project.git",
+          defaultBranch: "main",
+          localRepoPath: path.join(linkedProjectRoot, "repos", "repo_1", "repo"),
+          connectedAt: 1,
+        };
+
+        await mkdir(bindAlias);
+        try {
+          await runExecutable("mount", ["--bind", realParent, bindAlias]);
+          mounted = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT" || /permission denied|must be superuser|not permitted/iu.test(String(error))) {
+            context.skip();
+            return;
+          }
+          throw error;
+        }
+
+        await expect(
+          loader.createSharedResource({
+            name: "bind-parent-alias",
+            mountPath: "resources/bind-parent-alias",
+            sourcePath: bindAlias,
+          }),
+        ).rejects.toThrow(/aliases a protected project directory/u);
+      } finally {
+        if (mounted) {
+          await runExecutable("umount", [bindAlias]);
+          mounted = false;
+        }
+        if (!mounted) await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform !== "linux")(
+    "rejects a project-internal shared resource replaced by a bind mount",
+    async (context) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-resource-bind-root-"));
+      const source = path.join(root, "source");
+      const projectRoot = path.join(root, "project");
+      let mounted = false;
+      let bindMountPath: string | undefined;
+      try {
+        await mkdir(source);
+        const manager = new WorkspaceManager({
+          defaultSourcePath: source,
+          projectRoot,
+          runGit: createFakeWorkspaceGit("https://github.com/acme/bind-root-resource.git"),
+        });
+        const project = await manager.connect({ localPath: source });
+        const workspace = project.branches[0]!;
+        const resource = await manager.createSharedResource({
+          name: "bind-root-resource",
+          mountPath: "resources/bind-root-resource",
+        });
+        const protectedTarget = path.join(
+          projectRoot,
+          "worktrees",
+          "repo_1",
+          "protected-branch",
+        );
+        await mkdir(protectedTarget, { recursive: true });
+        bindMountPath = resource.sourcePath;
+        try {
+          await runExecutable("mount", ["--bind", protectedTarget, bindMountPath]);
+          mounted = true;
+        } catch (error) {
+          if (
+            (error as NodeJS.ErrnoException).code === "ENOENT" ||
+            /permission denied|must be superuser|not permitted/iu.test(String(error))
+          ) {
+            context.skip();
+            return;
+          }
+          throw error;
+        }
+
+        expect(() =>
+          manager.accessForAgent({
+            branchWorkspaceId: workspace.id,
+            allowSharedResourceWrites: true,
+          }),
+        ).toThrow(/trusted project mount/u);
+      } finally {
+        if (mounted && bindMountPath) {
+          await runExecutable("umount", [bindMountPath]);
+          mounted = false;
+        }
+        if (!mounted) await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform !== "linux")(
+    "rejects a nested bind mount inside an Agent-writable shared resource",
+    async (context) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-resource-bind-child-"));
+      const source = path.join(root, "source");
+      const projectRoot = path.join(root, "project");
+      let mounted = false;
+      let bindMountPath: string | undefined;
+      try {
+        await mkdir(source);
+        const manager = new WorkspaceManager({
+          defaultSourcePath: source,
+          projectRoot,
+          runGit: createFakeWorkspaceGit("https://github.com/acme/bind-child-resource.git"),
+        });
+        const project = await manager.connect({ localPath: source });
+        const workspace = project.branches[0]!;
+        const resource = await manager.createSharedResource({
+          name: "bind-child-resource",
+          mountPath: "resources/bind-child-resource",
+        });
+        const protectedTarget = path.join(
+          projectRoot,
+          "worktrees",
+          "repo_1",
+          "protected-branch",
+        );
+        bindMountPath = path.join(resource.sourcePath, "escape");
+        await Promise.all([
+          mkdir(protectedTarget, { recursive: true }),
+          mkdir(bindMountPath, { recursive: true }),
+        ]);
+        try {
+          await runExecutable("mount", ["--bind", protectedTarget, bindMountPath]);
+          mounted = true;
+        } catch (error) {
+          if (
+            (error as NodeJS.ErrnoException).code === "ENOENT" ||
+            /permission denied|must be superuser|not permitted/iu.test(String(error))
+          ) {
+            context.skip();
+            return;
+          }
+          throw error;
+        }
+
+        expect(() =>
+          manager.accessForAgent({
+            branchWorkspaceId: workspace.id,
+            allowSharedResourceWrites: true,
+          }),
+        ).toThrow(/nested mount/u);
+      } finally {
+        if (mounted && bindMountPath) {
+          await runExecutable("umount", [bindMountPath]);
+          mounted = false;
+        }
+        if (!mounted) await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform !== "linux")(
+    "rejects a nested bind mount in another repo resource before granting writes",
+    async (context) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-other-repo-bind-child-"));
+      const source = path.join(root, "source");
+      const projectRoot = path.join(root, "project");
+      let mounted = false;
+      let bindMountPath: string | undefined;
+      try {
+        await mkdir(source);
+        const manager = new WorkspaceManager({
+          defaultSourcePath: source,
+          projectRoot,
+          runGit: createFakeWorkspaceGit("https://github.com/acme/other-bind-child.git"),
+        });
+        const project = await manager.connect({ localPath: source });
+        const workspace = project.branches[0]!;
+        const resource = await manager.createSharedResource({
+          name: "current-repo-resource",
+          mountPath: "resources/current-repo-resource",
+        });
+        const candidateSource = path.join(projectRoot, "shared", "repo_2", "candidate");
+        const protectedTarget = path.join(
+          projectRoot,
+          "worktrees",
+          "repo_1",
+          "protected-branch",
+        );
+        bindMountPath = path.join(candidateSource, "escape");
+        await Promise.all([
+          mkdir(protectedTarget, { recursive: true }),
+          mkdir(bindMountPath, { recursive: true }),
+        ]);
+        const mutableState = (manager as unknown as {
+          state: { sharedResources: Array<typeof resource> };
+        }).state;
+        mutableState.sharedResources.push({
+          ...resource,
+          id: "shared_other_repo_bind_child",
+          repoId: "repo_2",
+          name: "other-repo-bind-child",
+          sourcePath: candidateSource,
+          mountPath: "resources/other-repo-bind-child",
+          access: "readOnly",
+        });
+        try {
+          await runExecutable("mount", ["--bind", protectedTarget, bindMountPath]);
+          mounted = true;
+        } catch (error) {
+          if (
+            (error as NodeJS.ErrnoException).code === "ENOENT" ||
+            /permission denied|must be superuser|not permitted/iu.test(String(error))
+          ) {
+            context.skip();
+            return;
+          }
+          throw error;
+        }
+
+        expect(() =>
+          manager.accessForAgent({
+            branchWorkspaceId: workspace.id,
+            allowSharedResourceWrites: true,
+          }),
+        ).toThrow(/nested mount/u);
+      } finally {
+        if (mounted && bindMountPath) {
+          await runExecutable("umount", [bindMountPath]);
+          mounted = false;
+        }
+        if (!mounted) await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(!DIRECTORY_MAPPING_TEST_SUPPORTED)(
+    "rejects another repo resource whose ancestor mapping is replaced before a write grant",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-other-repo-map-swap-"));
+      const source = path.join(root, "source");
+      const projectRoot = path.join(root, "project");
+      const candidateRepoRoot = path.join(projectRoot, "shared", "repo_2");
+      const displacedCandidateRepoRoot = `${candidateRepoRoot}-displaced`;
+      const outsideCandidateRepoRoot = path.join(root, "outside-repo_2");
+      let mapped = false;
+      try {
+        await mkdir(source);
+        const manager = new WorkspaceManager({
+          defaultSourcePath: source,
+          projectRoot,
+          runGit: createFakeWorkspaceGit("https://github.com/acme/other-map-swap.git"),
+        });
+        const project = await manager.connect({ localPath: source });
+        const workspace = project.branches[0]!;
+        const resource = await manager.createSharedResource({
+          name: "current-repo-resource",
+          mountPath: "resources/current-repo-resource",
+        });
+        const candidateSource = path.join(candidateRepoRoot, "dataset");
+        await mkdir(candidateSource, { recursive: true });
+        const mutableState = (manager as unknown as {
+          state: { sharedResources: Array<typeof resource> };
+        }).state;
+        mutableState.sharedResources.push({
+          ...resource,
+          id: "shared_other_repo_map_swap",
+          repoId: "repo_2",
+          name: "other-repo-map-swap",
+          sourcePath: candidateSource,
+          mountPath: "resources/other-repo-map-swap",
+          access: "readOnly",
+        });
+
+        await rename(candidateRepoRoot, displacedCandidateRepoRoot);
+        await mkdir(path.join(outsideCandidateRepoRoot, "dataset"), { recursive: true });
+        await symlink(
+          outsideCandidateRepoRoot,
+          candidateRepoRoot,
+          process.platform === "win32" ? "junction" : "dir",
+        );
+        mapped = true;
+
+        expect(() =>
+          manager.accessForAgent({
+            branchWorkspaceId: workspace.id,
+            allowSharedResourceWrites: true,
+          }),
+        ).toThrow(/unsafe ancestor mapping/u);
+      } finally {
+        if (mapped) {
+          await rm(candidateRepoRoot, { force: true });
+          mapped = false;
+        }
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("rejects a live project-root junction swap before workspace metadata access", async (context) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-project-root-swap-"));
@@ -1258,17 +1660,13 @@ describe("WorkspaceManager", () => {
         },
       ]);
 
-      await manager.createSharedResource({
-        name: "project-shared-root",
-        mountPath: "shared-root",
-        sourcePath: path.join(projectRoot, "shared"),
-      });
-      expect(() =>
-        manager.accessForAgent({
-          branchWorkspaceId: feature.id,
-          allowSharedResourceWrites: true,
+      await expect(
+        manager.createSharedResource({
+          name: "project-shared-root",
+          mountPath: "shared-root",
+          sourcePath: path.join(projectRoot, "shared"),
         }),
-      ).toThrow("too broad for Agent-level write access");
+      ).rejects.toThrow("too broad for Agent-level write access");
 
       const scratch = await manager.prepareAgentWorkspace("agent_1", {
         branchWorkspaceId: feature.id,
@@ -1288,6 +1686,320 @@ describe("WorkspaceManager", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it.skipIf(!DIRECTORY_JUNCTION_TEST_SUPPORTED)(
+    "rejects a shared-resource ancestor junction before creating its missing leaf",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-resource-junction-"));
+      const source = path.join(root, "source");
+      const projectRoot = path.join(root, "project");
+      const alias = path.join(root, "shared-alias");
+      await mkdir(source);
+      try {
+        const manager = new WorkspaceManager({
+          defaultSourcePath: source,
+          projectRoot,
+          runGit: createFakeWorkspaceGit("https://github.com/acme/junction-resource.git"),
+        });
+        await manager.connect({ localPath: source });
+        const protectedRoot = path.join(projectRoot, "shared", "repo_1");
+        const protectedLeaf = path.join(protectedRoot, "junction-leaf");
+        await mkdir(protectedRoot, { recursive: true });
+        await symlink(protectedRoot, alias, "junction");
+
+        await expect(
+          manager.createSharedResource({
+            name: "junction-leaf",
+            mountPath: "resources/junction-leaf",
+            sourcePath: path.join(alias, "junction-leaf"),
+          }),
+        ).rejects.toThrow(/unsafe ancestor mapping/u);
+        await expect(lstat(protectedLeaf)).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(!DIRECTORY_SYMLINK_TEST_SUPPORTED)(
+    "rejects a shared-resource ancestor directory symlink before creating its missing leaf",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-resource-dir-link-"));
+      const source = path.join(root, "source");
+      const projectRoot = path.join(root, "project");
+      const alias = path.join(root, "shared-alias");
+      await mkdir(source);
+      try {
+        const manager = new WorkspaceManager({
+          defaultSourcePath: source,
+          projectRoot,
+          runGit: createFakeWorkspaceGit("https://github.com/acme/symlink-resource.git"),
+        });
+        await manager.connect({ localPath: source });
+        const protectedRoot = path.join(projectRoot, "shared", "repo_1");
+        const protectedLeaf = path.join(protectedRoot, "symlink-leaf");
+        await mkdir(protectedRoot, { recursive: true });
+        await symlink(protectedRoot, alias, "dir");
+
+        await expect(
+          manager.createSharedResource({
+            name: "symlink-leaf",
+            mountPath: "resources/symlink-leaf",
+            sourcePath: path.join(alias, "symlink-leaf"),
+          }),
+        ).rejects.toThrow(/unsafe ancestor mapping/u);
+        await expect(lstat(protectedLeaf)).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "normalizes supported Windows namespace aliases and rejects other device namespaces",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-resource-namespace-"));
+      const source = path.join(root, "source");
+      const projectRoot = path.join(root, "project");
+      const externalSource = path.join(root, "external-source");
+      await Promise.all([mkdir(source), mkdir(externalSource)]);
+      try {
+        const manager = new WorkspaceManager({
+          defaultSourcePath: source,
+          projectRoot,
+          runGit: createFakeWorkspaceGit("https://github.com/acme/namespace-resource.git"),
+        });
+        const project = await manager.connect({ localPath: source });
+        const workspace = project.branches[0]!;
+
+        const namespacedExternal = await manager.createSharedResource({
+          name: "namespaced-external",
+          mountPath: "resources/namespaced-external",
+          sourcePath: path.toNamespacedPath(externalSource),
+        });
+        expect(namespacedExternal.sourcePath).toBe(path.resolve(externalSource));
+
+        const mutableState = (manager as unknown as {
+          state: {
+            sharedResources: Array<{
+              id: string;
+              repoId: string;
+              name: string;
+              sourcePath: string;
+              mountPath: string;
+              access: "readOnly" | "readWrite";
+            }>;
+          };
+        }).state;
+        mutableState.sharedResources.push({
+          id: "shared_other_repo_unc",
+          repoId: "repo_2",
+          name: "other-repo-unc",
+          sourcePath: "\\\\localhost\\C$\\agent-canvas-other-repo-alias",
+          mountPath: "resources/other-repo-unc",
+          access: "readOnly",
+        });
+        expect(() =>
+          manager.accessForAgent({
+            branchWorkspaceId: workspace.id,
+            allowSharedResourceWrites: true,
+          }),
+        ).toThrow(/External UNC shared resources/u);
+        mutableState.sharedResources.pop();
+
+        await expect(
+          manager.createSharedResource({
+            name: "namespaced-shared-root",
+            mountPath: "resources/namespaced-root",
+            sourcePath: path.toNamespacedPath(path.join(projectRoot, "shared")),
+          }),
+        ).rejects.toThrow(/too broad for Agent-level write access/u);
+        await expect(
+          manager.createSharedResource({
+            name: "global-root",
+            mountPath: "resources/global-root",
+            sourcePath: "\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy1",
+          }),
+        ).rejects.toThrow(/Unsupported Windows namespace/u);
+        await expect(
+          manager.createSharedResource({
+            name: "device-root",
+            mountPath: "resources/device-root",
+            sourcePath: "\\\\.\\C:\\",
+          }),
+        ).rejects.toThrow(/Unsupported Windows namespace/u);
+        await expect(
+          manager.createSharedResource({
+            name: "unc-admin-share",
+            mountPath: "resources/unc-admin-share",
+            sourcePath: "\\\\localhost\\C$\\agent-canvas-protected-alias",
+            access: "readWrite",
+          }),
+        ).rejects.toThrow(/External UNC shared resources/u);
+
+        const projectDrive = path.parse(projectRoot).root.slice(0, 1).toUpperCase();
+        const otherDrive = projectDrive === "Z" ? "Y" : "Z";
+        await expect(
+          manager.createSharedResource({
+            name: "unverified-drive",
+            mountPath: "resources/unverified-drive",
+            sourcePath: `${otherDrive}:\\agent-canvas-unverified-drive`,
+            access: "readWrite",
+          }),
+        ).rejects.toThrow(/trusted project volume/u);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "keeps a mapped-drive resource read-only but rejects Agent write promotion",
+    async (context) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-resource-subst-"));
+      const source = path.join(root, "source");
+      const projectRoot = path.join(root, "project");
+      const externalRoot = path.join(root, "external-volume-alias");
+      const availableDrive = [..."ZYXWVUTSRQPONMLKJIHGFED"].find(
+        (letter) => !existsSync(`${letter}:\\`),
+      );
+      let mapped = false;
+      try {
+        if (!availableDrive) {
+          context.skip();
+          return;
+        }
+        await Promise.all([
+          mkdir(source),
+          mkdir(path.join(externalRoot, "dataset"), { recursive: true }),
+        ]);
+        try {
+          await runExecutable("subst", [`${availableDrive}:`, externalRoot]);
+          mapped = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT" || /access.*denied/iu.test(String(error))) {
+            context.skip();
+            return;
+          }
+          throw error;
+        }
+
+        const manager = new WorkspaceManager({
+          defaultSourcePath: source,
+          projectRoot,
+          runGit: createFakeWorkspaceGit("https://github.com/acme/subst-resource.git"),
+        });
+        const project = await manager.connect({ localPath: source });
+        const workspace = project.branches[0]!;
+        const mappedSource = `${availableDrive}:\\dataset`;
+        const resource = await manager.createSharedResource({
+          name: "mapped-read-only",
+          mountPath: "resources/mapped-read-only",
+          sourcePath: mappedSource,
+        });
+
+        expect(resource.access).toBe("readOnly");
+        expect(manager.accessForAgent({ branchWorkspaceId: workspace.id }).writableDirectories)
+          .toEqual([]);
+        expect(() =>
+          manager.accessForAgent({
+            branchWorkspaceId: workspace.id,
+            allowSharedResourceWrites: true,
+          }),
+        ).toThrow(/trusted project volume/u);
+      } finally {
+        if (mapped && availableDrive) {
+          await runExecutable("subst", [`${availableDrive}:`, "/D"]);
+          mapped = false;
+        }
+        if (!mapped) await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(!DIRECTORY_MAPPING_TEST_SUPPORTED)(
+    "revalidates and rejects a safe external source parent replaced by another mapping",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-resource-source-swap-"));
+      const source = path.join(root, "source");
+      const projectRoot = path.join(root, "project");
+      const sourceParent = path.join(root, "external-source");
+      const displacedParent = path.join(root, "external-source-original");
+      const replacementParent = path.join(root, "external-source-replacement");
+      await Promise.all([mkdir(source), mkdir(sourceParent)]);
+      try {
+        const manager = new WorkspaceManager({
+          defaultSourcePath: source,
+          projectRoot,
+          runGit: createFakeWorkspaceGit("https://github.com/acme/source-swap-resource.git"),
+        });
+        const project = await manager.connect({ localPath: source });
+        const workspace = project.branches[0]!;
+        await manager.createSharedResource({
+          name: "external-dataset",
+          mountPath: "resources/external-dataset",
+          sourcePath: path.join(sourceParent, "dataset"),
+        });
+
+        await rename(sourceParent, displacedParent);
+        await mkdir(path.join(replacementParent, "dataset"), { recursive: true });
+        await symlink(
+          replacementParent,
+          sourceParent,
+          process.platform === "win32" ? "junction" : "dir",
+        );
+
+        expect(() =>
+          manager.accessForAgent({
+            branchWorkspaceId: workspace.id,
+            allowSharedResourceWrites: true,
+          }),
+        ).toThrow(/unsafe ancestor mapping/u);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(!DIRECTORY_MAPPING_TEST_SUPPORTED)(
+    "revalidates a shared-resource mount before granting Agent write access",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-resource-mount-swap-"));
+      const source = path.join(root, "source");
+      const projectRoot = path.join(root, "project");
+      const replacement = path.join(root, "replacement");
+      await Promise.all([mkdir(source), mkdir(replacement)]);
+      try {
+        const manager = new WorkspaceManager({
+          defaultSourcePath: source,
+          projectRoot,
+          runGit: createFakeWorkspaceGit("https://github.com/acme/mount-swap-resource.git"),
+        });
+        const project = await manager.connect({ localPath: source });
+        const workspace = project.branches[0]!;
+        await manager.createSharedResource({
+          name: "dataset",
+          mountPath: "resources/dataset",
+        });
+        const mountPath = path.join(workspace.worktreePath, "resources", "dataset");
+        await rm(mountPath, { recursive: true, force: true });
+        await symlink(
+          replacement,
+          mountPath,
+          process.platform === "win32" ? "junction" : "dir",
+        );
+
+        expect(() =>
+          manager.accessForAgent({
+            branchWorkspaceId: workspace.id,
+            allowSharedResourceWrites: true,
+          }),
+        ).toThrow(/mount points to a different directory/u);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("removes a staged clone when git reports failure after creating it", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-connect-clone-failure-"));
@@ -4021,11 +4733,39 @@ function testFilesystemSupportsFileSymlinks(): boolean {
   }
 }
 
+function testFilesystemSupportsDirectoryLink(type: "dir" | "junction"): boolean {
+  const root = mkdtempSync(path.join(os.tmpdir(), "agent-canvas-directory-link-probe-"));
+  try {
+    const target = path.join(root, "target");
+    mkdirSync(target);
+    symlinkSync(target, path.join(root, "probe-link"), type);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 async function runGit(args: string[], cwd: string): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile("git", args, { cwd, windowsHide: true }, (error, stdout, stderr) => {
       if (error) {
         reject(new Error((stderr || error.message).trim()));
+        return;
+      }
+      resolve(stdout.trim());
+    });
+  });
+}
+
+async function runExecutable(command: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { windowsHide: true }, (error, stdout, stderr) => {
+      if (error) {
+        const commandError = new Error((stderr || error.message).trim()) as NodeJS.ErrnoException;
+        commandError.code = (error as NodeJS.ErrnoException).code;
+        reject(commandError);
         return;
       }
       resolve(stdout.trim());

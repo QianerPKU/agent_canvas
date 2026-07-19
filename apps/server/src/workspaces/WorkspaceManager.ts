@@ -1,6 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { constants, type Dirent, type Stats } from "node:fs";
+import {
+  constants,
+  lstatSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  type Dirent,
+  type Stats,
+} from "node:fs";
 import {
   lstat,
   link,
@@ -50,6 +58,7 @@ import {
   type ManagedFileSnapshot,
   type ManagedTrustedRootBoundary,
   assertManagedTrustedRootBoundary,
+  assertManagedTrustedRootBoundarySync,
   captureManagedTrustedRootBoundary,
   readManagedFile,
   readManagedFileSnapshot,
@@ -985,7 +994,7 @@ export class WorkspaceManager {
     const mountPath = normalizeRelativePath(input.mountPath);
     const nextResourceCounter = this.resourceCounter + 1;
     const id = `shared_${nextResourceCounter}`;
-    const sourcePath = path.resolve(
+    const sourcePath = resolveSharedResourceSourcePath(
       input.sourcePath?.trim() || path.join(projectRoot, "shared", repo.id, safePathPart(name)),
     );
     const resource: SharedResourceMount = {
@@ -1019,6 +1028,7 @@ export class WorkspaceManager {
     try {
       await this.createSharedResourceSource(resource, journal.createdDirectories);
       await this.assertSharedResourceSource(resource);
+      this.assertSharedResourceCanonicalScope(resource);
       for (const plan of branches) {
         await this.assertSharedResourceSource(resource);
         await ensureDirectoryWithinRoot(projectRoot, plan.workspace.worktreePath, {
@@ -1111,6 +1121,8 @@ export class WorkspaceManager {
         }
         await assertManagedMountOwnership(plan.ownership);
         await assertExistingLinkPointsTo(resource.sourcePath, plan.mountPath);
+        const canonicalSourcePath = this.assertSharedResourceCanonicalScope(resource);
+        assertSharedResourceMountSync(plan.workspace, resource, canonicalSourcePath);
         const currentExcludePath = await gitPath(
           this.runGit,
           plan.workspace.worktreePath,
@@ -1160,6 +1172,8 @@ export class WorkspaceManager {
     resource: SharedResourceMount,
   ): Promise<{ branches: SharedResourceBranchPlan[]; ignores: SharedResourceIgnorePlan[] }> {
     const projectRoot = this.requireProjectRoot();
+    this.assertSharedResourceLexicalScope(resource);
+    this.assertSharedResourceCanonicalScope(resource, { allowMissing: true });
     if (isPathWithin(resource.sourcePath, projectRoot)) {
       await ensureDirectoryWithinRoot(projectRoot, resource.sourcePath, {
         allowRootMapping: true,
@@ -1560,19 +1574,22 @@ export class WorkspaceManager {
       (resource) => resource.repoId === workspace.repoId,
     );
     const allowSharedResourceWrites = config?.allowSharedResourceWrites === true;
-    const agentAuthorizedResources = allowSharedResourceWrites
-      ? resources.filter((resource) => resource.access === "readOnly")
-      : [];
-    for (const resource of agentAuthorizedResources) {
-      this.assertAgentSharedWriteScope(resource, workspace);
+    const writableSourcePaths = new Map<string, string>();
+    for (const resource of resources) {
+      if (resource.access === "readWrite" || allowSharedResourceWrites) {
+        writableSourcePaths.set(
+          resource.id,
+          this.assertAgentSharedWriteScope(resource, workspace),
+        );
+      }
     }
-    const agentAuthorizedSharedDirectories = agentAuthorizedResources.map(
-      (resource) => resource.sourcePath,
-    );
+    const agentAuthorizedSharedDirectories = resources
+      .filter((resource) => allowSharedResourceWrites && resource.access === "readOnly")
+      .map((resource) => writableSourcePaths.get(resource.id)!);
     const sharedResources: AgentSharedResourceReference[] = resources.map((resource) => ({
       name: resource.name,
       mountPath: path.join(workspace.worktreePath, resource.mountPath),
-      sourcePath: resource.sourcePath,
+      sourcePath: writableSourcePaths.get(resource.id) ?? resource.sourcePath,
       access: allowSharedResourceWrites ? "readWrite" : resource.access,
     }));
     const documentationContext = options.workDocumentationEnabled
@@ -1629,39 +1646,199 @@ export class WorkspaceManager {
       writableDirectories: [
         ...resources
           .filter((resource) => resource.access === "readWrite")
-          .map((resource) => resource.sourcePath),
+          .map((resource) => writableSourcePaths.get(resource.id)!),
       ],
       sharedResources,
     };
   }
 
-  private assertAgentSharedWriteScope(
-    resource: SharedResourceMount,
-    workspace: BranchWorkspace,
-  ): void {
-    const projectRoot = this.requireProjectRoot();
-    const sourcePath = path.resolve(resource.sourcePath);
-    const repoSharedRoot = path.join(projectRoot, "shared", workspace.repoId);
-    const sourceIsInsideProject = isPathWithin(sourcePath, projectRoot);
+  private assertSharedResourceLexicalScope(resource: SharedResourceMount): void {
+    const projectRoot = resolveSharedResourceSourcePath(this.requireProjectRoot());
+    const sourcePath = resolveSharedResourceSourcePath(resource.sourcePath);
+    const repoSharedRoot = path.join(projectRoot, "shared", resource.repoId);
     if (
-      (sourceIsInsideProject && !isPathWithin(sourcePath, repoSharedRoot)) ||
+      (isPathWithin(sourcePath, projectRoot) &&
+        !isPathStrictlyWithin(sourcePath, repoSharedRoot)) ||
       isPathWithin(projectRoot, sourcePath)
     ) {
       throw new Error(
         `Shared resource is too broad for Agent-level write access: ${resource.sourcePath}`,
       );
     }
-    const overlappingOtherRepoResource = this.state.sharedResources.find(
-      (candidate) =>
-        candidate.repoId !== workspace.repoId &&
-        (isPathWithin(candidate.sourcePath, sourcePath) ||
-          isPathWithin(sourcePath, candidate.sourcePath)),
+  }
+
+  private assertSharedResourceCanonicalScope(
+    resource: SharedResourceMount,
+    options: { allowMissing?: boolean; requireWritableIdentity?: boolean } = {},
+  ): string {
+    this.assertSharedResourceLexicalScope(resource);
+    const projectRoot = resolveSharedResourceSourcePath(this.requireProjectRoot());
+    const projectBoundary = this.currentProjectRootBoundary();
+    assertManagedTrustedRootBoundarySync(projectBoundary, "Canvas project root");
+    const realProjectRoot = path.resolve(projectBoundary.realPath);
+    const repoSharedRoot = path.join(projectRoot, "shared", resource.repoId);
+    const realRepoSharedRoot = path.join(
+      realProjectRoot,
+      path.relative(projectRoot, repoSharedRoot),
     );
+    const sourceLogicalPath = resolveSharedResourceSourcePath(resource.sourcePath);
+    const sourceIsInsideLogicalProject = isPathWithin(sourceLogicalPath, projectRoot);
+    const requiresVerifiedWritableIdentity =
+      resource.access === "readWrite" || options.requireWritableIdentity === true;
+    if (
+      requiresVerifiedWritableIdentity &&
+      process.platform === "win32" &&
+      !sourceIsInsideLogicalProject
+    ) {
+      assertExternalWindowsSharedResourceRoot(sourceLogicalPath, projectRoot, realProjectRoot);
+    }
+    const source = inspectSharedResourceDirectorySync(resource.sourcePath, options);
+    if (requiresVerifiedWritableIdentity && process.platform === "linux") {
+      assertLinuxSharedResourceMountTree(source.realPath, realProjectRoot);
+    }
+    const projectRootInspection = inspectSharedResourceDirectorySync(projectRoot, {
+      allowFinalMapping: true,
+    });
+
+    if (requiresVerifiedWritableIdentity && !sourceIsInsideLogicalProject) {
+      const deepestSourceAncestor = source.ancestors.at(-1);
+      if (
+        !deepestSourceAncestor ||
+        !isComparableFileIdentity(deepestSourceAncestor.identity) ||
+        !isComparableFileIdentity(projectBoundary.realIdentity)
+      ) {
+        throw new Error(
+          `Shared resource filesystem identity cannot be verified safely: ${resource.sourcePath}`,
+        );
+      }
+      if (
+        process.platform === "win32" &&
+        (source.ancestors.some((ancestor) => isWindowsUncPath(ancestor.realPath)) ||
+          deepestSourceAncestor.identity.dev !== projectBoundary.realIdentity.dev)
+      ) {
+        throw new Error(
+          `External Windows shared resource must use the trusted project volume: ${resource.sourcePath}`,
+        );
+      }
+    }
+
+    if (
+      (isPathWithin(source.realPath, realProjectRoot) &&
+        !isPathStrictlyWithin(source.realPath, realRepoSharedRoot)) ||
+      isPathWithin(realProjectRoot, source.realPath)
+    ) {
+      throw new Error(
+        `Shared resource is too broad for Agent-level write access: ${resource.sourcePath}`,
+      );
+    }
+
+    assertSharedResourceMappingsMatchProjectBoundary(
+      source,
+      projectRootInspection,
+      sourceIsInsideLogicalProject,
+    );
+
+    const protectedAncestors = uniqueSharedResourceAncestors([
+      ...projectRootInspection.ancestors,
+      ...inspectSharedResourceDirectorySync(path.join(projectRoot, "shared"), {
+        allowMissing: true,
+        allowFinalMapping: true,
+      }).ancestors,
+      ...inspectSharedResourceDirectorySync(repoSharedRoot, {
+        allowMissing: true,
+        allowFinalMapping: true,
+      }).ancestors,
+      ...inspectSharedResourceDirectorySync(realProjectRoot, {
+        allowFinalMapping: true,
+      }).ancestors,
+      ...inspectSharedResourceDirectorySync(path.join(realProjectRoot, "shared"), {
+        allowMissing: true,
+        allowFinalMapping: true,
+      }).ancestors,
+      ...inspectSharedResourceDirectorySync(realRepoSharedRoot, {
+        allowMissing: true,
+        allowFinalMapping: true,
+      }).ancestors,
+    ]);
+    for (const sourceAncestor of source.ancestors) {
+      const protectedAlias = protectedAncestors.find(
+        (protectedAncestor) =>
+          sameSharedResourceIdentity(sourceAncestor.identity, protectedAncestor.identity) &&
+          !sameFileSystemPath(sourceAncestor.logicalPath, protectedAncestor.logicalPath) &&
+          !(
+            sourceIsInsideLogicalProject &&
+            isTrustedSharedResourceBoundaryAlias(
+              sourceAncestor,
+              protectedAncestor,
+              source.mappings,
+            )
+          ),
+      );
+      if (protectedAlias) {
+        throw new Error(
+          `Shared resource path aliases a protected project directory: ${sourceAncestor.logicalPath}`,
+        );
+      }
+    }
+
+    const overlappingOtherRepoResource = this.state.sharedResources.find((candidate) => {
+      if (candidate.repoId === resource.repoId) return false;
+      const candidateLogicalPath = resolveSharedResourceSourcePath(candidate.sourcePath);
+      if (
+        requiresVerifiedWritableIdentity &&
+        !isPathWithin(candidateLogicalPath, projectRoot)
+      ) {
+        if (process.platform === "win32") {
+          assertExternalWindowsSharedResourceRoot(
+            candidateLogicalPath,
+            projectRoot,
+            realProjectRoot,
+          );
+        }
+      }
+      const candidateSource = inspectSharedResourceDirectorySync(candidate.sourcePath);
+      if (requiresVerifiedWritableIdentity) {
+        assertSharedResourceMappingsMatchProjectBoundary(
+          candidateSource,
+          projectRootInspection,
+          isPathWithin(candidateLogicalPath, projectRoot),
+        );
+        if (process.platform === "linux") {
+          assertLinuxSharedResourceMountTree(candidateSource.realPath, realProjectRoot);
+        }
+        assertSharedResourceOverlapCandidateComparable(
+          candidate,
+          candidateSource,
+          projectRoot,
+          projectBoundary.realIdentity,
+        );
+      }
+      return (
+        isPathWithin(candidateSource.realPath, source.realPath) ||
+        isPathWithin(source.realPath, candidateSource.realPath) ||
+        sharedResourceInspectionsOverlapByIdentity(source, candidateSource)
+      );
+    });
     if (overlappingOtherRepoResource) {
       throw new Error(
         `Shared resource contains another repo resource and cannot be Agent-writable: ${resource.sourcePath}`,
       );
     }
+    return source.realPath;
+  }
+
+  private assertAgentSharedWriteScope(
+    resource: SharedResourceMount,
+    workspace: BranchWorkspace,
+  ): string {
+    if (resource.repoId !== workspace.repoId) {
+      throw new Error(`Shared resource does not belong to Agent workspace: ${resource.sourcePath}`);
+    }
+    const sourcePath = this.assertSharedResourceCanonicalScope(resource, {
+      requireWritableIdentity: true,
+    });
+    assertSharedResourceMountSync(workspace, resource, sourcePath);
+    return sourcePath;
   }
 
   resolveAgentSettings<T extends { branchWorkspaceId?: string; cwd?: string; branch?: string }>(
@@ -3358,6 +3535,411 @@ function sameFileSystemPath(left: string, right: string): boolean {
     : normalizedLeft === normalizedRight;
 }
 
+interface SharedResourceDirectoryInspection {
+  logicalPath: string;
+  realPath: string;
+  mappings: Array<{ logicalPath: string; realPath: string }>;
+  ancestors: SharedResourceDirectoryAncestor[];
+  finalIdentity?: SharedResourceFileIdentity;
+}
+
+interface SharedResourceFileIdentity {
+  dev: number;
+  ino: number;
+}
+
+interface SharedResourceDirectoryAncestor {
+  logicalPath: string;
+  realPath: string;
+  identity: SharedResourceFileIdentity;
+}
+
+function resolveSharedResourceSourcePath(sourcePath: string): string {
+  if (process.platform !== "win32") return path.resolve(sourcePath);
+
+  const windowsPath = sourcePath.replaceAll("/", "\\");
+  const extendedPrefix = "\\\\?\\";
+  if (windowsPath.startsWith(extendedPrefix)) {
+    const namespacedPath = windowsPath.slice(extendedPrefix.length);
+    if (/^[a-z]:\\/iu.test(namespacedPath)) return path.resolve(namespacedPath);
+    if (namespacedPath.toUpperCase().startsWith("UNC\\")) {
+      const uncPath = namespacedPath.slice(4);
+      const [server, share] = uncPath.split("\\");
+      if (server && share) return path.resolve(`\\\\${uncPath}`);
+    }
+    throw new Error(`Unsupported Windows namespace for shared resource: ${sourcePath}`);
+  }
+
+  if (
+    windowsPath.startsWith("\\\\.\\") ||
+    windowsPath.startsWith("\\??\\") ||
+    windowsPath.startsWith("\\\\??\\")
+  ) {
+    throw new Error(`Unsupported Windows namespace for shared resource: ${sourcePath}`);
+  }
+  return path.resolve(sourcePath);
+}
+
+function canonicalDirectoryPathSync(directoryPath: string, label: string): string {
+  const resolved = resolveSharedResourceSourcePath(directoryPath);
+  let stat: Stats;
+  let canonical: string;
+  try {
+    stat = statSync(resolved);
+    canonical = realpathSync.native(resolved);
+  } catch (error) {
+    throw new Error(`${label} cannot be resolved safely: ${resolved}`, { cause: error });
+  }
+  if (!stat.isDirectory()) throw new Error(`${label} must be a directory: ${resolved}`);
+  return path.resolve(canonical);
+}
+
+function inspectSharedResourceDirectorySync(
+  sourcePath: string,
+  options: { allowMissing?: boolean; allowFinalMapping?: boolean } = {},
+): SharedResourceDirectoryInspection {
+  const logicalPath = resolveSharedResourceSourcePath(sourcePath);
+  const root = path.parse(logicalPath).root;
+  const segments = path.relative(root, logicalPath).split(path.sep).filter(Boolean);
+  const candidates = [
+    root,
+    ...segments.map((_, index) => path.join(root, ...segments.slice(0, index + 1))),
+  ];
+  const mappings: SharedResourceDirectoryInspection["mappings"] = [];
+  const ancestors: SharedResourceDirectoryAncestor[] = [];
+  let deepestExistingLogicalPath: string | undefined;
+  let deepestExistingRealPath: string | undefined;
+  let finalEntryStat: Stats | undefined;
+  let finalTargetStat: Stats | undefined;
+
+  for (const candidate of candidates) {
+    let entryStat: Stats;
+    let targetStat: Stats;
+    let realCandidate: string;
+    try {
+      entryStat = lstatSync(candidate);
+      targetStat = statSync(candidate);
+      realCandidate = path.resolve(realpathSync.native(candidate));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" && options.allowMissing) break;
+      throw new Error(`Shared resource path cannot be resolved safely: ${candidate}`, {
+        cause: error,
+      });
+    }
+    if (!targetStat.isDirectory()) {
+      throw new Error(`Shared resource path contains a non-directory: ${candidate}`);
+    }
+    if (entryStat.isSymbolicLink()) {
+      mappings.push({ logicalPath: candidate, realPath: realCandidate });
+    }
+    ancestors.push({
+      logicalPath: candidate,
+      realPath: realCandidate,
+      identity: { dev: targetStat.dev, ino: targetStat.ino },
+    });
+    deepestExistingLogicalPath = candidate;
+    deepestExistingRealPath = realCandidate;
+    if (sameFileSystemPath(candidate, logicalPath)) {
+      finalEntryStat = entryStat;
+      finalTargetStat = targetStat;
+    }
+  }
+
+  if (!deepestExistingLogicalPath || !deepestExistingRealPath) {
+    throw new Error(`Shared resource path has no resolvable ancestor: ${logicalPath}`);
+  }
+  if (finalEntryStat) {
+    const allowedFinalMapping =
+      finalEntryStat.isSymbolicLink() && options.allowFinalMapping === true;
+    if (
+      (!finalEntryStat.isDirectory() && !allowedFinalMapping) ||
+      (finalEntryStat.isSymbolicLink() && !allowedFinalMapping)
+    ) {
+      throw new Error(`Shared resource source must be an ordinary directory: ${logicalPath}`);
+    }
+  }
+  if (!finalEntryStat && !options.allowMissing) {
+    throw new Error(`Shared resource source does not exist: ${logicalPath}`);
+  }
+  const realPath = finalEntryStat
+    ? path.resolve(realpathSync.native(logicalPath))
+    : path.resolve(
+        deepestExistingRealPath,
+        path.relative(deepestExistingLogicalPath, logicalPath),
+      );
+  return {
+    logicalPath,
+    realPath,
+    mappings,
+    ancestors,
+    finalIdentity: finalTargetStat
+      ? { dev: finalTargetStat.dev, ino: finalTargetStat.ino }
+      : undefined,
+  };
+}
+
+function assertExternalWindowsSharedResourceRoot(
+  sourcePath: string,
+  projectRoot: string,
+  realProjectRoot: string,
+): void {
+  // Node does not expose enough Win32 volume metadata to prove that a UNC/admin share or a
+  // different drive letter is not another spelling of the protected project tree. Writable
+  // external roots therefore fail closed unless they stay on the trusted project volume.
+  if (isWindowsUncPath(sourcePath)) {
+    throw new Error(`External UNC shared resources cannot be Agent-writable: ${sourcePath}`);
+  }
+  const sourceRoot = path.parse(sourcePath).root;
+  const trustedRoots = [path.parse(projectRoot).root, path.parse(realProjectRoot).root];
+  if (!trustedRoots.some((trustedRoot) => sameFileSystemPath(sourceRoot, trustedRoot))) {
+    throw new Error(
+      `External Windows shared resource must use the trusted project volume: ${sourcePath}`,
+    );
+  }
+}
+
+function assertLinuxSharedResourceMountTree(
+  sourcePath: string,
+  realProjectRoot: string,
+): void {
+  const mountEntries = linuxMountEntries();
+  const resolvedSourcePath = path.resolve(sourcePath);
+  const sourceMount = linuxMountEntryForPath(resolvedSourcePath, mountEntries);
+  const projectMount = linuxMountEntryForPath(realProjectRoot, mountEntries);
+  if (sourceMount.mountId !== projectMount.mountId) {
+    throw new Error(
+      `Linux shared resource must use the trusted project mount: ${sourcePath}`,
+    );
+  }
+  const nestedMount = mountEntries.find((entry) =>
+    isPathStrictlyWithin(entry.mountPoint, resolvedSourcePath),
+  );
+  if (nestedMount) {
+    throw new Error(
+      `Linux shared resource contains a nested mount and cannot be Agent-writable: ${nestedMount.mountPoint}`,
+    );
+  }
+}
+
+interface LinuxMountEntry {
+  mountId: string;
+  mountPoint: string;
+}
+
+function linuxMountEntries(): LinuxMountEntry[] {
+  let mountInfo: string;
+  try {
+    mountInfo = readFileSync("/proc/self/mountinfo", "utf-8");
+  } catch (error) {
+    throw new Error("Linux mount identity cannot be verified safely", {
+      cause: error,
+    });
+  }
+  const mountEntries: LinuxMountEntry[] = [];
+  for (const line of mountInfo.split("\n")) {
+    if (!line) continue;
+    const fields = line.split(" ");
+    const mountId = fields[0];
+    const encodedMountPoint = fields[4];
+    if (!mountId || !/^\d+$/u.test(mountId) || !encodedMountPoint) continue;
+    mountEntries.push({
+      mountId,
+      mountPoint: path.resolve(decodeLinuxMountInfoPath(encodedMountPoint)),
+    });
+  }
+  if (mountEntries.length === 0) {
+    throw new Error("Linux mount identity cannot be verified safely");
+  }
+  return mountEntries;
+}
+
+function linuxMountEntryForPath(
+  candidatePath: string,
+  mountEntries: LinuxMountEntry[],
+): LinuxMountEntry {
+  const resolvedCandidate = path.resolve(candidatePath);
+  let bestMount: LinuxMountEntry | undefined;
+  for (const mountEntry of mountEntries) {
+    if (
+      isPathWithin(resolvedCandidate, mountEntry.mountPoint) &&
+      (!bestMount || mountEntry.mountPoint.length >= bestMount.mountPoint.length)
+    ) {
+      bestMount = mountEntry;
+    }
+  }
+  if (!bestMount) {
+    throw new Error(`Linux mount identity cannot be verified safely: ${candidatePath}`);
+  }
+  return bestMount;
+}
+
+function decodeLinuxMountInfoPath(value: string): string {
+  return value.replace(/\\([0-7]{3})/gu, (_match, octal: string) =>
+    String.fromCharCode(Number.parseInt(octal, 8)),
+  );
+}
+
+function isWindowsUncPath(candidatePath: string): boolean {
+  if (process.platform !== "win32") return false;
+  const windowsPath = candidatePath.replaceAll("/", "\\");
+  const upperPath = windowsPath.toUpperCase();
+  return upperPath.startsWith("\\\\?\\UNC\\") ||
+    (!upperPath.startsWith("\\\\?\\") && upperPath.startsWith("\\\\"));
+}
+
+function isComparableFileIdentity(identity: SharedResourceFileIdentity): boolean {
+  return Number.isFinite(identity.dev) && Number.isFinite(identity.ino) && identity.ino !== 0;
+}
+
+function assertSharedResourceOverlapCandidateComparable(
+  resource: SharedResourceMount,
+  source: SharedResourceDirectoryInspection,
+  projectRoot: string,
+  projectIdentity: SharedResourceFileIdentity,
+): void {
+  if (isPathWithin(source.logicalPath, projectRoot)) return;
+  const deepestAncestor = source.ancestors.at(-1);
+  if (
+    !deepestAncestor ||
+    !isComparableFileIdentity(deepestAncestor.identity) ||
+    !isComparableFileIdentity(projectIdentity)
+  ) {
+    throw new Error(
+      `Other repo shared resource identity cannot be compared safely: ${resource.sourcePath}`,
+    );
+  }
+  if (process.platform === "win32") {
+    if (
+      source.ancestors.some((ancestor) => isWindowsUncPath(ancestor.realPath)) ||
+      deepestAncestor.identity.dev !== projectIdentity.dev
+    ) {
+      throw new Error(
+        `Other repo Windows shared resource identity cannot be compared safely: ${resource.sourcePath}`,
+      );
+    }
+  }
+}
+
+function sameSharedResourceIdentity(
+  left: SharedResourceFileIdentity,
+  right: SharedResourceFileIdentity,
+): boolean {
+  return (
+    isComparableFileIdentity(left) &&
+    isComparableFileIdentity(right) &&
+    left.dev === right.dev &&
+    left.ino === right.ino
+  );
+}
+
+function uniqueSharedResourceAncestors(
+  ancestors: SharedResourceDirectoryAncestor[],
+): SharedResourceDirectoryAncestor[] {
+  const unique = new Map<string, SharedResourceDirectoryAncestor>();
+  for (const ancestor of ancestors) {
+    const key = process.platform === "win32"
+      ? ancestor.logicalPath.toLowerCase()
+      : ancestor.logicalPath;
+    unique.set(key, ancestor);
+  }
+  return [...unique.values()];
+}
+
+function isTrustedSharedResourceBoundaryAlias(
+  sourceAncestor: SharedResourceDirectoryAncestor,
+  protectedAncestor: SharedResourceDirectoryAncestor,
+  trustedMappings: SharedResourceDirectoryInspection["mappings"],
+): boolean {
+  return trustedMappings.some((mapping) => {
+    if (!isPathWithin(sourceAncestor.logicalPath, mapping.logicalPath)) return false;
+    const relativePath = path.relative(mapping.logicalPath, sourceAncestor.logicalPath);
+    const expectedRealPath = path.resolve(mapping.realPath, relativePath);
+    return (
+      sameFileSystemPath(expectedRealPath, protectedAncestor.logicalPath) ||
+      sameFileSystemPath(expectedRealPath, protectedAncestor.realPath)
+    );
+  });
+}
+
+function assertSharedResourceMappingsMatchProjectBoundary(
+  source: SharedResourceDirectoryInspection,
+  projectRoot: SharedResourceDirectoryInspection,
+  sourceIsInsideLogicalProject: boolean,
+): void {
+  for (const mapping of source.mappings) {
+    const mappingMatchesProjectBoundary =
+      sourceIsInsideLogicalProject &&
+      projectRoot.mappings.some(
+        (projectMapping) =>
+          sameFileSystemPath(mapping.logicalPath, projectMapping.logicalPath) &&
+          sameFileSystemPath(mapping.realPath, projectMapping.realPath),
+      );
+    if (!mappingMatchesProjectBoundary) {
+      throw new Error(
+        `Shared resource path contains an unsafe ancestor mapping: ${mapping.logicalPath}`,
+      );
+    }
+  }
+}
+
+function sharedResourceInspectionsOverlapByIdentity(
+  left: SharedResourceDirectoryInspection,
+  right: SharedResourceDirectoryInspection,
+): boolean {
+  return (
+    (left.finalIdentity !== undefined &&
+      right.ancestors.some((ancestor) =>
+        sameSharedResourceIdentity(left.finalIdentity!, ancestor.identity),
+      )) ||
+    (right.finalIdentity !== undefined &&
+      left.ancestors.some((ancestor) =>
+        sameSharedResourceIdentity(right.finalIdentity!, ancestor.identity),
+      ))
+  );
+}
+
+function assertSharedResourceMountSync(
+  workspace: BranchWorkspace,
+  resource: SharedResourceMount,
+  expectedSourcePath: string,
+): void {
+  const workspaceRoot = path.resolve(workspace.worktreePath);
+  const mountPath = path.resolve(workspaceRoot, resource.mountPath);
+  if (!isPathStrictlyWithin(mountPath, workspaceRoot)) {
+    throw new Error(`Shared resource mount escapes Agent workspace: ${mountPath}`);
+  }
+
+  const mountParent = path.dirname(mountPath);
+  const relativeParent = path.relative(workspaceRoot, mountParent);
+  const parentSegments = relativeParent.split(path.sep).filter(Boolean);
+  const parentCandidates = [
+    workspaceRoot,
+    ...parentSegments.map((_, index) =>
+      path.join(workspaceRoot, ...parentSegments.slice(0, index + 1)),
+    ),
+  ];
+  const realWorkspaceRoot = canonicalDirectoryPathSync(workspaceRoot, "Agent workspace root");
+  for (const candidate of parentCandidates) {
+    const stat = lstatSync(candidate);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error(`Shared resource mount path contains an unsafe mapping: ${candidate}`);
+    }
+    const realCandidate = realpathSync.native(candidate);
+    if (!isPathWithin(realCandidate, realWorkspaceRoot)) {
+      throw new Error(`Shared resource mount path escapes Agent workspace: ${candidate}`);
+    }
+  }
+
+  const mountStat = lstatSync(mountPath);
+  if (!mountStat.isSymbolicLink()) {
+    throw new Error(`Shared resource mount is no longer a managed mapping: ${mountPath}`);
+  }
+  const realMountPath = canonicalDirectoryPathSync(mountPath, "Shared resource mount");
+  if (!sameFileSystemPath(realMountPath, expectedSourcePath)) {
+    throw new Error(`Shared resource mount points to a different directory: ${mountPath}`);
+  }
+}
+
 function parseProjectIndex(content: string | undefined): ProjectIndex {
   if (content === undefined) return { projects: [] };
   try {
@@ -4441,6 +5023,10 @@ function isPathWithin(candidate: string, parent: string): boolean {
     relative === "" ||
     (!path.isAbsolute(relative) && !relative.startsWith(`..${path.sep}`) && relative !== "..")
   );
+}
+
+function isPathStrictlyWithin(candidate: string, parent: string): boolean {
+  return !sameFileSystemPath(candidate, parent) && isPathWithin(candidate, parent);
 }
 
 function nonEmptyString(value: unknown): string | undefined {
