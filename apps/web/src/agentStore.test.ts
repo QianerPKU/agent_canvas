@@ -542,6 +542,161 @@ describe("agentStore 轮次模型", () => {
     expect(v.cwd).toBe("E:\\repo\\feature-a");
   });
 
+  it("insertForked 为早到的 live fork 节点补元数据和锚点 usage 而不覆盖运行态", () => {
+    const liveTurns = [
+      {
+        index: 0,
+        status: "running" as const,
+        lines: [{ kind: "system" as const, text: "会话建立 · runtime-model" }],
+      },
+    ];
+    let map: AgentMap = {
+      a1: newAgentView("a1", {
+        provider: "codex",
+        model: "parent-model",
+        reasoningEffort: "high",
+        branchWorkspaceId: "branch_main",
+        branch: "main",
+        cwd: "E:\\repo\\main",
+        scratchDirectory: "E:\\repo\\main\\.agent-tmp\\a1",
+        systemPrompt: "parent policy",
+        latestUsage: { contextTokens: 8192, contextWindow: 128000 },
+        turns: [
+          {
+            index: 0,
+            status: "done",
+            lines: [],
+            anchorUuid: "u1",
+            usage: { contextTokens: 2048, contextWindow: 128000 },
+          },
+          {
+            index: 1,
+            status: "idle",
+            lines: [],
+            usage: { contextTokens: 8192, contextWindow: 128000 },
+          },
+        ],
+      }),
+      a2: newAgentView("a2", {
+        status: "running",
+        sessionId: "session-a2",
+        model: "runtime-model",
+        turns: liveTurns,
+        lastSeq: 3,
+      }),
+    };
+
+    map = insertForked(map, "a2", { parentAgentId: "a1", anchorUuid: "u1" }, {
+      model: "requested-model",
+      reasoningEffort: "medium",
+      branchWorkspaceId: "branch_feature",
+      branch: "feature/a",
+      cwd: "E:\\repo\\feature-a",
+      scratchDirectory: "E:\\repo\\feature-a\\.agent-tmp\\a2",
+    });
+
+    expect(get(map, "a2")).toMatchObject({
+      status: "running",
+      sessionId: "session-a2",
+      model: "runtime-model",
+      lastSeq: 3,
+      provider: "codex",
+      reasoningEffort: "medium",
+      branchWorkspaceId: "branch_feature",
+      branch: "feature/a",
+      cwd: "E:\\repo\\feature-a",
+      scratchDirectory: "E:\\repo\\feature-a\\.agent-tmp\\a2",
+      systemPrompt: "parent policy",
+      latestUsage: { contextTokens: 2048, contextWindow: 128000 },
+      forkOrigin: { parentAgentId: "a1", anchorUuid: "u1" },
+    });
+    expect(get(map, "a2").turns[0]).toMatchObject({
+      status: "running",
+      usage: { contextTokens: 2048, contextWindow: 128000 },
+    });
+    expect(get(map, "a2").turns[0]!.lines).toBe(liveTurns[0]!.lines);
+  });
+
+  it("insertForked 不会用父锚点覆盖早到 child 的自身 usage", () => {
+    let map: AgentMap = {
+      a1: newAgentView("a1", {
+        turns: [
+          {
+            index: 0,
+            status: "done",
+            lines: [],
+            anchorUuid: "u1",
+            usage: { contextTokens: 2048, contextWindow: 128000 },
+          },
+        ],
+      }),
+      a2: newAgentView("a2", {
+        status: "running",
+        latestUsage: { contextTokens: 3072, contextWindow: 128000 },
+        turns: [
+          {
+            index: 0,
+            status: "running",
+            lines: [],
+            usage: { contextTokens: 3072, contextWindow: 128000 },
+          },
+        ],
+        lastSeq: 4,
+      }),
+    };
+
+    map = insertForked(map, "a2", { parentAgentId: "a1", anchorUuid: "u1" });
+
+    expect(get(map, "a2")).toMatchObject({
+      status: "running",
+      latestUsage: { contextTokens: 3072, contextWindow: 128000 },
+      lastSeq: 4,
+      forkOrigin: { parentAgentId: "a1", anchorUuid: "u1" },
+    });
+    expect(get(map, "a2").turns[0]!.usage?.contextTokens).toBe(3072);
+  });
+
+  it("insertForked 不会在 child 新 session 后复活父锚点 usage", () => {
+    let map: AgentMap = {
+      a1: newAgentView("a1", {
+        turns: [
+          {
+            index: 0,
+            status: "done",
+            lines: [],
+            anchorUuid: "u1",
+            usage: { contextTokens: 2048, contextWindow: 128000 },
+          },
+        ],
+      }),
+      a2: newAgentView("a2", {
+        status: "running",
+        latestUsage: undefined,
+        turns: [
+          {
+            index: 0,
+            status: "done",
+            lines: [],
+            usage: { contextTokens: 3072, contextWindow: 128000 },
+          },
+          { index: 1, status: "running", lines: [] },
+        ],
+        lastSeq: 5,
+      }),
+    };
+
+    map = insertForked(map, "a2", { parentAgentId: "a1", anchorUuid: "u1" });
+
+    expect(get(map, "a2").latestUsage).toBeUndefined();
+    expect(get(map, "a2").turns[0]!.usage?.contextTokens).toBe(3072);
+    expect(get(map, "a2").turns[1]!.usage).toBeUndefined();
+    expect(get(map, "a2")).toMatchObject({
+      status: "running",
+      lastSeq: 5,
+      forkOrigin: { parentAgentId: "a1", anchorUuid: "u1" },
+    });
+  });
+
   it("applyHello 携带 forkOrigin", () => {
     const map = applyHello([
       {
@@ -570,7 +725,12 @@ describe("agentStore 轮次模型", () => {
         {
           id: "a1",
           status: "waiting_input",
-          config: { prompt: "", provider: "claude", systemPrompt: "private" },
+          config: {
+            prompt: "",
+            provider: "claude",
+            model: "snapshot-model",
+            systemPrompt: "private",
+          },
           createdAt: 1,
           lastEventSeq: history.at(-1)!.seq,
         },
@@ -587,6 +747,7 @@ describe("agentStore 轮次模型", () => {
     expect(get(map).turns[1]).toMatchObject({ status: "idle" });
     expect(get(map)).toMatchObject({
       status: "waiting_input",
+      model: "snapshot-model",
       systemPrompt: "private",
       lastSeq: history.at(-1)!.seq,
     });
@@ -648,7 +809,7 @@ describe("agentStore 轮次模型", () => {
       env("a1", {
         kind: "system_init",
         sessionId: "s1",
-        model: "gpt-5.5",
+        model: "old-history-model",
         cwd: "/tmp",
         tools: [],
       }),
@@ -661,7 +822,7 @@ describe("agentStore 轮次模型", () => {
       env("a1", {
         kind: "system_init",
         sessionId: "s2",
-        model: "gpt-5.5",
+        model: "runtime-model",
         cwd: "/tmp",
         tools: [],
       }),
@@ -678,7 +839,7 @@ describe("agentStore 轮次模型", () => {
           id: "a1",
           status: "waiting_input",
           sessionId: "s1",
-          config: { prompt: "", provider: "codex" },
+          config: { prompt: "", provider: "codex", model: "stale-model" },
           createdAt: 1,
           lastEventSeq: 4,
           usage: { contextTokens: 4096, contextWindow: 128000 },
@@ -690,6 +851,7 @@ describe("agentStore 轮次模型", () => {
     expect(get(map)).toMatchObject({
       status: "running",
       sessionId: "s2",
+      model: "runtime-model",
       lastInitializedSessionId: "s2",
       latestUsage: { contextTokens: 8192, contextWindow: 128000 },
       lastSeq: history.at(-1)!.seq,
@@ -697,6 +859,40 @@ describe("agentStore 轮次模型", () => {
     expect(get(map).turns.at(-1)!.usage).toEqual({
       contextTokens: 8192,
       contextWindow: 128000,
+    });
+  });
+
+  it("applyHello keeps a snapshot model when only ordinary history is newer", () => {
+    seq = 0;
+    const history = [
+      env("a1", {
+        kind: "system_init",
+        sessionId: "s1",
+        model: "old-runtime-model",
+        cwd: "/tmp",
+        tools: [],
+      }),
+      env("a1", { kind: "status", status: "running" }),
+    ];
+
+    const map = applyHello(
+      [
+        {
+          id: "a1",
+          status: "waiting_input",
+          sessionId: "s1",
+          config: { prompt: "", provider: "codex", model: "updated-model" },
+          createdAt: 1,
+          lastEventSeq: 1,
+        },
+      ],
+      { a1: history },
+    );
+
+    expect(get(map)).toMatchObject({
+      status: "running",
+      model: "updated-model",
+      lastSeq: 2,
     });
   });
 

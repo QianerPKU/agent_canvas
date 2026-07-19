@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type {
   AgentEventEnvelope,
   AgentSnapshot,
+  AgentStartConfig,
   PullRequestFlowSnapshot,
   SyncFlowSnapshot,
 } from "@agent-canvas/shared";
@@ -37,6 +38,11 @@ class FakeRunner {
   send(text: string): void {
     this.sent.push(text);
     this.status = "running";
+  }
+
+  start(text: string): void {
+    this.sent.push(text);
+    this.status = "starting";
   }
 
   async steer(text: string): Promise<void> {
@@ -91,6 +97,12 @@ class FakeHost implements PullRequestAgentHost, SyncFlowAgentHost {
 
   get(id: string): FakeRunner | undefined {
     return this.runners.get(id);
+  }
+
+  async startAgent(id: string, config: AgentStartConfig): Promise<void> {
+    const runner = this.runners.get(id);
+    if (!runner) throw new Error(`unknown agent: ${id}`);
+    runner.start(config.prompt);
   }
 
   historyOf(id: string): AgentEventEnvelope[] {

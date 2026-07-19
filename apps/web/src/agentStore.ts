@@ -126,6 +126,9 @@ export function applyHello(
     const history = histories[a.id]?.slice().sort((left, right) => left.seq - right.seq) ?? [];
     const historyMaxSeq = history.at(-1)?.seq ?? 0;
     const historyIsNewer = historyMaxSeq > a.lastEventSeq;
+    const historyHasNewerModel = history.some(
+      ({ seq, event }) => seq > a.lastEventSeq && event.kind === "system_init",
+    );
     if (
       a.usage !== undefined ||
       history.some(
@@ -189,7 +192,7 @@ export function applyHello(
       provider: a.provider ?? a.config.provider ?? map[a.id]!.provider,
       status: historyIsNewer ? replayed.status : a.status,
       sessionId: historyIsNewer ? replayed.sessionId : a.sessionId,
-      model: a.config.model,
+      model: historyHasNewerModel ? replayed.model : a.config.model,
       reasoningEffort: a.config.reasoningEffort,
       branchWorkspaceId: a.config.branchWorkspaceId,
       branch: a.config.branch,
@@ -241,25 +244,38 @@ export function insertForked(
   origin: ForkOrigin,
   options: Omit<ForkAgentInput, "anchorUuid"> = {},
 ): AgentMap {
-  if (map[id]) return map;
   const parent = map[origin.parentAgentId];
   const forkUsage = usageAtForkOrigin(map, origin);
+  const live = map[id];
+  const childHasOwnUsage =
+    live?.latestUsage !== undefined || live?.turns.some((turn) => turn.usage !== undefined);
+  const base = live
+    ? !childHasOwnUsage && forkUsage
+      ? withLastTurn(
+          { ...live, latestUsage: forkUsage },
+          (turn) => ({ ...turn, usage: forkUsage }),
+        )
+      : live
+    : newAgentView(id, { latestUsage: forkUsage });
   return {
     ...map,
-    [id]: newAgentView(id, {
-      provider: parent?.provider,
-      model: options.model ?? parent?.model,
-      reasoningEffort: options.reasoningEffort ?? parent?.reasoningEffort,
-      branchWorkspaceId: options.branchWorkspaceId ?? parent?.branchWorkspaceId,
-      branch: options.branch ?? parent?.branch,
-      cwd: options.cwd ?? parent?.cwd,
-      scratchDirectory: options.scratchDirectory ?? parent?.scratchDirectory,
-      systemPrompt: parent?.systemPrompt,
-      // A historical fork resumes at the anchor's context, not at the parent
-      // thread's latest context. Leave it unknown when the anchor is unavailable.
-      latestUsage: forkUsage,
+    [id]: {
+      ...base,
+      provider: live?.provider ?? parent?.provider,
+      // A system_init event can beat the HTTP fork response. Its runtime model/session are
+      // authoritative; requested and inherited settings only fill metadata that has not arrived.
+      model: live?.model ?? options.model ?? parent?.model,
+      reasoningEffort:
+        options.reasoningEffort ?? live?.reasoningEffort ?? parent?.reasoningEffort,
+      branchWorkspaceId:
+        options.branchWorkspaceId ?? live?.branchWorkspaceId ?? parent?.branchWorkspaceId,
+      branch: options.branch ?? live?.branch ?? parent?.branch,
+      cwd: options.cwd ?? live?.cwd ?? parent?.cwd,
+      scratchDirectory:
+        options.scratchDirectory ?? live?.scratchDirectory ?? parent?.scratchDirectory,
+      systemPrompt: live?.systemPrompt ?? parent?.systemPrompt,
       forkOrigin: origin,
-    }),
+    },
   };
 }
 
