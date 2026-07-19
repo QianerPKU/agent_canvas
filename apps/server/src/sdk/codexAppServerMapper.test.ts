@@ -240,14 +240,14 @@ describe("codex app-server mapper", () => {
                 cachedInputTokens: 4,
                 outputTokens: 3,
                 totalTokens: 17,
-                reasoningOutputTokens: 0,
+                reasoningOutputTokens: 2,
               },
               total: {
-                inputTokens: 20,
-                cachedInputTokens: 8,
-                outputTokens: 6,
-                totalTokens: 34,
-                reasoningOutputTokens: 1,
+                inputTokens: 200000,
+                cachedInputTokens: 80000,
+                outputTokens: 6000,
+                totalTokens: 206000,
+                reasoningOutputTokens: 1000,
               },
               modelContextWindow: 128000,
             },
@@ -255,7 +255,21 @@ describe("codex app-server mapper", () => {
         },
         state,
       ),
-    ).toEqual([]);
+    ).toEqual([
+      {
+        type: "usage",
+        session_id: "thr_1",
+        usage: {
+          input_tokens: 10,
+          output_tokens: 3,
+          total_tokens: 17,
+          reasoning_output_tokens: 2,
+          cache_read_input_tokens: 4,
+          context_window: 128000,
+          context_tokens: 17,
+        },
+      },
+    ]);
 
     expect(
       mapCodexNotification(
@@ -278,10 +292,10 @@ describe("codex app-server mapper", () => {
           input_tokens: 10,
           output_tokens: 3,
           total_tokens: 17,
-          reasoning_output_tokens: 0,
+          reasoning_output_tokens: 2,
           cache_read_input_tokens: 4,
           context_window: 128000,
-          context_tokens: 34,
+          context_tokens: 17,
         },
         duration_ms: 123,
         num_turns: 1,

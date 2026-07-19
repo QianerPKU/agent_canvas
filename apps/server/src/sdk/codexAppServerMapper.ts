@@ -46,8 +46,17 @@ export function mapCodexNotification(
   const params = asRecord(msg?.params);
 
   if (method === "thread/tokenUsage/updated") {
-    state.usage = mapUsage(asRecord(params?.tokenUsage));
-    return [];
+    const usage = mapUsage(asRecord(params?.tokenUsage));
+    state.usage = usage;
+    return usage
+      ? [
+          {
+            type: "usage",
+            usage,
+            session_id: state.threadId ?? stringValue(params?.threadId),
+          },
+        ]
+      : [];
   }
 
   if (method === "item/agentMessage/delta") {
@@ -259,7 +268,6 @@ function toolResult(
 
 function mapUsage(tokenUsage: Record<string, unknown> | undefined): SdkUsage | undefined {
   const last = asRecord(tokenUsage?.last);
-  const total = asRecord(tokenUsage?.total);
   if (!last) return undefined;
   return {
     input_tokens: numberValue(last.inputTokens),
@@ -268,9 +276,9 @@ function mapUsage(tokenUsage: Record<string, unknown> | undefined): SdkUsage | u
     reasoning_output_tokens: numberValue(last.reasoningOutputTokens),
     cache_read_input_tokens: numberValue(last.cachedInputTokens),
     context_window: numberValue(tokenUsage?.modelContextWindow),
-    context_tokens:
-      numberValue(total?.totalTokens) ??
-      numberValue(last.totalTokens),
+    // Codex exposes thread-lifetime accounting in `total`, while `last.totalTokens`
+    // is the latest active context size used by its own context-window display.
+    context_tokens: numberValue(last.totalTokens),
   };
 }
 
