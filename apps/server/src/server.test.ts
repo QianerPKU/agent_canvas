@@ -10,6 +10,7 @@ import type {
   AgentEventEnvelope,
   AgentSnapshot,
   PullRequestFlowSnapshot,
+  SyncFlowSnapshot,
 } from "@agent-canvas/shared";
 import { AgentManager } from "./AgentManager.js";
 import { CommitManager } from "./commits/CommitManager.js";
@@ -342,6 +343,7 @@ describe("HTTP server", () => {
   let syncHost: FakeSyncHost;
   let pullRequestFlowManager: PullRequestFlowManager;
   let syncFlowManager: SyncFlowManager;
+  let flushCanvasState: () => Promise<void>;
   const openFile = vi
     .fn<(filePath: string, options?: OpenInVscodeOptions) => Promise<void>>()
     .mockResolvedValue(undefined);
@@ -410,7 +412,11 @@ describe("HTTP server", () => {
     });
     syncHost = new FakeSyncHost();
     syncFlowManager = new SyncFlowManager({ host: syncHost });
-    ({ httpServer: server, pullRequestFlowManager } = createServer(manager, fileManager, {
+    ({
+      httpServer: server,
+      pullRequestFlowManager,
+      flushCanvasState,
+    } = createServer(manager, fileManager, {
       defaultCwd: root,
       openFile,
       pickDirectory,
@@ -1455,12 +1461,13 @@ describe("HTTP server", () => {
   });
 
   it("sync flow REST supports create, direct review authorization and applied callback", async () => {
+    const flowSecret = "agent_canvas_cap_user-controlled-sync-text";
     const created = await rawRequest(port, "POST", "/api/sync-flows", {
       kind: "cherry_pick",
       proposerAgentId: "agent_sync",
       sourceBranch: "main",
       commitSha: "abcdef123456",
-      summary: "Apply shared fix",
+      summary: `Apply ${flowSecret} shared fix`,
       reason: "Feature branch needs this commit",
       files: ["src/sync.ts"],
     });
@@ -1472,10 +1479,15 @@ describe("HTTP server", () => {
       status: "queued",
       files: ["src/sync.ts"],
     });
+    expect(JSON.stringify(created.json)).not.toContain(flowSecret);
+    expect(created.json.flow.summary).toContain("[redacted]");
+    expect(syncFlowManager.get(created.json.flow.id)?.summary).not.toContain(flowSecret);
+    expect(syncFlowManager.get(created.json.flow.id)?.summary).toContain("[redacted]");
     await vi.waitFor(() => {
       expect(syncFlowManager.get(created.json.flow.id)?.status).toBe("review_collecting");
     });
     const collecting = await request(port, "GET", `/api/sync-flows/${created.json.flow.id}`);
+    expect(JSON.stringify(collecting.json)).not.toContain(flowSecret);
     expect(collecting.json.flow).toMatchObject({
       status: "review_collecting",
       reviewRequest: expect.objectContaining({
@@ -1528,6 +1540,7 @@ describe("HTTP server", () => {
       },
     );
     expect(reviewed.status).toBe(200);
+    expect(JSON.stringify(reviewed.json)).not.toContain(flowSecret);
     expect(reviewed.json.flow.status).toBe("review_collecting");
     expect(syncHost.history).toEqual([]);
     expect(syncHost.runner.getStatus()).toBe("running");
@@ -1560,16 +1573,19 @@ describe("HTTP server", () => {
       `/api/sync-flows/${created.json.flow.id}/applied`,
       {
         callbackToken,
-        summary: "Applied shared fix",
+        summary: `Applied ${flowSecret} shared fix`,
         files: ["src/sync.ts"],
       },
     );
 
     expect(applied.status).toBe(200);
+    expect(JSON.stringify(applied.json)).not.toContain(flowSecret);
     expect(applied.json.flow).toMatchObject({
       status: "applied",
-      applied: { summary: "Applied shared fix", files: ["src/sync.ts"] },
+      applied: { summary: expect.stringContaining("[redacted]"), files: ["src/sync.ts"] },
     });
+    expect(syncFlowManager.get(created.json.flow.id)?.applied?.summary).not.toContain(flowSecret);
+    expect(syncFlowManager.get(created.json.flow.id)?.applied?.summary).toContain("[redacted]");
 
     const duplicateApplied = await rawRequest(
       port,
@@ -1577,7 +1593,7 @@ describe("HTTP server", () => {
       `/api/sync-flows/${created.json.flow.id}/applied`,
       {
         callbackToken,
-        summary: "Applied shared fix",
+        summary: `Applied ${flowSecret} shared fix`,
         files: ["src/sync.ts"],
       },
     );
@@ -1585,6 +1601,7 @@ describe("HTTP server", () => {
     expect(duplicateApplied.json.flow.status).toBe("applied");
 
     const listedSyncFlows = await request(port, "GET", "/api/sync-flows");
+    expect(JSON.stringify(listedSyncFlows.json)).not.toContain(flowSecret);
     expect(
       listedSyncFlows.json.flows.some((flow: { id: string }) => flow.id === created.json.flow.id),
     ).toBe(true);
@@ -1594,9 +1611,11 @@ describe("HTTP server", () => {
   });
 
   it("PR review REST forwards a direct callback without waiting for an agent result", async () => {
+    const flowSecret = "agent_canvas_cap_user-controlled-pr-review";
     const flow = {
       id: "pr_flow_route",
       status: "create_pr_authorized",
+      summary: `Reviewed ${flowSecret}`,
     } as Awaited<ReturnType<PullRequestFlowManager["submitReview"]>>;
     const submitReview = vi
       .spyOn(pullRequestFlowManager, "submitReview")
@@ -1619,22 +1638,170 @@ describe("HTTP server", () => {
         body,
       );
 
-      expect(reviewed).toEqual({ status: 200, json: { flow } });
+      expect(reviewed.status).toBe(200);
+      expect(JSON.stringify(reviewed.json)).not.toContain(flowSecret);
+      expect(reviewed.json.flow.summary).toContain("[redacted]");
+      expect(flow.summary).toContain(flowSecret);
       expect(submitReview).toHaveBeenCalledWith("pr_flow_route", body);
 
-      submitReview.mockRejectedValueOnce(new Error("review no longer pending"));
+      submitReview.mockRejectedValueOnce(new Error(`review ${flowSecret} no longer pending`));
       const rejected = await request(
         port,
         "POST",
         "/api/pr-flows/pr_flow_route/reviews",
         body,
       );
-      expect(rejected).toEqual({
-        status: 400,
-        json: { error: "review no longer pending" },
-      });
+      expect(rejected.status).toBe(400);
+      expect(JSON.stringify(rejected.json)).not.toContain(flowSecret);
+      expect(rejected.json.error).toContain("[redacted]");
     } finally {
       submitReview.mockRestore();
+    }
+  });
+
+  it("redacts PR and sync flow state across REST and WebSocket boundaries", async () => {
+    const flowSecret = "agent_canvas_cap_public-flow-boundary";
+    const now = Date.now();
+    const prFlow: PullRequestFlowSnapshot = {
+      id: "pr_flow_public_redaction",
+      proposerAgentId: "agent_missing_pr",
+      sourceBranch: "feature/public-redaction",
+      targetBranch: "main",
+      summary: `PR ${flowSecret} summary`,
+      files: [`src/${flowSecret}.ts`],
+      fileChanges: [{ status: "M", path: `src/${flowSecret}.ts` }],
+      status: "create_pr_authorized",
+      createdAt: now,
+      updatedAt: now,
+      deadlineAt: now + 60_000,
+      reviewRequests: [
+        {
+          id: "pr_review_public_redaction",
+          stage: "source_preflight",
+          requestedAgentIds: ["agent_missing_pr"],
+          pendingAgentIds: [],
+          retryCounts: { agent_missing_pr: 0 },
+          responses: [
+            {
+              agentId: "agent_missing_pr",
+              stage: "source_preflight",
+              decision: "approve",
+              summary: `Nested ${flowSecret}`,
+              risks: [flowSecret],
+              filesReviewed: [],
+              requiredChanges: [],
+              retryCount: 0,
+              receivedAt: now,
+            },
+          ],
+          requestedAt: now,
+          deadlineAt: now + 60_000,
+        },
+      ],
+      createAuthorization: {
+        agentId: "agent_missing_pr",
+        issuedAt: now,
+        expiresAt: now + 60_000,
+      },
+    };
+    const syncFlow: SyncFlowSnapshot = {
+      id: "sync_flow_public_redaction",
+      kind: "branch_pull",
+      proposerAgentId: "agent_missing_sync",
+      targetBranch: "feature/public-redaction",
+      sourceBranch: "main",
+      strategy: "merge",
+      summary: `Sync ${flowSecret} summary`,
+      reason: `Reason ${flowSecret}`,
+      files: [`src/${flowSecret}.ts`],
+      fileChanges: [{ status: "M", path: `src/${flowSecret}.ts` }],
+      status: "apply_authorized",
+      createdAt: now,
+      updatedAt: now,
+      deadlineAt: now + 60_000,
+      reviewRequest: {
+        id: "sync_review_public_redaction",
+        requestedAgentIds: ["agent_missing_sync"],
+        pendingAgentIds: [],
+        retryCounts: { agent_missing_sync: 0 },
+        responses: [
+          {
+            agentId: "agent_missing_sync",
+            decision: "approve",
+            summary: `Nested ${flowSecret}`,
+            risks: [flowSecret],
+            filesReviewed: [],
+            requiredChanges: [],
+            retryCount: 0,
+            receivedAt: now,
+          },
+        ],
+        requestedAt: now,
+        deadlineAt: now + 60_000,
+      },
+      applyAuthorization: {
+        agentId: "agent_missing_sync",
+        issuedAt: now,
+        expiresAt: now + 60_000,
+      },
+    };
+    const originalPrFlows = pullRequestFlowManager.exportState();
+    const originalSyncFlows = syncFlowManager.exportState();
+    let socket: WebSocket | undefined;
+
+    try {
+      pullRequestFlowManager.importState([prFlow], { deferActivation: true });
+      syncFlowManager.importState([syncFlow], { deferActivation: true });
+
+      socket = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+      const helloPromise = nextWebSocketFrame(socket, "hello");
+      await once(socket, "open");
+      const hello = await helloPromise;
+
+      const responses = await Promise.all([
+        request(port, "GET", "/api/pr-flows"),
+        request(port, "GET", "/api/sync-flows"),
+        request(port, "GET", `/api/pr-flows/${prFlow.id}`),
+        request(port, "GET", `/api/sync-flows/${syncFlow.id}`),
+      ]);
+      for (const payload of [hello, ...responses.map((response) => response.json)]) {
+        expect(JSON.stringify(payload)).not.toContain(flowSecret);
+        expect(JSON.stringify(payload)).toContain("[redacted]");
+      }
+
+      const unknownResponses = await Promise.all([
+        request(port, "GET", `/api/pr-flows/${encodeURIComponent(flowSecret)}`),
+        request(port, "GET", `/api/sync-flows/${encodeURIComponent(flowSecret)}`),
+      ]);
+      for (const response of unknownResponses) {
+        expect(response.status).toBe(404);
+        expect(JSON.stringify(response.json)).not.toContain(flowSecret);
+        expect(response.json.error).toContain("[redacted]");
+      }
+
+      const prFramePromise = nextWebSocketFrame(socket, "pr_flow");
+      const prCancelled = await request(port, "POST", `/api/pr-flows/${prFlow.id}/cancel`);
+      const prFrame = await prFramePromise;
+      const syncFramePromise = nextWebSocketFrame(socket, "sync_flow");
+      const syncCancelled = await request(
+        port,
+        "POST",
+        `/api/sync-flows/${syncFlow.id}/cancel`,
+      );
+      const syncFrame = await syncFramePromise;
+
+      for (const payload of [prCancelled.json, syncCancelled.json, prFrame, syncFrame]) {
+        expect(JSON.stringify(payload)).not.toContain(flowSecret);
+        expect(JSON.stringify(payload)).toContain("[redacted]");
+      }
+      expect(JSON.stringify(pullRequestFlowManager.get(prFlow.id))).not.toContain(flowSecret);
+      expect(JSON.stringify(syncFlowManager.get(syncFlow.id))).not.toContain(flowSecret);
+      expect(JSON.stringify(prFlow)).toContain(flowSecret);
+      expect(JSON.stringify(syncFlow)).toContain(flowSecret);
+    } finally {
+      socket?.close();
+      pullRequestFlowManager.importState(originalPrFlows, { deferActivation: true });
+      syncFlowManager.importState(originalSyncFlows, { deferActivation: true });
     }
   });
 
@@ -2898,6 +3065,7 @@ describe("HTTP server", () => {
   });
 
   it("publishes the authoritative workspace and hello before activating overdue imported flows", async () => {
+    const flowSecret = "agent_canvas_cap_legacy-import";
     const target = await request(port, "POST", "/api/canvas-projects", {
       name: "overdue-flow-target",
     });
@@ -2915,9 +3083,9 @@ describe("HTTP server", () => {
         proposerAgentId: "agent_old",
         sourceBranch: "feature/old",
         targetBranch: "main",
-        summary: "Expired imported PR",
-        files: ["src/old-pr.ts"],
-        fileChanges: [{ status: "M", path: "src/old-pr.ts" }],
+        summary: `Expired imported PR ${flowSecret}`,
+        files: [`src/${flowSecret}.ts`],
+        fileChanges: [{ status: "M", path: `src/${flowSecret}.ts` }],
         status: "create_pr_authorized",
         createdAt: 1,
         updatedAt: 1,
@@ -2927,7 +3095,30 @@ describe("HTTP server", () => {
           issuedAt: 1,
           expiresAt: 1,
         },
-        reviewRequests: [],
+        reviewRequests: [
+          {
+            id: "legacy_pr_review",
+            stage: "source_preflight",
+            requestedAgentIds: ["agent_old"],
+            pendingAgentIds: [],
+            retryCounts: { [flowSecret]: 0 },
+            responses: [
+              {
+                agentId: "agent_old",
+                stage: "source_preflight",
+                decision: "approve",
+                summary: `Imported nested ${flowSecret}`,
+                risks: [flowSecret],
+                filesReviewed: [],
+                requiredChanges: [],
+                retryCount: 0,
+                receivedAt: 1,
+              },
+            ],
+            requestedAt: 1,
+            deadlineAt: 1,
+          },
+        ],
       },
     ];
     state.syncFlows = [
@@ -2937,10 +3128,10 @@ describe("HTTP server", () => {
         proposerAgentId: "agent_old",
         targetBranch: "feature/old",
         commitSha: "abcdef123456",
-        summary: "Expired imported sync",
-        reason: "Exercise activation ordering",
-        files: ["src/old-sync.ts"],
-        fileChanges: [{ status: "M", path: "src/old-sync.ts" }],
+        summary: `Expired imported sync ${flowSecret}`,
+        reason: `Exercise activation ordering ${flowSecret}`,
+        files: [`src/${flowSecret}.ts`],
+        fileChanges: [{ status: "M", path: `src/${flowSecret}.ts` }],
         status: "apply_authorized",
         createdAt: 1,
         updatedAt: 1,
@@ -2949,6 +3140,15 @@ describe("HTTP server", () => {
           agentId: "agent_old",
           issuedAt: 1,
           expiresAt: 1,
+        },
+        reviewRequest: {
+          id: "legacy_sync_review",
+          requestedAgentIds: ["agent_old"],
+          pendingAgentIds: [],
+          retryCounts: { [flowSecret]: 0 },
+          responses: [],
+          requestedAt: 1,
+          deadlineAt: 1,
         },
       },
     ];
@@ -2999,6 +3199,27 @@ describe("HTTP server", () => {
     expect(frames[syncFlowIndex]).toMatchObject({
       type: "sync_flow",
       flow: { id: "sync_flow_1", status: "timed_out" },
+    });
+    for (const payload of [
+      frames[helloIndex],
+      frames[prFlowIndex],
+      frames[syncFlowIndex],
+      (await request(port, "GET", "/api/pr-flows")).json,
+      (await request(port, "GET", "/api/sync-flows")).json,
+    ]) {
+      expect(JSON.stringify(payload)).not.toContain(flowSecret);
+      expect(JSON.stringify(payload)).toContain("[redacted]");
+    }
+    await flushCanvasState();
+    const persistedText = await readFile(statePath, "utf-8");
+    const persistedState = JSON.parse(persistedText);
+    expect(persistedText).not.toContain(flowSecret);
+    expect(persistedText).toContain("[redacted]");
+    expect(persistedState.prFlows[0].reviewRequests[0].retryCounts).toEqual({
+      "[redacted]": 0,
+    });
+    expect(persistedState.syncFlows[0].reviewRequest.retryCounts).toEqual({
+      "[redacted]": 0,
     });
     socket.close();
   });

@@ -48,6 +48,10 @@ import { CommitManager } from "./commits/CommitManager.js";
 import { pickDirectory as defaultPickDirectory, type PickDirectory } from "./files/DirectoryPicker.js";
 import { FileManager } from "./files/FileManager.js";
 import {
+  redactFlowCapabilities,
+  redactFlowCapabilityText,
+} from "./flowCapabilityRedaction.js";
+import {
   openFileInVscode,
   type OpenInVscodeOptions,
 } from "./files/VscodeFileOpener.js";
@@ -321,8 +325,8 @@ export function createServer(
     type: "hello",
     agents: manager.list().map(publicAgentSnapshot),
     histories: publicAgentHistories(manager.exportState().histories),
-    prFlows: pullRequestFlowManager.list(),
-    syncFlows: syncFlowManager.list(),
+    prFlows: redactFlowCapabilities(pullRequestFlowManager.list()),
+    syncFlows: redactFlowCapabilities(syncFlowManager.list()),
     commits: commitManager.list(),
   });
   const broadcastHello = (): void => broadcastFrame(helloFrame());
@@ -409,12 +413,12 @@ export function createServer(
   });
 
   pullRequestFlowManager.onFlow((flow) => {
-    broadcastFrame({ type: "pr_flow", flow });
+    broadcastFrame({ type: "pr_flow", flow: redactFlowCapabilities(flow) });
     canvasState.saveSoon();
   });
 
   syncFlowManager.onFlow((flow) => {
-    broadcastFrame({ type: "sync_flow", flow });
+    broadcastFrame({ type: "sync_flow", flow: redactFlowCapabilities(flow) });
     canvasState.saveSoon();
   });
 
@@ -966,11 +970,11 @@ async function handleHttp(
   }
 
   if (method === "GET" && path === "/api/pr-flows") {
-    return sendJson(res, 200, { flows: pullRequestFlowManager.list() });
+    return sendJson(res, 200, { flows: redactFlowCapabilities(pullRequestFlowManager.list()) });
   }
 
   if (method === "GET" && path === "/api/sync-flows") {
-    return sendJson(res, 200, { flows: syncFlowManager.list() });
+    return sendJson(res, 200, { flows: redactFlowCapabilities(syncFlowManager.list()) });
   }
 
   if (method === "GET" && path === "/api/commits") {
@@ -1003,26 +1007,30 @@ async function handleHttp(
   if (method === "POST" && path === "/api/pr-flows") {
     const body = await readJson<CreatePullRequestFlowInput>(req);
     try {
-      const flow = await pullRequestFlowManager.create(body ?? ({} as CreatePullRequestFlowInput));
+      const flow = await pullRequestFlowManager.create(
+        redactFlowCapabilities(body ?? ({} as CreatePullRequestFlowInput)),
+      );
       canvasState.saveSoon();
       return sendJson(res, 201, {
-        flow,
+        flow: redactFlowCapabilities(flow),
       });
     } catch (error) {
-      return sendJson(res, 400, { error: errMsg(error) });
+      return sendJson(res, 400, { error: redactFlowCapabilityText(errMsg(error)) });
     }
   }
 
   if (method === "POST" && path === "/api/sync-flows") {
     const body = await readJson<CreateSyncFlowInput>(req);
     try {
-      const flow = await syncFlowManager.create(body ?? ({} as CreateSyncFlowInput));
+      const flow = await syncFlowManager.create(
+        redactFlowCapabilities(body ?? ({} as CreateSyncFlowInput)),
+      );
       canvasState.saveSoon();
       return sendJson(res, 201, {
-        flow,
+        flow: redactFlowCapabilities(flow),
       });
     } catch (error) {
-      return sendJson(res, 400, { error: errMsg(error) });
+      return sendJson(res, 400, { error: redactFlowCapabilityText(errMsg(error)) });
     }
   }
 
@@ -1033,42 +1041,55 @@ async function handleHttp(
     if (method === "GET" && !action) {
       const flow = pullRequestFlowManager.get(id);
       return flow
-        ? sendJson(res, 200, { flow })
-        : sendJson(res, 404, { error: `unknown PR flow: ${id}` });
+        ? sendJson(res, 200, { flow: redactFlowCapabilities(flow) })
+        : sendJson(res, 404, {
+            error: redactFlowCapabilityText(`unknown PR flow: ${id}`),
+          });
     }
     if (method === "POST" && action === "pr-created") {
       const body = await readJson<PullRequestCreatedInput | SubmitPullRequestCreatedInput>(req);
       try {
         let flow;
         if (hasNonEmptyString(body, "completionToken")) {
-          flow = await pullRequestFlowManager.submitPrCreated(
-            id,
+          const submission = redactFlowCapabilities(
             body as unknown as SubmitPullRequestCreatedInput,
           );
+          submission.completionToken = body.completionToken as string;
+          flow = await pullRequestFlowManager.submitPrCreated(
+            id,
+            submission,
+          );
         } else if (isTrustedUiFlowCompletionRequest(req, allowedOrigins)) {
-          flow = await pullRequestFlowManager.recordPrCreated(id, body ?? {});
+          flow = await pullRequestFlowManager.recordPrCreated(
+            id,
+            redactFlowCapabilities(body ?? {}),
+          );
         } else {
           throw new Error("missing PR completionToken");
         }
         canvasState.saveSoon();
         return sendJson(res, 200, {
-          flow,
+          flow: redactFlowCapabilities(flow),
         });
       } catch (error) {
-        return sendJson(res, 400, { error: errMsg(error) });
+        return sendJson(res, 400, { error: redactFlowCapabilityText(errMsg(error)) });
       }
     }
     if (method === "POST" && action === "reviews") {
       const body = await readJson<SubmitPullRequestReviewInput>(req);
       try {
-        const flow = await pullRequestFlowManager.submitReview(
-          id,
+        const submission = redactFlowCapabilities(
           body ?? ({} as SubmitPullRequestReviewInput),
         );
+        if (body) submission.reviewToken = body.reviewToken;
+        const flow = await pullRequestFlowManager.submitReview(
+          id,
+          submission,
+        );
         canvasState.saveSoon();
-        return sendJson(res, 200, { flow });
+        return sendJson(res, 200, { flow: redactFlowCapabilities(flow) });
       } catch (error) {
-        return sendJson(res, 400, { error: errMsg(error) });
+        return sendJson(res, 400, { error: redactFlowCapabilityText(errMsg(error)) });
       }
     }
     if (method === "POST" && action === "merged") {
@@ -1076,9 +1097,11 @@ async function handleHttp(
       try {
         let flow;
         if (hasNonEmptyString(body, "completionToken")) {
+          const submission = redactFlowCapabilities(body as SubmitPullRequestMergedInput);
+          submission.completionToken = body.completionToken;
           flow = pullRequestFlowManager.submitMerged(
             id,
-            body as SubmitPullRequestMergedInput,
+            submission,
           );
         } else if (isTrustedUiFlowCompletionRequest(req, allowedOrigins)) {
           flow = pullRequestFlowManager.recordMerged(id);
@@ -1086,27 +1109,27 @@ async function handleHttp(
           throw new Error("missing PR completionToken");
         }
         canvasState.saveSoon();
-        return sendJson(res, 200, { flow });
+        return sendJson(res, 200, { flow: redactFlowCapabilities(flow) });
       } catch (error) {
-        return sendJson(res, 400, { error: errMsg(error) });
+        return sendJson(res, 400, { error: redactFlowCapabilityText(errMsg(error)) });
       }
     }
     if (method === "POST" && action === "cancel") {
       try {
         const flow = pullRequestFlowManager.cancel(id);
         canvasState.saveSoon();
-        return sendJson(res, 200, { flow });
+        return sendJson(res, 200, { flow: redactFlowCapabilities(flow) });
       } catch (error) {
-        return sendJson(res, 404, { error: errMsg(error) });
+        return sendJson(res, 404, { error: redactFlowCapabilityText(errMsg(error)) });
       }
     }
     if (method === "POST" && action === "retry") {
       try {
         const flow = await pullRequestFlowManager.retryQueued(id);
         canvasState.saveSoon();
-        return sendJson(res, 200, { flow });
+        return sendJson(res, 200, { flow: redactFlowCapabilities(flow) });
       } catch (error) {
-        return sendJson(res, 400, { error: errMsg(error) });
+        return sendJson(res, 400, { error: redactFlowCapabilityText(errMsg(error)) });
       }
     }
   }
@@ -1118,20 +1141,26 @@ async function handleHttp(
     if (method === "GET" && !action) {
       const flow = syncFlowManager.get(id);
       return flow
-        ? sendJson(res, 200, { flow })
-        : sendJson(res, 404, { error: `unknown sync flow: ${id}` });
+        ? sendJson(res, 200, { flow: redactFlowCapabilities(flow) })
+        : sendJson(res, 404, {
+            error: redactFlowCapabilityText(`unknown sync flow: ${id}`),
+          });
     }
     if (method === "POST" && action === "reviews") {
       const body = await readJson<SyncFlowReviewSubmission>(req);
       try {
-        const flow = await syncFlowManager.submitReview(
-          id,
+        const submission = redactFlowCapabilities(
           body ?? ({} as SyncFlowReviewSubmission),
         );
+        if (body) submission.reviewToken = body.reviewToken;
+        const flow = await syncFlowManager.submitReview(
+          id,
+          submission,
+        );
         canvasState.saveSoon();
-        return sendJson(res, 200, { flow });
+        return sendJson(res, 200, { flow: redactFlowCapabilities(flow) });
       } catch (error) {
-        return sendJson(res, 400, { error: errMsg(error) });
+        return sendJson(res, 400, { error: redactFlowCapabilityText(errMsg(error)) });
       }
     }
     if (method === "POST" && action === "applied") {
@@ -1139,30 +1168,34 @@ async function handleHttp(
       try {
         let flow;
         if (hasNonEmptyString(body, "callbackToken")) {
-          flow = await syncFlowManager.submitApplied(
-            id,
+          const submission = redactFlowCapabilities(
             body as unknown as SyncFlowAppliedSubmission,
           );
+          submission.callbackToken = body.callbackToken as string;
+          flow = await syncFlowManager.submitApplied(
+            id,
+            submission,
+          );
         } else if (isTrustedUiFlowCompletionRequest(req, allowedOrigins)) {
-          flow = syncFlowManager.recordApplied(id, body ?? {});
+          flow = syncFlowManager.recordApplied(id, redactFlowCapabilities(body ?? {}));
         } else {
           throw new Error("missing sync applied callbackToken");
         }
         canvasState.saveSoon();
         return sendJson(res, 200, {
-          flow,
+          flow: redactFlowCapabilities(flow),
         });
       } catch (error) {
-        return sendJson(res, 400, { error: errMsg(error) });
+        return sendJson(res, 400, { error: redactFlowCapabilityText(errMsg(error)) });
       }
     }
     if (method === "POST" && action === "cancel") {
       try {
         const flow = syncFlowManager.cancel(id);
         canvasState.saveSoon();
-        return sendJson(res, 200, { flow });
+        return sendJson(res, 200, { flow: redactFlowCapabilities(flow) });
       } catch (error) {
-        return sendJson(res, 404, { error: errMsg(error) });
+        return sendJson(res, 404, { error: redactFlowCapabilityText(errMsg(error)) });
       }
     }
   }
@@ -1946,8 +1979,8 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
       files: deps.fileManager.exportState(),
       prompts: deps.promptManager.exportState(),
       commits: deps.commitManager.exportState(),
-      prFlows: deps.pullRequestFlowManager.exportState(),
-      syncFlows: deps.syncFlowManager.exportState(),
+      prFlows: redactFlowCapabilities(deps.pullRequestFlowManager.exportState()),
+      syncFlows: redactFlowCapabilities(deps.syncFlowManager.exportState()),
       layout,
     };
     const statePath = path.join(project.projectRoot, CANVAS_STATE_FILE);
@@ -2003,8 +2036,12 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
 
     // Both owners are imported without activation only after agents, prompts, commits, and layout
     // are complete. The route activates them together after broadcasting the restored snapshot.
-    deps.pullRequestFlowManager.importState(state?.prFlows, { deferActivation: true });
-    deps.syncFlowManager.importState(state?.syncFlows, { deferActivation: true });
+    deps.pullRequestFlowManager.importState(redactFlowCapabilities(state?.prFlows), {
+      deferActivation: true,
+    });
+    deps.syncFlowManager.importState(redactFlowCapabilities(state?.syncFlows), {
+      deferActivation: true,
+    });
     canvasStateWritable = true;
     if (deps.manager.appSettings().workDocumentationEnabled) {
       try {
@@ -2293,18 +2330,14 @@ function redactAgentCapabilities(value: unknown, field?: string): unknown {
   if (!isRecord(value)) return value;
   return Object.fromEntries(
     Object.entries(value).map(([key, item]) => [
-      key,
+      redactFlowCapabilityText(key),
       redactAgentCapabilities(item, key),
     ]),
   );
 }
 
 function redactAgentCapabilityText(text: string): string {
-  return text
-    .replace(
-      /\bagent_canvas_cap_[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/giu,
-      REDACTED_AGENT_CAPABILITY,
-    )
+  return redactFlowCapabilityText(text)
     .replace(
       /("(?:reviewToken|completionToken|callbackToken)"\s*:\s*")[^"]*(")/giu,
       `$1${REDACTED_AGENT_CAPABILITY}$2`,

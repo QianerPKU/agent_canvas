@@ -17,6 +17,10 @@ import {
   type BranchReviewJob,
   type BranchReviewStartResult,
 } from "../reviews/BranchReviewQueue.js";
+import {
+  redactFlowCapabilities,
+  redactFlowCapabilityText,
+} from "../flowCapabilityRedaction.js";
 import { DEFAULT_BRANCH_REVIEW_TIMEOUT_MS } from "../reviews/reviewDefaults.js";
 
 type DeliverableRunner = {
@@ -185,7 +189,7 @@ export class SyncFlowManager {
   }
 
   exportState(): SyncFlowSnapshot[] {
-    return this.list();
+    return redactFlowCapabilities(this.list());
   }
 
   hasOpenFlows(): boolean {
@@ -212,7 +216,8 @@ export class SyncFlowManager {
     // before the rest of the project state is authoritative.
     this.reviewQueue.replaceOwner(REVIEW_QUEUE_OWNER, []);
     this.flows.clear();
-    for (const flow of flows ?? []) {
+    for (const importedFlow of flows ?? []) {
+      const flow = redactFlowCapabilities(importedFlow);
       const participantAgentIds = uniqueStrings([
         ...(flow.participantAgentIds ?? []),
         ...(flow.reviewRequest?.requestedAgentIds ?? []),
@@ -312,6 +317,7 @@ export class SyncFlowManager {
   }
 
   async create(input: CreateSyncFlowInput): Promise<SyncFlowSnapshot> {
+    input = redactFlowCapabilities(input);
     const epoch = this.stateGeneration;
     if (!input?.proposerAgentId) throw new Error("missing proposerAgentId");
     if (!input.summary?.trim()) throw new Error("missing summary");
@@ -321,7 +327,9 @@ export class SyncFlowManager {
     if (!isActiveAgentStatus(proposer.status)) {
       throw new Error("proposer agent must be running or waiting_input");
     }
-    const targetBranch = input.targetBranch?.trim() || proposer.config.branch;
+    const targetBranch = redactFlowCapabilityText(
+      input.targetBranch?.trim() || proposer.config.branch || "",
+    );
     if (!targetBranch) throw new Error("missing targetBranch");
     if (input.kind === "cherry_pick" && !input.commitSha.trim()) {
       throw new Error("missing commitSha");
@@ -369,7 +377,6 @@ export class SyncFlowManager {
       updatedAt: createdAt,
       reviewQueueSequence: this.reviewQueue.reserveSequence(),
     };
-    this.flows.set(flow.id, flow);
     this.save(flow);
     this.startBackgroundOperation(flow.id, async () => {
       await this.reviewQueue.enqueue(this.reviewJob(flow, "queued"));
@@ -400,7 +407,7 @@ export class SyncFlowManager {
     if (capability.token !== callbackToken) {
       throw new Error("invalid or expired sync applied callbackToken");
     }
-    const submission = normalizeAppliedSubmission(flow, input);
+    const submission = normalizeAppliedSubmission(flow, canonicalAppliedInput(input));
     if (capability.accepted) {
       if (sameAppliedSubmission(capability.accepted, submission)) return flow;
       throw new Error("sync applied callback already submitted with different data");
@@ -792,10 +799,11 @@ export class SyncFlowManager {
       throw new Error("sync flow can only be marked applied after authorization");
     }
     this.closeTimer(flowId);
-    const fileChanges = updatedFileChangesForApplied(flow, input);
+    const canonicalInput = canonicalAppliedInput(input);
+    const fileChanges = updatedFileChangesForApplied(flow, canonicalInput);
     const applied: SyncFlowAppliedInfo = {
-      summary: input.summary?.trim() || flow.summary,
-      commitSha: input.commitSha?.trim() || undefined,
+      summary: canonicalInput.summary?.trim() || flow.summary,
+      commitSha: canonicalInput.commitSha?.trim() || undefined,
       files: pathsFromFileChanges(fileChanges),
       fileChanges,
       reportedByAgentId,
@@ -1210,6 +1218,8 @@ export class SyncFlowManager {
   }
 
   private save(flow: SyncFlowSnapshot): void {
+    const canonical = redactFlowCapabilities(flow);
+    Object.assign(flow, canonical);
     const previous = this.flows.get(flow.id);
     this.flows.set(flow.id, flow);
     if (
@@ -1492,13 +1502,19 @@ function isReviewDecision(value: unknown): value is SyncFlowReviewDecision {
 
 function normalizeReviewSubmission(input: SyncFlowReviewSubmission): NormalizedSyncFlowReview {
   const candidate = input as Partial<SyncFlowReviewSubmission> | undefined;
-  const agentId = typeof candidate?.agentId === "string" ? candidate.agentId.trim() : "";
+  const agentId =
+    typeof candidate?.agentId === "string"
+      ? redactFlowCapabilityText(candidate.agentId).trim()
+      : "";
   if (!agentId) throw new Error("missing review agentId");
   const reviewToken =
     typeof candidate?.reviewToken === "string" ? candidate.reviewToken.trim() : "";
   if (!reviewToken) throw new Error("missing sync reviewToken");
   if (!isReviewDecision(candidate?.decision)) throw new Error("invalid sync review decision");
-  const summary = typeof candidate?.summary === "string" ? candidate.summary.trim() : "";
+  const summary =
+    typeof candidate?.summary === "string"
+      ? redactFlowCapabilityText(candidate.summary).trim()
+      : "";
   if (!summary) throw new Error("missing sync review summary");
   return {
     agentId,
@@ -1516,7 +1532,7 @@ function reviewStringArray(value: unknown, field: string): string[] {
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
     throw new Error(`invalid sync review ${field}`);
   }
-  return uniqueStrings(value);
+  return uniqueStrings(value.map((item) => redactFlowCapabilityText(item)));
 }
 
 function sameNormalizedReviewSubmission(
@@ -1538,6 +1554,15 @@ function normalizeCallbackToken(value: unknown): string {
   const token = typeof value === "string" ? value.trim() : "";
   if (!token) throw new Error("missing sync applied callbackToken");
   return token;
+}
+
+function canonicalAppliedInput(input: SyncFlowAppliedInput): SyncFlowAppliedInput {
+  return redactFlowCapabilities({
+    summary: input.summary,
+    commitSha: input.commitSha,
+    files: input.files,
+    fileChanges: input.fileChanges,
+  });
 }
 
 function normalizeAppliedSubmission(
@@ -1645,26 +1670,28 @@ function reviewPrompt(
   reviewerAgentId: string,
   reviewToken: string,
 ): string {
+  const safeFlow = redactFlowCapabilities(flow);
+  const safeReviewerAgentId = redactFlowCapabilityText(reviewerAgentId);
   const proposerRule = reviewerAgentId === flow.proposerAgentId
     ? "If all reviewers approve, only a later explicit apply-authorization message grants you a limited write exception for this sync."
     : "A review approval does not grant you permission to modify the workspace or Git state for this sync.";
   return [
-    `Agent Canvas sync review request (${kindLabel(flow.kind)}).`,
-    `flowId: ${flow.id}`,
-    `targetBranch: ${flow.targetBranch}`,
-    flow.sourceBranch ? `sourceBranch: ${flow.sourceBranch}` : undefined,
-    flow.commitSha ? `commitSha: ${flow.commitSha}` : undefined,
-    flow.strategy ? `strategy: ${flow.strategy}` : undefined,
-    `title: ${flow.title ?? "(untitled)"}`,
-    `summary: ${flow.summary}`,
-    `reason: ${flow.reason}`,
+    `Agent Canvas sync review request (${kindLabel(safeFlow.kind)}).`,
+    `flowId: ${safeFlow.id}`,
+    `targetBranch: ${safeFlow.targetBranch}`,
+    safeFlow.sourceBranch ? `sourceBranch: ${safeFlow.sourceBranch}` : undefined,
+    safeFlow.commitSha ? `commitSha: ${safeFlow.commitSha}` : undefined,
+    safeFlow.strategy ? `strategy: ${safeFlow.strategy}` : undefined,
+    `title: ${safeFlow.title ?? "(untitled)"}`,
+    `summary: ${safeFlow.summary}`,
+    `reason: ${safeFlow.reason}`,
     "files:",
-    formatFiles(flow.files),
+    formatFiles(safeFlow.files),
     "changedFiles:",
-    formatFileChanges(flow.fileChanges),
+    formatFileChanges(safeFlow.fileChanges),
     "Review the current state. You may inspect the repository as needed.",
     "Your primary review goal is to decide whether this sync is acceptable for your own current work on the target branch.",
-    flow.kind === "cherry_pick"
+    safeFlow.kind === "cherry_pick"
       ? "Check whether cherry-picking this single commit would interfere with the part you are currently working on, unfinished experiments, pending validation, or local conflicts."
       : "Check whether pulling/merging this source branch would interfere with the part you are currently working on, unfinished experiments, pending validation, or local conflicts.",
     "If the sync would disrupt your current work or should wait, reject or request changes and explain the impact in summary, risks, and requiredChanges.",
@@ -1672,9 +1699,9 @@ function reviewPrompt(
     "Submitting this review callback does not release that freeze; remain read-only while the flow is still waiting or apply-authorized.",
     proposerRule,
     "Submit the decision with an actual HTTP request to the Agent Canvas API base from the built-in workspace rules (set decision to exactly one of approve, reject, needs_changes, or blocked):",
-    `POST /api/sync-flows/${flow.id}/reviews`,
+    `POST /api/sync-flows/${safeFlow.id}/reviews`,
     "JSON body:",
-    reviewSubmissionBody(reviewerAgentId, reviewToken),
+    reviewSubmissionBody(safeReviewerAgentId, reviewToken),
     "This POST is an intermediate tool call. Do not end your reply or print the JSON as a final answer merely to submit the review.",
   ]
     .filter(Boolean)
@@ -1686,13 +1713,15 @@ function retryPrompt(
   reviewerAgentId: string,
   reviewToken: string,
 ): string {
+  const safeFlow = redactFlowCapabilities(flow);
+  const safeReviewerAgentId = redactFlowCapabilityText(reviewerAgentId);
   return [
     "Your previous sync review response was not registered by Agent Canvas.",
     "Keep the entire workspace, Git state, and PR state read-only before and after this corrected callback. The freeze lasts until Agent Canvas sends a closure/release notice for this flow.",
     "Submit the corrected decision with an actual HTTP request (set decision to exactly one of approve, reject, needs_changes, or blocked):",
-    `POST /api/sync-flows/${flow.id}/reviews`,
+    `POST /api/sync-flows/${safeFlow.id}/reviews`,
     "JSON body:",
-    reviewSubmissionBody(reviewerAgentId, reviewToken),
+    reviewSubmissionBody(safeReviewerAgentId, reviewToken),
     "This POST is an intermediate tool call. Do not end your reply or print the JSON as a final answer merely to submit the review.",
   ].join("\n");
 }
@@ -1700,7 +1729,7 @@ function retryPrompt(
 function reviewSubmissionBody(reviewerAgentId: string, reviewToken: string): string {
   return JSON.stringify(
     {
-      agentId: reviewerAgentId,
+      agentId: redactFlowCapabilityText(reviewerAgentId),
       reviewToken,
       decision: "approve",
       summary: "short review summary focused on impact to your current work",
@@ -1718,44 +1747,46 @@ function applyAuthorizationPrompt(
   responses: SyncFlowReviewResponse[],
   callbackToken: string,
 ): string {
+  const safeFlow = redactFlowCapabilities(flow);
+  const safeResponses = redactFlowCapabilities(responses);
   const actionText =
-    flow.kind === "cherry_pick"
+    safeFlow.kind === "cherry_pick"
       ? [
           "You are authorized to cherry-pick the requested commit into your current target branch.",
-          `commitSha: ${flow.commitSha}`,
-          flow.sourceBranch ? `sourceBranch: ${flow.sourceBranch}` : undefined,
+          `commitSha: ${safeFlow.commitSha}`,
+          safeFlow.sourceBranch ? `sourceBranch: ${safeFlow.sourceBranch}` : undefined,
           "You may fetch the source branch/commit, run git cherry-pick, resolve conflicts, run tests, commit the result, and push the updated target branch as needed.",
         ]
       : [
           "You are authorized to pull/merge the requested source branch into your current target branch.",
-          `sourceBranch: ${flow.sourceBranch}`,
-          `strategy: ${flow.strategy ?? "merge"}`,
+          `sourceBranch: ${safeFlow.sourceBranch}`,
+          `strategy: ${safeFlow.strategy ?? "merge"}`,
           "You may fetch, merge/rebase/pull according to the strategy, resolve conflicts, run tests, commit the result, and push the updated target branch as needed.",
         ];
   return [
     "Agent Canvas sync authorization granted.",
-    `flowId: ${flow.id}`,
-    `targetBranch: ${flow.targetBranch}`,
+    `flowId: ${safeFlow.id}`,
+    `targetBranch: ${safeFlow.targetBranch}`,
     ...actionText.filter(Boolean),
-    `summary: ${flow.summary}`,
-    `reason: ${flow.reason}`,
+    `summary: ${safeFlow.summary}`,
+    `reason: ${safeFlow.reason}`,
     "files:",
-    formatFiles(flow.files),
+    formatFiles(safeFlow.files),
     "changedFiles:",
-    formatFileChanges(flow.fileChanges),
+    formatFileChanges(safeFlow.fileChanges),
     "",
     "All participants remain under this flow's read-only freeze until Agent Canvas sends a closure/release notice.",
     "This authorization grants only the proposer a limited write exception for the changes required by this sync flow. Keep unrelated workspace, Git, PR, and external state unchanged until the flow is recorded as applied.",
     "After the sync is complete, record it with an actual HTTP request to the Agent Canvas API base from the built-in workspace rules:",
-    `POST /api/sync-flows/${flow.id}/applied`,
+    `POST /api/sync-flows/${safeFlow.id}/applied`,
     "JSON body:",
     JSON.stringify(
       {
         callbackToken,
-        summary: flow.summary,
+        summary: safeFlow.summary,
         commitSha: "resulting commit sha if applicable",
-        files: flow.files,
-        fileChanges: flow.fileChanges,
+        files: safeFlow.files,
+        fileChanges: safeFlow.fileChanges,
       },
       null,
       2,
@@ -1763,7 +1794,7 @@ function applyAuthorizationPrompt(
     "This POST is an intermediate tool call. After it succeeds, continue the remaining user task and end the reply only when the overall task is complete. Do not emit the legacy completion JSON as the final answer.",
     "",
     "Review summary:",
-    reviewSummary(responses),
+    reviewSummary(safeResponses),
   ].join("\n");
 }
 
@@ -1771,31 +1802,35 @@ function reviewFailurePrompt(
   flow: SyncFlowSnapshot,
   responses: SyncFlowReviewResponse[],
 ): string {
+  const safeFlow = redactFlowCapabilities(flow);
+  const safeResponses = redactFlowCapabilities(responses);
   return [
     "Agent Canvas sync review failed. Do not apply this sync flow.",
     "This flow is closed. The workspace/Git/PR read-only freeze imposed by this sync flow is now released.",
     "This releases only the flow named below; continue to obey any freeze imposed by another active PR or sync flow.",
-    `flowId: ${flow.id}`,
-    reviewSummary(responses),
+    `flowId: ${safeFlow.id}`,
+    reviewSummary(safeResponses),
   ].join("\n");
 }
 
 function reviewFreezeReleasePrompt(flow: SyncFlowSnapshot): string {
+  const safeFlow = redactFlowCapabilities(flow);
   return [
     "Agent Canvas sync flow closure/release notice.",
-    `flowId: ${flow.id}`,
-    `status: ${flow.status}`,
+    `flowId: ${safeFlow.id}`,
+    `status: ${safeFlow.status}`,
     "The workspace/Git/PR read-only freeze imposed by this sync flow is now released.",
     "This releases only this flow; if another PR or sync flow is still active, continue to obey that flow's freeze and authorization limits.",
-    flow.status === "applied"
+    safeFlow.status === "applied"
       ? "The authorized sync was recorded as applied; continue the remaining user task."
       : "Do not perform this sync unless a new flow separately authorizes it.",
   ].join("\n");
 }
 
 function reviewSummary(responses: SyncFlowReviewResponse[]): string {
-  if (responses.length === 0) return "No active reviewers were available.";
-  return responses
+  const safeResponses = redactFlowCapabilities(responses);
+  if (safeResponses.length === 0) return "No active reviewers were available.";
+  return safeResponses
     .map(
       (response) =>
         `- ${response.agentId}: ${response.decision}; ${response.summary}` +

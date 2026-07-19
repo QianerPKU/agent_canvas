@@ -53,9 +53,19 @@ auto-approval and premature prompt delivery during project reload.
 
 Review and apply callback tokens are private, in-memory capabilities. They are bound to the exact
 flow, review request/action, and agent, and are included only in that agent's prompt. Tokens never
-enter a flow snapshot. Newly issued values use the reserved `agent_canvas_cap_` prefix so public
-REST/WebSocket history and agent snapshots, plus persisted canvas agent state, redact both named
-token fields and bare token echoes. Import clears all old capabilities. When an
+enter a flow snapshot. The entire `agent_canvas_cap_` namespace is reserved: create metadata,
+review text/arrays, applied completion metadata, legacy result payloads, and imported state are
+deep-canonicalized before they can be stored, exported, persisted, broadcast, or interpolated into
+another flow prompt. Dedicated `reviewToken` and `callbackToken` values are verified separately and
+remain private; canonicalization applies only to the surrounding payload. Export performs a second
+redacted deep copy as a defense against future storage bypasses. Every review, retry,
+authorization/restored-authorization, failure, and closure prompt also builds from a fresh redacted
+copy of its flow and review responses. The dedicated private token is injected only after that copy
+is made; the finished prompt is never passed through the redactor. This second prompt boundary
+prevents a mutable `get()`/`list()` reference or another future in-memory bypass from reflecting a
+reserved-prefix value while preserving the newly issued callback capability. Public REST/WebSocket
+history and agent snapshots, plus persisted canvas agent state, also redact named token fields and
+bare token echoes. Import clears all old capabilities. When an
 unexpired imported flow is already `apply_authorized`, activation issues a fresh apply token and
 best-effort redelivers the authorization prompt; deferred imports do not do so before activation.
 

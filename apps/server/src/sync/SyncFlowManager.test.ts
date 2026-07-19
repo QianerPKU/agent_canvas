@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AgentEventEnvelope, AgentSnapshot, SyncFlowSnapshot } from "@agent-canvas/shared";
+import type {
+  AgentEventEnvelope,
+  AgentSnapshot,
+  SyncFlowAppliedInput,
+  SyncFlowSnapshot,
+} from "@agent-canvas/shared";
 import { SyncFlowManager, type SyncFlowAgentHost } from "./SyncFlowManager.js";
 
 interface FakeDeliveryOptions {
@@ -135,6 +140,8 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+const CAPABILITY_ECHO = "agent_canvas_cap_future-format-secret";
+
 describe("SyncFlowManager", () => {
   it("settles direct send and steer validation failures in the background", async () => {
     const host = new FakeHost();
@@ -189,6 +196,87 @@ describe("SyncFlowManager", () => {
     await waitForMicrotasks(() => manager.get(flow.id)?.status === "review_collecting");
     await waitForMicrotasks(() => !manager.hasPendingOperations());
     expect(manager.get(flow.id)?.reviewRequest).toBeDefined();
+  });
+
+  it.each(["branch_pull", "cherry_pick"] as const)(
+    "canonicalizes reserved-prefix echoes before %s resolution, snapshots, and review prompts",
+    async (kind) => {
+      const host = new FakeHost();
+      const proposer = host.addAgent("agent_1", "feature/current", "waiting_input");
+      const observed: SyncFlowSnapshot[] = [];
+      const manager = new SyncFlowManager({ host });
+      manager.onFlow((flow) => observed.push(flow));
+      const common = {
+        proposerAgentId: "agent_1",
+        title: `title ${CAPABILITY_ECHO}`,
+        summary: `summary ${CAPABILITY_ECHO}`,
+        reason: `reason ${CAPABILITY_ECHO}`,
+        files: [`src/${CAPABILITY_ECHO}`],
+      };
+
+      const flow = await manager.create(
+        kind === "branch_pull"
+          ? {
+              ...common,
+              kind,
+              sourceBranch: `source-${CAPABILITY_ECHO}`,
+            }
+          : {
+              ...common,
+              kind,
+              sourceBranch: `source-${CAPABILITY_ECHO}`,
+              commitSha: `commit-${CAPABILITY_ECHO}`,
+            },
+      );
+      await waitForMicrotasks(() => manager.get(flow.id)?.status === "review_collecting");
+      await waitForMicrotasks(() => !manager.hasPendingOperations());
+
+      const stored = manager.get(flow.id)!;
+      const exported = manager.exportState();
+      expect(exported[0]).not.toBe(stored);
+      expect(exported[0]?.reviewRequest).not.toBe(stored.reviewRequest);
+      expect(
+        JSON.stringify({ flow, stored, listed: manager.list(), exported, observed }),
+      ).not.toContain(CAPABILITY_ECHO);
+      expect(JSON.stringify(exported)).toContain("[redacted]");
+      expect(proposer.sent[0]).not.toContain(CAPABILITY_ECHO);
+      expect(proposer.sent[0]).toContain("[redacted]");
+      expect(tokenFromPrompt(proposer.sent[0]!, "reviewToken")).toMatch(
+        /^agent_canvas_cap_/u,
+      );
+    },
+  );
+
+  it("canonicalizes the proposer branch fallback before changed-file resolution", async () => {
+    const host = new FakeHost();
+    host.addAgent("agent_1", `feature/${CAPABILITY_ECHO}`, "waiting_input");
+    host.addAgent("agent_2", "feature/[redacted]", "waiting_input");
+    const resolveChangedFiles = vi.fn(async (input) => {
+      expect(input.targetBranch).toBe("feature/[redacted]");
+      expect(
+        JSON.stringify({
+          targetBranch: input.targetBranch,
+          sourceBranch: input.sourceBranch,
+          files: input.files,
+        }),
+      ).not.toContain(CAPABILITY_ECHO);
+      return [{ status: "M", path: "src/fallback.ts" }];
+    });
+    const manager = new SyncFlowManager({ host, resolveChangedFiles });
+
+    const flow = await manager.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_1",
+      sourceBranch: "main",
+      summary: "Canonicalize the fallback branch",
+      reason: "Do not expose agent configuration through the resolver",
+      files: ["src/fallback.ts"],
+    });
+    await waitForMicrotasks(() => !manager.hasPendingOperations());
+
+    expect(resolveChangedFiles).toHaveBeenCalledOnce();
+    expect(flow.targetBranch).toBe("feature/[redacted]");
+    expect(JSON.stringify(manager.exportState())).not.toContain(CAPABILITY_ECHO);
   });
 
   it("submits reviews through intermediate callbacks without waiting for a result event", async () => {
@@ -312,6 +400,49 @@ describe("SyncFlowManager", () => {
         call.text.startsWith("Agent Canvas sync flow closure/release notice."),
       )?.options,
     ).toEqual({ automationKey, replaceQueued: true });
+  });
+
+  it("keeps the direct review capability private while canonicalizing echoed review fields", async () => {
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/current", "waiting_input");
+    const manager = new SyncFlowManager({ host });
+    const flow = await manager.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_1",
+      sourceBranch: "main",
+      summary: "Canonical direct review",
+      reason: "Do not reflect private review capabilities",
+      files: ["src/direct-review.ts"],
+    });
+    await waitForMicrotasks(() => manager.get(flow.id)?.status === "review_collecting");
+    await waitForMicrotasks(() => !manager.hasPendingOperations());
+    const reviewPrompt = proposer.sent[0]!;
+    const reviewToken = tokenFromPrompt(reviewPrompt, "reviewToken");
+
+    await manager.submitReview(flow.id, {
+      agentId: "agent_1",
+      reviewToken,
+      decision: "approve",
+      summary: `summary ${CAPABILITY_ECHO}`,
+      risks: [`risk ${CAPABILITY_ECHO}`],
+      filesReviewed: [`src/${CAPABILITY_ECHO}`],
+      requiredChanges: [`change ${CAPABILITY_ECHO}`],
+    });
+    await waitForMicrotasks(() => manager.get(flow.id)?.status === "apply_authorized");
+    await waitForMicrotasks(() => !manager.hasPendingOperations());
+
+    const authorized = manager.get(flow.id)!;
+    const authorizationPrompt = latestDeliveryContaining(proposer, "sync authorization granted");
+    expect(reviewToken).toMatch(/^agent_canvas_cap_/u);
+    expect(reviewPrompt).toContain(reviewToken);
+    expect(JSON.stringify([authorized, manager.list(), manager.exportState()])).not.toContain(
+      CAPABILITY_ECHO,
+    );
+    expect(authorizationPrompt).not.toContain(CAPABILITY_ECHO);
+    expect(authorizationPrompt).toContain("[redacted]");
+    expect(tokenFromPrompt(authorizationPrompt, "callbackToken")).toMatch(
+      /^agent_canvas_cap_/u,
+    );
   });
 
   it("resolves the final direct review while blocked authorization delivery stays pending", async () => {
@@ -458,6 +589,50 @@ describe("SyncFlowManager", () => {
     expect(manager.get(flow.id)?.status).toBe("apply_authorized");
   });
 
+  it("canonicalizes legacy review echoes before failure snapshots and release prompts", async () => {
+    let now = 2000;
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/current", "waiting_input");
+    const manager = new SyncFlowManager({ host, now: () => now });
+    const flow = await manager.create({
+      kind: "branch_pull",
+      proposerAgentId: "agent_1",
+      sourceBranch: "main",
+      summary: "Canonical legacy review",
+      reason: "Legacy result fields must pass through canonical state",
+      files: ["src/legacy-review.ts"],
+    });
+    await waitForMicrotasks(() => manager.get(flow.id)?.status === "review_collecting");
+    await waitForMicrotasks(() => !manager.hasPendingOperations());
+
+    proposer.setStatus("waiting_input");
+    now += 1;
+    host.assistant(
+      "agent_1",
+      JSON.stringify({
+        agentCanvasSyncReview: true,
+        flowId: flow.id,
+        decision: "reject",
+        summary: `summary ${CAPABILITY_ECHO}`,
+        risks: [`risk ${CAPABILITY_ECHO}`],
+        filesReviewed: [`src/${CAPABILITY_ECHO}`],
+        requiredChanges: [`change ${CAPABILITY_ECHO}`],
+      }),
+      now,
+    );
+    await manager.handleAgentEvent(host.result("agent_1", now));
+    await waitForMicrotasks(() => manager.get(flow.id)?.status === "review_failed");
+    await waitForMicrotasks(() => !manager.hasPendingOperations());
+
+    const failed = manager.get(flow.id)!;
+    const failurePrompt = latestDeliveryContaining(proposer, "sync review failed");
+    expect(JSON.stringify([failed, manager.list(), manager.exportState()])).not.toContain(
+      CAPABILITY_ECHO,
+    );
+    expect(failurePrompt).not.toContain(CAPABILITY_ECHO);
+    expect(failurePrompt).toContain("[redacted]");
+  });
+
   it("ignores an old result while the current review prompt exists only as queued input", async () => {
     let now = 1500;
     const host = new FakeHost();
@@ -598,6 +773,79 @@ describe("SyncFlowManager", () => {
       reportedByAgentId: "agent_1",
     });
   });
+
+  it.each(["direct", "trusted", "legacy"] as const)(
+    "canonicalizes %s applied completion fields before snapshots, export, and closure",
+    async (completionPath) => {
+      let now = 3000;
+      const host = new FakeHost();
+      const proposer = host.addAgent("agent_1", "feature/current", "waiting_input");
+      const manager = new SyncFlowManager({ host, now: () => now });
+      const flow = await manager.create({
+        kind: "branch_pull",
+        proposerAgentId: "agent_1",
+        sourceBranch: "main",
+        summary: `Canonical ${completionPath} completion`,
+        reason: "Completion payloads must not reflect capabilities",
+        files: ["src/applied.ts"],
+      });
+      await waitForMicrotasks(() => manager.get(flow.id)?.status === "review_collecting");
+      await waitForMicrotasks(() => !manager.hasPendingOperations());
+      const reviewToken = tokenFromPrompt(proposer.sent[0]!, "reviewToken");
+      await manager.submitReview(flow.id, {
+        agentId: "agent_1",
+        reviewToken,
+        decision: "approve",
+        summary: "safe to apply",
+      });
+      await waitForMicrotasks(() => manager.get(flow.id)?.status === "apply_authorized");
+      await waitForMicrotasks(() => !manager.hasPendingOperations());
+      const authorizationPrompt = latestDeliveryContaining(
+        proposer,
+        "sync authorization granted",
+      );
+      const callbackToken = tokenFromPrompt(authorizationPrompt, "callbackToken");
+      const payload: SyncFlowAppliedInput = {
+        summary: `summary ${CAPABILITY_ECHO}`,
+        commitSha: `commit-${CAPABILITY_ECHO}`,
+        files: [`src/${CAPABILITY_ECHO}`],
+        fileChanges: [{ status: `M-${CAPABILITY_ECHO}`, path: `src/${CAPABILITY_ECHO}` }],
+      };
+
+      let applied: SyncFlowSnapshot;
+      if (completionPath === "direct") {
+        applied = await manager.submitApplied(flow.id, { ...payload, callbackToken });
+        expect(await manager.submitApplied(flow.id, { ...payload, callbackToken })).toBe(applied);
+      } else if (completionPath === "trusted") {
+        applied = manager.recordApplied(flow.id, payload);
+      } else {
+        proposer.setStatus("waiting_input");
+        now += 1;
+        host.assistant(
+          "agent_1",
+          JSON.stringify({
+            agentCanvasSyncEvent: "applied",
+            flowId: flow.id,
+            ...payload,
+          }),
+          now,
+        );
+        await manager.handleAgentEvent(host.result("agent_1", now));
+        applied = manager.get(flow.id)!;
+      }
+      await waitForMicrotasks(() => manager.get(flow.id)?.status === "applied");
+      await waitForMicrotasks(() => !manager.hasPendingOperations());
+
+      expect(applied).toBe(manager.get(flow.id));
+      expect(JSON.stringify([applied, manager.list(), manager.exportState()])).not.toContain(
+        CAPABILITY_ECHO,
+      );
+      expect(JSON.stringify(applied)).toContain("[redacted]");
+      expect(latestDeliveryContaining(proposer, "closure/release notice")).not.toContain(
+        CAPABILITY_ECHO,
+      );
+    },
+  );
 
   it("resolves changed files for a branch pull flow", async () => {
     let now = 2000;
@@ -1028,6 +1276,162 @@ describe("SyncFlowManager", () => {
     expect(overdue.hasPendingOperations()).toBe(false);
   });
 
+  it("deep-canonicalizes imported snapshots before export and restored authorization prompts", async () => {
+    const now = 6000;
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/current", "waiting_input");
+    const imported: SyncFlowSnapshot = {
+      id: "sync_flow_91",
+      kind: "branch_pull",
+      proposerAgentId: "agent_1",
+      targetBranch: "feature/current",
+      sourceBranch: `source-${CAPABILITY_ECHO}`,
+      title: `title ${CAPABILITY_ECHO}`,
+      summary: `summary ${CAPABILITY_ECHO}`,
+      reason: `reason ${CAPABILITY_ECHO}`,
+      files: [`src/${CAPABILITY_ECHO}`],
+      fileChanges: [{ status: `M-${CAPABILITY_ECHO}`, path: `src/${CAPABILITY_ECHO}` }],
+      status: "apply_authorized",
+      createdAt: now - 100,
+      updatedAt: now - 50,
+      deadlineAt: now + 1000,
+      failureReason: `failure ${CAPABILITY_ECHO}`,
+      participantAgentIds: ["agent_1"],
+      reviewRequest: {
+        id: "sync_flow_91:review:1",
+        requestedAgentIds: ["agent_1"],
+        pendingAgentIds: [],
+        retryCounts: { agent_1: 0 },
+        responses: [
+          {
+            agentId: "agent_1",
+            decision: "approve",
+            summary: `review ${CAPABILITY_ECHO}`,
+            risks: [`risk ${CAPABILITY_ECHO}`],
+            filesReviewed: [`src/${CAPABILITY_ECHO}`],
+            requiredChanges: [`change ${CAPABILITY_ECHO}`],
+            retryCount: 0,
+            receivedAt: now - 75,
+          },
+        ],
+        requestedAt: now - 90,
+        deadlineAt: now + 1000,
+      },
+      applyAuthorization: {
+        agentId: "agent_1",
+        issuedAt: now - 50,
+        expiresAt: now + 1000,
+      },
+      applied: {
+        summary: `applied ${CAPABILITY_ECHO}`,
+        commitSha: `commit-${CAPABILITY_ECHO}`,
+        files: [`src/${CAPABILITY_ECHO}`],
+        fileChanges: [{ status: `M-${CAPABILITY_ECHO}`, path: `src/${CAPABILITY_ECHO}` }],
+        appliedAt: now - 25,
+      },
+    };
+    const manager = new SyncFlowManager({ host, now: () => now });
+
+    manager.importState([imported], { deferActivation: true });
+    const stored = manager.get(imported.id)!;
+    const exported = manager.exportState();
+    expect(JSON.stringify(imported)).toContain(CAPABILITY_ECHO);
+    expect(stored).not.toBe(imported);
+    expect(exported[0]).not.toBe(stored);
+    expect(exported[0]?.reviewRequest).not.toBe(stored.reviewRequest);
+    expect(JSON.stringify([stored, manager.list(), exported])).not.toContain(CAPABILITY_ECHO);
+    expect(JSON.stringify(exported)).toContain("[redacted]");
+
+    manager.activateImportedState();
+    await waitForMicrotasks(() => !manager.hasPendingOperations());
+    const restoredPrompt = latestDeliveryContaining(proposer, "sync authorization granted");
+    const callbackToken = tokenFromPrompt(restoredPrompt, "callbackToken");
+    expect(restoredPrompt).not.toContain(CAPABILITY_ECHO);
+    expect(restoredPrompt).toContain("[redacted]");
+    expect(callbackToken).toMatch(/^agent_canvas_cap_/u);
+    expect(JSON.stringify(manager.exportState())).not.toContain(callbackToken);
+  });
+
+  it("redacts deferred-import reference pollution at the restored prompt boundary while keeping the fresh callback usable", async () => {
+    let now = 7000;
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/current", "waiting_input");
+    const imported: SyncFlowSnapshot = {
+      id: "sync_flow_92",
+      kind: "branch_pull",
+      proposerAgentId: "agent_1",
+      targetBranch: "feature/current",
+      sourceBranch: "main",
+      summary: "safe imported summary",
+      reason: "safe imported reason",
+      files: ["src/restored.ts"],
+      fileChanges: [{ status: "M", path: "src/restored.ts" }],
+      status: "apply_authorized",
+      createdAt: now - 100,
+      updatedAt: now - 50,
+      deadlineAt: now + 1000,
+      participantAgentIds: ["agent_1"],
+      reviewRequest: {
+        id: "sync_flow_92:review:1",
+        requestedAgentIds: ["agent_1"],
+        pendingAgentIds: [],
+        retryCounts: { agent_1: 0 },
+        responses: [
+          {
+            agentId: "agent_1",
+            decision: "approve",
+            summary: "safe imported review",
+            risks: [],
+            filesReviewed: ["src/restored.ts"],
+            requiredChanges: [],
+            retryCount: 0,
+            receivedAt: now - 75,
+          },
+        ],
+        requestedAt: now - 90,
+        deadlineAt: now + 1000,
+      },
+      applyAuthorization: {
+        agentId: "agent_1",
+        issuedAt: now - 50,
+        expiresAt: now + 1000,
+      },
+    };
+    const manager = new SyncFlowManager({ host, now: () => now });
+    manager.importState([imported], { deferActivation: true });
+
+    const getReference = manager.get(imported.id)!;
+    getReference.summary = `get ${CAPABILITY_ECHO}`;
+    getReference.files[0] = `src/get-${CAPABILITY_ECHO}`;
+    getReference.reviewRequest!.responses[0]!.summary = `review ${CAPABILITY_ECHO}`;
+    const listReference = manager.list()[0]!;
+    listReference.reason = `list ${CAPABILITY_ECHO}`;
+    listReference.sourceBranch = `source-${CAPABILITY_ECHO}`;
+    listReference.fileChanges[0]!.path = `src/list-${CAPABILITY_ECHO}`;
+    listReference.reviewRequest!.responses[0]!.requiredChanges = [
+      `change ${CAPABILITY_ECHO}`,
+    ];
+    expect(JSON.stringify(manager.get(imported.id))).toContain(CAPABILITY_ECHO);
+
+    manager.activateImportedState();
+    await waitForMicrotasks(() => !manager.hasPendingOperations());
+    const restoredPrompt = latestDeliveryContaining(proposer, "sync authorization granted");
+    const callbackToken = tokenFromPrompt(restoredPrompt, "callbackToken");
+    expect(restoredPrompt).not.toContain(CAPABILITY_ECHO);
+    expect(restoredPrompt).toContain("[redacted]");
+    expect(callbackToken).toMatch(/^agent_canvas_cap_/u);
+
+    now += 1;
+    const applied = await manager.submitApplied(imported.id, {
+      callbackToken,
+      summary: "safe restored completion",
+      files: ["src/restored.ts"],
+    });
+    expect(applied.status).toBe("applied");
+    expect(JSON.stringify(applied)).not.toContain(CAPABILITY_ECHO);
+    await waitForMicrotasks(() => !manager.hasPendingOperations());
+  });
+
   it("reissues a private apply callback token when imported authorization is activated", async () => {
     let now = 6000;
     const host = new FakeHost();
@@ -1292,6 +1696,14 @@ async function waitForMicrotasks(predicate: () => boolean): Promise<void> {
     await Promise.resolve();
   }
   throw new Error("timed out waiting for async sync review work");
+}
+
+function latestDeliveryContaining(runner: FakeRunner, marker: string): string {
+  const delivery = [...runner.deliveryCalls]
+    .reverse()
+    .find((candidate) => candidate.text.includes(marker));
+  if (!delivery) throw new Error(`missing delivery containing ${marker}`);
+  return delivery.text;
 }
 
 function tokenFromPrompt(prompt: string, field: "reviewToken" | "callbackToken"): string {

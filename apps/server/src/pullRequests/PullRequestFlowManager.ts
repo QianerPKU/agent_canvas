@@ -19,6 +19,10 @@ import {
   type BranchReviewJob,
   type BranchReviewStartResult,
 } from "../reviews/BranchReviewQueue.js";
+import {
+  redactFlowCapabilities,
+  redactFlowCapabilityText,
+} from "../flowCapabilityRedaction.js";
 import { DEFAULT_BRANCH_REVIEW_TIMEOUT_MS } from "../reviews/reviewDefaults.js";
 
 type DeliverableRunner = {
@@ -198,7 +202,7 @@ export class PullRequestFlowManager {
   }
 
   exportState(): PullRequestFlowSnapshot[] {
-    return this.list();
+    return redactFlowCapabilities(this.list());
   }
 
   hasOpenFlows(): boolean {
@@ -258,7 +262,8 @@ export class PullRequestFlowManager {
     // caller has restored the rest of the project state and explicitly activates this import.
     this.reviewQueue.replaceOwner(REVIEW_QUEUE_OWNER, []);
     this.flows.clear();
-    for (const flow of flows ?? []) {
+    for (const importedFlow of flows ?? []) {
+      const flow = redactFlowCapabilities(importedFlow);
       const collectingStage: PullRequestReviewStage | undefined =
         flow.status === "source_review_collecting"
           ? "source_preflight"
@@ -326,6 +331,7 @@ export class PullRequestFlowManager {
   }
 
   async create(input: CreatePullRequestFlowInput): Promise<PullRequestFlowSnapshot> {
+    input = redactFlowCapabilities(input);
     const generation = this.stateGeneration;
     if (!input.proposerAgentId) throw new Error("missing proposerAgentId");
     if (!input.targetBranch) throw new Error("missing targetBranch");
@@ -335,7 +341,9 @@ export class PullRequestFlowManager {
     if (!isActiveAgentStatus(proposer.status)) {
       throw new Error("proposer agent must be running or waiting_input");
     }
-    const sourceBranch = input.sourceBranch?.trim() || proposer.config.branch;
+    const sourceBranch = redactFlowCapabilityText(
+      input.sourceBranch?.trim() || proposer.config.branch || "",
+    );
     if (!sourceBranch) throw new Error("missing sourceBranch");
     const targetBranch = input.targetBranch.trim();
     await this.ensureBranchesReady?.({
@@ -376,7 +384,6 @@ export class PullRequestFlowManager {
       currentStage: "source_preflight",
       reviewRequests: [],
     };
-    this.flows.set(flow.id, flow);
     this.save(flow);
     this.startBackgroundOperation(flow.id, async () => {
       await this.reviewQueue.enqueue(this.reviewJob(flow, "source_preflight", "queued"));
@@ -391,21 +398,26 @@ export class PullRequestFlowManager {
   ): Promise<PullRequestFlowSnapshot> {
     const flow = this.requireFlow(flowId);
     const callback = normalizeCompletionSubmission(input);
-    const payloadFingerprint = prCreatedPayloadFingerprint(input);
     const accepted = this.acceptedCompletionCallback(
       flow,
       "pr_created",
       callback.agentId,
       callback.completionToken,
-      payloadFingerprint,
     );
-    if (accepted) return flow;
-    this.assertCompletionCapability(
-      flow,
-      "pr_created",
-      callback.agentId,
-      callback.completionToken,
-    );
+    if (!accepted) {
+      this.assertCompletionCapability(
+        flow,
+        "pr_created",
+        callback.agentId,
+        callback.completionToken,
+      );
+    }
+    const createdInput = canonicalPrCreatedInput(input);
+    const payloadFingerprint = prCreatedPayloadFingerprint(createdInput);
+    if (accepted) {
+      this.assertAcceptedCompletionPayload(accepted, payloadFingerprint);
+      return flow;
+    }
     const receipt = this.rememberCompletionCallback(
       flow,
       "pr_created",
@@ -414,7 +426,7 @@ export class PullRequestFlowManager {
       payloadFingerprint,
     );
     try {
-      return await this.recordPrCreated(flowId, input, callback.agentId);
+      return await this.recordPrCreated(flowId, createdInput, callback.agentId);
     } catch (error) {
       this.forgetCompletionCallback(receipt);
       throw error;
@@ -431,6 +443,10 @@ export class PullRequestFlowManager {
     if (flow.status !== "create_pr_authorized") {
       throw new Error("PR can only be recorded after create_pr authorization");
     }
+    input = canonicalPrCreatedInput(input);
+    reportedByAgentId = reportedByAgentId
+      ? redactFlowCapabilityText(reportedByAgentId).trim()
+      : undefined;
     const fileChanges = updatedFileChangesForPr(flow, input);
     const files = pathsFromFileChanges(fileChanges);
     const pr: PullRequestCreatedInfo = {
@@ -477,9 +493,11 @@ export class PullRequestFlowManager {
       "merged",
       callback.agentId,
       callback.completionToken,
-      payloadFingerprint,
     );
-    if (accepted) return flow;
+    if (accepted) {
+      this.assertAcceptedCompletionPayload(accepted, payloadFingerprint);
+      return flow;
+    }
     this.assertCompletionCapability(
       flow,
       "merged",
@@ -1258,19 +1276,24 @@ export class PullRequestFlowManager {
     action: PullRequestCompletionAction,
     agentId: string,
     token: string,
-    payloadFingerprint: string,
-  ): boolean {
+  ): AcceptedCompletionCallback | undefined {
     const accepted = this.acceptedCompletionCallbacks.get(
       completionCapabilityKey(flow.id, action, agentId),
     );
-    if (!accepted) return false;
+    if (!accepted) return undefined;
     if (flow.proposerAgentId !== agentId || accepted.token !== token) {
       throw new Error(`invalid or expired PR ${action} completionToken`);
     }
+    return accepted;
+  }
+
+  private assertAcceptedCompletionPayload(
+    accepted: AcceptedCompletionCallback,
+    payloadFingerprint: string,
+  ): void {
     if (accepted.payloadFingerprint !== payloadFingerprint) {
-      throw new Error(`conflicting PR ${action} completion submission`);
+      throw new Error(`conflicting PR ${accepted.action} completion submission`);
     }
-    return true;
   }
 
   private rememberCompletionCallback(
@@ -1558,6 +1581,8 @@ export class PullRequestFlowManager {
   }
 
   private save(flow: PullRequestFlowSnapshot): void {
+    const canonical = redactFlowCapabilities(flow);
+    Object.assign(flow, canonical);
     const previous = this.flows.get(flow.id);
     this.flows.set(flow.id, flow);
     const becameClosed =
@@ -1932,7 +1957,18 @@ function updatedFileChangesForPr(
   return flow.fileChanges;
 }
 
-function prCreatedPayloadFingerprint(input: SubmitPullRequestCreatedInput): string {
+function canonicalPrCreatedInput(input: PullRequestCreatedInput): PullRequestCreatedInput {
+  return redactFlowCapabilities({
+    prNumber: input.prNumber,
+    prUrl: input.prUrl,
+    title: input.title,
+    summary: input.summary,
+    files: input.files,
+    fileChanges: input.fileChanges,
+  });
+}
+
+function prCreatedPayloadFingerprint(input: PullRequestCreatedInput): string {
   return JSON.stringify({
     prNumber: input.prNumber,
     prUrl: input.prUrl?.trim() || undefined,
@@ -1972,11 +2008,11 @@ function normalizeReviewSubmission(
     throw new Error("missing PR review summary");
   }
   return {
-    agentId: input.agentId.trim(),
+    agentId: redactFlowCapabilityText(input.agentId).trim(),
     reviewToken: input.reviewToken.trim(),
     stage: input.stage,
     decision: input.decision,
-    summary: input.summary.trim(),
+    summary: redactFlowCapabilityText(input.summary).trim(),
     risks: normalizeReviewStringArray(input.risks, "risks"),
     filesReviewed: normalizeReviewStringArray(input.filesReviewed, "filesReviewed"),
     requiredChanges: normalizeReviewStringArray(input.requiredChanges, "requiredChanges"),
@@ -1994,7 +2030,7 @@ function normalizeCompletionSubmission(
     throw new Error("missing PR completionToken");
   }
   return {
-    agentId: input.agentId.trim(),
+    agentId: redactFlowCapabilityText(input.agentId).trim(),
     completionToken: input.completionToken.trim(),
   };
 }
@@ -2004,7 +2040,7 @@ function normalizeReviewStringArray(value: unknown, field: string): string[] {
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
     throw new Error(`PR review ${field} must be an array of strings`);
   }
-  return uniqueStrings(value);
+  return uniqueStrings(value.map((item) => redactFlowCapabilityText(item)));
 }
 
 function sameReviewSubmission(
@@ -2032,20 +2068,23 @@ function reviewPrompt(
   reviewerAgentId: string,
   reviewToken: string,
 ): string {
-  const files = formatFiles(flow.files);
-  const fileChanges = formatFileChanges(flow.fileChanges);
+  const isProposer = reviewerAgentId === flow.proposerAgentId;
+  const safeFlow = redactFlowCapabilities(flow);
+  const safeReviewerAgentId = redactFlowCapabilityText(reviewerAgentId);
+  const files = formatFiles(safeFlow.files);
+  const fileChanges = formatFileChanges(safeFlow.fileChanges);
   const label = stage === "source_preflight" ? "source branch preflight" : "target branch merge";
   const prInfo =
-    stage === "target_merge" && flow.pr
-      ? `\nPR: ${flow.pr.prUrl ?? flow.pr.prNumber ?? "(not provided)"}`
+    stage === "target_merge" && safeFlow.pr
+      ? `\nPR: ${safeFlow.pr.prUrl ?? safeFlow.pr.prNumber ?? "(not provided)"}`
       : "";
   return [
     `Agent Canvas PR review request (${label}).`,
-    `flowId: ${flow.id}`,
-    `sourceBranch: ${flow.sourceBranch}`,
-    `targetBranch: ${flow.targetBranch}`,
-    `title: ${flow.title ?? "(untitled)"}`,
-    `summary: ${flow.summary}`,
+    `flowId: ${safeFlow.id}`,
+    `sourceBranch: ${safeFlow.sourceBranch}`,
+    `targetBranch: ${safeFlow.targetBranch}`,
+    `title: ${safeFlow.title ?? "(untitled)"}`,
+    `summary: ${safeFlow.summary}`,
     "files:",
     files,
     "changedFiles (git diff --name-status):",
@@ -2055,10 +2094,10 @@ function reviewPrompt(
     reviewImpactInstruction(stage),
     "",
     reviewReadOnlyInstruction(),
-    `When the review is ready, call POST /api/pr-flows/${flow.id}/reviews as an intermediate tool call with this JSON body (set decision to exactly one of approve, reject, needs_changes, or blocked):`,
+    `When the review is ready, call POST /api/pr-flows/${safeFlow.id}/reviews as an intermediate tool call with this JSON body (set decision to exactly one of approve, reject, needs_changes, or blocked):`,
     JSON.stringify(
       {
-        agentId: reviewerAgentId,
+        agentId: safeReviewerAgentId,
         reviewToken,
         stage,
         decision: "approve",
@@ -2073,7 +2112,7 @@ function reviewPrompt(
     "Do not print or return the callback JSON as assistant text. The callback is an intermediate tool call, not the end of your reply.",
     "Wait for the HTTP response, then continue the task you were doing in the same reply.",
     "After the review callback succeeds, this flow's read-only freeze remains in force until Agent Canvas reports that the flow merged, failed, was cancelled, timed out, or became blocked.",
-    reviewerAgentId === flow.proposerAgentId
+    isProposer
       ? "Because you are also this flow's proposer, only an explicit create or merge authorization grants the limited mutation exception described in that authorization."
       : "Wait for an explicit flow-closed release before making any workspace, Git, remote branch, or PR mutation.",
   ]
@@ -2109,13 +2148,16 @@ function retryPrompt(
   reviewerAgentId: string,
   reviewToken: string,
 ): string {
+  const isProposer = reviewerAgentId === flow.proposerAgentId;
+  const safeFlow = redactFlowCapabilities(flow);
+  const safeReviewerAgentId = redactFlowCapabilityText(reviewerAgentId);
   return [
     "Your previous PR review response was not valid JSON for Agent Canvas.",
     reviewReadOnlyInstruction(),
-    `Submit the review by calling POST /api/pr-flows/${flow.id}/reviews as an intermediate tool call with this JSON body (set decision to exactly one of approve, reject, needs_changes, or blocked):`,
+    `Submit the review by calling POST /api/pr-flows/${safeFlow.id}/reviews as an intermediate tool call with this JSON body (set decision to exactly one of approve, reject, needs_changes, or blocked):`,
     JSON.stringify(
       {
-        agentId: reviewerAgentId,
+        agentId: safeReviewerAgentId,
         reviewToken,
         stage,
         decision: "approve",
@@ -2130,7 +2172,7 @@ function retryPrompt(
     "Do not print or return the callback JSON as assistant text, and do not end your reply after submitting it.",
     "Wait for the HTTP response, then continue the task you were doing in the same reply.",
     "The flow's read-only freeze remains in force after the callback until Agent Canvas sends an explicit flow-closed release.",
-    reviewerAgentId === flow.proposerAgentId
+    isProposer
       ? "Only an explicit create or merge authorization grants the limited mutation exception described in that authorization."
       : "Continue read-only work while waiting for the flow-closed release.",
   ].join("\n");
@@ -2141,32 +2183,34 @@ function createPrAuthorizationPrompt(
   responses: PullRequestReviewResponse[],
   completionToken: string,
 ): string {
+  const safeFlow = redactFlowCapabilities(flow);
+  const safeResponses = redactFlowCapabilities(responses);
   return [
     "Agent Canvas PR authorization granted.",
     "You are authorized to create the PR for this flow from the reviewed source head.",
-    `flowId: ${flow.id}`,
-    `sourceBranch: ${flow.sourceBranch}`,
-    `targetBranch: ${flow.targetBranch}`,
-    `title: ${flow.title ?? "(choose a suitable title)"}`,
-    `summary: ${flow.summary}`,
+    `flowId: ${safeFlow.id}`,
+    `sourceBranch: ${safeFlow.sourceBranch}`,
+    `targetBranch: ${safeFlow.targetBranch}`,
+    `title: ${safeFlow.title ?? "(choose a suitable title)"}`,
+    `summary: ${safeFlow.summary}`,
     "files:",
-    formatFiles(flow.files),
+    formatFiles(safeFlow.files),
     "changedFiles (git diff --name-status):",
-    formatFileChanges(flow.fileChanges),
+    formatFileChanges(safeFlow.fileChanges),
     "",
     "This authorization lifts the proposer freeze only to create this PR from the exact reviewed and already-pushed source head. Unrelated workspace, Git, remote branch, and PR mutations remain prohibited.",
     "Do not edit files, create commits, push, or sync/rewrite the source branch at this stage. If the PR cannot be created from the reviewed head, report the blocker instead of changing it. Do not merge the PR yet.",
-    `After the PR exists, call POST /api/pr-flows/${flow.id}/pr-created as an intermediate tool call with this JSON body:`,
+    `After the PR exists, call POST /api/pr-flows/${safeFlow.id}/pr-created as an intermediate tool call with this JSON body:`,
     JSON.stringify(
       {
-        agentId: flow.proposerAgentId,
+        agentId: safeFlow.proposerAgentId,
         completionToken,
         prNumber: 0,
         prUrl: "https://github.com/OWNER/REPO/pull/0",
-        title: flow.title ?? "",
-        summary: flow.summary,
-        files: flow.files,
-        fileChanges: flow.fileChanges,
+        title: safeFlow.title ?? "",
+        summary: safeFlow.summary,
+        files: safeFlow.files,
+        fileChanges: safeFlow.fileChanges,
       },
       null,
       2,
@@ -2176,7 +2220,7 @@ function createPrAuthorizationPrompt(
     "As soon as the pr-created callback succeeds, the entire workspace, Git state, remote branch, and PR state become read-only again until Agent Canvas grants merge authorization or reports failure for this flow.",
     "",
     "Source review summary:",
-    reviewSummary(responses),
+    reviewSummary(safeResponses),
   ].join("\n");
 }
 
@@ -2185,19 +2229,21 @@ function mergeAuthorizationPrompt(
   responses: PullRequestReviewResponse[],
   completionToken: string,
 ): string {
+  const safeFlow = redactFlowCapabilities(flow);
+  const safeResponses = redactFlowCapabilities(responses);
   return [
     "Agent Canvas merge authorization granted.",
     "You are authorized to merge the PR for this flow.",
-    `flowId: ${flow.id}`,
-    `sourceBranch: ${flow.sourceBranch}`,
-    `targetBranch: ${flow.targetBranch}`,
-    `PR: ${flow.pr?.prUrl ?? flow.pr?.prNumber ?? "(not provided)"}`,
+    `flowId: ${safeFlow.id}`,
+    `sourceBranch: ${safeFlow.sourceBranch}`,
+    `targetBranch: ${safeFlow.targetBranch}`,
+    `PR: ${safeFlow.pr?.prUrl ?? safeFlow.pr?.prNumber ?? "(not provided)"}`,
     "",
     "This authorization lifts the proposer freeze only to merge this exact, already-reviewed PR. Unrelated workspace, Git, remote branch, and PR mutations remain prohibited.",
     "Do not edit files, create new source-branch or workspace commits, push, sync/rewrite branches, or update the PR contents. The authorized merge itself may update this PR and create its target-branch merge commit. If the reviewed PR cannot be merged as-is, report the blocker instead of changing it.",
-    `After the merge is complete, call POST /api/pr-flows/${flow.id}/merged as an intermediate tool call with this JSON body:`,
+    `After the merge is complete, call POST /api/pr-flows/${safeFlow.id}/merged as an intermediate tool call with this JSON body:`,
     JSON.stringify(
-      { agentId: flow.proposerAgentId, completionToken },
+      { agentId: safeFlow.proposerAgentId, completionToken },
       null,
       2,
     ),
@@ -2205,7 +2251,7 @@ function mergeAuthorizationPrompt(
     "Wait for the HTTP response, then continue the task you were doing in the same reply. A successful merged callback closes this flow and releases its freeze.",
     "",
     "Target review summary:",
-    reviewSummary(responses),
+    reviewSummary(safeResponses),
   ].join("\n");
 }
 
@@ -2213,12 +2259,14 @@ function sourceFailurePrompt(
   flow: PullRequestFlowSnapshot,
   responses: PullRequestReviewResponse[],
 ): string {
+  const safeFlow = redactFlowCapabilities(flow);
+  const safeResponses = redactFlowCapabilities(responses);
   return [
     "Agent Canvas PR source preflight failed. Do not create the PR for this flow.",
     "The workspace/Git/PR freeze imposed by this flow is now released.",
     "This releases only this flow; continue to obey every freeze imposed by another active PR or sync flow.",
-    `flowId: ${flow.id}`,
-    reviewSummary(responses),
+    `flowId: ${safeFlow.id}`,
+    reviewSummary(safeResponses),
   ].join("\n");
 }
 
@@ -2226,40 +2274,44 @@ function targetFailurePrompt(
   flow: PullRequestFlowSnapshot,
   responses: PullRequestReviewResponse[],
 ): string {
+  const safeFlow = redactFlowCapabilities(flow);
+  const safeResponses = redactFlowCapabilities(responses);
   return [
     "Agent Canvas target branch review failed. Do not merge the PR for this flow.",
     "The workspace/Git/PR freeze imposed by this flow is now released.",
     "This releases only this flow; continue to obey every freeze imposed by another active PR or sync flow.",
-    `flowId: ${flow.id}`,
-    reviewSummary(responses),
+    `flowId: ${safeFlow.id}`,
+    reviewSummary(safeResponses),
   ].join("\n");
 }
 
 function reviewFreezeReleasePrompt(flow: PullRequestFlowSnapshot): string {
-  if (flow.status === "source_review_failed") {
-    const request = [...flow.reviewRequests]
+  const safeFlow = redactFlowCapabilities(flow);
+  if (safeFlow.status === "source_review_failed") {
+    const request = [...safeFlow.reviewRequests]
       .reverse()
       .find((candidate) => candidate.stage === "source_preflight");
-    return sourceFailurePrompt(flow, request?.responses ?? []);
+    return sourceFailurePrompt(safeFlow, request?.responses ?? []);
   }
-  if (flow.status === "target_review_failed") {
-    const request = [...flow.reviewRequests]
+  if (safeFlow.status === "target_review_failed") {
+    const request = [...safeFlow.reviewRequests]
       .reverse()
       .find((candidate) => candidate.stage === "target_merge");
-    return targetFailurePrompt(flow, request?.responses ?? []);
+    return targetFailurePrompt(safeFlow, request?.responses ?? []);
   }
   return [
     "Agent Canvas PR flow closed. The read-only workspace/Git/PR freeze imposed by this flow is now released.",
-    `flowId: ${flow.id}`,
-    `status: ${flow.status}`,
+    `flowId: ${safeFlow.id}`,
+    `status: ${safeFlow.status}`,
     "This releases only the freeze imposed by this flow. If any other active PR or sync flow still imposes a freeze, you must continue to obey it.",
     "Resume your prior task subject to every other active flow and normal workspace policy.",
   ].join("\n");
 }
 
 function reviewSummary(responses: PullRequestReviewResponse[]): string {
-  if (responses.length === 0) return "No active reviewers were available.";
-  return responses
+  const safeResponses = redactFlowCapabilities(responses);
+  if (safeResponses.length === 0) return "No active reviewers were available.";
+  return safeResponses
     .map(
       (response) =>
         `- ${response.agentId}: ${response.decision}; ${response.summary}` +

@@ -167,6 +167,7 @@ afterEach(() => {
 });
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+const RESERVED_CAPABILITY_ECHO = "agent_canvas_cap_not-a-uuid-echo";
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void;
@@ -228,6 +229,394 @@ describe("PullRequestFlowManager", () => {
         summary: "Idle proposer must start explicitly",
       }),
     ).rejects.toThrow("proposer agent must be running or waiting_input");
+  });
+
+  it("redacts reserved capability echoes from create, direct review, and pr-created data", async () => {
+    const host = new FakeHost();
+    const sourceBranch = "feature/[redacted]";
+    const targetBranch = "main/[redacted]";
+    const proposer = host.addAgent("agent_1", sourceBranch, "waiting_input");
+    const targetReviewer = host.addAgent("agent_2", targetBranch, "waiting_input");
+    const ensureBranchesReady = vi.fn(async (context) => {
+      expect(JSON.stringify(context)).not.toContain(RESERVED_CAPABILITY_ECHO);
+    });
+    const resolveChangedFiles = vi.fn(async (context) => {
+      expect(JSON.stringify(context)).not.toContain(RESERVED_CAPABILITY_ECHO);
+      return [{ status: `M ${RESERVED_CAPABILITY_ECHO}`, path: "src/[redacted]" }];
+    });
+    const manager = new PullRequestFlowManager({
+      host,
+      ensureBranchesReady,
+      resolveChangedFiles,
+    });
+
+    let flow = await manager.create({
+      proposerAgentId: "agent_1",
+      sourceBranch: `feature/${RESERVED_CAPABILITY_ECHO}`,
+      targetBranch: `main/${RESERVED_CAPABILITY_ECHO}`,
+      title: `Title ${RESERVED_CAPABILITY_ECHO}`,
+      summary: `Summary ${RESERVED_CAPABILITY_ECHO}`,
+      files: [`src/${RESERVED_CAPABILITY_ECHO}`],
+    });
+    flow = await waitForFlow(
+      manager,
+      flow.id,
+      (candidate) => candidate.status === "source_review_collecting",
+    );
+    const sourcePrompt = await waitForDelivery(
+      proposer,
+      `POST /api/pr-flows/${flow.id}/reviews`,
+    );
+    expect(JSON.stringify(flow)).not.toContain(RESERVED_CAPABILITY_ECHO);
+    expect(JSON.stringify(manager.exportState())).not.toContain(RESERVED_CAPABILITY_ECHO);
+    expect(sourcePrompt).not.toContain(RESERVED_CAPABILITY_ECHO);
+    expect(sourcePrompt).toContain("[redacted]");
+    const reviewToken = extractPromptToken(sourcePrompt, "reviewToken");
+    expect(reviewToken).toMatch(/^agent_canvas_cap_/u);
+
+    proposer.setStatus("waiting_input");
+    await manager.submitReview(flow.id, {
+      agentId: "agent_1",
+      reviewToken,
+      stage: "source_preflight",
+      decision: "approve",
+      summary: `Approved ${RESERVED_CAPABILITY_ECHO}`,
+      risks: [RESERVED_CAPABILITY_ECHO],
+      filesReviewed: [`src/${RESERVED_CAPABILITY_ECHO}`],
+      requiredChanges: [`None ${RESERVED_CAPABILITY_ECHO}`],
+    });
+    flow = await waitForFlow(
+      manager,
+      flow.id,
+      (candidate) => candidate.status === "create_pr_authorized",
+    );
+    const createPrompt = await waitForDelivery(
+      proposer,
+      `/api/pr-flows/${flow.id}/pr-created`,
+    );
+    expect(createPrompt).not.toContain(RESERVED_CAPABILITY_ECHO);
+    expect(JSON.stringify(flow)).not.toContain(RESERVED_CAPABILITY_ECHO);
+    const completionToken = extractPromptToken(createPrompt, "completionToken");
+    expect(completionToken).toMatch(/^agent_canvas_cap_/u);
+
+    proposer.setStatus("waiting_input");
+    const prCreated = {
+      agentId: "agent_1",
+      completionToken,
+      prNumber: 41,
+      prUrl: `https://example.test/${RESERVED_CAPABILITY_ECHO}`,
+      title: `PR ${RESERVED_CAPABILITY_ECHO}`,
+      summary: `PR summary ${RESERVED_CAPABILITY_ECHO}`,
+      files: [`pr/${RESERVED_CAPABILITY_ECHO}`],
+      fileChanges: [
+        { status: `M ${RESERVED_CAPABILITY_ECHO}`, path: `pr/${RESERVED_CAPABILITY_ECHO}` },
+      ],
+    };
+    flow = await manager.submitPrCreated(flow.id, prCreated);
+    expect((await manager.submitPrCreated(flow.id, prCreated)).id).toBe(flow.id);
+    flow = await waitForFlow(
+      manager,
+      flow.id,
+      (candidate) => candidate.status === "target_review_collecting",
+    );
+    const targetPrompt = await waitForDelivery(
+      targetReviewer,
+      `POST /api/pr-flows/${flow.id}/reviews`,
+    );
+    expect(targetPrompt).not.toContain(RESERVED_CAPABILITY_ECHO);
+    expect(targetPrompt).toContain("[redacted]");
+    expect(JSON.stringify(manager.exportState())).not.toContain(RESERVED_CAPABILITY_ECHO);
+  });
+
+  it("redacts reserved capability echoes captured from legacy review and pr-created results", async () => {
+    let now = 900;
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/legacy-redaction", "waiting_input");
+    const targetReviewer = host.addAgent("agent_2", "main", "waiting_input");
+    const manager = new PullRequestFlowManager({ host, now: () => now });
+    let flow = await manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "main",
+      summary: "Legacy redaction",
+      files: ["src/legacy-redaction.ts"],
+    });
+    flow = await waitForFlow(
+      manager,
+      flow.id,
+      (candidate) => candidate.status === "source_review_collecting",
+    );
+    await waitForDelivery(proposer, `POST /api/pr-flows/${flow.id}/reviews`);
+
+    now += 1;
+    proposer.setStatus("waiting_input");
+    host.assistant(
+      "agent_1",
+      JSON.stringify({
+        agentCanvasPrReview: true,
+        flowId: flow.id,
+        stage: "source_preflight",
+        decision: "approve",
+        summary: `Legacy review ${RESERVED_CAPABILITY_ECHO}`,
+        risks: [RESERVED_CAPABILITY_ECHO],
+        filesReviewed: [`src/${RESERVED_CAPABILITY_ECHO}`],
+        requiredChanges: [`Legacy change ${RESERVED_CAPABILITY_ECHO}`],
+      }),
+      now,
+    );
+    await manager.handleAgentEvent(host.result("agent_1", now));
+    flow = await waitForFlow(
+      manager,
+      flow.id,
+      (candidate) => candidate.status === "create_pr_authorized",
+    );
+    const authorizationPrompt = await waitForDelivery(
+      proposer,
+      `/api/pr-flows/${flow.id}/pr-created`,
+    );
+    expect(authorizationPrompt).not.toContain(RESERVED_CAPABILITY_ECHO);
+    expect(JSON.stringify(flow)).not.toContain(RESERVED_CAPABILITY_ECHO);
+
+    now += 1;
+    proposer.setStatus("waiting_input");
+    host.assistant(
+      "agent_1",
+      JSON.stringify({
+        agentCanvasPrEvent: "pr_created",
+        flowId: flow.id,
+        prNumber: 42,
+        prUrl: `https://example.test/${RESERVED_CAPABILITY_ECHO}`,
+        title: `Legacy PR ${RESERVED_CAPABILITY_ECHO}`,
+        summary: `Legacy PR summary ${RESERVED_CAPABILITY_ECHO}`,
+        files: [`legacy/${RESERVED_CAPABILITY_ECHO}`],
+        fileChanges: [
+          {
+            status: `A ${RESERVED_CAPABILITY_ECHO}`,
+            path: `legacy/${RESERVED_CAPABILITY_ECHO}`,
+          },
+        ],
+      }),
+      now,
+    );
+    await manager.handleAgentEvent(host.result("agent_1", now));
+    flow = await waitForFlow(
+      manager,
+      flow.id,
+      (candidate) => candidate.status === "target_review_collecting",
+    );
+    const targetPrompt = await waitForDelivery(
+      targetReviewer,
+      `POST /api/pr-flows/${flow.id}/reviews`,
+    );
+    expect(targetPrompt).not.toContain(RESERVED_CAPABILITY_ECHO);
+    expect(JSON.stringify(manager.exportState())).not.toContain(RESERVED_CAPABILITY_ECHO);
+
+    proposer.setStatus("waiting_input");
+    let rejected = await manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "main",
+      summary: "Legacy failure redaction",
+      files: ["src/legacy-failure.ts"],
+    });
+    rejected = await waitForFlow(
+      manager,
+      rejected.id,
+      (candidate) => candidate.status === "source_review_collecting",
+    );
+    await waitForDelivery(proposer, `POST /api/pr-flows/${rejected.id}/reviews`);
+    now += 1;
+    proposer.setStatus("waiting_input");
+    host.assistant(
+      "agent_1",
+      JSON.stringify({
+        agentCanvasPrReview: true,
+        flowId: rejected.id,
+        stage: "source_preflight",
+        decision: "reject",
+        summary: `Reject ${RESERVED_CAPABILITY_ECHO}`,
+        requiredChanges: [`Remove ${RESERVED_CAPABILITY_ECHO}`],
+      }),
+      now,
+    );
+    await manager.handleAgentEvent(host.result("agent_1", now));
+    rejected = await waitForFlow(
+      manager,
+      rejected.id,
+      (candidate) => candidate.status === "source_review_failed",
+    );
+    const releasePrompt = await waitForDelivery(proposer, "PR source preflight failed");
+    expect(releasePrompt).not.toContain(RESERVED_CAPABILITY_ECHO);
+    expect(JSON.stringify(rejected)).not.toContain(RESERVED_CAPABILITY_ECHO);
+  });
+
+  it("deep-redacts imported state, exports a copy, and redelivers a safe authorization", async () => {
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/import-redaction", "waiting_input");
+    const manager = new PullRequestFlowManager({ host });
+    let flow = await manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "main",
+      summary: "Import redaction",
+      files: ["src/import-redaction.ts"],
+    });
+    flow = await waitForFlow(
+      manager,
+      flow.id,
+      (candidate) => candidate.status === "source_review_collecting",
+    );
+    const reviewPrompt = await waitForDelivery(
+      proposer,
+      `POST /api/pr-flows/${flow.id}/reviews`,
+    );
+    proposer.setStatus("waiting_input");
+    await manager.submitReview(flow.id, {
+      agentId: "agent_1",
+      reviewToken: extractPromptToken(reviewPrompt, "reviewToken"),
+      stage: "source_preflight",
+      decision: "approve",
+      summary: "Ready to import",
+    });
+    flow = await waitForFlow(
+      manager,
+      flow.id,
+      (candidate) => candidate.status === "create_pr_authorized",
+    );
+    const authorizationPath = `/api/pr-flows/${flow.id}/pr-created`;
+    await waitForDelivery(proposer, authorizationPath);
+    const authorizationCount = proposer.deliveries.filter((delivery) =>
+      delivery.text.includes(authorizationPath),
+    ).length;
+
+    const exported = manager.exportState();
+    const exportedFlow = exported[0]!;
+    exportedFlow.title = RESERVED_CAPABILITY_ECHO;
+    exportedFlow.summary = RESERVED_CAPABILITY_ECHO;
+    exportedFlow.files = [RESERVED_CAPABILITY_ECHO];
+    exportedFlow.fileChanges = [
+      { status: RESERVED_CAPABILITY_ECHO, path: RESERVED_CAPABILITY_ECHO },
+    ];
+    exportedFlow.reviewRequests[0]!.responses[0]!.summary = RESERVED_CAPABILITY_ECHO;
+    exportedFlow.reviewRequests[0]!.responses[0]!.risks = [RESERVED_CAPABILITY_ECHO];
+    exportedFlow.reviewRequests[0]!.responses[0]!.filesReviewed = [
+      RESERVED_CAPABILITY_ECHO,
+    ];
+    exportedFlow.reviewRequests[0]!.responses[0]!.requiredChanges = [
+      RESERVED_CAPABILITY_ECHO,
+    ];
+    Object.assign(exportedFlow, { completionToken: RESERVED_CAPABILITY_ECHO });
+    expect(manager.get(flow.id)?.summary).toBe("Import redaction");
+
+    manager.importState(exported, { deferActivation: true });
+    expect(JSON.stringify(manager.get(flow.id))).not.toContain(RESERVED_CAPABILITY_ECHO);
+    const safeExport = manager.exportState();
+    expect(JSON.stringify(safeExport)).not.toContain(RESERVED_CAPABILITY_ECHO);
+    safeExport[0]!.summary = "mutated export";
+    expect(manager.get(flow.id)?.summary).not.toBe("mutated export");
+
+    proposer.setStatus("waiting_input");
+    manager.activateImportedState();
+    await waitUntil(
+      () =>
+        proposer.deliveries.filter((delivery) => delivery.text.includes(authorizationPath))
+          .length > authorizationCount,
+    );
+    const restoredPrompt = findDelivery(proposer, authorizationPath);
+    expect(restoredPrompt).not.toContain(RESERVED_CAPABILITY_ECHO);
+    expect(restoredPrompt).toContain("[redacted]");
+    expect(extractPromptToken(restoredPrompt, "completionToken")).toMatch(
+      /^agent_canvas_cap_/u,
+    );
+  });
+
+  it("redacts get/list reference pollution at the restored prompt boundary", async () => {
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/prompt-boundary", "waiting_input");
+    const manager = new PullRequestFlowManager({
+      host,
+      now: () => 2_000,
+      setTimer: () => Symbol("timer"),
+      clearTimer: () => undefined,
+    });
+    const imported: PullRequestFlowSnapshot = {
+      id: "pr_flow_91",
+      proposerAgentId: "agent_1",
+      sourceBranch: "feature/prompt-boundary",
+      targetBranch: "main",
+      title: "Safe imported title",
+      summary: "Safe imported summary",
+      files: ["src/prompt-boundary.ts"],
+      fileChanges: [{ status: "M", path: "src/prompt-boundary.ts" }],
+      status: "create_pr_authorized",
+      createdAt: 1_000,
+      updatedAt: 1_500,
+      deadlineAt: 10_000,
+      reviewRequests: [
+        {
+          id: "pr_flow_91:source_preflight:1",
+          stage: "source_preflight",
+          requestedAgentIds: ["agent_1"],
+          pendingAgentIds: [],
+          retryCounts: { agent_1: 0 },
+          responses: [
+            {
+              agentId: "agent_1",
+              stage: "source_preflight",
+              decision: "approve",
+              summary: "Safe imported review",
+              risks: [],
+              filesReviewed: ["src/prompt-boundary.ts"],
+              requiredChanges: [],
+              retryCount: 0,
+              receivedAt: 1_400,
+            },
+          ],
+          requestedAt: 1_100,
+          deadlineAt: 1_400,
+        },
+      ],
+      createAuthorization: {
+        agentId: "agent_1",
+        issuedAt: 1_500,
+        expiresAt: 10_000,
+      },
+    };
+
+    manager.importState([imported], { deferActivation: true });
+    const byGet = manager.get(imported.id)!;
+    byGet.summary = `polluted ${RESERVED_CAPABILITY_ECHO}`;
+    byGet.files = [`polluted/${RESERVED_CAPABILITY_ECHO}`];
+    const byList = manager.list()[0]!;
+    byList.title = `polluted ${RESERVED_CAPABILITY_ECHO}`;
+    byList.fileChanges = [
+      {
+        status: `M ${RESERVED_CAPABILITY_ECHO}`,
+        path: `polluted/${RESERVED_CAPABILITY_ECHO}`,
+      },
+    ];
+    byList.reviewRequests[0]!.responses[0]!.summary =
+      `polluted review ${RESERVED_CAPABILITY_ECHO}`;
+    byList.reviewRequests[0]!.responses[0]!.requiredChanges = [
+      `polluted change ${RESERVED_CAPABILITY_ECHO}`,
+    ];
+
+    manager.activateImportedState();
+    const restoredPrompt = await waitForDelivery(
+      proposer,
+      `/api/pr-flows/${imported.id}/pr-created`,
+    );
+    expect(restoredPrompt).not.toContain(RESERVED_CAPABILITY_ECHO);
+    expect(restoredPrompt).toContain("[redacted]");
+    const completionToken = extractPromptToken(restoredPrompt, "completionToken");
+    expect(completionToken).toMatch(/^agent_canvas_cap_/u);
+    expect(completionToken).not.toBe("[redacted]");
+
+    proposer.setStatus("waiting_input");
+    const next = await manager.submitPrCreated(imported.id, {
+      agentId: "agent_1",
+      completionToken,
+      prNumber: 91,
+      prUrl: "https://example.test/pr/91",
+    });
+    expect(next).toMatchObject({ status: "queued", currentStage: "target_merge" });
   });
 
   it("authorizes create and merge after source and target approvals", async () => {
