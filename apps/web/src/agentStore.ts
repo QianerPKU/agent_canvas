@@ -85,6 +85,8 @@ export interface AgentView {
   turns: Turn[];
   /** 线程最近一次 usage；最新 idle/running 节点持续展示该值。 */
   latestUsage?: UsageInfo;
+  /** 最近一次 system_init 的 session；snapshot 暂时无 sessionId 时仍用于识别会话切换。 */
+  lastInitializedSessionId?: string;
   forkOrigin?: ForkOrigin;
   createdAt?: number;
   lastSeq: number;
@@ -118,8 +120,27 @@ export function applyHello(
   histories: Record<string, AgentEventEnvelope[]> = {},
 ): AgentMap {
   const map: AgentMap = {};
+  const agentsWithOwnUsage = new Set<string>();
+  const agentsWithSessionChange = new Set<string>();
   for (const a of agents) {
     const history = histories[a.id]?.slice().sort((left, right) => left.seq - right.seq) ?? [];
+    if (
+      a.usage !== undefined ||
+      history.some(
+        ({ event }) =>
+          event.kind === "usage" || (event.kind === "result" && event.usage !== undefined),
+      )
+    ) {
+      agentsWithOwnUsage.add(a.id);
+    }
+    const initializedSessions = new Set(
+      history.flatMap(({ event }) =>
+        event.kind === "system_init" ? [event.sessionId] : [],
+      ),
+    );
+    if (a.sessionId) initializedSessions.add(a.sessionId);
+    if (initializedSessions.size > 1) agentsWithSessionChange.add(a.id);
+    const snapshotUsage = history.length > 0 ? undefined : a.usage;
     map[a.id] = newAgentView(a.id, {
       provider: a.provider ?? a.config.provider,
       status: a.status,
@@ -133,17 +154,27 @@ export function applyHello(
       systemPrompt: a.config.systemPrompt,
       forkOrigin: a.forkOrigin,
       createdAt: a.createdAt,
-      latestUsage: history.length > 0 ? undefined : a.usage,
+      latestUsage: snapshotUsage,
+      lastInitializedSessionId: history.length > 0 ? undefined : a.sessionId,
       lastSeq: histories[a.id]?.length ? 0 : a.lastEventSeq,
     });
     for (const envelope of history) {
       map[a.id] = applyEnvelope(map, envelope)[a.id] ?? map[a.id]!;
     }
     const replayed = map[a.id]!;
-    const latestUsage = a.usage ?? replayed.latestUsage;
+    const candidateUsage = a.usage ?? replayed.latestUsage;
+    const lastInitializedSessionId = a.sessionId ?? replayed.lastInitializedSessionId;
+    const snapshotSessionChanged =
+      a.usage === undefined &&
+      !!a.sessionId &&
+      !!replayed.lastInitializedSessionId &&
+      a.sessionId !== replayed.lastInitializedSessionId;
+    const latestUsage = snapshotSessionChanged ? undefined : candidateUsage;
     const restored = latestUsage
       ? withLastTurn(replayed, (turn) => ({ ...turn, usage: latestUsage }))
-      : replayed;
+      : snapshotSessionChanged
+        ? withLastTurn(replayed, (turn) => ({ ...turn, usage: undefined }))
+        : replayed;
     map[a.id] = {
       ...restored,
       provider: a.provider ?? a.config.provider ?? map[a.id]!.provider,
@@ -159,10 +190,37 @@ export function applyHello(
       forkOrigin: a.forkOrigin,
       createdAt: a.createdAt,
       latestUsage,
+      lastInitializedSessionId,
       lastSeq: a.lastEventSeq,
     };
   }
+  // Fork snapshots can precede their parent in `agents`. Resolve inherited
+  // usage only after every parent's history has been replayed, and only when
+  // the child has never reported usage of its own.
+  for (const a of agents) {
+    const child = map[a.id];
+    if (
+      !child?.forkOrigin ||
+      child.latestUsage ||
+      agentsWithOwnUsage.has(a.id) ||
+      agentsWithSessionChange.has(a.id)
+    ) {
+      continue;
+    }
+    const forkUsage = usageAtForkOrigin(map, child.forkOrigin);
+    if (!forkUsage) continue;
+    map[a.id] = withLastTurn(
+      { ...child, latestUsage: forkUsage },
+      (turn) => ({ ...turn, usage: forkUsage }),
+    );
+  }
   return map;
+}
+
+function usageAtForkOrigin(map: AgentMap, origin: ForkOrigin): UsageInfo | undefined {
+  return map[origin.parentAgentId]?.turns.find(
+    (turn) => turn.anchorUuid === origin.anchorUuid,
+  )?.usage;
 }
 
 /** 乐观插入一个 fork 出来的新 agent。 */
@@ -174,9 +232,7 @@ export function insertForked(
 ): AgentMap {
   if (map[id]) return map;
   const parent = map[origin.parentAgentId];
-  const forkUsage = parent?.turns.find(
-    (turn) => turn.anchorUuid === origin.anchorUuid,
-  )?.usage;
+  const forkUsage = usageAtForkOrigin(map, origin);
   return {
     ...map,
     [id]: newAgentView(id, {
@@ -335,7 +391,8 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
     case "user_approval_result":
       return updateApprovalLine(view, event.requestId, event.action, event.summary);
     case "system_init": {
-      const changedSession = !!view.sessionId && view.sessionId !== event.sessionId;
+      const previousSessionId = view.lastInitializedSessionId ?? view.sessionId;
+      const changedSession = !!previousSessionId && previousSessionId !== event.sessionId;
       const initialized = changedSession
         ? withLastTurn(
             { ...view, latestUsage: undefined },
@@ -343,7 +400,12 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
           )
         : view;
       return pushLineToLast(
-        { ...initialized, sessionId: event.sessionId, model: event.model },
+        {
+          ...initialized,
+          sessionId: event.sessionId,
+          lastInitializedSessionId: event.sessionId,
+          model: event.model,
+        },
         { kind: "system", text: `会话建立 · ${event.model}` },
       );
     }

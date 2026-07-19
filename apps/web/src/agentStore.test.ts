@@ -641,6 +641,171 @@ describe("agentStore 轮次模型", () => {
     });
   });
 
+  it("applyHello 在所有 history 回放后从父锚点恢复 fork usage", () => {
+    seq = 0;
+    const parentHistory = [
+      env("parent", { kind: "user_input", text: "first" }),
+      env("parent", SYS),
+      env("parent", {
+        kind: "usage",
+        usage: { contextTokens: 2048, contextWindow: 128000 },
+      }),
+      env("parent", { kind: "assistant_text", text: "one", messageUuid: "u1" }),
+      env("parent", {
+        kind: "result",
+        subtype: "success",
+        isError: false,
+        anchorUuid: "u1",
+      }),
+      env("parent", { kind: "user_input", text: "second" }),
+      env("parent", {
+        kind: "usage",
+        usage: { contextTokens: 8192, contextWindow: 128000 },
+      }),
+      env("parent", { kind: "assistant_text", text: "two", messageUuid: "u2" }),
+      env("parent", {
+        kind: "result",
+        subtype: "success",
+        isError: false,
+        anchorUuid: "u2",
+      }),
+    ];
+
+    const map = applyHello(
+      [
+        {
+          id: "child",
+          status: "waiting_input",
+          config: { prompt: "", provider: "codex" },
+          createdAt: 2,
+          lastEventSeq: 0,
+          forkOrigin: { parentAgentId: "parent", anchorUuid: "u1" },
+        },
+        {
+          id: "parent",
+          status: "waiting_input",
+          sessionId: "s1",
+          config: { prompt: "", provider: "codex" },
+          createdAt: 1,
+          lastEventSeq: parentHistory.at(-1)!.seq,
+          usage: { contextTokens: 8192, contextWindow: 128000 },
+        },
+      ],
+      { parent: parentHistory },
+    );
+
+    expect(get(map, "parent").latestUsage?.contextTokens).toBe(8192);
+    expect(get(map, "child").latestUsage?.contextTokens).toBe(2048);
+    expect(get(map, "child").turns[0]!.usage?.contextTokens).toBe(2048);
+  });
+
+  it("applyHello 不会为已切换 session 的 fork 重新回填父锚点 usage", () => {
+    seq = 0;
+    const parentHistory = [
+      env("parent", { kind: "user_input", text: "parent" }),
+      env("parent", SYS),
+      env("parent", {
+        kind: "usage",
+        usage: { contextTokens: 2048, contextWindow: 128000 },
+      }),
+      env("parent", {
+        kind: "result",
+        subtype: "success",
+        isError: false,
+        anchorUuid: "u1",
+      }),
+    ];
+    const childHistory = [
+      env("child", { kind: "user_input", text: "first child session" }),
+      env("child", {
+        kind: "system_init",
+        sessionId: "child-s1",
+        model: "gpt-5.5",
+        cwd: "/tmp",
+        tools: [],
+      }),
+      env("child", { kind: "result", subtype: "success", isError: false }),
+      env("child", { kind: "user_input", text: "second child session" }),
+      env("child", {
+        kind: "system_init",
+        sessionId: "child-s2",
+        model: "gpt-5.5",
+        cwd: "/tmp",
+        tools: [],
+      }),
+    ];
+
+    const map = applyHello(
+      [
+        {
+          id: "parent",
+          status: "waiting_input",
+          sessionId: "s1",
+          config: { prompt: "", provider: "codex" },
+          createdAt: 1,
+          lastEventSeq: parentHistory.at(-1)!.seq,
+          usage: { contextTokens: 2048, contextWindow: 128000 },
+        },
+        {
+          id: "child",
+          status: "running",
+          sessionId: "child-s2",
+          config: { prompt: "", provider: "codex" },
+          createdAt: 2,
+          lastEventSeq: childHistory.at(-1)!.seq,
+          forkOrigin: { parentAgentId: "parent", anchorUuid: "u1" },
+        },
+      ],
+      { parent: parentHistory, child: childHistory },
+    );
+
+    expect(get(map, "child").latestUsage).toBeUndefined();
+    expect(get(map, "child").turns.at(-1)!.usage).toBeUndefined();
+  });
+
+  it("新 session 启动窗口重连后仍在 system_init 清除旧 usage", () => {
+    seq = 0;
+    const history = [
+      env("a1", { kind: "user_input", text: "old session" }),
+      env("a1", SYS),
+      env("a1", {
+        kind: "usage",
+        usage: { contextTokens: 4096, contextWindow: 128000 },
+      }),
+      env("a1", { kind: "result", subtype: "success", isError: false }),
+      env("a1", { kind: "user_input", text: "new session" }),
+    ];
+    let map = applyHello(
+      [
+        {
+          id: "a1",
+          status: "starting",
+          config: { prompt: "new session", provider: "codex" },
+          createdAt: 1,
+          lastEventSeq: history.at(-1)!.seq,
+        },
+      ],
+      { a1: history },
+    );
+
+    expect(get(map).sessionId).toBeUndefined();
+    expect(get(map).latestUsage?.contextTokens).toBe(4096);
+
+    map = applyEnvelope(
+      map,
+      env("a1", {
+        kind: "system_init",
+        sessionId: "s2",
+        model: "gpt-5.5",
+        cwd: "/tmp",
+        tools: [],
+      }),
+    );
+
+    expect(get(map).latestUsage).toBeUndefined();
+    expect(get(map).turns.at(-1)!.usage).toBeUndefined();
+  });
+
   it("忽略旧 seq", () => {
     let map: AgentMap = { a1: newAgentView("a1", { lastSeq: 5 }) };
     map = applyEnvelope(map, {
