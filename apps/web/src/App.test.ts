@@ -20,6 +20,7 @@ import {
   isCurrentWorkspaceUpdate,
   isSameBranchWorkspace,
   ownsProjectOperation,
+  reconcileWorkspaceBranchOptions,
   resolveCurrentProjectOpenStep,
   staggeredNodePositions,
   workDocumentationMutationWarning,
@@ -307,6 +308,84 @@ describe("isSameBranchWorkspace", () => {
 
   it("accepts the exact branch workspace returned by the mutation", () => {
     expect(isSameBranchWorkspace(created, { ...created })).toBe(true);
+  });
+});
+
+describe("reconcileWorkspaceBranchOptions", () => {
+  it("adopts authoritative workspaces without dropping remote-only branch options", () => {
+    const reconciled = reconcileWorkspaceBranchOptions(
+      [
+        {
+          branch: "feature/metadata",
+          hasWorkspace: false,
+          isDefault: false,
+        },
+        {
+          branch: "feature/remote-only",
+          hasWorkspace: false,
+          isDefault: false,
+        },
+        {
+          branch: "feature/removed-workspace",
+          branchWorkspaceId: "branch_old",
+          worktreePath: "/projects/a/worktrees/removed",
+          hasWorkspace: true,
+          isDefault: false,
+        },
+      ],
+      {
+        projectRoot: "/projects/a",
+        branches: [
+          {
+            id: "branch_main",
+            repoId: "repo_1",
+            branch: "main",
+            baseBranch: "main",
+            worktreePath: "/projects/a/repo",
+            scratchRoot: "/projects/a/repo/.agent-tmp",
+            isDefault: true,
+            createdAt: 1,
+          },
+          {
+            id: "branch_feature",
+            repoId: "repo_1",
+            branch: "feature/metadata",
+            baseBranch: "main",
+            worktreePath: "/projects/a/worktrees/feature-metadata",
+            scratchRoot: "/projects/a/worktrees/feature-metadata/.agent-tmp",
+            isDefault: false,
+            createdAt: 2,
+          },
+        ],
+        sharedResources: [],
+      },
+    );
+
+    expect(reconciled.map((option) => option.branch)).toEqual([
+      "feature/metadata",
+      "feature/remote-only",
+      "feature/removed-workspace",
+      "main",
+    ]);
+    expect(reconciled.find((option) => option.branch === "feature/metadata")).toMatchObject({
+      branchWorkspaceId: "branch_feature",
+      hasWorkspace: true,
+    });
+    expect(reconciled.find((option) => option.branch === "feature/remote-only")).toMatchObject({
+      hasWorkspace: false,
+    });
+    expect(reconciled.find((option) => option.branch === "feature/removed-workspace")).toEqual({
+      branch: "feature/removed-workspace",
+      branchWorkspaceId: undefined,
+      worktreePath: undefined,
+      hasWorkspace: false,
+      isDefault: false,
+    });
+    expect(reconciled.find((option) => option.branch === "main")).toMatchObject({
+      branchWorkspaceId: "branch_main",
+      hasWorkspace: true,
+      isDefault: true,
+    });
   });
 });
 
