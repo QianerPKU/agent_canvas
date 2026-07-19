@@ -2,7 +2,11 @@
 import { StrictMode, type PropsWithChildren } from "react";
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AgentCommitSnapshot, PullRequestFlowSnapshot } from "@agent-canvas/shared";
+import type {
+  AgentCommitSnapshot,
+  BranchWorkspace,
+  PullRequestFlowSnapshot,
+} from "@agent-canvas/shared";
 import { api } from "./api.js";
 import { useAgentCanvas } from "./useAgentCanvas.js";
 
@@ -41,6 +45,8 @@ function sendWorkspaceFrame(
   projectId: string,
   workDocumentation: { ready: boolean; error?: string } = { ready: true },
   revision = 1,
+  branches: BranchWorkspace[] = [],
+  projectRoot = `/projects/${projectId}`,
 ): void {
   socket.onmessage?.call(
     socket as unknown as WebSocket,
@@ -48,15 +54,15 @@ function sendWorkspaceFrame(
       data: JSON.stringify({
         type: "workspace",
         workspace: {
-          projectRoot: `/projects/${projectId}`,
+          projectRoot,
           revision,
           canvasProject: {
             id: projectId,
             name: projectId,
-            projectRoot: `/projects/${projectId}`,
+            projectRoot,
             createdAt: 1,
           },
-          branches: [],
+          branches,
           sharedResources: [],
         },
         workDocumentation,
@@ -720,33 +726,75 @@ describe("useAgentCanvas", () => {
     unmount();
   });
 
-  it("treats every workspace frame and higher same-project revision as authoritative", () => {
+  it("keeps project state for same-identity metadata and replaces it on revision changes", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("WebSocket", FakeWebSocket);
     mockEmptyRefresh();
 
     const { result, unmount } = renderHook(() => useAgentCanvas());
-    act(() => vi.runOnlyPendingTimers());
+    await act(async () => {
+      vi.advanceTimersByTime(0);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     const socket = FakeWebSocket.instances[0]!;
-    act(() => sendWorkspaceFrame(socket, "project_old"));
+    act(() => {
+      sendHelloFrame(socket, "agent_existing");
+      sendWorkspaceFrame(socket, "project_old");
+    });
     const firstGeneration = result.current.currentWorkspaceEventGeneration();
-    const firstUpdate = result.current.workspaceUpdate;
+    const firstSnapshotGeneration = result.current.currentWorkspaceSnapshotGeneration();
+    const replacementUpdate = result.current.workspaceUpdate;
+    const createdBranch: BranchWorkspace = {
+      id: "branch_2",
+      repoId: "repo_1",
+      branch: "feature/metadata",
+      baseBranch: "main",
+      worktreePath: "/projects/project_old/worktrees/feature-metadata",
+      scratchRoot: "/projects/project_old/worktrees/feature-metadata/.agent-tmp",
+      isDefault: false,
+      createdAt: 2,
+    };
 
-    act(() => sendWorkspaceFrame(socket, "project_old"));
+    act(() =>
+      sendWorkspaceFrame(
+        socket,
+        "project_old",
+        { ready: false, error: "documentation status changed" },
+        1,
+        [createdBranch],
+      ),
+    );
 
-    expect(result.current.currentWorkspaceEventGeneration()).toBe(firstGeneration + 1);
-    expect(result.current.workspaceUpdate).not.toBe(firstUpdate);
+    expect(result.current.currentWorkspaceEventGeneration()).toBe(firstGeneration);
+    expect(result.current.currentWorkspaceSnapshotGeneration()).toBe(
+      firstSnapshotGeneration + 1,
+    );
+    expect(result.current.workspaceUpdate).toBe(replacementUpdate);
+    expect(result.current.workspaceMetadataUpdate).toMatchObject({
+      workspace: { branches: [createdBranch] },
+      workDocumentation: { ready: false, error: "documentation status changed" },
+    });
+    expect(result.current.currentWorkspaceSnapshot()?.branches).toEqual([createdBranch]);
+    expect(Object.keys(result.current.agents)).toEqual(["agent_existing"]);
 
     act(() =>
       sendWorkspaceFrame(socket, "project_old", {
-        ready: false,
-        error: "documentation status changed",
+        ready: true,
       }, 2),
     );
-    expect(result.current.currentWorkspaceEventGeneration()).toBe(firstGeneration + 2);
+    expect(result.current.currentWorkspaceEventGeneration()).toBe(firstGeneration + 1);
+    expect(result.current.currentWorkspaceSnapshotGeneration()).toBe(
+      firstSnapshotGeneration + 2,
+    );
     expect(result.current.currentWorkspaceEventIdentity()).toBe("project:project_old@2");
+    expect(result.current.currentWorkspaceSnapshot()?.revision).toBe(2);
     const highRevisionGeneration = result.current.currentWorkspaceEventGeneration();
+    const highRevisionSnapshotGeneration =
+      result.current.currentWorkspaceSnapshotGeneration();
     const highRevisionUpdate = result.current.workspaceUpdate;
+    expect(result.current.workspaceMetadataUpdate).toBeUndefined();
+    expect(result.current.agents).toEqual({});
 
     act(() =>
       sendWorkspaceFrame(socket, "project_old", {
@@ -755,8 +803,12 @@ describe("useAgentCanvas", () => {
       }, 1),
     );
     expect(result.current.currentWorkspaceEventGeneration()).toBe(highRevisionGeneration);
+    expect(result.current.currentWorkspaceSnapshotGeneration()).toBe(
+      highRevisionSnapshotGeneration,
+    );
     expect(result.current.workspaceUpdate).toBe(highRevisionUpdate);
     expect(result.current.currentWorkspaceEventIdentity()).toBe("project:project_old@2");
+    expect(result.current.currentWorkspaceSnapshot()?.revision).toBe(2);
     unmount();
   });
 
@@ -770,11 +822,16 @@ describe("useAgentCanvas", () => {
     const firstSocket = FakeWebSocket.instances[0]!;
     act(() => sendWorkspaceFrame(firstSocket, "project_same"));
     const firstGeneration = result.current.currentWorkspaceEventGeneration();
+    const firstSnapshotGeneration = result.current.currentWorkspaceSnapshotGeneration();
     const firstUpdate = result.current.workspaceUpdate;
 
     act(() => {
       firstSocket.onclose?.call(firstSocket as unknown as WebSocket, {} as CloseEvent);
     });
+    expect(result.current.currentWorkspaceSnapshot()).toBeUndefined();
+    expect(result.current.currentWorkspaceSnapshotGeneration()).toBe(
+      firstSnapshotGeneration + 1,
+    );
     act(() => vi.advanceTimersByTime(1_000));
     const reconnectedSocket = FakeWebSocket.instances[1]!;
     act(() => sendWorkspaceFrame(reconnectedSocket, "project_same"));
@@ -784,6 +841,105 @@ describe("useAgentCanvas", () => {
     expect(result.current.workspaceUpdate).toMatchObject({
       workspace: { canvasProject: { id: "project_same" } },
     });
+    expect(result.current.workspaceMetadataUpdate).toBeUndefined();
+    expect(result.current.currentWorkspaceSnapshotGeneration()).toBe(
+      firstSnapshotGeneration + 2,
+    );
+    const reconnectGeneration = result.current.currentWorkspaceEventGeneration();
+    act(() => sendWorkspaceFrame(reconnectedSocket, "project_same"));
+    expect(result.current.currentWorkspaceEventGeneration()).toBe(reconnectGeneration);
+    expect(result.current.workspaceMetadataUpdate).toMatchObject({
+      workspace: { canvasProject: { id: "project_same" } },
+    });
+    unmount();
+  });
+
+  it("lets an in-flight project refresh complete across same-identity metadata", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    await act(async () => {
+      vi.advanceTimersByTime(0);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    act(() => sendWorkspaceFrame(socket, "project_same"));
+
+    let resolveAgents!: (agents: Awaited<ReturnType<typeof api.list>>) => void;
+    vi.mocked(api.list).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveAgents = resolve;
+      }),
+    );
+    let pendingRefresh!: Promise<void>;
+    act(() => {
+      pendingRefresh = result.current.refresh();
+    });
+    const generation = result.current.currentWorkspaceEventGeneration();
+    act(() =>
+      sendWorkspaceFrame(
+        socket,
+        "project_same",
+        { ready: false, error: "metadata only" },
+      ),
+    );
+    expect(result.current.currentWorkspaceEventGeneration()).toBe(generation);
+
+    await act(async () => {
+      resolveAgents([
+        {
+          id: "agent_from_refresh",
+          status: "idle",
+          config: { prompt: "" },
+          createdAt: 1,
+          lastEventSeq: 0,
+        },
+      ]);
+      await pendingRefresh;
+    });
+
+    expect(Object.keys(result.current.agents)).toEqual(["agent_from_refresh"]);
+    expect(result.current.workspaceMetadataUpdate).toMatchObject({
+      workDocumentation: { ready: false, error: "metadata only" },
+    });
+    unmount();
+  });
+
+  it("fails safe when the same project and revision arrive from a different root", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    await act(async () => {
+      vi.advanceTimersByTime(0);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    act(() => {
+      sendHelloFrame(socket, "agent_existing");
+      sendWorkspaceFrame(socket, "project_same");
+    });
+    const generation = result.current.currentWorkspaceEventGeneration();
+
+    act(() =>
+      sendWorkspaceFrame(
+        socket,
+        "project_same",
+        { ready: true },
+        1,
+        [],
+        "/relocated/project_same",
+      ),
+    );
+
+    expect(result.current.currentWorkspaceEventGeneration()).toBe(generation + 1);
+    expect(result.current.workspaceMetadataUpdate).toBeUndefined();
+    expect(result.current.agents).toEqual({});
     unmount();
   });
 
