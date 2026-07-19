@@ -90,9 +90,13 @@ describe("branch review queue project reload", () => {
       reason: "Exercise project state restoration",
       files: ["src/reload.ts"],
     });
+    await waitUntil(
+      () => firstHarness.syncFlowManager.get(created.id)?.status === "review_collecting",
+    );
     await waitUntil(() => firstSession.steered.length === 1);
-    expect(created.status).toBe("review_collecting");
-    const firstReviewRequestId = created.reviewRequest?.id;
+    const collecting = firstHarness.syncFlowManager.get(created.id);
+    expect(collecting?.status).toBe("review_collecting");
+    const firstReviewRequestId = collecting?.reviewRequest?.id;
     expect(firstReviewRequestId).toBeTruthy();
 
     const statePath = path.join(projectA.json.project.projectRoot, "canvas-state.json");
@@ -192,7 +196,7 @@ describe("branch review queue project reload", () => {
     });
     expect(project.status).toBe(201);
 
-    const restoredSync = await firstSyncManager.create({
+    const createdRestoredSync = await firstSyncManager.create({
       kind: "branch_pull",
       proposerAgentId: firstHost.agentId,
       sourceBranch: "main",
@@ -202,13 +206,21 @@ describe("branch review queue project reload", () => {
       reason: "This restored review must retain the first branch reservation",
       files: ["src/restored-sync.ts"],
     });
-    const restoredPr = await firstPrManager.create({
+    const createdRestoredPr = await firstPrManager.create({
       proposerAgentId: firstHost.agentId,
       targetBranch: "main",
       title: "Persisted auto-open PR",
       summary: "This equal-time review must remain second in the shared FIFO",
       files: ["src/restored-pr.ts"],
     });
+    await waitUntil(
+      () => firstSyncManager.get(createdRestoredSync.id)?.status === "review_collecting",
+    );
+    await waitUntil(
+      () => !firstPrManager.hasPendingOperations() && !firstSyncManager.hasPendingOperations(),
+    );
+    const restoredSync = firstSyncManager.get(createdRestoredSync.id)!;
+    const restoredPr = firstPrManager.get(createdRestoredPr.id)!;
     expect(restoredSync.createdAt).toBe(restoredPr.createdAt);
     expect(restoredSync.reviewQueueSequence).toBeLessThan(restoredPr.reviewQueueSequence!);
     expect(restoredSync.status).toBe("review_collecting");
@@ -294,15 +306,21 @@ describe("branch review queue project reload", () => {
       () => restartedPrManager.get(restoredPr.id)?.status === "source_review_collecting",
     );
     expect(restartedSyncManager.get(fresh.json.flow.id)?.status).toBe("queued");
-    expect(restartedHost.runner.sent).toHaveLength(2);
-    expect(restartedHost.runner.sent[1]).toContain(`flowId: ${restoredPr.id}`);
+    const reviewsAfterSyncCancel = restartedHost.runner.sent.filter((message) =>
+      message.includes("review request"),
+    );
+    expect(reviewsAfterSyncCancel).toHaveLength(2);
+    expect(reviewsAfterSyncCancel[1]).toContain(`flowId: ${restoredPr.id}`);
 
     restartedPrManager.cancel(restoredPr.id);
     await waitUntil(
       () => restartedSyncManager.get(fresh.json.flow.id)?.status === "review_collecting",
     );
-    expect(restartedHost.runner.sent).toHaveLength(3);
-    expect(restartedHost.runner.sent[2]).toContain(`flowId: ${fresh.json.flow.id}`);
+    const reviewsAfterPrCancel = restartedHost.runner.sent.filter((message) =>
+      message.includes("review request"),
+    );
+    expect(reviewsAfterPrCancel).toHaveLength(3);
+    expect(reviewsAfterPrCancel[2]).toContain(`flowId: ${fresh.json.flow.id}`);
   }, 15_000);
 
   it("waits for prompt and layout restoration before rebuilding or persisting PR and sync queues", async () => {
@@ -361,17 +379,24 @@ describe("branch review queue project reload", () => {
     });
     expect(layout.status, JSON.stringify(layout.json)).toBe(200);
 
-    const prFlow = await firstPullRequestFlowManager.create({
+    const createdPrFlow = await firstPullRequestFlowManager.create({
       proposerAgentId: firstHost.agentId,
       targetBranch: "main",
       title: "Restore queue ordering",
       summary: "Persist a collecting PR review",
       files: ["src/pr.ts"],
     });
+    await waitUntil(
+      () =>
+        firstPullRequestFlowManager.get(createdPrFlow.id)?.status ===
+        "source_review_collecting",
+    );
+    await waitUntil(() => !firstPullRequestFlowManager.hasPendingOperations());
+    const prFlow = firstPullRequestFlowManager.get(createdPrFlow.id)!;
     expect(prFlow.status).toBe("source_review_collecting");
     const oldPrRequestId = prFlow.reviewRequests.at(-1)?.id;
     expect(oldPrRequestId).toBeTruthy();
-    const syncFlow = await firstSyncFlowManager.create({
+    const createdSyncFlow = await firstSyncFlowManager.create({
       kind: "branch_pull",
       proposerAgentId: firstHost.agentId,
       sourceBranch: "main",
@@ -381,6 +406,12 @@ describe("branch review queue project reload", () => {
       reason: "Share the branch review queue",
       files: ["src/sync.ts"],
     });
+    await waitUntil(
+      () =>
+        !firstPullRequestFlowManager.hasPendingOperations() &&
+        !firstSyncFlowManager.hasPendingOperations(),
+    );
+    const syncFlow = firstSyncFlowManager.get(createdSyncFlow.id)!;
     expect(syncFlow.status).toBe("queued");
 
     firstHost.runner.setStatus("waiting_input");
@@ -588,6 +619,11 @@ async function createHarness(
     if (closed) return;
     closed = true;
     try {
+      await waitUntil(
+        () =>
+          !result.pullRequestFlowManager.hasPendingOperations() &&
+          !result.syncFlowManager.hasPendingOperations(),
+      );
       // Drain the debounced canvas save before retiring review timers and runners. This preserves
       // the exact persisted reload fixture while preventing the old server from writing into a
       // project after the replacement server (or the next test) has taken ownership of it.

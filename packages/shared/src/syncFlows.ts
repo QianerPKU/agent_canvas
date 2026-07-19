@@ -115,6 +115,8 @@ export interface SyncFlowSnapshot {
   closedAt?: number;
   failureReason?: string;
   deadlineAt?: number;
+  /** All agents that have participated in a review request for this flow. */
+  participantAgentIds?: string[];
   reviewRequest?: SyncFlowReviewRequest;
   applyAuthorization?: SyncFlowAuthorization;
   applied?: SyncFlowAppliedInfo;

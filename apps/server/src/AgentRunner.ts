@@ -61,6 +61,16 @@ interface PendingApproval {
   cleanup?: () => void;
 }
 
+interface PendingQueuedInput {
+  text: string;
+  automationKey?: string;
+}
+
+export interface AgentDeliveryOptions {
+  automationKey?: string;
+  replaceQueued?: boolean;
+}
+
 /**
  * 单个 agent 的生命周期管理：封装 Agent SDK 的一次 query，
  * 驱动流式输入（用于中途干预），把 SDK 消息归一为统一事件向外广播，
@@ -93,7 +103,7 @@ export class AgentRunner {
   private promptInjectionPending = false;
   private policyPromptInjectionPending = false;
   private pendingInjectedPrompts: AgentPromptReference[] = [];
-  private pendingQueuedInputs: string[] = [];
+  private pendingQueuedInputs: PendingQueuedInput[] = [];
   private inputTransitionTail: Promise<void> = Promise.resolve();
   private readonly pendingQuestions = new Map<string, PendingQuestion>();
   private readonly pendingApprovals = new Map<string, PendingApproval>();
@@ -343,7 +353,7 @@ export class AgentRunner {
     }
     const isQueuedInput = this.status === "starting" || this.status === "running";
     if (isQueuedInput) {
-      this.pendingQueuedInputs.push(text);
+      this.pendingQueuedInputs.push({ text });
       this.emit({ kind: "user_input", text, mode: "queued" });
       return Promise.resolve();
     }
@@ -373,11 +383,19 @@ export class AgentRunner {
    * preparation runs first; the final send/steer/queue decision is serialized
    * with result transitions and uses the provider's live steer capability.
    */
-  async deliver(text: string): Promise<void> {
+  async deliver(text: string, options: AgentDeliveryOptions = {}): Promise<void> {
     const generation = this.lifecycleGeneration;
     return await this.runInputTransition(async () => {
       if (generation !== this.lifecycleGeneration) {
         throw new Error(`agent ${this.id} delivery target changed before dispatch`);
+      }
+      // A closure replacement must revoke stale same-flow inputs even when path preparation for
+      // the replacement itself fails. Keeping this inside the serialized transition preserves
+      // ordering with concurrent deliveries while making the safety revocation unconditional.
+      if (options.replaceQueued && options.automationKey !== undefined) {
+        this.pendingQueuedInputs = this.pendingQueuedInputs.filter(
+          (input) => input.automationKey !== options.automationKey,
+        );
       }
       await this.prepareFileAccess?.(this.id);
       if (generation !== this.lifecycleGeneration) {
@@ -389,7 +407,7 @@ export class AgentRunner {
         throw new Error(`agent ${this.id} is not active (${this.status})`);
       }
       if (this.status === "starting") {
-        this.pendingQueuedInputs.push(text);
+        this.pendingQueuedInputs.push({ text, automationKey: options.automationKey });
         this.emit({ kind: "user_input", text, mode: "queued" });
         return;
       }
@@ -461,21 +479,10 @@ export class AgentRunner {
       }
 
       // Codex clears its turn id before yielding result, and a newly queued
-      // turn is not steerable until turn/start completes. Preserve delivery
-      // order through that gap instead of steering a stale/nonexistent turn.
-      this.pendingQueuedInputs.push(text);
-      if (!handle?.steer) {
-        await handle?.interrupt?.().catch(() => undefined);
-        if (
-          generation !== this.lifecycleGeneration ||
-          inputQueue !== this.inputQueue ||
-          inputQueue.isClosed ||
-          handle !== this.handle ||
-          this.status !== "running"
-        ) {
-          throw new Error(`agent ${this.id} delivery target changed during dispatch`);
-        }
-      }
+      // turn is not steerable until turn/start completes. Providers without
+      // native steer also land here. Automation must never interrupt the
+      // agent's active response: queue it for the next natural turn boundary.
+      this.pendingQueuedInputs.push({ text, automationKey: options.automationKey });
       this.emit({ kind: "user_input", text, mode: "queued" });
     });
   }
@@ -509,9 +516,9 @@ export class AgentRunner {
       if (handle?.steer && (handle.canSteerNow?.() ?? true)) {
         await handle.steer(input);
       } else if (handle?.steer) {
-        this.pendingQueuedInputs.unshift(text);
+        this.pendingQueuedInputs.unshift({ text });
       } else if (handle?.interrupt) {
-        this.pendingQueuedInputs.unshift(text);
+        this.pendingQueuedInputs.unshift({ text });
         await handle.interrupt().catch(() => undefined);
       } else {
         inputQueue.push(input);
@@ -816,7 +823,7 @@ export class AgentRunner {
     const inputQueue = expected.inputQueue;
     const handle = expected.handle;
     const generation = expected.generation;
-    let queuedInput: string | undefined;
+    let queuedInput: PendingQueuedInput | undefined;
     let nextStatus: AgentStatus | undefined;
     if (!inputQueue || inputQueue.isClosed) {
       this.pendingQueuedInputs = [];
@@ -851,7 +858,7 @@ export class AgentRunner {
         }
         inputQueue.push(
           toUserInput(
-            queuedInput,
+            queuedInput.text,
             this.resolveFileAccess?.(this.id),
             this.promptAccessForNextInput(),
           ),
@@ -868,7 +875,7 @@ export class AgentRunner {
     const statusChanged = nextStatus !== undefined && this.status !== nextStatus;
     if (nextStatus !== undefined) this.status = nextStatus;
     this.emit(enriched);
-    if (queuedInput) this.emit({ kind: "user_input", text: queuedInput });
+    if (queuedInput) this.emit({ kind: "user_input", text: queuedInput.text });
     if (statusChanged && nextStatus !== undefined) {
       this.emit({ kind: "status", status: nextStatus });
     }

@@ -4,6 +4,8 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import type {
+  AgentEvent,
+  AgentEventEnvelope,
   AgentApprovalResponse,
   AgentCanvasSettings,
   AgentCanvasConfig,
@@ -11,6 +13,7 @@ import type {
   AgentQuestionResponse,
   AgentPromptReference,
   AgentSettings,
+  AgentSnapshot,
   AgentStartConfig,
   BranchDiffSummary,
   CanvasFileNode,
@@ -49,10 +52,19 @@ import {
   type OpenInVscodeOptions,
 } from "./files/VscodeFileOpener.js";
 import { PromptManager } from "./prompts/PromptManager.js";
-import { PullRequestFlowManager } from "./pullRequests/PullRequestFlowManager.js";
+import {
+  PullRequestFlowManager,
+  type SubmitPullRequestCreatedInput,
+  type SubmitPullRequestMergedInput,
+  type SubmitPullRequestReviewInput,
+} from "./pullRequests/PullRequestFlowManager.js";
 import { BranchReviewQueue } from "./reviews/BranchReviewQueue.js";
 import { CodexAuthManager } from "./sdk/CodexAuthManager.js";
-import { SyncFlowManager } from "./sync/SyncFlowManager.js";
+import {
+  SyncFlowManager,
+  type SyncFlowAppliedSubmission,
+  type SyncFlowReviewSubmission,
+} from "./sync/SyncFlowManager.js";
 import {
   WorkspaceManager,
   WorkspaceProjectChangedError,
@@ -307,8 +319,8 @@ export function createServer(
   };
   const helloFrame = (): ServerFrame => ({
     type: "hello",
-    agents: manager.list(),
-    histories: manager.exportState().histories,
+    agents: manager.list().map(publicAgentSnapshot),
+    histories: publicAgentHistories(manager.exportState().histories),
     prFlows: pullRequestFlowManager.list(),
     syncFlows: syncFlowManager.list(),
     commits: commitManager.list(),
@@ -338,34 +350,62 @@ export function createServer(
       );
   });
 
+  // Keep derived agent work ordered without holding the project transaction while it can deliver
+  // another agent input. The transaction protects the public event snapshot; the derived-event
+  // guard prevents a project replacement until all flow bookkeeping and deliveries settle.
+  let derivedAgentEventChain: Promise<void> = Promise.resolve();
   // 把 manager 的事件广播到所有 WS 客户端
   manager.onEvent((envelope) => {
     // Agent completion can asynchronously advance PR/sync flows. Keep that derived mutation
     // ordered with project switches so a late old-project result cannot update newly imported
     // flow state. Calls are enqueued in listener order.
     const finishDerivedEvent = canvasState.beginDerivedAgentEvent();
-    void canvasState
-      .runProjectTransaction(
-        async () => {
-          broadcastFrame({ type: "event", envelope });
-          if (
-            envelope.event.kind === "status" &&
-            (envelope.event.status === "running" ||
-              envelope.event.status === "waiting_input")
-          ) {
-            const branch = manager.configOf(envelope.agentId)?.branch?.trim();
-            if (branch) await reviewQueue.retryBranch(branch);
-          }
-          await Promise.all([
-            pullRequestFlowManager.handleAgentEvent(envelope),
-            syncFlowManager.handleAgentEvent(envelope),
-          ]);
-          canvasState.saveSoon();
-        },
-        { forceEnqueue: true },
-      )
-      .catch(() => undefined)
-      .finally(finishDerivedEvent);
+    const shouldRetryClosureReleases =
+      envelope.event.kind === "status" &&
+      (envelope.event.status === "running" ||
+        envelope.event.status === "waiting_input");
+    let branchToRetry: string | undefined;
+    const publicEventRecorded = canvasState.runProjectTransaction(
+      async () => {
+        broadcastFrame({ type: "event", envelope: publicAgentEventEnvelope(envelope) });
+        if (shouldRetryClosureReleases) {
+          branchToRetry = manager.configOf(envelope.agentId)?.branch?.trim() || undefined;
+        }
+      },
+      { forceEnqueue: true },
+    );
+    void publicEventRecorded.catch(() => undefined);
+    const derivedWork = derivedAgentEventChain.then(async () => {
+      await publicEventRecorded;
+      if (!shouldRetryClosureReleases && envelope.event.kind === "status") {
+        pullRequestFlowManager.forgetClosureReleasesForAgent(envelope.agentId);
+        syncFlowManager.forgetClosureReleasesForAgent(envelope.agentId);
+      }
+      await Promise.all([
+        pullRequestFlowManager.handleAgentEvent(envelope),
+        syncFlowManager.handleAgentEvent(envelope),
+      ]);
+      canvasState.saveSoon();
+      if (shouldRetryClosureReleases) {
+        const currentStatus = manager.snapshot(envelope.agentId)?.status;
+        if (currentStatus !== "running" && currentStatus !== "waiting_input") return;
+        const currentBranch = manager.configOf(envelope.agentId)?.branch?.trim();
+        if (!branchToRetry || currentBranch !== branchToRetry) return;
+        // Review activation and closure delivery can both need a queued project transaction to
+        // prepare file access. They can also serialize behind an earlier delivery already waiting
+        // for that transaction. Never await either one while holding the project queue.
+        await reviewQueue.retryBranch(branchToRetry);
+        await Promise.all([
+          pullRequestFlowManager.retryClosureReleasesForAgent(envelope.agentId),
+          syncFlowManager.retryClosureReleasesForAgent(envelope.agentId),
+        ]);
+      }
+    });
+    derivedAgentEventChain = derivedWork.then(
+      () => undefined,
+      () => undefined,
+    );
+    void derivedWork.catch(() => undefined).finally(finishDerivedEvent);
   });
 
   pullRequestFlowManager.onFlow((flow) => {
@@ -922,7 +962,7 @@ async function handleHttp(
   }
 
   if (method === "GET" && path === "/api/agents") {
-    return sendJson(res, 200, { agents: manager.list() });
+    return sendJson(res, 200, { agents: manager.list().map(publicAgentSnapshot) });
   }
 
   if (method === "GET" && path === "/api/pr-flows") {
@@ -997,9 +1037,19 @@ async function handleHttp(
         : sendJson(res, 404, { error: `unknown PR flow: ${id}` });
     }
     if (method === "POST" && action === "pr-created") {
-      const body = await readJson<PullRequestCreatedInput>(req);
+      const body = await readJson<PullRequestCreatedInput | SubmitPullRequestCreatedInput>(req);
       try {
-        const flow = await pullRequestFlowManager.recordPrCreated(id, body ?? {});
+        let flow;
+        if (hasNonEmptyString(body, "completionToken")) {
+          flow = await pullRequestFlowManager.submitPrCreated(
+            id,
+            body as unknown as SubmitPullRequestCreatedInput,
+          );
+        } else if (isTrustedUiFlowCompletionRequest(req, allowedOrigins)) {
+          flow = await pullRequestFlowManager.recordPrCreated(id, body ?? {});
+        } else {
+          throw new Error("missing PR completionToken");
+        }
         canvasState.saveSoon();
         return sendJson(res, 200, {
           flow,
@@ -1008,9 +1058,33 @@ async function handleHttp(
         return sendJson(res, 400, { error: errMsg(error) });
       }
     }
-    if (method === "POST" && action === "merged") {
+    if (method === "POST" && action === "reviews") {
+      const body = await readJson<SubmitPullRequestReviewInput>(req);
       try {
-        const flow = pullRequestFlowManager.recordMerged(id);
+        const flow = await pullRequestFlowManager.submitReview(
+          id,
+          body ?? ({} as SubmitPullRequestReviewInput),
+        );
+        canvasState.saveSoon();
+        return sendJson(res, 200, { flow });
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
+    }
+    if (method === "POST" && action === "merged") {
+      const body = await readJson<SubmitPullRequestMergedInput>(req);
+      try {
+        let flow;
+        if (hasNonEmptyString(body, "completionToken")) {
+          flow = pullRequestFlowManager.submitMerged(
+            id,
+            body as SubmitPullRequestMergedInput,
+          );
+        } else if (isTrustedUiFlowCompletionRequest(req, allowedOrigins)) {
+          flow = pullRequestFlowManager.recordMerged(id);
+        } else {
+          throw new Error("missing PR completionToken");
+        }
         canvasState.saveSoon();
         return sendJson(res, 200, { flow });
       } catch (error) {
@@ -1047,10 +1121,33 @@ async function handleHttp(
         ? sendJson(res, 200, { flow })
         : sendJson(res, 404, { error: `unknown sync flow: ${id}` });
     }
-    if (method === "POST" && action === "applied") {
-      const body = await readJson<SyncFlowAppliedInput>(req);
+    if (method === "POST" && action === "reviews") {
+      const body = await readJson<SyncFlowReviewSubmission>(req);
       try {
-        const flow = syncFlowManager.recordApplied(id, body ?? {});
+        const flow = await syncFlowManager.submitReview(
+          id,
+          body ?? ({} as SyncFlowReviewSubmission),
+        );
+        canvasState.saveSoon();
+        return sendJson(res, 200, { flow });
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
+    }
+    if (method === "POST" && action === "applied") {
+      const body = await readJson<SyncFlowAppliedInput | SyncFlowAppliedSubmission>(req);
+      try {
+        let flow;
+        if (hasNonEmptyString(body, "callbackToken")) {
+          flow = await syncFlowManager.submitApplied(
+            id,
+            body as unknown as SyncFlowAppliedSubmission,
+          );
+        } else if (isTrustedUiFlowCompletionRequest(req, allowedOrigins)) {
+          flow = syncFlowManager.recordApplied(id, body ?? {});
+        } else {
+          throw new Error("missing sync applied callbackToken");
+        }
         canvasState.saveSoon();
         return sendJson(res, 200, {
           flow,
@@ -1366,12 +1463,13 @@ async function handleHttp(
     if (!runner) return sendJson(res, 404, { error: `未知 agent: ${id}` });
 
     if (method === "GET" && !action) {
-      return sendJson(res, 200, manager.snapshot(id));
+      return sendJson(res, 200, publicAgentSnapshot(manager.snapshot(id)!));
     }
     if (method === "PATCH" && action === "settings") {
       const body = await readJson<UpdateAgentSettingsInput>(req);
-      return await canvasState.runProjectTransaction(async () => {
-        try {
+      try {
+        let branchToRetry: string | undefined;
+        const snapshot = await canvasState.runProjectTransaction(async () => {
           const currentConfig = manager.configOf(id);
           const branchChanged =
             body?.branchWorkspaceId !== undefined || body?.branch !== undefined;
@@ -1404,20 +1502,30 @@ async function handleHttp(
             branchSwitchPrompt: branchChanged ? branchSwitchPrompt(diff) : undefined,
           });
           if (branchChanged && snapshot.status === "waiting_input") {
-            const destinationBranch = snapshot.config?.branch?.trim();
-            if (destinationBranch) {
-              await reviewQueue.retryBranch(destinationBranch);
-            }
+            branchToRetry = snapshot.config?.branch?.trim() || undefined;
           }
           canvasState.saveSoon();
-          return sendJson(res, 200, snapshot);
-        } catch (error) {
-          return sendJson(res, 400, { error: errMsg(error) });
+          return snapshot;
+        });
+        const currentSnapshot = manager.snapshot(id);
+        if (
+          branchToRetry &&
+          currentSnapshot?.status === "waiting_input" &&
+          currentSnapshot.config?.branch?.trim() === branchToRetry
+        ) {
+          // Do not await activation from the project-scoped HTTP transaction. Its delivery can
+          // serialize behind an older input transition whose file preparation needs this queue.
+          void reviewQueue.retryBranch(branchToRetry).catch(() => undefined);
         }
-      });
+        return sendJson(res, 200, publicAgentSnapshot(snapshot));
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
     }
     if (method === "GET" && action === "history") {
-      return sendJson(res, 200, { events: manager.historyOf(id) });
+      return sendJson(res, 200, {
+        events: manager.historyOf(id).map(publicAgentEventEnvelope),
+      });
     }
     if (method === "POST" && action === "open-workspace") {
       const cwd = manager.configOf(id)?.cwd?.trim();
@@ -1641,9 +1749,9 @@ function requiresExpectedProjectMutation(req: http.IncomingMessage): boolean {
   if (
     /^\/api\/agents\/[^/]+\/(?:commits|report-result)$/u.test(pathname) ||
     pathname === "/api/pr-flows" ||
-    /^\/api\/pr-flows\/[^/]+(?:\/[^/]+)?$/u.test(pathname) ||
+    /^\/api\/pr-flows\/[^/]+\/(?:reviews|pr-created|merged)$/u.test(pathname) ||
     pathname === "/api/sync-flows" ||
-    /^\/api\/sync-flows\/[^/]+(?:\/[^/]+)?$/u.test(pathname)
+    /^\/api\/sync-flows\/[^/]+\/(?:reviews|applied)$/u.test(pathname)
   ) {
     return false;
   }
@@ -1652,6 +1760,8 @@ function requiresExpectedProjectMutation(req: http.IncomingMessage): boolean {
     pathname === "/api/canvas-layout" ||
     pathname === "/api/workspace/connect" ||
     /^\/api\/workspace\/(?:branches|shared-resources)(?:\/[^/]+)?$/u.test(pathname) ||
+    /^\/api\/pr-flows\/[^/]+\/(?:cancel|retry)$/u.test(pathname) ||
+    /^\/api\/sync-flows\/[^/]+\/cancel$/u.test(pathname) ||
     pathname === "/api/agents" ||
     /^\/api\/agents\/[^/]+(?:\/[^/]+(?:\/[^/]+)?)?$/u.test(pathname) ||
     pathname === "/api/files" ||
@@ -1825,7 +1935,7 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
     const state: CanvasProjectState = {
       version: 1,
       updatedAt: Date.now(),
-      agents: deps.manager.exportState(),
+      agents: persistableAgentState(deps.manager.exportState()),
       files: deps.fileManager.exportState(),
       prompts: deps.promptManager.exportState(),
       commits: deps.commitManager.exportState(),
@@ -2128,6 +2238,104 @@ function positiveNumber(value: unknown): number | undefined {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const AGENT_CAPABILITY_FIELDS = new Set([
+  "reviewToken",
+  "completionToken",
+  "callbackToken",
+]);
+const REDACTED_AGENT_CAPABILITY = "[redacted]";
+
+function publicAgentHistories(
+  histories: Record<string, AgentEventEnvelope[]>,
+): Record<string, AgentEventEnvelope[]> {
+  return Object.fromEntries(
+    Object.entries(histories).map(([agentId, events]) => [
+      agentId,
+      events.map(publicAgentEventEnvelope),
+    ]),
+  );
+}
+
+function persistableAgentState(
+  state: NonNullable<CanvasProjectState["agents"]>,
+): NonNullable<CanvasProjectState["agents"]> {
+  return {
+    ...state,
+    agents: state.agents.map(publicAgentSnapshot),
+    histories: publicAgentHistories(state.histories),
+  };
+}
+
+function publicAgentSnapshot(snapshot: AgentSnapshot): AgentSnapshot {
+  return redactAgentCapabilities(snapshot) as AgentSnapshot;
+}
+
+function publicAgentEventEnvelope(envelope: AgentEventEnvelope): AgentEventEnvelope {
+  return {
+    ...envelope,
+    event: redactAgentCapabilities(envelope.event) as AgentEvent,
+  };
+}
+
+function redactAgentCapabilities(value: unknown, field?: string): unknown {
+  if (field && AGENT_CAPABILITY_FIELDS.has(field)) return REDACTED_AGENT_CAPABILITY;
+  if (typeof value === "string") return redactAgentCapabilityText(value);
+  if (Array.isArray(value)) return value.map((item) => redactAgentCapabilities(item));
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      key,
+      redactAgentCapabilities(item, key),
+    ]),
+  );
+}
+
+function redactAgentCapabilityText(text: string): string {
+  return text
+    .replace(
+      /\bagent_canvas_cap_[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/giu,
+      REDACTED_AGENT_CAPABILITY,
+    )
+    .replace(
+      /("(?:reviewToken|completionToken|callbackToken)"\s*:\s*")[^"]*(")/giu,
+      `$1${REDACTED_AGENT_CAPABILITY}$2`,
+    )
+    .replace(
+      /(\b(?:reviewToken|completionToken|callbackToken)\s*=\s*")[^"]*(")/giu,
+      `$1${REDACTED_AGENT_CAPABILITY}$2`,
+    )
+    .replace(
+      /(\b(?:reviewToken|completionToken|callbackToken)\s*=\s*')[^']*(')/giu,
+      `$1${REDACTED_AGENT_CAPABILITY}$2`,
+    );
+}
+
+function hasNonEmptyString(
+  value: unknown,
+  key: string,
+): value is Record<string, unknown> {
+  return isRecord(value) && typeof value[key] === "string" && value[key].trim().length > 0;
+}
+
+function hasExpectedProjectMutationHeaders(req: http.IncomingMessage): boolean {
+  return (
+    singleHeader(req.headers["x-agent-canvas-project-id"]) !== undefined &&
+    singleHeader(req.headers["x-agent-canvas-project-revision"]) !== undefined
+  );
+}
+
+function isTrustedUiFlowCompletionRequest(
+  req: http.IncomingMessage,
+  allowedOrigins: Set<string>,
+): boolean {
+  const origin = singleHeader(req.headers.origin)?.trim();
+  return (
+    Boolean(origin) &&
+    hasExpectedProjectMutationHeaders(req) &&
+    isTrustedBrowserRequest(req, allowedOrigins)
+  );
 }
 
 async function resolveAgentWorkspaceSettings<T extends AgentSettings>(

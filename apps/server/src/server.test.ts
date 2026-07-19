@@ -117,6 +117,14 @@ class FakeSyncHost implements SyncFlowAgentHost {
   }
 }
 
+function promptToken(messages: string[], field: "reviewToken" | "callbackToken"): string {
+  for (const message of [...messages].reverse()) {
+    const match = message.match(new RegExp(`"${field}"\\s*:\\s*"([^"]+)"`));
+    if (match?.[1]) return match[1];
+  }
+  throw new Error(`missing ${field} in delivered flow prompt`);
+}
+
 class FakeCodexAuthManager extends CodexAuthManager {
   private loginStarted = false;
 
@@ -755,7 +763,10 @@ describe("HTTP server", () => {
       host: isolatedManager,
       reviewQueue: isolatedReviewQueue,
     });
-    const { httpServer: isolatedServer } = createServer(isolatedManager, undefined, {
+    const {
+      httpServer: isolatedServer,
+      flushCanvasState: flushIsolatedCanvasState,
+    } = createServer(isolatedManager, undefined, {
       defaultCwd: isolatedRoot,
       workspaceManager: isolatedWorkspaceManager,
       reviewQueue: isolatedReviewQueue,
@@ -825,9 +836,11 @@ describe("HTTP server", () => {
         projectHeaders,
       );
       expect(prSwitch.status).toBe(200);
-      expect(isolatedPrManager.get(prFlow.id)).toMatchObject({
-        status: "source_review_collecting",
-        currentStage: "source_preflight",
+      await vi.waitFor(() => {
+        expect(isolatedPrManager.get(prFlow.id)).toMatchObject({
+          status: "source_review_collecting",
+          currentStage: "source_preflight",
+        });
       });
       expect(isolatedPrManager.get(prFlow.id)?.reviewRequests.at(-1)?.requestedAgentIds).toEqual([
         reviewerId,
@@ -849,10 +862,14 @@ describe("HTTP server", () => {
       ]);
 
       isolatedSyncManager.cancel(syncFlow.id);
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      await vi.waitFor(() => {
+        expect(isolatedPrManager.hasPendingOperations()).toBe(false);
+        expect(isolatedSyncManager.hasPendingOperations()).toBe(false);
+      });
     } finally {
-      await new Promise<void>((resolve) => isolatedServer.close(() => resolve()));
       await isolatedManager.clear();
+      await flushIsolatedCanvasState();
+      await new Promise<void>((resolve) => isolatedServer.close(() => resolve()));
       await removeTempRoot(isolatedRoot);
     }
   });
@@ -865,6 +882,190 @@ describe("HTTP server", () => {
     const listed = await request(port, "GET", "/api/agents");
     expect(listed.status).toBe(200);
     expect(listed.json.agents.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("does not hold the project transaction while a status event starts a deferred review", async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-status-retry-"));
+    const isolatedProjectRoot = path.join(isolatedRoot, "project");
+    let finishTurn!: () => void;
+    const turnFinished = new Promise<void>((resolve) => {
+      finishTurn = resolve;
+    });
+    const queryHandles: Array<{ close: () => void }> = [];
+    const isolatedQuery: QueryFn = () => {
+      let close!: () => void;
+      const closed = new Promise<void>((resolve) => {
+        close = resolve;
+      });
+      queryHandles.push({ close });
+      return {
+        async *[Symbol.asyncIterator]() {
+          yield {
+            type: "system" as const,
+            subtype: "init" as const,
+            session_id: "session-status-retry",
+            model: "codex-test",
+            cwd: isolatedRoot,
+            tools: [],
+          };
+          await turnFinished;
+          yield {
+            type: "result" as const,
+            subtype: "success",
+            is_error: false,
+            session_id: "session-status-retry",
+          };
+          await closed;
+        },
+        terminate: async () => close(),
+      };
+    };
+    const isolatedRunGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return "https://github.com/acme/status-retry.git";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        await writeFile(path.join(String(args[2]), ".gitkeep"), "");
+        return "";
+      }
+      if (args[0] === "worktree" && args[1] === "add") {
+        await mkdir(path.join(String(args[4]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        if (args[1] === "--verify") return "a".repeat(40);
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      return "";
+    };
+    const isolatedWorkspaceManager = new WorkspaceManager({
+      defaultSourcePath: isolatedRoot,
+      projectRoot: isolatedProjectRoot,
+      projectsRoot: path.join(isolatedRoot, "projects-index"),
+      runGit: isolatedRunGit,
+    });
+    const isolatedProject = await isolatedWorkspaceManager.connect({
+      localPath: isolatedRoot,
+    });
+    const mainBranch = isolatedProject.branches[0]!;
+    const isolatedManager = new AgentManager({ query: isolatedQuery });
+    const isolatedReviewQueue = new BranchReviewQueue();
+    const {
+      flushCanvasState: flushIsolatedCanvasState,
+      pullRequestFlowManager: isolatedPrManager,
+    } = createServer(isolatedManager, undefined, {
+      defaultCwd: isolatedRoot,
+      workspaceManager: isolatedWorkspaceManager,
+      reviewQueue: isolatedReviewQueue,
+    });
+    const runner = isolatedManager.create({
+      provider: "codex",
+      branchWorkspaceId: mainBranch.id,
+      branch: mainBranch.branch,
+      cwd: mainBranch.worktreePath,
+    });
+    const handlePrEvent = isolatedPrManager.handleAgentEvent.bind(isolatedPrManager);
+    let resultDerivedDelivery: Promise<void> | undefined;
+    const handlePrEventSpy = vi
+      .spyOn(isolatedPrManager, "handleAgentEvent")
+      .mockImplementation(async (envelope) => {
+        if (envelope.event.kind === "result") {
+          resultDerivedDelivery = runner.deliver("Legacy result-derived automation", {
+            automationKey: "result-derived-flow",
+          });
+          void resultDerivedDelivery.catch(() => undefined);
+          await resultDerivedDelivery;
+        }
+        await handlePrEvent(envelope);
+      });
+    const running = isolatedManager
+      .startAgent(runner.id, { prompt: "Keep the turn open for a retry race" })
+      .catch(() => undefined);
+    let unsubscribe = (): void => undefined;
+
+    try {
+      await vi.waitFor(() => {
+        expect(isolatedManager.snapshot(runner.id)?.status).toBe("running");
+      });
+
+      const jobId = "status-retry-deferred-review";
+      let startAttempts = 0;
+      let retryDelivery: Promise<void> | undefined;
+      expect(
+        await isolatedReviewQueue.enqueue({
+          id: jobId,
+          owner: "status-retry-test",
+          branch: mainBranch.branch,
+          order: 1,
+          start: () => {
+            startAttempts += 1;
+            if (startAttempts === 1) return "deferred";
+            retryDelivery = runner.deliver("Start the deferred review", {
+              automationKey: "status-retry-flow",
+            });
+            return retryDelivery.then(() => "started" as const);
+          },
+        }),
+      ).toBe("queued");
+
+      let resolveWaitingStatus!: () => void;
+      const waitingStatus = new Promise<void>((resolve) => {
+        resolveWaitingStatus = resolve;
+      });
+      let earlierDelivery: Promise<void> | undefined;
+      unsubscribe = isolatedManager.onEvent((envelope) => {
+        if (
+          envelope.agentId !== runner.id ||
+          envelope.event.kind !== "status" ||
+          envelope.event.status !== "waiting_input" ||
+          earlierDelivery
+        ) {
+          return;
+        }
+        earlierDelivery = runner.deliver("Older queued automation", {
+          automationKey: "older-automation",
+        });
+        void earlierDelivery.catch(() => undefined);
+        resolveWaitingStatus();
+      });
+
+      finishTurn();
+      await waitingStatus;
+      await vi.waitFor(() => {
+        expect(startAttempts).toBe(2);
+        expect(retryDelivery).toBeDefined();
+        expect(resultDerivedDelivery).toBeDefined();
+      });
+
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          Promise.all([earlierDelivery!, resultDerivedDelivery!, retryDelivery!]),
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(
+              () => reject(new Error("status-triggered review activation deadlocked")),
+              2_000,
+            );
+          }),
+        ]);
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
+      expect(isolatedReviewQueue.stateOf(jobId)).toBe("active");
+      isolatedReviewQueue.complete(jobId);
+    } finally {
+      unsubscribe();
+      handlePrEventSpy.mockRestore();
+      finishTurn();
+      for (const handle of queryHandles) handle.close();
+      await isolatedManager.clear();
+      await running;
+      await Promise.race([
+        flushIsolatedCanvasState().catch(() => undefined),
+        new Promise<void>((resolve) => setTimeout(resolve, 250)),
+      ]);
+      await removeTempRoot(isolatedRoot);
+    }
   });
 
   it("opens an agent branch workspace with VS Code", async () => {
@@ -1043,8 +1244,8 @@ describe("HTTP server", () => {
     expect(copiedContent.json.content).toBe("metric,value\naccuracy,0.92\n");
   });
 
-  it("sync flow REST supports create, review authorization and applied fallback", async () => {
-    const created = await request(port, "POST", "/api/sync-flows", {
+  it("sync flow REST supports create, direct review authorization and applied callback", async () => {
+    const created = await rawRequest(port, "POST", "/api/sync-flows", {
       kind: "cherry_pick",
       proposerAgentId: "agent_sync",
       sourceBranch: "main",
@@ -1058,33 +1259,97 @@ describe("HTTP server", () => {
     expect(created.json.flow).toMatchObject({
       kind: "cherry_pick",
       proposerAgentId: "agent_sync",
-      status: "review_collecting",
+      status: "queued",
       files: ["src/sync.ts"],
     });
+    await vi.waitFor(() => {
+      expect(syncFlowManager.get(created.json.flow.id)?.status).toBe("review_collecting");
+    });
+    const collecting = await request(port, "GET", `/api/sync-flows/${created.json.flow.id}`);
+    expect(collecting.json.flow).toMatchObject({
+      status: "review_collecting",
+      reviewRequest: expect.objectContaining({
+        requestedAgentIds: ["agent_sync"],
+        pendingAgentIds: ["agent_sync"],
+      }),
+    });
+    await vi.waitFor(() => {
+      expect(() => promptToken(syncHost.runner.sent, "reviewToken")).not.toThrow();
+    });
+    const reviewToken = promptToken(syncHost.runner.sent, "reviewToken");
 
-    const reviewedAt = Date.now() + 1;
-    syncHost.assistant(
-      JSON.stringify({
-        agentCanvasSyncReview: true,
-        flowId: created.json.flow.id,
+    const missingReviewToken = await rawRequest(
+      port,
+      "POST",
+      `/api/sync-flows/${created.json.flow.id}/reviews`,
+      {
+        agentId: "agent_sync",
+        decision: "approve",
+        summary: "missing capability",
+      },
+    );
+    expect(missingReviewToken.status).toBe(400);
+
+    const rejectedReviewer = await rawRequest(
+      port,
+      "POST",
+      `/api/sync-flows/${created.json.flow.id}/reviews`,
+      {
+        agentId: "unknown_agent",
+        reviewToken,
+        decision: "approve",
+        summary: "not an assigned reviewer",
+      },
+    );
+    expect(rejectedReviewer.status).toBe(400);
+
+    const reviewed = await rawRequest(
+      port,
+      "POST",
+      `/api/sync-flows/${created.json.flow.id}/reviews`,
+      {
+        agentId: "agent_sync",
+        reviewToken,
         decision: "approve",
         summary: "safe to apply",
         risks: [],
         filesReviewed: ["src/sync.ts"],
         requiredChanges: [],
-      }),
-      reviewedAt,
+      },
     );
-    await syncFlowManager.handleAgentEvent(syncHost.result(reviewedAt));
+    expect(reviewed.status).toBe(200);
+    expect(reviewed.json.flow.status).toBe("review_collecting");
+    expect(syncHost.history).toEqual([]);
+    expect(syncHost.runner.getStatus()).toBe("running");
 
+    await vi.waitFor(() => {
+      expect(syncFlowManager.get(created.json.flow.id)?.status).toBe("apply_authorized");
+    });
     const authorized = await request(port, "GET", `/api/sync-flows/${created.json.flow.id}`);
     expect(authorized.json.flow.status).toBe("apply_authorized");
+    await vi.waitFor(() => {
+      expect(() => promptToken(syncHost.runner.sent, "callbackToken")).not.toThrow();
+    });
+    const callbackToken = promptToken(syncHost.runner.sent, "callbackToken");
 
-    const applied = await request(
+    const rejectedApplied = await rawRequest(
       port,
       "POST",
       `/api/sync-flows/${created.json.flow.id}/applied`,
       {
+        callbackToken: "wrong-token",
+        summary: "must not apply",
+      },
+    );
+    expect(rejectedApplied.status).toBe(400);
+    expect(syncFlowManager.get(created.json.flow.id)?.status).toBe("apply_authorized");
+
+    const applied = await rawRequest(
+      port,
+      "POST",
+      `/api/sync-flows/${created.json.flow.id}/applied`,
+      {
+        callbackToken,
         summary: "Applied shared fix",
         files: ["src/sync.ts"],
       },
@@ -1096,13 +1361,375 @@ describe("HTTP server", () => {
       applied: { summary: "Applied shared fix", files: ["src/sync.ts"] },
     });
 
+    const duplicateApplied = await rawRequest(
+      port,
+      "POST",
+      `/api/sync-flows/${created.json.flow.id}/applied`,
+      {
+        callbackToken,
+        summary: "Applied shared fix",
+        files: ["src/sync.ts"],
+      },
+    );
+    expect(duplicateApplied.status).toBe(200);
+    expect(duplicateApplied.json.flow.status).toBe("applied");
+
     const listedSyncFlows = await request(port, "GET", "/api/sync-flows");
     expect(
       listedSyncFlows.json.flows.some((flow: { id: string }) => flow.id === created.json.flow.id),
     ).toBe(true);
+    await vi.waitFor(() => {
+      expect(syncFlowManager.hasPendingOperations()).toBe(false);
+    });
   });
 
-  it("keeps tokenless agent flow callbacks compatible with project revision enforcement", async () => {
+  it("PR review REST forwards a direct callback without waiting for an agent result", async () => {
+    const flow = {
+      id: "pr_flow_route",
+      status: "create_pr_authorized",
+    } as Awaited<ReturnType<PullRequestFlowManager["submitReview"]>>;
+    const submitReview = vi
+      .spyOn(pullRequestFlowManager, "submitReview")
+      .mockResolvedValue(flow);
+    try {
+      const body = {
+        agentId: "agent_pr",
+        reviewToken: "review-capability",
+        stage: "source_preflight",
+        decision: "approve",
+        summary: "safe to create",
+        risks: [],
+        filesReviewed: ["src/pr.ts"],
+        requiredChanges: [],
+      };
+      const reviewed = await request(
+        port,
+        "POST",
+        "/api/pr-flows/pr_flow_route/reviews",
+        body,
+      );
+
+      expect(reviewed).toEqual({ status: 200, json: { flow } });
+      expect(submitReview).toHaveBeenCalledWith("pr_flow_route", body);
+
+      submitReview.mockRejectedValueOnce(new Error("review no longer pending"));
+      const rejected = await request(
+        port,
+        "POST",
+        "/api/pr-flows/pr_flow_route/reviews",
+        body,
+      );
+      expect(rejected).toEqual({
+        status: 400,
+        json: { error: "review no longer pending" },
+      });
+    } finally {
+      submitReview.mockRestore();
+    }
+  });
+
+  it("redacts flow capability tokens from public history and WebSocket snapshots", async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-token-redaction-"));
+    const secrets = {
+      reviewToken: "review-secret-value",
+      completionToken: "completion-secret-value",
+      callbackToken: "callback-secret-value",
+      standaloneToken: "agent_canvas_cap_11111111-2222-4333-8444-555555555555",
+    };
+    const isolatedQuery: QueryFn = () => ({
+      async *[Symbol.asyncIterator]() {
+        yield {
+          type: "system" as const,
+          subtype: "init" as const,
+          session_id: "session-token-redaction",
+          model: "codex-test",
+          cwd: isolatedRoot,
+          tools: [],
+        };
+        yield {
+          type: "assistant" as const,
+          session_id: "session-token-redaction",
+          message: {
+            role: "assistant",
+            content: [{ type: "text" as const, text: JSON.stringify(secrets) }],
+          },
+        };
+        yield {
+          type: "result" as const,
+          subtype: "success",
+          is_error: false,
+          session_id: "session-token-redaction",
+        };
+      },
+    });
+    const isolatedManager = new AgentManager({ query: isolatedQuery });
+    const isolatedWorkspaceManager = new WorkspaceManager({
+      defaultSourcePath: isolatedRoot,
+      autoOpenDefault: false,
+    });
+    const runner = isolatedManager.create({ provider: "codex", cwd: isolatedRoot });
+    await isolatedManager.startAgent(runner.id, {
+      prompt: "ordinary task",
+    });
+    await vi.waitFor(() => {
+      const privateHistory = JSON.stringify(isolatedManager.historyOf(runner.id));
+      for (const secret of Object.values(secrets)) expect(privateHistory).toContain(secret);
+    });
+    const privateSnapshot = isolatedManager.snapshot(runner.id)!;
+    runner.restore({
+      ...privateSnapshot,
+      config: {
+        ...privateSnapshot.config,
+        prompt: JSON.stringify(secrets),
+      },
+    });
+    const {
+      httpServer: isolatedServer,
+      flushCanvasState: flushIsolatedCanvasState,
+    } = createServer(isolatedManager, undefined, {
+      defaultCwd: isolatedRoot,
+      workspaceManager: isolatedWorkspaceManager,
+      allowedOrigins: ["http://127.0.0.1:5317"],
+    });
+    let socket: WebSocket | undefined;
+
+    try {
+      await new Promise<void>((resolve) => isolatedServer.listen(0, resolve));
+      const isolatedPort = (isolatedServer.address() as AddressInfo).port;
+      const history = await rawRequest(
+        isolatedPort,
+        "GET",
+        `/api/agents/${runner.id}/history`,
+      );
+      const publicHistory = JSON.stringify(history.json);
+      expect(history.status).toBe(200);
+      expect(publicHistory).toContain("[redacted]");
+      for (const secret of Object.values(secrets)) expect(publicHistory).not.toContain(secret);
+
+      const agents = await rawRequest(isolatedPort, "GET", "/api/agents");
+      const publicAgents = JSON.stringify(agents.json);
+      expect(agents.status).toBe(200);
+      expect(publicAgents).toContain("[redacted]");
+      for (const secret of Object.values(secrets)) expect(publicAgents).not.toContain(secret);
+
+      const detail = await rawRequest(isolatedPort, "GET", `/api/agents/${runner.id}`);
+      const publicDetail = JSON.stringify(detail.json);
+      expect(detail.status).toBe(200);
+      expect(publicDetail).toContain("[redacted]");
+      for (const secret of Object.values(secrets)) expect(publicDetail).not.toContain(secret);
+
+      socket = new WebSocket(`ws://127.0.0.1:${isolatedPort}/ws`, {
+        headers: { Origin: "http://127.0.0.1:5317" },
+      });
+      const helloPromise = nextWebSocketFrame(socket, "hello");
+      await once(socket, "open");
+      const publicHello = JSON.stringify(await helloPromise);
+      expect(publicHello).toContain("[redacted]");
+      for (const secret of Object.values(secrets)) expect(publicHello).not.toContain(secret);
+      const socketClosed = once(socket, "close");
+      socket.close();
+      await socketClosed;
+    } finally {
+      if (socket && socket.readyState !== WebSocket.CLOSED) {
+        const socketClosed = once(socket, "close");
+        socket.close();
+        await socketClosed;
+      }
+      await isolatedManager.clear();
+      await flushIsolatedCanvasState();
+      await new Promise<void>((resolve) => isolatedServer.close(() => resolve()));
+      await removeTempRoot(isolatedRoot);
+    }
+  });
+
+  it("uses capability callbacks for agents while restricting UI completion fallbacks to trusted origins", async () => {
+    const prCreatedFlow = {
+      id: "pr_flow_completion_route",
+      status: "queued",
+    } as Awaited<ReturnType<PullRequestFlowManager["submitPrCreated"]>>;
+    const prMergedFlow = {
+      ...prCreatedFlow,
+      status: "merged",
+    } as ReturnType<PullRequestFlowManager["submitMerged"]>;
+    const syncAppliedFlow = {
+      id: "sync_flow_completion_route",
+      status: "applied",
+    } as Awaited<ReturnType<SyncFlowManager["submitApplied"]>>;
+    const submitPrCreated = vi
+      .spyOn(pullRequestFlowManager, "submitPrCreated")
+      .mockResolvedValue(prCreatedFlow);
+    const recordPrCreated = vi
+      .spyOn(pullRequestFlowManager, "recordPrCreated")
+      .mockResolvedValue(prCreatedFlow);
+    const submitMerged = vi
+      .spyOn(pullRequestFlowManager, "submitMerged")
+      .mockReturnValue(prMergedFlow);
+    const recordMerged = vi
+      .spyOn(pullRequestFlowManager, "recordMerged")
+      .mockReturnValue(prMergedFlow);
+    const submitApplied = vi
+      .spyOn(syncFlowManager, "submitApplied")
+      .mockResolvedValue(syncAppliedFlow);
+    const recordApplied = vi
+      .spyOn(syncFlowManager, "recordApplied")
+      .mockReturnValue(syncAppliedFlow);
+    try {
+      const agentPrCreatedBody = {
+        agentId: "agent_pr",
+        completionToken: "create-capability",
+        prNumber: 12,
+      };
+      expect(
+        await rawRequest(
+          port,
+          "POST",
+          "/api/pr-flows/pr_flow_completion_route/pr-created",
+          agentPrCreatedBody,
+        ),
+      ).toEqual({ status: 200, json: { flow: prCreatedFlow } });
+      expect(submitPrCreated).toHaveBeenCalledWith(
+        "pr_flow_completion_route",
+        agentPrCreatedBody,
+      );
+
+      const missingPrToken = await request(
+        port,
+        "POST",
+        "/api/pr-flows/pr_flow_completion_route/pr-created",
+        { prNumber: 12 },
+      );
+      expect(missingPrToken).toEqual({
+        status: 400,
+        json: { error: "missing PR completionToken" },
+      });
+      expect(recordPrCreated).not.toHaveBeenCalled();
+
+      const emptyOriginPrCreated = await request(
+        port,
+        "POST",
+        "/api/pr-flows/pr_flow_completion_route/pr-created",
+        { prNumber: 12 },
+        { Origin: "" },
+      );
+      expect(emptyOriginPrCreated).toEqual({
+        status: 400,
+        json: { error: "missing PR completionToken" },
+      });
+      expect(recordPrCreated).not.toHaveBeenCalled();
+
+      const crossSitePrCreated = await request(
+        port,
+        "POST",
+        "/api/pr-flows/pr_flow_completion_route/pr-created",
+        { prNumber: 12 },
+        {
+          Origin: "http://127.0.0.1:5317",
+          "Sec-Fetch-Site": "cross-site",
+        },
+      );
+      expect(crossSitePrCreated.status).toBe(403);
+      expect(recordPrCreated).not.toHaveBeenCalled();
+
+      const uiPrCreated = await request(
+        port,
+        "POST",
+        "/api/pr-flows/pr_flow_completion_route/pr-created",
+        { prNumber: 12 },
+        { Origin: "http://127.0.0.1:5317" },
+      );
+      expect(uiPrCreated).toEqual({ status: 200, json: { flow: prCreatedFlow } });
+      expect(recordPrCreated).toHaveBeenCalledWith(
+        "pr_flow_completion_route",
+        { prNumber: 12 },
+      );
+
+      const agentMergedBody = {
+        agentId: "agent_pr",
+        completionToken: "merge-capability",
+      };
+      expect(
+        await rawRequest(
+          port,
+          "POST",
+          "/api/pr-flows/pr_flow_completion_route/merged",
+          agentMergedBody,
+        ),
+      ).toEqual({ status: 200, json: { flow: prMergedFlow } });
+      expect(submitMerged).toHaveBeenCalledWith(
+        "pr_flow_completion_route",
+        agentMergedBody,
+      );
+      expect(
+        await request(
+          port,
+          "POST",
+          "/api/pr-flows/pr_flow_completion_route/merged",
+        ),
+      ).toEqual({ status: 400, json: { error: "missing PR completionToken" } });
+      expect(recordMerged).not.toHaveBeenCalled();
+      expect(
+        await request(
+          port,
+          "POST",
+          "/api/pr-flows/pr_flow_completion_route/merged",
+          undefined,
+          { Origin: "http://127.0.0.1:5317" },
+        ),
+      ).toEqual({ status: 200, json: { flow: prMergedFlow } });
+      expect(recordMerged).toHaveBeenCalledWith("pr_flow_completion_route");
+
+      const agentAppliedBody = {
+        callbackToken: "apply-capability",
+        summary: "Applied by agent",
+      };
+      expect(
+        await rawRequest(
+          port,
+          "POST",
+          "/api/sync-flows/sync_flow_completion_route/applied",
+          agentAppliedBody,
+        ),
+      ).toEqual({ status: 200, json: { flow: syncAppliedFlow } });
+      expect(submitApplied).toHaveBeenCalledWith(
+        "sync_flow_completion_route",
+        agentAppliedBody,
+      );
+      expect(
+        await request(
+          port,
+          "POST",
+          "/api/sync-flows/sync_flow_completion_route/applied",
+          { summary: "missing token" },
+        ),
+      ).toEqual({
+        status: 400,
+        json: { error: "missing sync applied callbackToken" },
+      });
+      expect(recordApplied).not.toHaveBeenCalled();
+      expect(
+        await request(
+          port,
+          "POST",
+          "/api/sync-flows/sync_flow_completion_route/applied",
+          { summary: "Applied from UI" },
+          { Origin: "http://127.0.0.1:5317" },
+        ),
+      ).toEqual({ status: 200, json: { flow: syncAppliedFlow } });
+      expect(recordApplied).toHaveBeenCalledWith(
+        "sync_flow_completion_route",
+        { summary: "Applied from UI" },
+      );
+    } finally {
+      submitPrCreated.mockRestore();
+      recordPrCreated.mockRestore();
+      submitMerged.mockRestore();
+      recordMerged.mockRestore();
+      submitApplied.mockRestore();
+      recordApplied.mockRestore();
+    }
+  });
+
+  it("requires project revision headers for UI-only flow control actions", async () => {
     const created = await rawRequest(port, "POST", "/api/sync-flows", {
       kind: "cherry_pick",
       proposerAgentId: "agent_sync",
@@ -1119,8 +1746,19 @@ describe("HTTP server", () => {
       "POST",
       `/api/sync-flows/${created.json.flow.id}/cancel`,
     );
-    expect(cancelled.status).toBe(200);
-    expect(cancelled.json.flow.status).toBe("cancelled");
+    expect(cancelled.status).toBe(409);
+    expect(syncFlowManager.get(created.json.flow.id)?.status).not.toBe("cancelled");
+
+    const uiCancelled = await request(
+      port,
+      "POST",
+      `/api/sync-flows/${created.json.flow.id}/cancel`,
+    );
+    expect(uiCancelled.status).toBe(200);
+    expect(uiCancelled.json.flow.status).toBe("cancelled");
+    await vi.waitFor(() => {
+      expect(syncFlowManager.hasPendingOperations()).toBe(false);
+    });
   });
 
   it("history 记录用户输入", async () => {
