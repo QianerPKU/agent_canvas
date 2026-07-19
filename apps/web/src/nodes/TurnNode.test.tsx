@@ -126,6 +126,22 @@ describe("TurnNode", () => {
     expect(screen.getByText("abcdef1")).toBeTruthy();
   });
 
+  it("显示 Codex 当前上下文占用与窗口大小", () => {
+    const actions = makeActions();
+    renderTurn(
+      {
+        index: 1,
+        status: "running",
+        lines: [],
+        usage: { contextTokens: 4096, contextWindow: 128000 },
+      },
+      "running",
+      actions,
+    );
+
+    expect(screen.getByText("4.1k / 128k")).toBeTruthy();
+  });
+
   it("最小化节点显示 base commit 短 hash", () => {
     const actions = makeActions();
     const data: TurnNodeData = {
@@ -151,6 +167,31 @@ describe("TurnNode", () => {
     );
 
     expect(screen.getByText("abcdef1")).toBeTruthy();
+  });
+
+  it("最小化节点的提示仍包含上下文占用", () => {
+    const actions = makeActions();
+    const data: TurnNodeData = {
+      agentId: "agent_1",
+      turn: {
+        index: 2,
+        status: "done",
+        lines: [],
+        usage: { contextTokens: 4096, contextWindow: 128000 },
+      },
+      agentStatus: "waiting_input",
+      isLatest: false,
+      windowState: { minimized: true, restoreWidth: 360, restoreHeight: 300 },
+      onOpenHistory: vi.fn(),
+      actions,
+    };
+    render(
+      <ReactFlowProvider>
+        <TurnNode {...({ data, id: "agent_1#2" } as unknown as NodeProps<TurnNodeType>)} />
+      </ReactFlowProvider>,
+    );
+
+    expect(screen.getByTitle(/context: 4\.1k \/ 128k/)).toBeTruthy();
   });
 
   it("只有最新活跃轮次显示资源读写 Handle", () => {

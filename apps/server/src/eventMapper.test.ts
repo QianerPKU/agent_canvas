@@ -197,6 +197,36 @@ describe("mapSdkMessage", () => {
     ]);
   });
 
+  it("usage → 独立上下文用量事件", () => {
+    const msg: SdkMessage = {
+      type: "usage",
+      session_id: "s1",
+      usage: {
+        input_tokens: 100,
+        output_tokens: 20,
+        total_tokens: 120,
+        context_tokens: 4096,
+        context_window: 128000,
+      },
+    };
+
+    expect(mapSdkMessage(msg)).toEqual([
+      {
+        kind: "usage",
+        usage: {
+          inputTokens: 100,
+          outputTokens: 20,
+          totalTokens: 120,
+          reasoningOutputTokens: undefined,
+          cacheCreationInputTokens: undefined,
+          cacheReadInputTokens: undefined,
+          contextTokens: 4096,
+          contextWindow: 128000,
+        },
+      },
+    ]);
+  });
+
   it("未知/不关心的消息 → 空数组", () => {
     expect(mapSdkMessage({ type: "stream_event", event: {}, session_id: "s1" })).toEqual([]);
     expect(mapSdkMessage({ type: "whatever" })).toEqual([]);

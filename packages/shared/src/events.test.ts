@@ -64,6 +64,14 @@ describe("AgentEvent 联合类型", () => {
     };
     expect(ev.request.command).toBe("npm test");
   });
+
+  it("包含独立 usage 事件", () => {
+    const ev: AgentEvent = {
+      kind: "usage",
+      usage: { contextTokens: 4096, contextWindow: 128000 },
+    };
+    expect(ev.usage.contextTokens).toBe(4096);
+  });
 });
 
 describe("Codex models", () => {

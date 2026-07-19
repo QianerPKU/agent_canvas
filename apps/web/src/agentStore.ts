@@ -83,6 +83,8 @@ export interface AgentView {
   systemPrompt?: string;
   status: AgentStatus;
   turns: Turn[];
+  /** 线程最近一次 usage；最新 idle/running 节点持续展示该值。 */
+  latestUsage?: UsageInfo;
   forkOrigin?: ForkOrigin;
   createdAt?: number;
   lastSeq: number;
@@ -96,12 +98,18 @@ export function emptyMap(): AgentMap {
   return {};
 }
 
-function idleTurn(index: number): Turn {
-  return { index, lines: [], status: "idle" };
+function idleTurn(index: number, usage?: UsageInfo): Turn {
+  return { index, lines: [], status: "idle", usage };
 }
 
 export function newAgentView(id: string, partial: Partial<AgentView> = {}): AgentView {
-  return { id, status: "idle", turns: [idleTurn(0)], lastSeq: 0, ...partial };
+  return {
+    id,
+    status: "idle",
+    lastSeq: 0,
+    ...partial,
+    turns: partial.turns ?? [idleTurn(0, partial.latestUsage)],
+  };
 }
 
 /** hello 帧：用快照重建表；带 histories 时会恢复多轮对话节点。 */
@@ -111,6 +119,7 @@ export function applyHello(
 ): AgentMap {
   const map: AgentMap = {};
   for (const a of agents) {
+    const history = histories[a.id]?.slice().sort((left, right) => left.seq - right.seq) ?? [];
     map[a.id] = newAgentView(a.id, {
       provider: a.provider ?? a.config.provider,
       status: a.status,
@@ -124,14 +133,19 @@ export function applyHello(
       systemPrompt: a.config.systemPrompt,
       forkOrigin: a.forkOrigin,
       createdAt: a.createdAt,
+      latestUsage: history.length > 0 ? undefined : a.usage,
       lastSeq: histories[a.id]?.length ? 0 : a.lastEventSeq,
     });
-    const history = histories[a.id]?.slice().sort((left, right) => left.seq - right.seq) ?? [];
     for (const envelope of history) {
       map[a.id] = applyEnvelope(map, envelope)[a.id] ?? map[a.id]!;
     }
+    const replayed = map[a.id]!;
+    const latestUsage = a.usage ?? replayed.latestUsage;
+    const restored = latestUsage
+      ? withLastTurn(replayed, (turn) => ({ ...turn, usage: latestUsage }))
+      : replayed;
     map[a.id] = {
-      ...map[a.id]!,
+      ...restored,
       provider: a.provider ?? a.config.provider ?? map[a.id]!.provider,
       status: a.status,
       sessionId: a.sessionId,
@@ -144,6 +158,7 @@ export function applyHello(
       systemPrompt: a.config.systemPrompt,
       forkOrigin: a.forkOrigin,
       createdAt: a.createdAt,
+      latestUsage,
       lastSeq: a.lastEventSeq,
     };
   }
@@ -159,6 +174,9 @@ export function insertForked(
 ): AgentMap {
   if (map[id]) return map;
   const parent = map[origin.parentAgentId];
+  const forkUsage = parent?.turns.find(
+    (turn) => turn.anchorUuid === origin.anchorUuid,
+  )?.usage;
   return {
     ...map,
     [id]: newAgentView(id, {
@@ -170,6 +188,9 @@ export function insertForked(
       cwd: options.cwd ?? parent?.cwd,
       scratchDirectory: options.scratchDirectory ?? parent?.scratchDirectory,
       systemPrompt: parent?.systemPrompt,
+      // A historical fork resumes at the anchor's context, not at the parent
+      // thread's latest context. Leave it unknown when the anchor is unavailable.
+      latestUsage: forkUsage,
       forkOrigin: origin,
     }),
   };
@@ -271,7 +292,10 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
       }));
       return {
         ...finalized,
-        turns: [...finalized.turns, idleTurn(finalized.turns.length)],
+        turns: [
+          ...finalized.turns,
+          idleTurn(finalized.turns.length, finalized.latestUsage),
+        ],
       };
     }
     case "user_input":
@@ -310,15 +334,28 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
       });
     case "user_approval_result":
       return updateApprovalLine(view, event.requestId, event.action, event.summary);
-    case "system_init":
+    case "system_init": {
+      const changedSession = !!view.sessionId && view.sessionId !== event.sessionId;
+      const initialized = changedSession
+        ? withLastTurn(
+            { ...view, latestUsage: undefined },
+            (turn) => ({ ...turn, usage: undefined }),
+          )
+        : view;
       return pushLineToLast(
-        { ...view, sessionId: event.sessionId, model: event.model },
+        { ...initialized, sessionId: event.sessionId, model: event.model },
         { kind: "system", text: `会话建立 · ${event.model}` },
       );
+    }
     case "assistant_text":
       return appendAssistantText(view, event.text, event.messageUuid);
     case "thinking":
       return appendThinking(view, event.text, event.messageUuid);
+    case "usage":
+      return withLastTurn(
+        { ...view, latestUsage: event.usage },
+        (turn) => ({ ...turn, usage: event.usage }),
+      );
     case "tool_use":
       return pushLineToLast(view, { kind: "tool_use", name: event.name, input: event.input });
     case "tool_result":
@@ -329,16 +366,21 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
       });
     case "result": {
       const cost = event.costUsd != null ? ` · $${event.costUsd.toFixed(4)}` : "";
+      const latestUsage = event.usage ?? view.latestUsage;
       const finalized = withLastTurn(view, (t) => ({
         ...t,
         status: event.isError ? "error" : "done",
         anchorUuid: event.anchorUuid ?? t.anchorUuid,
         costUsd: event.costUsd ?? t.costUsd,
-        usage: event.usage ?? t.usage,
+        usage: latestUsage ?? t.usage,
         lines: pushLine(t.lines, { kind: "result", text: `本轮完成 · ${event.subtype}${cost}` }),
       }));
       // 自动延伸一个新的 idle 轮（待输入节点）
-      return { ...finalized, turns: [...finalized.turns, idleTurn(finalized.turns.length)] };
+      return {
+        ...finalized,
+        latestUsage,
+        turns: [...finalized.turns, idleTurn(finalized.turns.length, latestUsage)],
+      };
     }
     case "error":
       return pushLineToLast(view, { kind: "error", text: event.message });
@@ -417,7 +459,10 @@ function endLastTurn(view: AgentView, status: TurnStatus): AgentView {
   if (last?.status === "idle" && !last.userInput && last.lines.length === 0) return finalized;
   return {
     ...finalized,
-    turns: [...finalized.turns, idleTurn(finalized.turns.length)],
+    turns: [
+      ...finalized.turns,
+      idleTurn(finalized.turns.length, finalized.latestUsage),
+    ],
   };
 }
 

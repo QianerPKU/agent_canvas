@@ -29,6 +29,7 @@ interface FakeSecurityDefaults {
 function makeFakeSpawn(
   options: {
     completeTurnStart?: boolean;
+    compactTokenUsage?: Record<string, unknown>;
     rejectSettingsUpdateCalls?: number[];
     rejectTurnStart?: boolean;
     securityDefaults?: FakeSecurityDefaults;
@@ -214,6 +215,16 @@ function makeFakeSpawn(
             turn: { id: "compact-turn", status: "inProgress" },
           },
         });
+        if (options.compactTokenUsage) {
+          write({
+            method: "thread/tokenUsage/updated",
+            params: {
+              threadId: "thread-1",
+              turnId: "compact-turn",
+              tokenUsage: options.compactTokenUsage,
+            },
+          });
+        }
         write({
           method: "item/completed",
           params: {
@@ -246,12 +257,38 @@ function makeFakeSpawn(
         method: "turn/completed",
         params: { threadId: "thread-1", turn: { id: turnId, status: "completed" } },
       }),
+    emitTokenUsage: (
+      turnId: string,
+      tokenUsage: Record<string, unknown>,
+    ) =>
+      write({
+        method: "thread/tokenUsage/updated",
+        params: { threadId: "thread-1", turnId, tokenUsage },
+      }),
   };
 }
 
 describe("Codex app-server query", () => {
   it("将 /compact 转为原生 thread/compact/start，并可终止 CLI", async () => {
-    const fake = makeFakeSpawn();
+    const fake = makeFakeSpawn({
+      compactTokenUsage: {
+        last: {
+          inputTokens: 800,
+          cachedInputTokens: 500,
+          outputTokens: 20,
+          totalTokens: 820,
+          reasoningOutputTokens: 0,
+        },
+        total: {
+          inputTokens: 5000,
+          cachedInputTokens: 3000,
+          outputTokens: 200,
+          totalTokens: 5200,
+          reasoningOutputTokens: 50,
+        },
+        modelContextWindow: 128000,
+      },
+    });
     const prompt = new AsyncMessageQueue<SdkUserInput>();
     prompt.push(userInput("先完成一轮"));
 
@@ -270,6 +307,10 @@ describe("Codex app-server query", () => {
     });
 
     prompt.push(userInput("/compact"));
+    expect((await iterator.next()).value).toMatchObject({
+      type: "usage",
+      usage: { context_tokens: 820, context_window: 128000 },
+    });
     expect((await iterator.next()).value).toEqual({
       type: "system",
       subtype: "compact_boundary",
@@ -281,6 +322,52 @@ describe("Codex app-server query", () => {
     await handle.terminate?.();
     expect(fake.requests).toContain("thread/compact/start");
     expect(fake.proc.kill).toHaveBeenCalledOnce();
+  });
+
+  it("接收 resume 后携带旧 turnId 的线程 usage，不把它误过滤", async () => {
+    const fake = makeFakeSpawn({ completeTurnStart: false });
+    const prompt = new AsyncMessageQueue<SdkUserInput>();
+    prompt.push(userInput("继续处理"));
+
+    const handle = createCodexAppServerQuery({ spawnFn: fake.spawnFn })({
+      prompt,
+      options: { model: "gpt-5.5" },
+    });
+    const iterator = handle[Symbol.asyncIterator]();
+    await iterator.next();
+
+    const usageMessage = iterator.next();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fake.emitTokenUsage("previous-turn", {
+      last: {
+        inputTokens: 4090,
+        cachedInputTokens: 2048,
+        outputTokens: 6,
+        totalTokens: 4096,
+        reasoningOutputTokens: 0,
+      },
+      total: {
+        inputTokens: 90000,
+        cachedInputTokens: 80000,
+        outputTokens: 10000,
+        totalTokens: 100000,
+        reasoningOutputTokens: 5000,
+      },
+      modelContextWindow: 128000,
+    });
+
+    expect((await usageMessage).value).toMatchObject({
+      type: "usage",
+      usage: { context_tokens: 4096, context_window: 128000 },
+    });
+
+    const completed = iterator.next();
+    fake.completeTurn();
+    expect((await completed).value).toMatchObject({
+      type: "result",
+      usage: { context_tokens: 4096 },
+    });
+    await handle.terminate?.();
   });
 
   it("每轮临时写权限结束后恢复 Codex 线程原始安全策略", async () => {

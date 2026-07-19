@@ -5,6 +5,7 @@ import type {
   SdkMessage,
   SdkResultMessage,
   SdkUsage,
+  SdkUsageMessage,
 } from "./sdk/types.js";
 
 /**
@@ -24,6 +25,10 @@ export function mapSdkMessage(msg: SdkMessage): AgentEvent[] {
       );
     case "user":
       return mapUser((msg as { message: SdkApiMessage }).message);
+    case "usage": {
+      const usage = mapUsage((msg as SdkUsageMessage).usage);
+      return usage ? [{ kind: "usage", usage }] : [];
+    }
     case "result":
       return [mapResult(msg as SdkResultMessage)];
     // stream_event（partial）等暂不投影成统一事件

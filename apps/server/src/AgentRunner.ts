@@ -744,6 +744,13 @@ export class AgentRunner {
   }
 
   private async applyEvent(event: AgentEvent, sourceHandle?: QueryHandle): Promise<void> {
+    // Usage is an independent Codex app-server notification. Preserve it even
+    // when a stopped turn's terminal result is intentionally suppressed.
+    if (event.kind === "usage") {
+      this.usage = event.usage;
+      this.emit(event);
+      return;
+    }
     if (this.interruptedTurnPending) {
       if (event.kind === "result") this.interruptedTurnPending = false;
       return;

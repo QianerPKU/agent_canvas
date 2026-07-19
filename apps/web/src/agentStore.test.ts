@@ -314,6 +314,75 @@ describe("agentStore 轮次模型", () => {
     expect(v.turns[1]).toMatchObject({ index: 1, status: "idle" });
   });
 
+  it("usage 实时更新当前轮，并在 result 后延续到新的 idle/running 轮", () => {
+    seq = 0;
+    let map: AgentMap = { a1: newAgentView("a1") };
+    map = recordInput(map, "a1", "长任务");
+    map = applyEnvelope(
+      map,
+      env("a1", {
+        kind: "usage",
+        usage: { contextTokens: 4096, contextWindow: 128000 },
+      }),
+    );
+
+    expect(get(map).latestUsage).toEqual({
+      contextTokens: 4096,
+      contextWindow: 128000,
+    });
+    expect(get(map).turns[0]!.usage?.contextTokens).toBe(4096);
+
+    map = applyEnvelope(
+      map,
+      env("a1", { kind: "result", subtype: "success", isError: false }),
+    );
+    expect(get(map).turns[0]!.usage?.contextTokens).toBe(4096);
+    expect(get(map).turns[1]).toMatchObject({
+      status: "idle",
+      usage: { contextTokens: 4096, contextWindow: 128000 },
+    });
+
+    map = recordInput(map, "a1", "继续");
+    expect(get(map).turns[1]).toMatchObject({
+      status: "running",
+      usage: { contextTokens: 4096, contextWindow: 128000 },
+    });
+  });
+
+  it("新 session 初始化时清除当前轮继承的旧线程 usage", () => {
+    seq = 0;
+    let map: AgentMap = { a1: newAgentView("a1") };
+    map = recordInput(map, "a1", "旧会话");
+    map = applyEnvelope(map, env("a1", SYS));
+    map = applyEnvelope(
+      map,
+      env("a1", {
+        kind: "usage",
+        usage: { contextTokens: 4096, contextWindow: 128000 },
+      }),
+    );
+    map = applyEnvelope(
+      map,
+      env("a1", { kind: "result", subtype: "success", isError: false }),
+    );
+    map = recordInput(map, "a1", "新会话");
+
+    map = applyEnvelope(
+      map,
+      env("a1", {
+        kind: "system_init",
+        sessionId: "s2",
+        model: "gpt-5.5",
+        cwd: "/tmp",
+        tools: [],
+      }),
+    );
+
+    expect(get(map).latestUsage).toBeUndefined();
+    expect(get(map).turns[0]!.usage?.contextTokens).toBe(4096);
+    expect(get(map).turns[1]!.usage).toBeUndefined();
+  });
+
   it("turn_context 按 turnIndex 写入对应历史轮", () => {
     seq = 0;
     let map: AgentMap = { a1: newAgentView("a1") };
@@ -414,6 +483,45 @@ describe("agentStore 轮次模型", () => {
     expect(v.turns[0]!.status).toBe("idle");
   });
 
+  it("insertForked 继承锚点轮 usage，而不是父线程最新 usage", () => {
+    let map: AgentMap = {
+      a1: newAgentView("a1", {
+        latestUsage: { contextTokens: 8192, contextWindow: 128000 },
+        turns: [
+          {
+            index: 0,
+            status: "done",
+            lines: [],
+            anchorUuid: "u1",
+            usage: { contextTokens: 2048, contextWindow: 128000 },
+          },
+          {
+            index: 1,
+            status: "done",
+            lines: [],
+            anchorUuid: "u2",
+            usage: { contextTokens: 8192, contextWindow: 128000 },
+          },
+          { index: 2, status: "idle", lines: [] },
+        ],
+      }),
+    };
+
+    map = insertForked(map, "from-old-anchor", {
+      parentAgentId: "a1",
+      anchorUuid: "u1",
+    });
+    expect(get(map, "from-old-anchor").latestUsage?.contextTokens).toBe(2048);
+    expect(get(map, "from-old-anchor").turns[0]!.usage?.contextTokens).toBe(2048);
+
+    map = insertForked(map, "missing-anchor", {
+      parentAgentId: "a1",
+      anchorUuid: "unknown",
+    });
+    expect(get(map, "missing-anchor").latestUsage).toBeUndefined();
+    expect(get(map, "missing-anchor").turns[0]!.usage).toBeUndefined();
+  });
+
   it("insertForked 可以覆盖 fork 子 agent 的 branch", () => {
     let map: AgentMap = {
       a1: newAgentView("a1", {
@@ -481,6 +589,55 @@ describe("agentStore 轮次模型", () => {
       status: "waiting_input",
       systemPrompt: "private",
       lastSeq: history.at(-1)!.seq,
+    });
+  });
+
+  it("applyHello 在 history 缺失时从 snapshot 恢复最新 usage", () => {
+    const map = applyHello([
+      {
+        id: "a1",
+        status: "waiting_input",
+        config: { prompt: "", provider: "codex" },
+        createdAt: 1,
+        lastEventSeq: 7,
+        usage: { contextTokens: 8192, contextWindow: 128000 },
+      },
+    ]);
+
+    expect(get(map).latestUsage).toEqual({
+      contextTokens: 8192,
+      contextWindow: 128000,
+    });
+    expect(get(map).turns[0]).toMatchObject({
+      status: "idle",
+      usage: { contextTokens: 8192, contextWindow: 128000 },
+    });
+  });
+
+  it("applyHello 用 snapshot usage 补齐 history 回放后的最新 idle 轮", () => {
+    seq = 0;
+    const history = [
+      env("a1", { kind: "user_input", text: "first" }),
+      env("a1", { kind: "result", subtype: "success", isError: false }),
+    ];
+    const map = applyHello(
+      [
+        {
+          id: "a1",
+          status: "waiting_input",
+          config: { prompt: "", provider: "codex" },
+          createdAt: 1,
+          lastEventSeq: history.at(-1)!.seq,
+          usage: { contextTokens: 16384, contextWindow: 128000 },
+        },
+      ],
+      { a1: history },
+    );
+
+    expect(get(map).turns[0]!.usage).toBeUndefined();
+    expect(get(map).turns[1]).toMatchObject({
+      status: "idle",
+      usage: { contextTokens: 16384, contextWindow: 128000 },
     });
   });
 

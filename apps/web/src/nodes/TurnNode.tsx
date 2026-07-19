@@ -217,6 +217,11 @@ export function TurnNode({
     displayBranch ? `branch: ${displayBranch}` : undefined,
     turn.baseCommitSha ? `base commit: ${turn.baseCommitSha}` : undefined,
     turn.cwd ? `cwd: ${turn.cwd}` : undefined,
+    turn.usage?.contextTokens != null
+      ? `context: ${formatTokens(turn.usage.contextTokens)}${
+          turn.usage.contextWindow ? ` / ${formatTokens(turn.usage.contextWindow)}` : ""
+        }`
+      : undefined,
   ]
     .filter(Boolean)
     .join("\n");
