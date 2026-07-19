@@ -20,10 +20,18 @@ export async function readCodexUsage(
   const client = new CodexUsageClient(deps);
   try {
     await client.start();
-    const [tokenUsage, rateLimits] = await Promise.all([
-      client.request("account/usage/read").catch(() => undefined),
-      client.request("account/rateLimits/read").catch(() => undefined),
+    const [tokenUsageResult, rateLimitsResult] = await Promise.allSettled([
+      client.request("account/usage/read"),
+      client.request("account/rateLimits/read"),
     ]);
+    if (tokenUsageResult.status === "rejected" && rateLimitsResult.status === "rejected") {
+      throw new AggregateError(
+        [tokenUsageResult.reason, rateLimitsResult.reason],
+        "Unable to read Codex usage or rate limits",
+      );
+    }
+    const tokenUsage = tokenUsageResult.status === "fulfilled" ? tokenUsageResult.value : undefined;
+    const rateLimits = rateLimitsResult.status === "fulfilled" ? rateLimitsResult.value : undefined;
     return {
       tokenUsage: accountTokenUsageSummary(tokenUsage),
       rateLimits,
@@ -92,9 +100,18 @@ class CodexUsageClient {
       child.once("spawn", onSpawn);
       setImmediate(() => settle(resolve));
     });
+    await this.request("initialize", {
+      clientInfo: {
+        name: "agent_canvas",
+        title: "agent_canvas",
+        version: "0.0.1",
+      },
+      capabilities: { experimentalApi: true },
+    });
+    this.notify("initialized", {});
   }
 
-  request(method: string): Promise<unknown> {
+  request(method: string, params?: unknown): Promise<unknown> {
     if (!this.child) throw new Error("Codex usage client is not started");
     const id = this.nextId++;
     const timer = setTimeout(() => {
@@ -106,8 +123,13 @@ class CodexUsageClient {
     const promise = new Promise<unknown>((resolve, reject) => {
       this.pending.set(id, { resolve, reject, timer });
     });
-    this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method })}\n`);
+    this.write({ jsonrpc: "2.0", id, method, params });
     return promise;
+  }
+
+  notify(method: string, params?: unknown): void {
+    if (!this.child) throw new Error("Codex usage client is not started");
+    this.write({ jsonrpc: "2.0", method, params });
   }
 
   close(): void {
@@ -140,6 +162,10 @@ class CodexUsageClient {
       pending.reject(error);
     }
     this.pending.clear();
+  }
+
+  private write(message: unknown): void {
+    this.child?.stdin.write(`${JSON.stringify(message)}\n`);
   }
 }
 
