@@ -644,11 +644,14 @@ describe("HTTP server", () => {
     });
     expect(resource.status).toBe(201);
 
+    const retryBranch = vi.spyOn(syncFlowManager.getReviewQueue(), "retryBranch");
     const created = await request(port, "POST", "/api/agents", {
       branchWorkspaceId: feature.json.branch.id,
       systemPrompt: "branch rules",
     });
     expect(created.status).toBe(201);
+    expect(retryBranch).toHaveBeenCalledWith("feature/server-test");
+    retryBranch.mockRestore();
 
     const listed = await request(port, "GET", "/api/agents");
     const snapshot = listed.json.agents.find(
@@ -674,11 +677,14 @@ describe("HTTP server", () => {
     });
     expect(created.status).toBe(201);
 
+    const retryBranch = vi.spyOn(syncFlowManager.getReviewQueue(), "retryBranch");
     const updated = await request(port, "PATCH", `/api/agents/${created.json.id}/settings`, {
       branchWorkspaceId: feature.json.branch.id,
       systemPrompt: "switchable",
     });
     expect(updated.status).toBe(200);
+    expect(retryBranch).toHaveBeenCalledWith("feature/settings-switch");
+    retryBranch.mockRestore();
     expect(updated.json.config).toMatchObject({
       branchWorkspaceId: feature.json.branch.id,
       branch: "feature/settings-switch",

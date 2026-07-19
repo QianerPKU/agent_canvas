@@ -1,6 +1,7 @@
 import type {
   AgentEventEnvelope,
   AgentSnapshot,
+  AgentStartConfig,
   PullRequestChangedFile,
   PullRequestCreatedInput,
   PullRequestCreatedInfo,
@@ -20,12 +21,14 @@ import {
 import { DEFAULT_BRANCH_REVIEW_TIMEOUT_MS } from "../reviews/reviewDefaults.js";
 
 type DeliverableRunner = {
+  getStatus(): string;
   deliver(text: string): Promise<void>;
 };
 
 export interface PullRequestAgentHost {
   list(): AgentSnapshot[];
   get(id: string): DeliverableRunner | undefined;
+  startAgent(id: string, config: AgentStartConfig): Promise<void>;
   historyOf(id: string): AgentEventEnvelope[];
   currentTurnIndex?(id: string): number;
 }
@@ -424,7 +427,7 @@ export class PullRequestFlowManager {
     if (!this.isCurrentGeneration(generation)) return "started";
     flow = this.requireFlow(flowId);
     if (flow.status !== "queued" || flow.currentStage !== stage) return "started";
-    const reviewers = this.activeReviewersFor(flow, stage);
+    const reviewers = this.reviewersFor(flow, stage);
     if (reviewers.length === 0) {
       const branch = stage === "source_preflight" ? flow.sourceBranch : flow.targetBranch;
       this.save({
@@ -486,6 +489,7 @@ export class PullRequestFlowManager {
             await this.deliverToAgent(
               reviewer.id,
               reviewPrompt(this.requireFlow(flowId), stage),
+              { startIfIdle: true },
             ),
         );
         if (delivery.status === "invalidated") return;
@@ -596,7 +600,10 @@ export class PullRequestFlowManager {
       this.saveRequest(flowId, request);
       const delivery = await this.reviewQueue.runWhileReserved(
         reviewJobId(flowId, stage),
-        async () => await this.deliverToAgent(agentId, retryPrompt(flow, stage)),
+        async () =>
+          await this.deliverToAgent(agentId, retryPrompt(flow, stage), {
+            startIfIdle: true,
+          }),
       );
       if (delivery.status === "invalidated") return;
       return;
@@ -733,14 +740,18 @@ export class PullRequestFlowManager {
     }
   }
 
-  private activeReviewersFor(
+  private reviewersFor(
     flow: PullRequestFlowSnapshot,
     stage: PullRequestReviewStage,
   ): AgentSnapshot[] {
     const branch = stage === "source_preflight" ? flow.sourceBranch : flow.targetBranch;
-    return this.host
-      .list()
-      .filter((agent) => agent.config.branch === branch && isActiveAgentStatus(agent.status));
+    const branchAgents = this.host.list().filter((agent) => agent.config.branch === branch);
+    const activeReviewers = branchAgents.filter((agent) => isActiveAgentStatus(agent.status));
+    if (activeReviewers.length > 0) return activeReviewers;
+    const idleReviewers = branchAgents
+      .filter((agent) => agent.status === "idle")
+      .sort(compareAgentCreationOrder);
+    return idleReviewers.slice(0, 1);
   }
 
   private async trackPendingOperation<T>(operation: () => Promise<T>): Promise<T> {
@@ -766,9 +777,17 @@ export class PullRequestFlowManager {
     return resolved;
   }
 
-  private async deliverToAgent(agentId: string, text: string): Promise<void> {
+  private async deliverToAgent(
+    agentId: string,
+    text: string,
+    options: { startIfIdle?: boolean } = {},
+  ): Promise<void> {
     const runner = this.host.get(agentId);
     if (!runner) throw new Error(`unknown agent: ${agentId}`);
+    if (options.startIfIdle && runner.getStatus() === "idle") {
+      await this.host.startAgent(agentId, { prompt: text });
+      return;
+    }
     await runner.deliver(text);
   }
 
@@ -943,6 +962,11 @@ function reviewJobOrder(flow: PullRequestFlowSnapshot, stage: PullRequestReviewS
 
 function isActiveAgentStatus(status: string): boolean {
   return status === "running" || status === "waiting_input";
+}
+
+function compareAgentCreationOrder(left: AgentSnapshot, right: AgentSnapshot): number {
+  if (left.createdAt !== right.createdAt) return left.createdAt - right.createdAt;
+  return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
 }
 
 function currentRequest(

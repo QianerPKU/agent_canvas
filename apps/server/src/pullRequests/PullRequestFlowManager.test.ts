@@ -2,6 +2,7 @@ import { describe, expect, it, vi, afterEach } from "vitest";
 import type {
   AgentEventEnvelope,
   AgentSnapshot,
+  AgentStartConfig,
   PullRequestFlowSnapshot,
 } from "@agent-canvas/shared";
 import {
@@ -11,6 +12,7 @@ import {
 
 class FakeRunner {
   readonly sent: string[] = [];
+  readonly started: string[] = [];
   readonly steered: string[] = [];
   activeSteers = 0;
   maxConcurrentSteers = 0;
@@ -29,6 +31,12 @@ class FakeRunner {
   send(text: string): void {
     this.sent.push(text);
     this.status = "running";
+  }
+
+  start(text: string): void {
+    this.started.push(text);
+    this.sent.push(text);
+    this.status = "starting";
   }
 
   blockNextSteerUntil(block: Promise<void>): void {
@@ -61,30 +69,42 @@ class FakeRunner {
 class FakeHost implements PullRequestAgentHost {
   readonly runners = new Map<string, FakeRunner>();
   readonly histories = new Map<string, AgentEventEnvelope[]>();
-  private readonly agents: Array<{ id: string; branch: string; runner: FakeRunner }> = [];
+  private readonly agents: Array<{
+    id: string;
+    branch: string;
+    runner: FakeRunner;
+    createdAt: number;
+  }> = [];
+  private createdAt = 0;
   seq = 0;
 
   addAgent(id: string, branch: string, status: string): FakeRunner {
     const runner = new FakeRunner(status);
     this.runners.set(id, runner);
     this.histories.set(id, []);
-    this.agents.push({ id, branch, runner });
+    this.agents.push({ id, branch, runner, createdAt: ++this.createdAt });
     return runner;
   }
 
   list(): AgentSnapshot[] {
-    return this.agents.map(({ id, branch, runner }) => ({
+    return this.agents.map(({ id, branch, runner, createdAt }) => ({
       id,
       provider: "codex",
       status: runner.getStatus() as AgentSnapshot["status"],
       config: { prompt: "", provider: "codex", branch },
-      createdAt: 0,
+      createdAt,
       lastEventSeq: this.seq,
     }));
   }
 
   get(id: string): FakeRunner | undefined {
     return this.runners.get(id);
+  }
+
+  async startAgent(id: string, config: AgentStartConfig): Promise<void> {
+    const runner = this.runners.get(id);
+    if (!runner) throw new Error(`unknown agent: ${id}`);
+    runner.start(config.prompt);
   }
 
   historyOf(id: string): AgentEventEnvelope[] {
@@ -144,6 +164,20 @@ async function flushMicrotasks(): Promise<void> {
 }
 
 describe("PullRequestFlowManager", () => {
+  it("still rejects an idle proposer", async () => {
+    const host = new FakeHost();
+    host.addAgent("agent_1", "feature/a", "idle");
+    const manager = new PullRequestFlowManager({ host });
+
+    await expect(
+      manager.create({
+        proposerAgentId: "agent_1",
+        targetBranch: "main",
+        summary: "Idle proposer must start explicitly",
+      }),
+    ).rejects.toThrow("proposer agent must be running or waiting_input");
+  });
+
   it("authorizes create and merge after source and target approvals", async () => {
     let now = 1000;
     const host = new FakeHost();
@@ -209,7 +243,7 @@ describe("PullRequestFlowManager", () => {
     expect(proposer.sent.at(-1)).toContain("authorized to merge the PR");
   });
 
-  it("keeps a target review queued when the target branch has no active reviewers", async () => {
+  it("starts an idle target reviewer after a deferred target review is retried", async () => {
     let now = 1500;
     const host = new FakeHost();
     const proposer = host.addAgent("agent_1", "feature/a", "waiting_input");
@@ -239,6 +273,49 @@ describe("PullRequestFlowManager", () => {
     expect(flow.failureReason).toContain("waiting for an active reviewer on branch main");
     expect(flow.reviewRequests).toHaveLength(1);
     expect(flow.reviewRequests[0]?.stage).toBe("source_preflight");
+
+    const idleReviewer = host.addAgent("agent_3", "main", "idle");
+    const laterIdleReviewer = host.addAgent("agent_4", "main", "idle");
+    await manager.getReviewQueue().retryBranch("main");
+
+    flow = manager.get(flow.id)!;
+    expect(flow).toMatchObject({
+      status: "target_review_collecting",
+      currentStage: "target_merge",
+      failureReason: undefined,
+    });
+    expect(flow.reviewRequests.at(-1)?.requestedAgentIds).toEqual(["agent_3"]);
+    expect(idleReviewer.getStatus()).toBe("starting");
+    expect(idleReviewer.started.at(-1)).toContain('"stage": "target_merge"');
+    expect(laterIdleReviewer.getStatus()).toBe("idle");
+    expect(laterIdleReviewer.started).toEqual([]);
+  });
+
+  it("prefers active reviewers without starting idle reviewers on the same branch", async () => {
+    let now = 1750;
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/a", "waiting_input");
+    const activeReviewer = host.addAgent("agent_2", "main", "waiting_input");
+    const idleReviewer = host.addAgent("agent_3", "main", "idle");
+    const manager = new PullRequestFlowManager({ host, now: () => now });
+
+    let flow = await manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "main",
+      summary: "Prefer the already active reviewer",
+      files: ["src/a.ts"],
+    });
+
+    now += 1;
+    proposer.setStatus("waiting_input");
+    host.assistant("agent_1", reviewJson(flow, "source_preflight", "approve"), now);
+    await manager.handleAgentEvent(host.result("agent_1", now));
+    flow = await manager.recordPrCreated(flow.id, { prNumber: 14 });
+
+    expect(flow.status).toBe("target_review_collecting");
+    expect(flow.reviewRequests.at(-1)?.requestedAgentIds).toEqual(["agent_2"]);
+    expect(activeReviewer.sent.at(-1)).toContain('"stage": "target_merge"');
+    expect(idleReviewer.started).toEqual([]);
   });
 
   it("retries invalid review JSON and then blocks the flow", async () => {

@@ -37,7 +37,6 @@ import {
   applyHello,
   emptyMap,
   insertForked,
-  newAgentView,
   recordAgentSettings,
   recordCompact,
   recordInput,
@@ -376,24 +375,10 @@ export function useAgentCanvas(): UseAgentCanvas {
         const workspaceGeneration = workspaceEventGenerationRef.current;
         const id = await api.create(settings);
         if (workspaceGeneration !== workspaceEventGenerationRef.current) return id;
-        // 后端 create 不发事件，乐观插入一个 idle 节点
-        setAgents((prev) =>
-          prev[id]
-            ? prev
-            : {
-                ...prev,
-                [id]: newAgentView(id, {
-                  provider: settings.provider,
-                  model: settings.model,
-                  reasoningEffort: settings.reasoningEffort,
-                  branchWorkspaceId: settings.branchWorkspaceId,
-                  branch: settings.branch,
-                  cwd: settings.cwd,
-                  scratchDirectory: settings.scratchDirectory,
-                  systemPrompt: settings.systemPrompt,
-                }),
-              },
-        );
+        // The backend normally creates an idle node, but an automation retry can start it before
+        // this response arrives. Merge settings into either the optimistic node or that live node
+        // without overwriting status/history received over WebSocket.
+        setAgents((prev) => recordAgentSettings(prev, id, settings));
         return id;
       },
       updateSettings: async (agentId, settings) => {

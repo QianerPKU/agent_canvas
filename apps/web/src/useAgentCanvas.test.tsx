@@ -97,6 +97,65 @@ afterEach(() => {
 });
 
 describe("useAgentCanvas", () => {
+  it("keeps an early start event while applying settings from a pending create response", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+    let resolveCreate!: (id: string) => void;
+    vi.spyOn(api, "create").mockReturnValue(
+      new Promise<string>((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    act(() => vi.runOnlyPendingTimers());
+    const socket = FakeWebSocket.instances[0]!;
+    const settings = {
+      provider: "codex" as const,
+      branchWorkspaceId: "branch_main",
+      branch: "main",
+      cwd: "C:\\repo\\main",
+      systemPrompt: "review main",
+    };
+    let pending!: Promise<string>;
+    act(() => {
+      pending = result.current.actions.create(settings);
+    });
+    act(() => {
+      socket.onmessage?.call(
+        socket as unknown as WebSocket,
+        {
+          data: JSON.stringify({
+            type: "event",
+            envelope: {
+              agentId: "agent_9",
+              seq: 1,
+              at: 1,
+              event: { kind: "status", status: "starting" },
+            },
+          }),
+        } as MessageEvent,
+      );
+    });
+
+    await act(async () => {
+      resolveCreate("agent_9");
+      await pending;
+    });
+
+    expect(result.current.agents.agent_9).toMatchObject({
+      status: "starting",
+      provider: "codex",
+      branchWorkspaceId: "branch_main",
+      branch: "main",
+      cwd: "C:\\repo\\main",
+      systemPrompt: "review main",
+      lastSeq: 1,
+    });
+    unmount();
+  });
+
   it("React StrictMode 下只建立一个 WebSocket", () => {
     vi.useFakeTimers();
     vi.stubGlobal("WebSocket", FakeWebSocket);
