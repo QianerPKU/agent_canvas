@@ -1984,6 +1984,7 @@ describe("HTTP server", () => {
     expect(branch.status).toBe(201);
     const [branchA, branchB] = await Promise.all(branchFrames);
     for (const frame of [branchA, branchB]) {
+      expect(frame.workspace.revision).toBe(connected.json.revision);
       expect(frame.workspace.branches).toContainEqual(
         expect.objectContaining({ branch: "feature/broadcast-to-peers" }),
       );
