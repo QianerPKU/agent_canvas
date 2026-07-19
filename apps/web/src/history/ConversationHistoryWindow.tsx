@@ -178,6 +178,15 @@ function HistoryEvent({ item }: { item: HistoryItem }): React.ReactElement {
       return <EventBlock tone="thinking" label="思考" time={time} content={event.text} />;
     case "assistant_text":
       return <EventBlock tone="assistant" label="答复" time={time} content={event.text} />;
+    case "usage":
+      return (
+        <EventBlock
+          tone="system"
+          label="上下文用量"
+          time={time}
+          content={usageText(event.usage)}
+        />
+      );
     case "user_question":
       return (
         <EventBlock
@@ -329,6 +338,18 @@ function resultText(event: Extract<AgentEvent, { kind: "result" }>): string {
     );
   }
   return details.join(" · ");
+}
+
+function usageText(usage: Extract<AgentEvent, { kind: "usage" }>["usage"]): string {
+  const context =
+    usage.contextTokens != null
+      ? `context ${usage.contextTokens}${usage.contextWindow ? ` / ${usage.contextWindow}` : ""}`
+      : undefined;
+  const turn =
+    usage.inputTokens != null || usage.outputTokens != null
+      ? `tokens ${usage.inputTokens ?? 0} in / ${usage.outputTokens ?? 0} out`
+      : undefined;
+  return [context, turn].filter((part): part is string => !!part).join(" · ") || "已更新";
 }
 
 function questionText(request: Extract<AgentEvent, { kind: "user_question" }>["request"]): string {
