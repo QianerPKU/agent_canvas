@@ -78,11 +78,13 @@ class FakeHost implements PullRequestAgentHost {
   private createdAt = 0;
   seq = 0;
 
-  addAgent(id: string, branch: string, status: string): FakeRunner {
+  addAgent(id: string, branch: string, status: string, createdAt?: number): FakeRunner {
     const runner = new FakeRunner(status);
     this.runners.set(id, runner);
     this.histories.set(id, []);
-    this.agents.push({ id, branch, runner, createdAt: ++this.createdAt });
+    const assignedCreatedAt = createdAt ?? this.createdAt + 1;
+    this.createdAt = Math.max(this.createdAt, assignedCreatedAt);
+    this.agents.push({ id, branch, runner, createdAt: assignedCreatedAt });
     return runner;
   }
 
@@ -289,6 +291,33 @@ describe("PullRequestFlowManager", () => {
     expect(idleReviewer.started.at(-1)).toContain('"stage": "target_merge"');
     expect(laterIdleReviewer.getStatus()).toBe("idle");
     expect(laterIdleReviewer.started).toEqual([]);
+  });
+
+  it("uses natural agent id order to choose between equally old idle target reviewers", async () => {
+    let now = 1650;
+    const host = new FakeHost();
+    const proposer = host.addAgent("agent_1", "feature/a", "waiting_input");
+    const agent10 = host.addAgent("agent_10", "main", "idle", 100);
+    const agent9 = host.addAgent("agent_9", "main", "idle", 100);
+    const manager = new PullRequestFlowManager({ host, now: () => now });
+
+    let flow = await manager.create({
+      proposerAgentId: "agent_1",
+      targetBranch: "main",
+      summary: "Choose a stable idle target reviewer",
+      files: ["src/a.ts"],
+    });
+
+    now += 1;
+    proposer.setStatus("waiting_input");
+    host.assistant("agent_1", reviewJson(flow, "source_preflight", "approve"), now);
+    await manager.handleAgentEvent(host.result("agent_1", now));
+    flow = await manager.recordPrCreated(flow.id, { prNumber: 15 });
+
+    expect(flow.status).toBe("target_review_collecting");
+    expect(flow.reviewRequests.at(-1)?.requestedAgentIds).toEqual(["agent_9"]);
+    expect(agent9.started.at(-1)).toContain('"stage": "target_merge"');
+    expect(agent10.started).toEqual([]);
   });
 
   it("prefers active reviewers without starting idle reviewers on the same branch", async () => {

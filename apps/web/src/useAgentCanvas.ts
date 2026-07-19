@@ -170,6 +170,9 @@ export function useAgentCanvas(): UseAgentCanvas {
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const refreshGenerationRef = useRef(0);
+  const agentMutationGenerationRef = useRef(0);
+  const agentMutationGenerationsRef = useRef(new Map<string, number>());
+  const helloSnapshotGenerationRef = useRef(0);
   const workspaceEventGenerationRef = useRef(0);
   const workspaceEventIdentityRef = useRef<string>();
   const latestWorkspaceVersionRef = useRef<{ projectId: string; revision: number }>();
@@ -184,7 +187,13 @@ export function useAgentCanvas(): UseAgentCanvas {
   const invalidateWorkspaceRefresh = useCallback(() => {
     refreshGenerationRef.current += 1;
   }, []);
+  const markAgentMutation = useCallback((agentId: string) => {
+    const generation = ++agentMutationGenerationRef.current;
+    agentMutationGenerationsRef.current.set(agentId, generation);
+  }, []);
   const clearProjectScopedState = useCallback(() => {
+    helloSnapshotGenerationRef.current += 1;
+    agentMutationGenerationsRef.current.clear();
     setAgents(emptyMap);
     setFiles([]);
     setFileConnections([]);
@@ -200,6 +209,8 @@ export function useAgentCanvas(): UseAgentCanvas {
 
   const refresh = useCallback(async () => {
     const generation = ++refreshGenerationRef.current;
+    const agentMutationGeneration = agentMutationGenerationRef.current;
+    const helloSnapshotGeneration = helloSnapshotGenerationRef.current;
     const [
       nextAgents,
       nextFiles,
@@ -223,14 +234,24 @@ export function useAgentCanvas(): UseAgentCanvas {
       nextAgents.map(async (agent) => [agent.id, await api.history(agent.id)] as const),
     );
     if (generation !== refreshGenerationRef.current) return;
-    setAgents(applyHello(nextAgents, Object.fromEntries(historyEntries)));
+    const refreshedAgents = applyHello(nextAgents, Object.fromEntries(historyEntries));
+    if (helloSnapshotGeneration === helloSnapshotGenerationRef.current) {
+      setAgents((current) =>
+        mergeRefreshedAgents(
+          current,
+          refreshedAgents,
+          agentMutationGenerationsRef.current,
+          agentMutationGeneration,
+        ),
+      );
+      setPrFlows((current) => mergeRefreshedFlows(current, nextPrFlows));
+      setSyncFlows((current) => mergeRefreshedFlows(current, nextSyncFlows));
+      setCommits(nextCommits);
+    }
     setFiles(nextFiles);
     setFileConnections(nextConnections);
     setPrompts(nextPrompts);
     setPromptConnections(nextPromptConnections);
-    setPrFlows(nextPrFlows);
-    setSyncFlows(nextSyncFlows);
-    setCommits(nextCommits);
   }, []);
 
   useEffect(() => {
@@ -274,11 +295,13 @@ export function useAgentCanvas(): UseAgentCanvas {
           return;
         }
         if (frame.type === "hello") {
+          helloSnapshotGenerationRef.current += 1;
           setAgents(applyHello(frame.agents, frame.histories));
           setPrFlows(frame.prFlows ?? []);
           setSyncFlows(frame.syncFlows ?? []);
           setCommits(frame.commits ?? []);
         } else if (frame.type === "event") {
+          markAgentMutation(frame.envelope.agentId);
           setAgents((prev) => applyEnvelope(prev, frame.envelope));
         } else if (frame.type === "pr_flow") {
           setPrFlows((prev) => upsertFlow(prev, frame.flow));
@@ -367,7 +390,7 @@ export function useAgentCanvas(): UseAgentCanvas {
       wsRef.current = null;
       currentSocket?.close();
     };
-  }, [clearProjectScopedState, refresh]);
+  }, [clearProjectScopedState, markAgentMutation, refresh]);
 
   const actions = useMemo<AgentActions>(
     () => ({
@@ -378,13 +401,15 @@ export function useAgentCanvas(): UseAgentCanvas {
         // The backend normally creates an idle node, but an automation retry can start it before
         // this response arrives. Merge settings into either the optimistic node or that live node
         // without overwriting status/history received over WebSocket.
-        setAgents((prev) => recordAgentSettings(prev, id, settings));
+        markAgentMutation(id);
+        setAgents((prev) => recordAgentSettings(prev, id, definedAgentSettings(settings)));
         return id;
       },
       updateSettings: async (agentId, settings) => {
         const workspaceGeneration = workspaceEventGenerationRef.current;
         const snapshot = await api.updateAgentSettings(agentId, settings);
         if (workspaceGeneration !== workspaceEventGenerationRef.current) return;
+        markAgentMutation(agentId);
         setAgents((prev) =>
           recordAgentSettings(prev, agentId, {
             provider: snapshot.config.provider,
@@ -405,6 +430,7 @@ export function useAgentCanvas(): UseAgentCanvas {
         const startReasoningEffort = view?.reasoningEffort;
         // 首轮（idle）用 start（fork 出来的 agent 由后端合并 fork 配置）；续轮用 send
         if (!view || view.status === "idle") {
+          markAgentMutation(agentId);
           setAgents((prev) => recordInput(prev, agentId, text, startProvider, startModel));
           await api.start(agentId, {
             prompt: text,
@@ -422,6 +448,7 @@ export function useAgentCanvas(): UseAgentCanvas {
           view.status === "stopped" ||
           view.status === "terminated"
         ) {
+          markAgentMutation(agentId);
           setAgents((prev) => recordInput(prev, agentId, text, startProvider, startModel));
           await api.send(agentId, text);
         } else {
@@ -435,6 +462,7 @@ export function useAgentCanvas(): UseAgentCanvas {
         api.answerApproval(agentId, requestId, response).then(() => undefined),
       stop: (agentId) => api.stop(agentId).then(() => undefined),
       compact: async (agentId) => {
+        markAgentMutation(agentId);
         setAgents((prev) => recordCompact(prev, agentId));
         await api.compact(agentId);
       },
@@ -444,6 +472,7 @@ export function useAgentCanvas(): UseAgentCanvas {
         const workspaceGeneration = workspaceEventGenerationRef.current;
         const { id, origin } = await api.fork(agentId, anchorUuid, options);
         if (workspaceGeneration !== workspaceEventGenerationRef.current) return;
+        markAgentMutation(id);
         setAgents((prev) => insertForked(prev, id, origin, options));
         const [nextFileConnections, nextPromptConnections] = await Promise.all([
           api.listFileConnections(),
@@ -454,7 +483,7 @@ export function useAgentCanvas(): UseAgentCanvas {
         setPromptConnections(nextPromptConnections);
       },
     }),
-    [],
+    [markAgentMutation],
   );
 
   const fileActions = useMemo<FileActions>(
@@ -627,11 +656,57 @@ export function useAgentCanvas(): UseAgentCanvas {
   };
 }
 
+function mergeRefreshedAgents(
+  current: AgentMap,
+  refreshed: AgentMap,
+  mutationGenerations: ReadonlyMap<string, number>,
+  refreshStartedAtGeneration: number,
+): AgentMap {
+  const merged: AgentMap = { ...refreshed };
+  for (const [agentId, currentAgent] of Object.entries(current)) {
+    const refreshedAgent = refreshed[agentId];
+    const changedDuringRefresh =
+      (mutationGenerations.get(agentId) ?? 0) > refreshStartedAtGeneration;
+    if (changedDuringRefresh) {
+      merged[agentId] = currentAgent;
+      continue;
+    }
+    if (refreshedAgent && refreshedAgent.lastSeq > currentAgent.lastSeq) continue;
+    if (refreshedAgent && currentAgent.lastSeq > refreshedAgent.lastSeq) {
+      merged[agentId] = currentAgent;
+    }
+  }
+  return merged;
+}
+
+function mergeRefreshedFlows<T extends { id: string; updatedAt: number }>(
+  current: T[],
+  refreshed: T[],
+): T[] {
+  const refreshedById = new Map(refreshed.map((flow) => [flow.id, flow]));
+  const currentIds = new Set(current.map((flow) => flow.id));
+  return [
+    ...current.map((flow) => {
+      const snapshot = refreshedById.get(flow.id);
+      return snapshot && snapshot.updatedAt > flow.updatedAt ? snapshot : flow;
+    }),
+    ...refreshed.filter((flow) => !currentIds.has(flow.id)),
+  ];
+}
+
+function definedAgentSettings(settings: AgentSettings): AgentSettings {
+  return Object.fromEntries(
+    Object.entries(settings).filter(([, value]) => value !== undefined),
+  ) as AgentSettings;
+}
+
 function upsertFlow(
   flows: PullRequestFlowSnapshot[],
   flow: PullRequestFlowSnapshot,
 ): PullRequestFlowSnapshot[] {
-  return flows.some((candidate) => candidate.id === flow.id)
+  const existing = flows.find((candidate) => candidate.id === flow.id);
+  if (existing && existing.updatedAt > flow.updatedAt) return flows;
+  return existing
     ? flows.map((candidate) => (candidate.id === flow.id ? flow : candidate))
     : [flow, ...flows];
 }
@@ -655,7 +730,9 @@ function upsertSyncFlow(
   flows: SyncFlowSnapshot[],
   flow: SyncFlowSnapshot,
 ): SyncFlowSnapshot[] {
-  return flows.some((candidate) => candidate.id === flow.id)
+  const existing = flows.find((candidate) => candidate.id === flow.id);
+  if (existing && existing.updatedAt > flow.updatedAt) return flows;
+  return existing
     ? flows.map((candidate) => (candidate.id === flow.id ? flow : candidate))
     : [flow, ...flows];
 }

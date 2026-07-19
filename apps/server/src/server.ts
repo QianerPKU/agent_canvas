@@ -1481,6 +1481,8 @@ async function handleHttp(
         if (!forked) return sendJson(res, 409, { error: "源会话尚未建立，无法 fork" });
         fileManager.copyAgentConnections(id, forked.id);
         promptManager.copyAgentConnections(id, forked.id);
+        const branch = manager.configOf(forked.id)?.branch?.trim();
+        if (branch) await reviewQueue.retryBranch(branch);
         canvasState.saveSoon();
         return sendJson(res, 201, { id: forked.id, origin: forked.origin });
       } catch (error) {

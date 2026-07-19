@@ -966,7 +966,31 @@ function isActiveAgentStatus(status: string): boolean {
 
 function compareAgentCreationOrder(left: AgentSnapshot, right: AgentSnapshot): number {
   if (left.createdAt !== right.createdAt) return left.createdAt - right.createdAt;
-  return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+  return compareNaturalIds(left.id, right.id);
+}
+
+function compareNaturalIds(left: string, right: string): number {
+  const leftParts = /^(.*?)(\d+)$/u.exec(left);
+  const rightParts = /^(.*?)(\d+)$/u.exec(right);
+  if (leftParts && rightParts && leftParts[1] === rightParts[1]) {
+    const numeric = compareDecimalStrings(leftParts[2]!, rightParts[2]!);
+    if (numeric !== 0) return numeric;
+  }
+  return compareStrings(left, right);
+}
+
+function compareDecimalStrings(left: string, right: string): number {
+  const normalizedLeft = left.replace(/^0+(?=\d)/u, "");
+  const normalizedRight = right.replace(/^0+(?=\d)/u, "");
+  return (
+    normalizedLeft.length - normalizedRight.length ||
+    compareStrings(normalizedLeft, normalizedRight) ||
+    compareStrings(left, right)
+  );
+}
+
+function compareStrings(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function currentRequest(
