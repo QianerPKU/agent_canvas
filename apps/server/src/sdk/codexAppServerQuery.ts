@@ -97,7 +97,7 @@ function createHandle(
       while (!next.done) {
         if (next.value.text.trim() === "/compact") {
           await client.request("thread/compact/start", { threadId });
-          yield* client.readCompactMessages(threadId);
+          yield* client.readCompactMessages(threadId, state);
         } else {
           const overrides = turnOverrides(
             options,
@@ -876,6 +876,12 @@ class CodexAppServerClient {
         throw new Error(`Codex app-server exited before turn completed${this.stderrSuffix()}`);
       }
       const msg = next.value;
+      if (isThreadUsage(msg, threadId)) {
+        for (const mapped of mapCodexNotification(msg, state)) {
+          yield mapped;
+        }
+        continue;
+      }
       if (!belongsToTurn(msg, threadId, turnId)) continue;
       for (const mapped of mapCodexNotification(msg, state)) {
         yield mapped;
@@ -884,7 +890,10 @@ class CodexAppServerClient {
     }
   }
 
-  async *readCompactMessages(threadId: string): AsyncGenerator<SdkMessage> {
+  async *readCompactMessages(
+    threadId: string,
+    state: ReturnType<typeof createCodexAppServerMapState>,
+  ): AsyncGenerator<SdkMessage> {
     const iterator = this.notifications[Symbol.asyncIterator]();
     let compactTurnId = "";
     let emittedBoundary = false;
@@ -896,6 +905,13 @@ class CodexAppServerClient {
       const msg = next.value;
       const params = asRecord(msg.params);
       if (stringValue(params?.threadId) !== threadId) continue;
+
+      if (isThreadUsage(msg, threadId)) {
+        for (const mapped of mapCodexNotification(msg, state)) {
+          yield mapped;
+        }
+        continue;
+      }
 
       if (msg.method === "turn/started") {
         compactTurnId = stringValue(asRecord(params?.turn)?.id);
@@ -1150,6 +1166,11 @@ function isTurnCompleted(message: JsonRpcMessage, threadId: string, turnId: stri
   const params = asRecord(message.params);
   const turn = asRecord(params?.turn);
   return stringValue(params?.threadId) === threadId && stringValue(turn?.id) === turnId;
+}
+
+function isThreadUsage(message: JsonRpcMessage, threadId: string): boolean {
+  if (message.method !== "thread/tokenUsage/updated") return false;
+  return stringValue(asRecord(message.params)?.threadId) === threadId;
 }
 
 function belongsToTurn(message: JsonRpcMessage, threadId: string, turnId: string): boolean {

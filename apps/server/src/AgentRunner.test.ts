@@ -173,6 +173,47 @@ describe("AgentRunner 生命周期", () => {
     await runner.stop();
   });
 
+  it("stop 后仍保留独立 usage 更新，不依赖被抑制的 result", async () => {
+    const ctl = makeControllableQuery();
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("usage-after-stop", { query: ctl.query });
+    runner.on((event) => events.push(event));
+
+    runner.start({ prompt: "长任务", provider: "codex" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+    await runner.stop();
+
+    ctl.emit({
+      type: "usage",
+      session_id: "s1",
+      usage: { context_tokens: 4096, context_window: 128000 },
+    });
+    ctl.emit(resultMsg({ usage: { context_tokens: 4096, context_window: 128000 } }));
+    await flush();
+
+    expect(runner.getStatus()).toBe("stopped");
+    expect(runner.snapshot().usage).toMatchObject({
+      contextTokens: 4096,
+      contextWindow: 128000,
+    });
+    expect(events).toContainEqual({
+      kind: "usage",
+      usage: {
+        inputTokens: undefined,
+        outputTokens: undefined,
+        totalTokens: undefined,
+        reasoningOutputTokens: undefined,
+        cacheCreationInputTokens: undefined,
+        cacheReadInputTokens: undefined,
+        contextTokens: 4096,
+        contextWindow: 128000,
+      },
+    });
+
+    await runner.terminate();
+  });
+
   it("运行中 send 先排队，当前轮 result 后再作为下一轮用户输入", async () => {
     const ctl = makeControllableQuery();
     const events: AgentEvent[] = [];
