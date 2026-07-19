@@ -103,6 +103,11 @@ export interface SdkResultMessage {
   num_turns?: number;
   session_id: string;
 }
+export interface SdkUsageMessage {
+  type: "usage";
+  usage: SdkUsage;
+  session_id: string;
+}
 export interface SdkStreamEventMessage {
   type: "stream_event";
   event: unknown;
@@ -115,6 +120,7 @@ export type SdkMessage =
   | SdkStatusMessage
   | SdkAssistantMessage
   | SdkUserMessage
+  | SdkUsageMessage
   | SdkResultMessage
   | SdkStreamEventMessage
   | { type: string; [k: string]: unknown };

@@ -84,6 +84,10 @@ export interface AgentView {
   allowSharedResourceWrites?: boolean;
   status: AgentStatus;
   turns: Turn[];
+  /** 线程最近一次 usage；最新 idle/running 节点持续展示该值。 */
+  latestUsage?: UsageInfo;
+  /** 最近一次 system_init 的 session；snapshot 暂时无 sessionId 时仍用于识别会话切换。 */
+  lastInitializedSessionId?: string;
   forkOrigin?: ForkOrigin;
   createdAt?: number;
   lastSeq: number;
@@ -97,12 +101,18 @@ export function emptyMap(): AgentMap {
   return {};
 }
 
-function idleTurn(index: number): Turn {
-  return { index, lines: [], status: "idle" };
+function idleTurn(index: number, usage?: UsageInfo): Turn {
+  return { index, lines: [], status: "idle", usage };
 }
 
 export function newAgentView(id: string, partial: Partial<AgentView> = {}): AgentView {
-  return { id, status: "idle", turns: [idleTurn(0)], lastSeq: 0, ...partial };
+  return {
+    id,
+    status: "idle",
+    lastSeq: 0,
+    ...partial,
+    turns: partial.turns ?? [idleTurn(0, partial.latestUsage)],
+  };
 }
 
 /** hello 帧：用快照重建表；带 histories 时会恢复多轮对话节点。 */
@@ -111,7 +121,32 @@ export function applyHello(
   histories: Record<string, AgentEventEnvelope[]> = {},
 ): AgentMap {
   const map: AgentMap = {};
+  const agentsWithOwnUsage = new Set<string>();
+  const agentsWithSessionChange = new Set<string>();
   for (const a of agents) {
+    const history = histories[a.id]?.slice().sort((left, right) => left.seq - right.seq) ?? [];
+    const historyMaxSeq = history.at(-1)?.seq ?? 0;
+    const historyIsNewer = historyMaxSeq > a.lastEventSeq;
+    const historyHasNewerModel = history.some(
+      ({ seq, event }) => seq > a.lastEventSeq && event.kind === "system_init",
+    );
+    if (
+      a.usage !== undefined ||
+      history.some(
+        ({ event }) =>
+          event.kind === "usage" || (event.kind === "result" && event.usage !== undefined),
+      )
+    ) {
+      agentsWithOwnUsage.add(a.id);
+    }
+    const initializedSessions = new Set(
+      history.flatMap(({ event }) =>
+        event.kind === "system_init" ? [event.sessionId] : [],
+      ),
+    );
+    if (a.sessionId) initializedSessions.add(a.sessionId);
+    if (initializedSessions.size > 1) agentsWithSessionChange.add(a.id);
+    const snapshotUsage = history.length > 0 ? undefined : a.usage;
     map[a.id] = newAgentView(a.id, {
       provider: a.provider ?? a.config.provider,
       status: a.status,
@@ -126,18 +161,40 @@ export function applyHello(
       allowSharedResourceWrites: a.config.allowSharedResourceWrites,
       forkOrigin: a.forkOrigin,
       createdAt: a.createdAt,
+      latestUsage: snapshotUsage,
+      lastInitializedSessionId: history.length > 0 ? undefined : a.sessionId,
       lastSeq: histories[a.id]?.length ? 0 : a.lastEventSeq,
     });
-    const history = histories[a.id]?.slice().sort((left, right) => left.seq - right.seq) ?? [];
     for (const envelope of history) {
       map[a.id] = applyEnvelope(map, envelope)[a.id] ?? map[a.id]!;
     }
+    const replayed = map[a.id]!;
+    const candidateUsage = a.usage ?? replayed.latestUsage;
+    const snapshotLastInitializedSessionId =
+      a.sessionId ?? replayed.lastInitializedSessionId;
+    const snapshotSessionChanged =
+      a.usage === undefined &&
+      !!a.sessionId &&
+      !!replayed.lastInitializedSessionId &&
+      a.sessionId !== replayed.lastInitializedSessionId;
+    const latestUsage = historyIsNewer
+      ? replayed.latestUsage
+      : snapshotSessionChanged
+        ? undefined
+        : candidateUsage;
+    const restored = historyIsNewer
+      ? replayed
+      : latestUsage
+        ? withLastTurn(replayed, (turn) => ({ ...turn, usage: latestUsage }))
+        : snapshotSessionChanged
+          ? withLastTurn(replayed, (turn) => ({ ...turn, usage: undefined }))
+          : replayed;
     map[a.id] = {
-      ...map[a.id]!,
+      ...restored,
       provider: a.provider ?? a.config.provider ?? map[a.id]!.provider,
-      status: a.status,
-      sessionId: a.sessionId,
-      model: a.config.model,
+      status: historyIsNewer ? replayed.status : a.status,
+      sessionId: historyIsNewer ? replayed.sessionId : a.sessionId,
+      model: historyHasNewerModel ? replayed.model : a.config.model,
       reasoningEffort: a.config.reasoningEffort,
       branchWorkspaceId: a.config.branchWorkspaceId,
       branch: a.config.branch,
@@ -147,10 +204,40 @@ export function applyHello(
       allowSharedResourceWrites: a.config.allowSharedResourceWrites,
       forkOrigin: a.forkOrigin,
       createdAt: a.createdAt,
-      lastSeq: a.lastEventSeq,
+      latestUsage,
+      lastInitializedSessionId: historyIsNewer
+        ? replayed.lastInitializedSessionId
+        : snapshotLastInitializedSessionId,
+      lastSeq: historyIsNewer ? replayed.lastSeq : a.lastEventSeq,
     };
   }
+  // Fork snapshots can precede their parent in `agents`. Resolve inherited
+  // usage only after every parent's history has been replayed, and only when
+  // the child has never reported usage of its own.
+  for (const a of agents) {
+    const child = map[a.id];
+    if (
+      !child?.forkOrigin ||
+      child.latestUsage ||
+      agentsWithOwnUsage.has(a.id) ||
+      agentsWithSessionChange.has(a.id)
+    ) {
+      continue;
+    }
+    const forkUsage = usageAtForkOrigin(map, child.forkOrigin);
+    if (!forkUsage) continue;
+    map[a.id] = withLastTurn(
+      { ...child, latestUsage: forkUsage },
+      (turn) => ({ ...turn, usage: forkUsage }),
+    );
+  }
   return map;
+}
+
+function usageAtForkOrigin(map: AgentMap, origin: ForkOrigin): UsageInfo | undefined {
+  return map[origin.parentAgentId]?.turns.find(
+    (turn) => turn.anchorUuid === origin.anchorUuid,
+  )?.usage;
 }
 
 /** 乐观插入一个 fork 出来的新 agent。 */
@@ -161,8 +248,18 @@ export function insertForked(
   options: Omit<ForkAgentInput, "anchorUuid"> = {},
 ): AgentMap {
   const parent = map[origin.parentAgentId];
+  const forkUsage = usageAtForkOrigin(map, origin);
   const live = map[id];
-  const base = live ?? newAgentView(id);
+  const childHasOwnUsage =
+    live?.latestUsage !== undefined || live?.turns.some((turn) => turn.usage !== undefined);
+  const base = live
+    ? !childHasOwnUsage && forkUsage
+      ? withLastTurn(
+          { ...live, latestUsage: forkUsage },
+          (turn) => ({ ...turn, usage: forkUsage }),
+        )
+      : live
+    : newAgentView(id, { latestUsage: forkUsage });
   return {
     ...map,
     [id]: {
@@ -287,7 +384,10 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
       }));
       return {
         ...finalized,
-        turns: [...finalized.turns, idleTurn(finalized.turns.length)],
+        turns: [
+          ...finalized.turns,
+          idleTurn(finalized.turns.length, finalized.latestUsage),
+        ],
       };
     }
     case "user_input":
@@ -326,15 +426,34 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
       });
     case "user_approval_result":
       return updateApprovalLine(view, event.requestId, event.action, event.summary);
-    case "system_init":
+    case "system_init": {
+      const previousSessionId = view.lastInitializedSessionId ?? view.sessionId;
+      const changedSession = !!previousSessionId && previousSessionId !== event.sessionId;
+      const initialized = changedSession
+        ? withLastTurn(
+            { ...view, latestUsage: undefined },
+            (turn) => ({ ...turn, usage: undefined }),
+          )
+        : view;
       return pushLineToLast(
-        { ...view, sessionId: event.sessionId, model: event.model },
+        {
+          ...initialized,
+          sessionId: event.sessionId,
+          lastInitializedSessionId: event.sessionId,
+          model: event.model,
+        },
         { kind: "system", text: `会话建立 · ${event.model}` },
       );
+    }
     case "assistant_text":
       return appendAssistantText(view, event.text, event.messageUuid);
     case "thinking":
       return appendThinking(view, event.text, event.messageUuid);
+    case "usage":
+      return withLastTurn(
+        { ...view, latestUsage: event.usage },
+        (turn) => ({ ...turn, usage: event.usage }),
+      );
     case "tool_use":
       return pushLineToLast(view, { kind: "tool_use", name: event.name, input: event.input });
     case "tool_result":
@@ -345,16 +464,21 @@ function foldEvent(view: AgentView, event: AgentEvent): AgentView {
       });
     case "result": {
       const cost = event.costUsd != null ? ` · $${event.costUsd.toFixed(4)}` : "";
+      const latestUsage = event.usage ?? view.latestUsage;
       const finalized = withLastTurn(view, (t) => ({
         ...t,
         status: event.isError ? "error" : "done",
         anchorUuid: event.anchorUuid ?? t.anchorUuid,
         costUsd: event.costUsd ?? t.costUsd,
-        usage: event.usage ?? t.usage,
+        usage: latestUsage ?? t.usage,
         lines: pushLine(t.lines, { kind: "result", text: `本轮完成 · ${event.subtype}${cost}` }),
       }));
       // 自动延伸一个新的 idle 轮（待输入节点）
-      return { ...finalized, turns: [...finalized.turns, idleTurn(finalized.turns.length)] };
+      return {
+        ...finalized,
+        latestUsage,
+        turns: [...finalized.turns, idleTurn(finalized.turns.length, latestUsage)],
+      };
     }
     case "error":
       return pushLineToLast(view, { kind: "error", text: event.message });
@@ -433,7 +557,10 @@ function endLastTurn(view: AgentView, status: TurnStatus): AgentView {
   if (last?.status === "idle" && !last.userInput && last.lines.length === 0) return finalized;
   return {
     ...finalized,
-    turns: [...finalized.turns, idleTurn(finalized.turns.length)],
+    turns: [
+      ...finalized.turns,
+      idleTurn(finalized.turns.length, finalized.latestUsage),
+    ],
   };
 }
 

@@ -118,7 +118,7 @@ export interface ForkAgentInput {
   allowSharedResourceWrites?: boolean;
 }
 
-/** token 使用量（来自 SDK result.usage）。 */
+/** token 使用量（来自 SDK 的实时 usage 通知或最终 result）。 */
 export interface UsageInfo {
   inputTokens?: number;
   outputTokens?: number;
@@ -252,6 +252,7 @@ export type AgentEvent =
   // messageUuid = 该 assistant 消息的 uuid，作为"从此轮 fork"的锚点
   | { kind: "assistant_text"; text: string; messageUuid?: string }
   | { kind: "thinking"; text: string; messageUuid?: string }
+  | { kind: "usage"; usage: UsageInfo }
   | { kind: "tool_use"; toolUseId: string; name: string; input: unknown; messageUuid?: string }
   | { kind: "tool_result"; toolUseId: string; isError: boolean; content: unknown }
   | {
