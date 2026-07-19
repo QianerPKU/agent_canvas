@@ -39,6 +39,7 @@ const workspaceFileSystemHooks = vi.hoisted(() => ({
     | ((sourcePath: string, destinationPath: string) => Promise<void>),
   afterReaddir: undefined as undefined | ((directoryPath: string) => Promise<void>),
   afterMkdir: undefined as undefined | ((directoryPath: string) => Promise<void>),
+  afterOpen: undefined as undefined | ((filePath: string) => Promise<void>),
   beforeRm: undefined as
     | undefined
     | ((targetPath: string, options: unknown) => Promise<void>),
@@ -73,6 +74,11 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     mkdir: async (...args: Parameters<typeof actual.mkdir>) => {
       const result = await actual.mkdir(...args);
       await workspaceFileSystemHooks.afterMkdir?.(String(args[0]));
+      return result;
+    },
+    open: async (...args: Parameters<typeof actual.open>) => {
+      const result = await actual.open(...args);
+      await workspaceFileSystemHooks.afterOpen?.(String(args[0]));
       return result;
     },
     rm: async (...args: Parameters<typeof actual.rm>) => {
@@ -114,6 +120,7 @@ function clearAfterManagedMountPublished(): void {
 
 import {
   WorkspaceManager as BaseWorkspaceManager,
+  resolvedFilesystemPathKey,
   type GitRunner,
   type WorkspaceManagerOptions,
 } from "./WorkspaceManager.js";
@@ -135,6 +142,14 @@ const CASE_DISTINCT_TEST_FILESYSTEM = testFilesystemPreservesCaseDistinctDirecto
 const FILE_SYMLINK_TEST_SUPPORTED = testFilesystemSupportsFileSymlinks();
 
 describe("WorkspaceManager", () => {
+  it("keeps Windows case variants distinct in filesystem ownership keys", () => {
+    expect(
+      resolvedFilesystemPathKey(String.raw`C:\Canvas\Project`, path.win32),
+    ).not.toBe(
+      resolvedFilesystemPathKey(String.raw`C:\canvas\project`, path.win32),
+    );
+  });
+
   it("rejects an external projects-root junction before creating its index", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-project-list-root-link-"));
     const outside = path.join(root, "outside");
@@ -1148,6 +1163,509 @@ describe("WorkspaceManager", () => {
     }
   });
 
+  (CASE_DISTINCT_TEST_FILESYSTEM ? it : it.skip)(
+    "keeps case-distinct external-file paths separate in the project authorization index",
+    async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-file-auth-case-"));
+      const projectsRoot = path.join(root, "projects");
+      try {
+        const projectRoot = path.join(root, "project");
+        const upperDirectory = path.join(root, "CaseFiles");
+        const lowerDirectory = path.join(root, "casefiles");
+        const upperFile = path.join(upperDirectory, "Report.txt");
+        const lowerFile = path.join(lowerDirectory, "report.txt");
+        await Promise.all([mkdir(upperDirectory), mkdir(lowerDirectory)]);
+        await Promise.all([
+          writeFile(upperFile, "upper", "utf-8"),
+          writeFile(lowerFile, "lower", "utf-8"),
+        ]);
+        const manager = new WorkspaceManager({
+          defaultSourcePath: root,
+          projectsRoot,
+          autoOpenDefault: false,
+        });
+        const project = await manager.createCanvasProject({ name: "Case auth", projectRoot });
+        await writeReferencedCanvasState(projectRoot, [{
+          id: "file_1",
+          name: "upper",
+          filePath: upperFile,
+        }]);
+        await manager.openCanvasProject({
+          id: project.id,
+          trustedExternalFilePaths: [upperFile],
+        });
+        await manager.closeCanvasProject();
+
+        await writeReferencedCanvasState(projectRoot, [{
+          id: "file_2",
+          name: "lower",
+          filePath: lowerFile,
+        }]);
+        await expect(manager.openCanvasProject({ id: project.id })).rejects.toThrow(
+          /重新授权/u,
+        );
+        await manager.openCanvasProject({
+          id: project.id,
+          trustedExternalFilePaths: [lowerFile],
+        });
+
+        const index = JSON.parse(
+          await readFile(path.join(projectsRoot, "index.json"), "utf-8"),
+        ) as { externalFileAuthorizations: Array<{ paths: string[] }> };
+        expect(index.externalFileAuthorizations).toHaveLength(1);
+        expect(index.externalFileAuthorizations[0]!.paths).toEqual([
+          await realpath(upperFile),
+          await realpath(lowerFile),
+        ]);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("does not inherit external-file authorization after project-root identity changes", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-file-auth-root-id-"));
+    const projectsRoot = path.join(root, "projects");
+    try {
+      const projectRoot = path.join(root, "project");
+      const externalFile = path.join(root, "outside.txt");
+      await writeFile(externalFile, "outside", "utf-8");
+      const manager = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+      const project = await manager.createCanvasProject({ name: "Root identity", projectRoot });
+      await writeReferencedCanvasState(projectRoot, [{
+        id: "file_1",
+        name: "outside",
+        filePath: externalFile,
+      }]);
+      await manager.openCanvasProject({
+        id: project.id,
+        trustedExternalFilePaths: [externalFile],
+      });
+      await manager.closeCanvasProject();
+
+      const indexPath = path.join(projectsRoot, "index.json");
+      const index = JSON.parse(await readFile(indexPath, "utf-8")) as {
+        externalFileAuthorizations: Array<{
+          projectRootIdentity: { dev: string; ino: string };
+        }>;
+      };
+      index.externalFileAuthorizations[0]!.projectRootIdentity.dev = "99999999999999999999";
+      await writeFile(indexPath, `${JSON.stringify(index, undefined, 2)}\n`, "utf-8");
+
+      const loader = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+      await expect(loader.openCanvasProject({ id: project.id })).rejects.toThrow(
+        /重新授权/u,
+      );
+      expect(loader.currentProjectId()).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed instead of migrating identityless external-file authorization", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-file-auth-legacy-id-"));
+    const projectsRoot = path.join(root, "projects");
+    try {
+      const projectRoot = path.join(root, "project");
+      const externalFile = path.join(root, "outside.txt");
+      await writeFile(externalFile, "outside", "utf-8");
+      const creator = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+      const project = await creator.createCanvasProject({ name: "Legacy identity", projectRoot });
+      await writeReferencedCanvasState(projectRoot, [{
+        id: "file_1",
+        name: "outside",
+        filePath: externalFile,
+      }]);
+      await creator.openCanvasProject({
+        id: project.id,
+        trustedExternalFilePaths: [externalFile],
+      });
+      await creator.closeCanvasProject();
+
+      const indexPath = path.join(projectsRoot, "index.json");
+      const original = JSON.parse(await readFile(indexPath, "utf-8")) as {
+        externalFileAuthorizations: Array<{
+          projectRootIdentity?: unknown;
+          pathIdentities?: unknown;
+        }>;
+      };
+      const withoutRootIdentity = structuredClone(original);
+      delete withoutRootIdentity.externalFileAuthorizations[0]!.projectRootIdentity;
+      const rootIdentitylessContent = `${JSON.stringify(withoutRootIdentity, undefined, 2)}\n`;
+      await writeFile(indexPath, rootIdentitylessContent, "utf-8");
+
+      const rootIdentitylessLoader = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+      await expect(rootIdentitylessLoader.openCanvasProject({ id: project.id })).rejects.toThrow(
+        /重新授权/u,
+      );
+      expect(rootIdentitylessLoader.currentProjectId()).toBeUndefined();
+      await expect(readFile(indexPath, "utf-8")).resolves.toBe(rootIdentitylessContent);
+
+      const withoutFileIdentity = structuredClone(original);
+      delete withoutFileIdentity.externalFileAuthorizations[0]!.pathIdentities;
+      const fileIdentitylessContent = `${JSON.stringify(withoutFileIdentity, undefined, 2)}\n`;
+      await writeFile(indexPath, fileIdentitylessContent, "utf-8");
+      const fileIdentitylessLoader = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+      await expect(fileIdentitylessLoader.openCanvasProject({ id: project.id })).rejects.toThrow(
+        /重新授权/u,
+      );
+      expect(fileIdentitylessLoader.currentProjectId()).toBeUndefined();
+      await expect(readFile(indexPath, "utf-8")).resolves.toBe(fileIdentitylessContent);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects lossy or invalid legacy numeric external-file identities", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-file-auth-number-id-"));
+    const projectsRoot = path.join(root, "projects");
+    try {
+      const projectRoot = path.join(root, "project");
+      const externalFile = path.join(root, "outside.txt");
+      await writeFile(externalFile, "outside", "utf-8");
+      const creator = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+      const project = await creator.createCanvasProject({ name: "Numeric identity", projectRoot });
+      await writeReferencedCanvasState(projectRoot, [{
+        id: "file_1",
+        name: "outside",
+        filePath: externalFile,
+      }]);
+      await creator.openCanvasProject({
+        id: project.id,
+        trustedExternalFilePaths: [externalFile],
+      });
+      await creator.closeCanvasProject();
+
+      const indexPath = path.join(projectsRoot, "index.json");
+      const original = JSON.parse(await readFile(indexPath, "utf-8")) as {
+        externalFileAuthorizations: Array<{
+          projectRootIdentity: { dev: string | number; ino: string | number };
+          pathIdentities: Array<{
+            path: string;
+            identity: { dev: string | number; ino: string | number };
+          }>;
+        }>;
+      };
+      const variants = [
+        {
+          label: "unsafe integer",
+          mutate: (value: typeof original) => {
+            value.externalFileAuthorizations[0]!.pathIdentities[0]!.identity.dev =
+              Number.MAX_SAFE_INTEGER + 1;
+          },
+        },
+        {
+          label: "negative integer",
+          mutate: (value: typeof original) => {
+            value.externalFileAuthorizations[0]!.pathIdentities[0]!.identity.ino = -1;
+          },
+        },
+        {
+          label: "fractional number",
+          mutate: (value: typeof original) => {
+            value.externalFileAuthorizations[0]!.projectRootIdentity.dev = 1.5;
+          },
+        },
+      ];
+
+      for (const variant of variants) {
+        const invalid = structuredClone(original);
+        variant.mutate(invalid);
+        const invalidContent = `${JSON.stringify(invalid, undefined, 2)}\n`;
+        await writeFile(indexPath, invalidContent, "utf-8");
+        const loader = new WorkspaceManager({
+          defaultSourcePath: root,
+          projectsRoot,
+          autoOpenDefault: false,
+        });
+
+        await expect(
+          loader.openCanvasProject({ id: project.id }),
+          variant.label,
+        ).rejects.toThrow(/授权/u);
+        expect(loader.currentProjectId(), variant.label).toBeUndefined();
+        await expect(readFile(indexPath, "utf-8"), variant.label).resolves.toBe(invalidContent);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves an authorized file identity while its location is missing", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-file-auth-missing-id-"));
+    const projectsRoot = path.join(root, "projects");
+    try {
+      const projectRoot = path.join(root, "project");
+      const externalFile = path.join(root, "outside.txt");
+      await writeFile(externalFile, "outside", "utf-8");
+      const creator = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+      const project = await creator.createCanvasProject({ name: "Missing identity", projectRoot });
+      await writeReferencedCanvasState(projectRoot, [{
+        id: "file_1",
+        name: "outside",
+        filePath: externalFile,
+      }]);
+      await creator.openCanvasProject({
+        id: project.id,
+        trustedExternalFilePaths: [externalFile],
+      });
+      const authorizationBefore = creator.currentTrustedExternalFileAuthorizations()![0]!;
+      await creator.closeCanvasProject();
+      await rm(externalFile);
+
+      const loader = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+      await expect(loader.openCanvasProject({ id: project.id })).resolves.toMatchObject({
+        canvasProject: { id: project.id },
+      });
+      expect(loader.currentTrustedExternalFileAuthorizations()).toEqual([authorizationBefore]);
+      const index = JSON.parse(
+        await readFile(path.join(projectsRoot, "index.json"), "utf-8"),
+      ) as {
+        externalFileAuthorizations: Array<{
+          pathIdentities: Array<{ path: string; identity: { dev: string; ino: string } }>;
+        }>;
+      };
+      expect(index.externalFileAuthorizations[0]!.pathIdentities).toEqual([{
+        path: authorizationBefore.path,
+        identity: authorizationBefore.identity,
+      }]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not upgrade persisted authorization to a replacement at the same path", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-file-auth-replaced-id-"));
+    const projectsRoot = path.join(root, "projects");
+    try {
+      const projectRoot = path.join(root, "project");
+      const externalFile = path.join(root, "outside.txt");
+      const displacedFile = path.join(root, "outside-original.txt");
+      await writeFile(externalFile, "original", "utf-8");
+      const creator = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+      const project = await creator.createCanvasProject({ name: "Replaced identity", projectRoot });
+      await writeReferencedCanvasState(projectRoot, [{
+        id: "file_1",
+        name: "outside",
+        filePath: externalFile,
+      }]);
+      await creator.openCanvasProject({
+        id: project.id,
+        trustedExternalFilePaths: [externalFile],
+      });
+      const authorizationBefore = creator.currentTrustedExternalFileAuthorizations()![0]!;
+      await creator.closeCanvasProject();
+
+      await rename(externalFile, displacedFile);
+      await writeFile(externalFile, "replacement", "utf-8");
+      const replacementStat = await lstat(externalFile, { bigint: true });
+      expect({
+        dev: replacementStat.dev.toString(),
+        ino: replacementStat.ino.toString(),
+      }).not.toEqual(authorizationBefore.identity);
+
+      const loader = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+      await expect(loader.openCanvasProject({ id: project.id })).resolves.toMatchObject({
+        canvasProject: { id: project.id },
+      });
+      expect(loader.currentTrustedExternalFileAuthorizations()).toEqual([authorizationBefore]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps project-open authorization only after the guarded state load succeeds", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-open-transaction-ok-"));
+    const projectsRoot = path.join(root, "projects");
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+      const previous = await manager.createCanvasProject({
+        name: "Previous project",
+        projectRoot: path.join(root, "previous"),
+      });
+      const target = await manager.createCanvasProject({
+        name: "Target project",
+        projectRoot: path.join(root, "target"),
+      });
+      const externalFile = path.join(root, "target-reference.txt");
+      await writeFile(externalFile, "target reference", "utf-8");
+      await writeReferencedCanvasState(target.projectRoot, [{
+        id: "file_1",
+        name: "target-reference",
+        filePath: externalFile,
+      }]);
+      await manager.openCanvasProject({ id: previous.id });
+
+      await expect(manager.withCanvasProjectOpen(
+        { id: target.id, trustedExternalFilePaths: [externalFile] },
+        async (workspace) => {
+          expect(workspace.canvasProject?.id).toBe(target.id);
+          await manager.prepareWorkDocumentationForAllBranches();
+          return "loaded";
+        },
+      )).resolves.toBe("loaded");
+
+      const canonicalExternalFile = await realpath(externalFile);
+      expect(manager.currentProjectId()).toBe(target.id);
+      expect(manager.currentTrustedExternalFilePaths()).toEqual([canonicalExternalFile]);
+      const index = JSON.parse(
+        await readFile(path.join(projectsRoot, "index.json"), "utf-8"),
+      ) as {
+        externalFileAuthorizations: Array<{ projectRoot: string; paths: string[] }>;
+      };
+      expect(index.externalFileAuthorizations).toContainEqual(expect.objectContaining({
+        projectRoot: await realpath(target.projectRoot),
+        paths: [canonicalExternalFile],
+        projectRootIdentity: expect.objectContaining({ dev: expect.any(String), ino: expect.any(String) }),
+        pathIdentities: [expect.objectContaining({ path: canonicalExternalFile })],
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rolls back project-open authorization when guarded state loading fails", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-open-transaction-fail-"));
+    const projectsRoot = path.join(root, "projects");
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+      const previous = await manager.createCanvasProject({
+        name: "Previous project",
+        projectRoot: path.join(root, "previous"),
+      });
+      const target = await manager.createCanvasProject({
+        name: "Target project",
+        projectRoot: path.join(root, "target"),
+      });
+      const externalFile = path.join(root, "rejected-reference.txt");
+      await writeFile(externalFile, "rejected reference", "utf-8");
+      await writeReferencedCanvasState(target.projectRoot, [{
+        id: "file_1",
+        name: "rejected-reference",
+        filePath: externalFile,
+      }]);
+      await manager.openCanvasProject({ id: previous.id });
+      const indexPath = path.join(projectsRoot, "index.json");
+      const indexBefore = await readFile(indexPath, "utf-8");
+      const trustedBefore = manager.currentTrustedExternalFilePaths();
+
+      await expect(manager.withCanvasProjectOpen(
+        { id: target.id, trustedExternalFilePaths: [externalFile] },
+        async () => {
+          throw new Error("canvas state import failed");
+        },
+      )).rejects.toThrow("canvas state import failed");
+
+      expect(manager.currentProjectId()).toBe(previous.id);
+      expect(manager.currentTrustedExternalFilePaths()).toEqual(trustedBefore);
+      await expect(readFile(indexPath, "utf-8")).resolves.toBe(indexBefore);
+      await expect(manager.openCanvasProject({ id: target.id })).rejects.toThrow();
+      expect(manager.currentProjectId()).toBe(previous.id);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not overwrite a concurrent index writer during project-open rollback", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-open-transaction-cas-"));
+    const projectsRoot = path.join(root, "projects");
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+      const previous = await manager.createCanvasProject({
+        name: "Previous project",
+        projectRoot: path.join(root, "previous"),
+      });
+      const target = await manager.createCanvasProject({
+        name: "Target project",
+        projectRoot: path.join(root, "target"),
+      });
+      const externalFile = path.join(root, "conflicting-reference.txt");
+      await writeFile(externalFile, "conflicting reference", "utf-8");
+      await writeReferencedCanvasState(target.projectRoot, [{
+        id: "file_1",
+        name: "conflicting-reference",
+        filePath: externalFile,
+      }]);
+      await manager.openCanvasProject({ id: previous.id });
+      const indexPath = path.join(projectsRoot, "index.json");
+      let concurrentContent = "";
+
+      await expect(manager.withCanvasProjectOpen(
+        { id: target.id, trustedExternalFilePaths: [externalFile] },
+        async () => {
+          const concurrentIndex = JSON.parse(await readFile(indexPath, "utf-8")) as {
+            projects: Array<{ name: string }>;
+          };
+          concurrentIndex.projects[0]!.name = "Concurrent project-index writer";
+          concurrentContent = `${JSON.stringify(concurrentIndex, undefined, 2)}\n`;
+          await writeFile(indexPath, concurrentContent, "utf-8");
+          throw new Error("state load failed after concurrent index write");
+        },
+      )).rejects.toMatchObject({
+        name: "AggregateError",
+        message: expect.stringContaining("rollback was incomplete"),
+      });
+
+      await expect(readFile(indexPath, "utf-8")).resolves.toBe(concurrentContent);
+      expect(manager.currentProjectId()).toBe(previous.id);
+      expect(manager.currentTrustedExternalFilePaths()).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("rolls back the selected project and index when external authorization fails", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-file-trust-rollback-"));
     const projectsRoot = path.join(root, "projects");
@@ -1209,8 +1727,11 @@ describe("WorkspaceManager", () => {
 
       await expect(manager.withExternalFileAuthorization(
         [externalFile],
-        async (canonicalPaths) => {
-          expect(canonicalPaths).toEqual([canonicalFile]);
+        async (authorizations) => {
+          expect(authorizations).toEqual([{
+            path: canonicalFile,
+            identity: expect.objectContaining({ dev: expect.any(String), ino: expect.any(String) }),
+          }]);
           return "published";
         },
       )).resolves.toBe("published");
@@ -1221,11 +1742,105 @@ describe("WorkspaceManager", () => {
       ) as {
         externalFileAuthorizations: Array<{ projectRoot: string; paths: string[] }>;
       };
-      expect(index.externalFileAuthorizations).toContainEqual({
+      expect(index.externalFileAuthorizations).toContainEqual(expect.objectContaining({
         projectRoot: await realpath(project.projectRoot),
         paths: [canonicalFile],
-      });
+        projectRootIdentity: expect.objectContaining({ dev: expect.any(String), ino: expect.any(String) }),
+        pathIdentities: [expect.objectContaining({ path: canonicalFile })],
+      }));
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects fresh external authorization without an existing regular non-symbolic-link file", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-file-trust-invalid-"));
+    const projectsRoot = path.join(root, "projects");
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+      await manager.createCanvasProject({
+        name: "Strict file trust",
+        projectRoot: path.join(root, "project"),
+      });
+      const directory = path.join(root, "directory");
+      const nonDirectory = path.join(root, "not-a-directory.txt");
+      const missing = path.join(root, "missing.txt");
+      await mkdir(directory);
+      await writeFile(nonDirectory, "file", "utf-8");
+      const invalidPaths = [directory, path.join(nonDirectory, "child.txt"), missing];
+      if (FILE_SYMLINK_TEST_SUPPORTED) {
+        const target = path.join(root, "symlink-target.txt");
+        const linked = path.join(root, "symlink.txt");
+        await writeFile(target, "target", "utf-8");
+        await symlink(target, linked, "file");
+        invalidPaths.push(linked);
+      }
+      const indexPath = path.join(projectsRoot, "index.json");
+      const indexBefore = await readFile(indexPath, "utf-8");
+      const publish = vi.fn(async () => "published");
+
+      for (const invalidPath of invalidPaths) {
+        await expect(manager.withExternalFileAuthorization(
+          [invalidPath],
+          publish,
+        )).rejects.toBeInstanceOf(Error);
+      }
+
+      expect(publish).not.toHaveBeenCalled();
+      expect(manager.currentTrustedExternalFilePaths()).toEqual([]);
+      await expect(readFile(indexPath, "utf-8")).resolves.toBe(indexBefore);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an external authorization when the selected path changes after its handle opens", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-file-trust-handle-race-"));
+    const projectsRoot = path.join(root, "projects");
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+      await manager.createCanvasProject({
+        name: "Handle-bound file trust",
+        projectRoot: path.join(root, "project"),
+      });
+      const selected = path.join(root, "selected.txt");
+      const displaced = path.join(root, "selected-displaced.txt");
+      const replacement = path.join(root, "selected-replacement.txt");
+      await Promise.all([
+        writeFile(selected, "selected", "utf-8"),
+        writeFile(replacement, "replacement", "utf-8"),
+      ]);
+      const canonicalSelected = await realpath(selected);
+      const indexPath = path.join(projectsRoot, "index.json");
+      const indexBefore = await readFile(indexPath, "utf-8");
+      const publish = vi.fn(async () => "published");
+      let swapped = false;
+      workspaceFileSystemHooks.afterOpen = async (openedPath) => {
+        if (swapped || !sameMockPath(openedPath, canonicalSelected)) return;
+        swapped = true;
+        await rename(selected, displaced);
+        await rename(replacement, selected);
+      };
+
+      await expect(manager.withExternalFileAuthorization(
+        [selected],
+        publish,
+      )).rejects.toThrow(/changed/u);
+
+      expect(swapped).toBe(true);
+      expect(publish).not.toHaveBeenCalled();
+      expect(manager.currentTrustedExternalFilePaths()).toEqual([]);
+      await expect(readFile(indexPath, "utf-8")).resolves.toBe(indexBefore);
+    } finally {
+      workspaceFileSystemHooks.afterOpen = undefined;
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -1271,10 +1886,7 @@ describe("WorkspaceManager", () => {
       )).rejects.toThrow("final validation failed");
 
       await expect(readFile(indexPath, "utf-8")).resolves.toBe(indexBefore);
-      expect(manager.currentTrustedExternalFilePaths()).toEqual([
-        canonicalExistingFile,
-        canonicalDiskOnlyFile,
-      ]);
+      expect(manager.currentTrustedExternalFilePaths()).toEqual([canonicalExistingFile]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

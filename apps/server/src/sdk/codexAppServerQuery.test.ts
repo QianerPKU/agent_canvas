@@ -33,6 +33,8 @@ function makeFakeSpawn(
     rejectSettingsUpdateCalls?: number[];
     rejectTurnStart?: boolean;
     securityDefaults?: FakeSecurityDefaults;
+    deferProcessClose?: boolean;
+    killError?: Error;
   } = {},
 ) {
   const completeTurnStart = options.completeTurnStart ?? true;
@@ -60,15 +62,31 @@ function makeFakeSpawn(
     stdout: PassThrough;
     stderr: PassThrough;
     exitCode: number | null;
+    signalCode: NodeJS.Signals | null;
     kill: ReturnType<typeof vi.fn>;
   };
   proc.stdin = stdin;
   proc.stdout = stdout;
   proc.stderr = stderr;
   proc.exitCode = null;
-  proc.kill = vi.fn(() => {
+  proc.signalCode = null;
+  const emitProcessExit = (): void => {
+    if (proc.exitCode !== null) return;
     proc.exitCode = 0;
     proc.emit("exit", 0, null);
+  };
+  const emitProcessClose = (): void => {
+    emitProcessExit();
+    proc.emit("close", 0, null);
+  };
+  let killError = options.killError;
+  proc.kill = vi.fn(() => {
+    if (killError) {
+      const error = killError;
+      killError = undefined;
+      throw error;
+    }
+    if (!options.deferProcessClose) emitProcessClose();
     return true;
   });
 
@@ -252,6 +270,8 @@ function makeFakeSpawn(
     effectiveTurnSecurity,
     securityUpdates,
     proc,
+    emitProcessExit,
+    emitProcessClose,
     completeTurn: (turnId = "turn-1") =>
       write({
         method: "turn/completed",
@@ -269,6 +289,49 @@ function makeFakeSpawn(
 }
 
 describe("Codex app-server query", () => {
+  it("waits for the child close event before resolving terminate", async () => {
+    const fake = makeFakeSpawn({ deferProcessClose: true });
+    const prompt = new AsyncMessageQueue<SdkUserInput>();
+    prompt.push(userInput("hold transport"));
+    const handle = createCodexAppServerQuery({ spawnFn: fake.spawnFn })({
+      prompt,
+      options: {},
+    });
+    const iterator = handle[Symbol.asyncIterator]();
+    await iterator.next();
+
+    let resolved = false;
+    const terminating = handle.terminate?.().then(() => {
+      resolved = true;
+    });
+    await Promise.resolve();
+    expect(fake.proc.kill).toHaveBeenCalledOnce();
+    expect(resolved).toBe(false);
+
+    fake.emitProcessExit();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+
+    fake.emitProcessClose();
+    await terminating;
+    expect(resolved).toBe(true);
+  });
+
+  it("propagates process signalling failures from terminate", async () => {
+    const fake = makeFakeSpawn({ killError: new Error("injected Codex kill failure") });
+    const prompt = new AsyncMessageQueue<SdkUserInput>();
+    prompt.push(userInput("hold transport"));
+    const handle = createCodexAppServerQuery({ spawnFn: fake.spawnFn })({
+      prompt,
+      options: {},
+    });
+    await handle[Symbol.asyncIterator]().next();
+
+    await expect(handle.terminate?.()).rejects.toThrow("injected Codex kill failure");
+    await expect(handle.terminate?.()).resolves.toBeUndefined();
+    expect(fake.proc.kill).toHaveBeenCalledTimes(2);
+  });
+
   it("将 /compact 转为原生 thread/compact/start，并可终止 CLI", async () => {
     const fake = makeFakeSpawn({
       compactTokenUsage: {

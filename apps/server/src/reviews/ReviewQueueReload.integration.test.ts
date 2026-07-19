@@ -652,6 +652,7 @@ const emptyQuery: QueryFn = () => ({
   async *[Symbol.asyncIterator]() {
     // This test's real AgentManager remains idle.
   },
+  terminate: async () => undefined,
 });
 
 class FakeReviewRunner {

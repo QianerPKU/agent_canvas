@@ -287,6 +287,119 @@ describe("AgentRunner 生命周期", () => {
     expect(runner.getStatus()).toBe("error");
   });
 
+  it("keeps a queued-dispatch snapshot unsettled when exact transport termination rejects", async () => {
+    const outputs: AsyncMessageQueue<SdkMessage>[] = [];
+    let queryCalls = 0;
+    let preparationCalls = 0;
+    let terminationAttempts = 0;
+    const query: QueryFn = () => {
+      const callIndex = queryCalls++;
+      const output = new AsyncMessageQueue<SdkMessage>();
+      outputs.push(output);
+      return {
+        [Symbol.asyncIterator]: () => output[Symbol.asyncIterator](),
+        terminate: async () => {
+          if (callIndex === 0) {
+            terminationAttempts += 1;
+            if (terminationAttempts === 1) throw new Error("provider still owns snapshot");
+          }
+          output.close();
+        },
+      };
+    };
+    const onProviderTurnSettled = vi.fn();
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("queued-termination-ledger-agent", {
+      query,
+      prepareFileAccess: () => {
+        preparationCalls += 1;
+        if (preparationCalls === 2) throw new Error("queued snapshot validation failed");
+      },
+      onProviderTurnSettled,
+    });
+    runner.on((event) => events.push(event));
+
+    await runner.start({ prompt: "first" });
+    outputs[0]!.push(SYSTEM_INIT);
+    await flush();
+    await runner.send("queued second");
+    outputs[0]!.push(resultMsg());
+
+    await vi.waitFor(() => expect(runner.getStatus()).toBe("stopped"));
+    expect(terminationAttempts).toBe(1);
+    expect(onProviderTurnSettled).not.toHaveBeenCalled();
+    expect(collectStatuses(events)).not.toContain("error");
+    expect(events).toContainEqual(expect.objectContaining({
+      kind: "error",
+      message: expect.stringContaining("termination remains pending"),
+    }));
+
+    await expect(runner.send("retry after exact close")).resolves.toBeUndefined();
+    expect(terminationAttempts).toBe(2);
+    expect(onProviderTurnSettled).toHaveBeenCalledTimes(1);
+    expect(queryCalls).toBe(2);
+    await runner.terminate();
+  });
+
+  it("does not publish a cleanup-triggering error when iterator failure cannot terminate exactly", async () => {
+    const crash = deferred();
+    const outputs: AsyncMessageQueue<SdkMessage>[] = [];
+    let queryCalls = 0;
+    let terminationAttempts = 0;
+    const query: QueryFn = () => {
+      const callIndex = queryCalls++;
+      const output = new AsyncMessageQueue<SdkMessage>();
+      outputs.push(output);
+      return {
+        async *[Symbol.asyncIterator]() {
+          if (callIndex === 0) {
+            yield SYSTEM_INIT;
+            await crash.promise;
+            throw new Error("provider iterator failed");
+          }
+          yield SYSTEM_INIT;
+          await new Promise<void>((resolve) => {
+            void (async () => {
+              for await (const _message of output) {
+                // Keep the second provider alive until exact termination closes the queue.
+              }
+              resolve();
+            })();
+          });
+        },
+        terminate: async () => {
+          if (callIndex === 0) {
+            terminationAttempts += 1;
+            if (terminationAttempts === 1) throw new Error("iterator transport still alive");
+          }
+          output.close();
+        },
+      };
+    };
+    const onProviderTurnSettled = vi.fn();
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("iterator-termination-ledger-agent", {
+      query,
+      onProviderTurnSettled,
+    });
+    runner.on((event) => events.push(event));
+
+    await runner.start({ prompt: "first" });
+    await vi.waitFor(() => expect(runner.getStatus()).toBe("running"));
+    crash.resolve();
+
+    await vi.waitFor(() => expect(runner.getStatus()).toBe("stopped"));
+    expect(terminationAttempts).toBe(1);
+    expect(onProviderTurnSettled).not.toHaveBeenCalled();
+    expect(collectStatuses(events)).not.toContain("error");
+
+    await expect(runner.send("restart after iterator close")).resolves.toBeUndefined();
+    expect(terminationAttempts).toBe(2);
+    expect(onProviderTurnSettled).toHaveBeenCalledTimes(1);
+    expect(queryCalls).toBe(2);
+    await runner.terminate();
+  });
+
   it("serializes concurrent automation delivery across a cleared turn and queued inputs", async () => {
     const ctl = makeControllableQuery();
     const queuedPreparation = deferred();
@@ -510,6 +623,74 @@ describe("AgentRunner 生命周期", () => {
     expect(ctl.inputs.map((input) => input.message.content)).toEqual(["start A", "start B"]);
   });
 
+  it("orders a delayed direct steer before a concurrently arriving result", async () => {
+    const ctl = makeControllableQuery();
+    const steerDelay = deferred();
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("direct-steer-result-order-agent", { query: ctl.query });
+    runner.on((event) => events.push(event));
+
+    await runner.start({ prompt: "start" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+    ctl.setSteerDelay(steerDelay.promise);
+    const steering = runner.steer("use the new snapshot");
+    await flush();
+    expect(ctl.steerCalls()).toBe(1);
+
+    ctl.emit(resultMsg());
+    await flush();
+    expect(events.some((event) => event.kind === "result")).toBe(false);
+    expect(runner.getStatus()).toBe("running");
+
+    steerDelay.resolve();
+    await steering;
+    await flush();
+    const steerIndex = events.findIndex(
+      (event) =>
+        event.kind === "user_input" &&
+        event.mode === "steer" &&
+        event.text === "use the new snapshot",
+    );
+    const resultIndex = events.findIndex((event) => event.kind === "result");
+    expect(steerIndex).toBeGreaterThanOrEqual(0);
+    expect(resultIndex).toBeGreaterThan(steerIndex);
+    expect(runner.getStatus()).toBe("waiting_input");
+  });
+
+  it("does not publish a delayed direct steer into a restarted lifecycle", async () => {
+    const ctl = makeControllableQuery();
+    const steerDelay = deferred();
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("direct-steer-restart-race-agent", { query: ctl.query });
+    runner.on((event) => events.push(event));
+
+    await runner.start({ prompt: "start A" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+    ctl.setSteerDelay(steerDelay.promise);
+    const steering = runner.steer("stale direct steer");
+    await flush();
+    expect(ctl.steerCalls()).toBe(1);
+
+    await runner.stop();
+    ctl.setSteerDelay(undefined);
+    await runner.start({ prompt: "start B" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+    steerDelay.resolve();
+
+    await expect(steering).rejects.toThrow("steer target changed during dispatch");
+    await flush();
+    expect(runner.getStatus()).toBe("running");
+    expect(
+      events.filter(
+        (event) => event.kind === "user_input" && event.text === "stale direct steer",
+      ),
+    ).toEqual([]);
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual(["start A", "start B"]);
+  });
+
   it("validates live paths before initial start resolves file access or starts the provider", async () => {
     const ctl = makeControllableQuery();
     const query = vi.fn(ctl.query);
@@ -626,7 +807,7 @@ describe("AgentRunner 生命周期", () => {
     expect(runner.getStatus()).toBe("running");
   });
 
-  it("blocks compact dispatch when live validation fails", async () => {
+  it("does not prepare a file snapshot for compact because the command carries no file access", async () => {
     const ctl = makeControllableQuery();
     let unsafe = false;
     const prepareFileAccess = vi.fn(async () => {
@@ -643,10 +824,13 @@ describe("AgentRunner 生命周期", () => {
     await flush();
     unsafe = true;
 
-    await expect(runner.compact()).rejects.toThrow("documentation mount was replaced");
-    expect(prepareFileAccess).toHaveBeenCalledTimes(2);
-    expect(ctl.inputs.map((input) => input.message.content)).toEqual(["first"]);
-    expect(runner.getStatus()).toBe("waiting_input");
+    await expect(runner.compact()).resolves.toBeUndefined();
+    await flush();
+    expect(prepareFileAccess).toHaveBeenCalledTimes(1);
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual(["first", "/compact"]);
+    expect(ctl.inputs[1]?.fileAccess).toBeUndefined();
+    expect(runner.getStatus()).toBe("running");
+    await runner.terminate();
   });
 
   it("revalidates a stopped session before restarting it with a new input", async () => {
@@ -943,7 +1127,11 @@ describe("AgentRunner 生命周期", () => {
 
   it("stop → stopped，调用 interrupt；继续输入时优先复用未关闭的流式会话", async () => {
     const ctl = makeControllableQuery();
-    const runner = new AgentRunner("a2", { query: ctl.query });
+    const onProviderTurnSettled = vi.fn();
+    const runner = new AgentRunner("a2", {
+      query: ctl.query,
+      onProviderTurnSettled,
+    });
     runner.start({ prompt: "x" });
     ctl.emit(SYSTEM_INIT);
     await flush();
@@ -953,12 +1141,386 @@ describe("AgentRunner 生命周期", () => {
     expect(ctl.wasInterrupted()).toBe(true);
     ctl.emit(resultMsg());
     await flush();
+    expect(onProviderTurnSettled).toHaveBeenCalledTimes(1);
 
     runner.send("y");
     await flush();
     expect(runner.getStatus()).toBe("running");
     expect(ctl.wasTerminated()).toBe(false);
     expect(ctl.inputs.map((input) => input.message.content)).toEqual(["x", "y"]);
+  });
+
+  it("does not let a hanging best-effort interrupt block stop or exact termination", async () => {
+    const output = new AsyncMessageQueue<SdkMessage>();
+    const interruptStarted = deferred();
+    const neverInterrupts = deferred();
+    let terminated = false;
+    const runner = new AgentRunner("hanging-interrupt-agent", {
+      query: () => ({
+        [Symbol.asyncIterator]: () => output[Symbol.asyncIterator](),
+        interrupt: async () => {
+          interruptStarted.resolve();
+          await neverInterrupts.promise;
+        },
+        terminate: async () => {
+          terminated = true;
+          output.close();
+        },
+      }),
+    });
+
+    await runner.start({ prompt: "start" });
+    output.push(SYSTEM_INIT);
+    await flush();
+    await expect(
+      Promise.race([
+        runner.stop().then(() => "stopped"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("timed out"), 100)),
+      ]),
+    ).resolves.toBe("stopped");
+    await interruptStarted.promise;
+    expect(runner.getStatus()).toBe("stopped");
+
+    await expect(runner.terminate()).resolves.toBeUndefined();
+    expect(terminated).toBe(true);
+    expect(runner.getStatus()).toBe("terminated");
+  });
+
+  it.each(["deliver", "steer"] as const)(
+    "does not let a hanging fallback interrupt block %s or exact termination",
+    async (operation) => {
+      const output = new AsyncMessageQueue<SdkMessage>();
+      const interruptStarted = deferred();
+      const neverInterrupts = deferred();
+      const runner = new AgentRunner(`hanging-${operation}-interrupt-agent`, {
+        query: () => ({
+          [Symbol.asyncIterator]: () => output[Symbol.asyncIterator](),
+          interrupt: async () => {
+            interruptStarted.resolve();
+            await neverInterrupts.promise;
+          },
+          terminate: async () => output.close(),
+        }),
+      });
+
+      await runner.start({ prompt: "start" });
+      output.push(SYSTEM_INIT);
+      await flush();
+      const dispatch = operation === "deliver"
+        ? runner.deliver("queued delivery")
+        : runner.steer("queued steer");
+      await expect(
+        Promise.race([
+          dispatch.then(() => "dispatched"),
+          new Promise<string>((resolve) => setTimeout(() => resolve("timed out"), 100)),
+        ]),
+      ).resolves.toBe("dispatched");
+      await interruptStarted.promise;
+      await expect(runner.terminate()).resolves.toBeUndefined();
+    },
+  );
+
+  it("waits for stopped transport termination and preserves concurrent restart inputs", async () => {
+    const termination = deferred();
+    const terminationStarted = deferred();
+    const outputs: AsyncMessageQueue<SdkMessage>[] = [];
+    const inputs: SdkUserInput[] = [];
+    let queryCalls = 0;
+    const query: QueryFn = ({ prompt }) => {
+      const callIndex = queryCalls++;
+      const output = new AsyncMessageQueue<SdkMessage>();
+      outputs.push(output);
+      if (typeof prompt !== "string") {
+        void (async () => {
+          for await (const input of prompt) inputs.push(input);
+        })();
+      }
+      return {
+        [Symbol.asyncIterator]: () => output[Symbol.asyncIterator](),
+        interrupt: async () => undefined,
+        terminate: async () => {
+          if (callIndex === 0) {
+            terminationStarted.resolve();
+            await termination.promise;
+          }
+          output.close();
+        },
+      };
+    };
+    const prepareFileAccess = vi.fn(async () => undefined);
+    const onProviderTurnSettled = vi.fn();
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("stopped-concurrent-restart-agent", {
+      query,
+      prepareFileAccess,
+      onProviderTurnSettled,
+    });
+    runner.on((event) => events.push(event));
+
+    await runner.start({ prompt: "start A" });
+    outputs[0]!.push(SYSTEM_INIT);
+    await flush();
+    await runner.stop();
+    const firstRestart = runner.send("restart one");
+    await terminationStarted.promise;
+    const secondRestart = runner.send("restart two");
+    await flush();
+
+    expect(queryCalls).toBe(1);
+    expect(prepareFileAccess).toHaveBeenCalledTimes(1);
+    expect(onProviderTurnSettled).not.toHaveBeenCalled();
+    termination.resolve();
+    await Promise.all([firstRestart, secondRestart]);
+    await flush();
+
+    expect(queryCalls).toBe(2);
+    expect(prepareFileAccess).toHaveBeenCalledTimes(2);
+    expect(onProviderTurnSettled).toHaveBeenCalledTimes(1);
+    expect(inputs.map((input) => input.message.content)).toEqual(["start A", "restart one"]);
+    expect(
+      events.filter((event) => event.kind === "user_input").map((event) => event.text),
+    ).toEqual(["start A", "restart one", "restart two"]);
+    await runner.terminate();
+  });
+
+  it("notifies stopped settlement only after a failed transport close is retried successfully", async () => {
+    const outputs: AsyncMessageQueue<SdkMessage>[] = [];
+    let queryCalls = 0;
+    let terminationAttempts = 0;
+    const query: QueryFn = () => {
+      const callIndex = queryCalls++;
+      const output = new AsyncMessageQueue<SdkMessage>();
+      outputs.push(output);
+      return {
+        [Symbol.asyncIterator]: () => output[Symbol.asyncIterator](),
+        interrupt: async () => undefined,
+        terminate: async () => {
+          if (callIndex === 0) {
+            terminationAttempts += 1;
+            if (terminationAttempts === 1) throw new Error("provider still owns snapshot");
+          }
+          output.close();
+        },
+      };
+    };
+    const onProviderTurnSettled = vi.fn();
+    const runner = new AgentRunner("stopped-close-retry-settlement-agent", {
+      query,
+      onProviderTurnSettled,
+    });
+
+    await runner.start({ prompt: "start A" });
+    outputs[0]!.push(SYSTEM_INIT);
+    await flush();
+    await runner.stop();
+
+    await expect(runner.send("first resume attempt")).rejects.toThrow(
+      /provider transport termination failed/u,
+    );
+    expect(onProviderTurnSettled).not.toHaveBeenCalled();
+    expect(queryCalls).toBe(1);
+    expect(runner.getStatus()).toBe("stopped");
+
+    await expect(runner.send("retry resume")).resolves.toBeUndefined();
+    expect(terminationAttempts).toBe(2);
+    expect(onProviderTurnSettled).toHaveBeenCalledTimes(1);
+    expect(queryCalls).toBe(2);
+    expect(runner.getStatus()).toBe("starting");
+    await runner.terminate();
+  });
+
+  it("preserves concurrent stopped inputs after the old provider naturally settles", async () => {
+    const outputs: AsyncMessageQueue<SdkMessage>[] = [];
+    const inputs: SdkUserInput[] = [];
+    const settled = deferred();
+    let queryCalls = 0;
+    const query: QueryFn = ({ prompt }) => {
+      queryCalls += 1;
+      const output = new AsyncMessageQueue<SdkMessage>();
+      outputs.push(output);
+      if (typeof prompt !== "string") {
+        void (async () => {
+          for await (const input of prompt) inputs.push(input);
+        })();
+      }
+      return {
+        [Symbol.asyncIterator]: () => output[Symbol.asyncIterator](),
+        interrupt: async () => undefined,
+        terminate: async () => output.close(),
+      };
+    };
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("settled-stopped-concurrent-agent", {
+      query,
+      onProviderTurnSettled: () => settled.resolve(),
+    });
+    runner.on((event) => events.push(event));
+
+    await runner.start({ prompt: "start A" });
+    outputs[0]!.push(SYSTEM_INIT);
+    await flush();
+    await runner.stop();
+    outputs[0]!.close();
+    await settled.promise;
+
+    const firstRestart = runner.send("restart one");
+    const secondRestart = runner.send("restart two");
+    await Promise.all([firstRestart, secondRestart]);
+    await flush();
+
+    expect(queryCalls).toBe(2);
+    expect(inputs.map((input) => input.message.content)).toEqual(["start A", "restart one"]);
+    expect(
+      events.filter((event) => event.kind === "user_input").map((event) => event.text),
+    ).toEqual(["start A", "restart one", "restart two"]);
+    await runner.terminate();
+  });
+
+  it("cancels every queued stopped restart when terminating a pending restart", async () => {
+    const termination = deferred();
+    const terminationStarted = deferred();
+    const output = new AsyncMessageQueue<SdkMessage>();
+    let queryCalls = 0;
+    const query: QueryFn = () => {
+      queryCalls += 1;
+      return {
+        [Symbol.asyncIterator]: () => output[Symbol.asyncIterator](),
+        interrupt: async () => undefined,
+        terminate: async () => {
+          terminationStarted.resolve();
+          await termination.promise;
+          output.close();
+        },
+      };
+    };
+    const runner = new AgentRunner("stopped-close-barrier-agent", { query });
+
+    await runner.start({ prompt: "start A" });
+    output.push(SYSTEM_INIT);
+    await flush();
+    await runner.stop();
+    const firstRestart = runner.send("start B");
+    await terminationStarted.promise;
+    const secondRestart = runner.send("queue after B");
+    const firstOutcome = firstRestart.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    const secondOutcome = secondRestart.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    let terminated = false;
+    const terminating = runner.terminate().then(() => {
+      terminated = true;
+    });
+    await flush();
+
+    expect(terminated).toBe(false);
+    expect(queryCalls).toBe(1);
+    termination.resolve();
+    await terminating;
+    const firstError = await firstOutcome;
+    const secondError = await secondOutcome;
+    expect(firstError).toBeInstanceOf(Error);
+    expect(String(firstError)).toMatch(/restart was cancelled before dispatch/u);
+    expect(secondError).toBeInstanceOf(Error);
+    expect(String(secondError)).toMatch(/closed-state input was cancelled/u);
+    expect(runner.getStatus()).toBe("terminated");
+    expect(queryCalls).toBe(1);
+  });
+
+  it("a second terminate cancels a restart queued while the first terminate is pending", async () => {
+    const termination = deferred();
+    const terminationStarted = deferred();
+    const output = new AsyncMessageQueue<SdkMessage>();
+    let queryCalls = 0;
+    const query: QueryFn = () => {
+      queryCalls += 1;
+      return {
+        [Symbol.asyncIterator]: () => output[Symbol.asyncIterator](),
+        terminate: async () => {
+          terminationStarted.resolve();
+          await termination.promise;
+          output.close();
+        },
+      };
+    };
+    const runner = new AgentRunner("terminate-restart-cancellation-agent", { query });
+
+    await runner.start({ prompt: "start A" });
+    output.push(SYSTEM_INIT);
+    await flush();
+    const firstTerminate = runner.terminate();
+    await terminationStarted.promise;
+    const restarting = runner.send("restart after terminate");
+    const restartOutcome = restarting.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await vi.waitFor(() => expect(runner.getStatus()).toBe("starting"));
+    const secondTerminate = runner.terminate();
+
+    termination.resolve();
+    await Promise.all([firstTerminate, secondTerminate]);
+    const restartError = await restartOutcome;
+    expect(restartError).toBeInstanceOf(Error);
+    expect(String(restartError)).toMatch(/start was cancelled before dispatch/u);
+    expect(runner.getStatus()).toBe("terminated");
+    expect(queryCalls).toBe(1);
+  });
+
+  it("terminate cancels a terminated-state restart before its transition microtask begins", async () => {
+    let queryCalls = 0;
+    const runner = new AgentRunner("same-tick-terminated-restart-agent", {
+      query: () => {
+        queryCalls += 1;
+        return {
+          async *[Symbol.asyncIterator]() {},
+          terminate: async () => undefined,
+        };
+      },
+    });
+    await runner.terminate();
+
+    const restarting = runner.send("must not restart");
+    const restartOutcome = restarting.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    const terminating = runner.terminate();
+
+    await terminating;
+    const restartError = await restartOutcome;
+    expect(restartError).toBeInstanceOf(Error);
+    expect(String(restartError)).toMatch(/closed-state input was cancelled before dispatch/u);
+    expect(queryCalls).toBe(0);
+    expect(runner.getStatus()).toBe("terminated");
+  });
+
+  it("propagates transport termination failures and retries the retained handle", async () => {
+    const output = new AsyncMessageQueue<SdkMessage>();
+    let attempts = 0;
+    const runner = new AgentRunner("retry-provider-termination-agent", {
+      query: () => ({
+        [Symbol.asyncIterator]: () => output[Symbol.asyncIterator](),
+        terminate: async () => {
+          attempts += 1;
+          if (attempts === 1) throw new Error("provider still alive");
+          output.close();
+        },
+      }),
+    });
+
+    await runner.start({ prompt: "start" });
+    output.push(SYSTEM_INIT);
+    await flush();
+    await expect(runner.terminate()).rejects.toThrow(/provider transport termination failed/u);
+    expect(runner.getStatus()).toBe("terminated");
+    expect(attempts).toBe(1);
+
+    await expect(runner.terminate()).resolves.toBeUndefined();
+    expect(attempts).toBe(2);
   });
 
   it("preserves a pending documentation policy across stop and stopped-session reuse", async () => {
@@ -1298,6 +1860,7 @@ describe("AgentRunner 生命周期", () => {
           async *[Symbol.asyncIterator]() {
             if (ending === "error") throw new Error("resumed provider failed");
           },
+          terminate: async () => undefined,
         };
       };
       const runner = new AgentRunner(`detached-${ending}-agent`, { query });
@@ -1397,6 +1960,7 @@ describe("AgentRunner 生命周期", () => {
       async *[Symbol.asyncIterator]() {
         throw new Error("boom");
       },
+      terminate: async () => undefined,
     });
     const events: AgentEvent[] = [];
     const runner = new AgentRunner("a4", { query });
@@ -1466,11 +2030,13 @@ describe("AgentRunner 生命周期", () => {
       async *[Symbol.asyncIterator]() {
         // empty
       },
+      terminate: async () => undefined,
     }));
     const codexQuery: QueryFn = vi.fn(() => ({
       async *[Symbol.asyncIterator]() {
         // empty
       },
+      terminate: async () => undefined,
     }));
 
     const runner = new AgentRunner("a8", { query: claudeQuery, codexQuery });

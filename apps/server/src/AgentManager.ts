@@ -84,6 +84,7 @@ export class AgentManager {
   private resolveFileAccess?: (agentId: string) => AgentFileAccess;
   private prepareFileAccess?: (agentId: string) => Promise<void> | void;
   private resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
+  private providerTurnSettledHandler?: (agentId: string) => void;
   private counter = 0;
   private suppressEvents = false;
   private stateGeneration = 0;
@@ -193,11 +194,26 @@ export class AgentManager {
     }
   }
 
+  /** Stop every provider transport without deleting the in-memory canvas state. */
+  async terminateAll(): Promise<void> {
+    this.invalidatePendingTurnContexts();
+    const results = await Promise.allSettled(
+      [...this.runners.values()].map((runner) => runner.terminate()),
+    );
+    const errors = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (errors.length > 0) {
+      throw new AggregateError(errors, "Failed to terminate all agent transports");
+    }
+  }
+
   private createRunner(
     id: string,
     draftConfig: Partial<AgentStartConfig>,
   ): AgentRunner {
-    const runner = new AgentRunner(id, {
+    let runner!: AgentRunner;
+    runner = new AgentRunner(id, {
       query: this.query,
       codexQuery: this.codexQuery,
       now: this.now,
@@ -214,6 +230,10 @@ export class AgentManager {
           sharedResources: [],
         },
       prepareFileAccess: (agentId) => this.prepareFileAccess?.(agentId),
+      onProviderTurnSettled: (agentId) => {
+        if (this.runners.get(id) !== runner) return;
+        this.providerTurnSettledHandler?.(agentId);
+      },
       resolvePromptAccess: (agentId) =>
         this.resolvePromptAccess?.(agentId) ?? {
           readablePrompts: [],
@@ -242,6 +262,10 @@ export class AgentManager {
 
   setFileAccessPreparer(prepareFileAccess: (agentId: string) => Promise<void> | void): void {
     this.prepareFileAccess = prepareFileAccess;
+  }
+
+  setProviderTurnSettledHandler(handler: (agentId: string) => void): void {
+    this.providerTurnSettledHandler = handler;
   }
 
   setPromptAccessResolver(resolvePromptAccess: (agentId: string) => AgentPromptAccess): void {

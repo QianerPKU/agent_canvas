@@ -18,6 +18,8 @@ type RunPickerCommand = (
   options?: { windowsHide?: boolean },
 ) => Promise<PickerCommandResult>;
 
+type ParsePickerOutput = (stdout: string) => string[];
+
 interface FilePickerRuntime {
   platform?: NodeJS.Platform;
   env?: NodeJS.ProcessEnv;
@@ -28,6 +30,12 @@ type PickAttempt =
   | { status: "picked"; paths: string[] }
   | { status: "cancelled" }
   | { status: "unavailable" };
+
+// Zenity accepts an arbitrary separator, but argv strings cannot contain NUL.
+// A selected Linux path cannot contain `/../`: slash separates components and
+// `..` is a reserved component. Framing the separator with newlines therefore
+// preserves real newlines in either directory or file names without ambiguity.
+const ZENITY_PATH_BOUNDARY = "\n/../\n";
 
 export function createFilePicker(runtime: FilePickerRuntime = {}): PickFiles {
   const platform = runtime.platform ?? process.platform;
@@ -100,12 +108,13 @@ async function pickLinuxFiles(
     "zenity",
     [
       "--file-selection",
-      ...(multiple ? ["--multiple", "--separator=\n"] : []),
+      ...(multiple ? ["--multiple", `--separator=${ZENITY_PATH_BOUNDARY}`] : []),
       ...(initial
         ? ["--filename", initial.endsWith("/") ? initial : `${initial}/`]
         : []),
     ],
     run,
+    parseZenityOutput,
   );
   if (zenity.status === "picked") return zenity.paths;
   if (zenity.status === "cancelled") return [];
@@ -113,11 +122,12 @@ async function pickLinuxFiles(
   const kdialog = await tryPickWith(
     "kdialog",
     [
-      "--getopenfilename",
+      "--getopenurl",
       initial || env.HOME || ".",
       ...(multiple ? ["--multiple", "--separate-output"] : []),
     ],
     run,
+    parseKDialogOutput,
   );
   if (kdialog.status === "picked") return kdialog.paths;
   if (kdialog.status === "cancelled") return [];
@@ -129,10 +139,11 @@ async function tryPickWith(
   command: string,
   args: string[],
   run: RunPickerCommand,
+  parseOutput: ParsePickerOutput,
 ): Promise<PickAttempt> {
   try {
     const result = await run(command, args);
-    const paths = outputPaths(result.stdout);
+    const paths = parseOutput(result.stdout);
     return paths.length > 0 ? { status: "picked", paths } : { status: "cancelled" };
   } catch (error) {
     return numericExitCode(error) === 1 ? { status: "cancelled" } : { status: "unavailable" };
@@ -164,6 +175,30 @@ function outputPaths(stdout: string): string[] {
   return stdout
     .split(/\r?\n/u)
     .filter((candidate) => candidate.length > 0);
+}
+
+function parseZenityOutput(stdout: string): string[] {
+  const output = stripLinuxOutputTerminator(stdout);
+  return output.length > 0 ? output.split(ZENITY_PATH_BOUNDARY) : [];
+}
+
+function parseKDialogOutput(stdout: string): string[] {
+  const output = stripLinuxOutputTerminator(stdout);
+  return output.length > 0
+    ? output.split("\n").map(linuxFileUrlToPath)
+    : [];
+}
+
+function stripLinuxOutputTerminator(stdout: string): string {
+  return stdout.endsWith("\n") ? stdout.slice(0, -1) : stdout;
+}
+
+function linuxFileUrlToPath(value: string): string {
+  const url = new URL(value);
+  if (url.protocol !== "file:" || (url.hostname && url.hostname !== "localhost")) {
+    throw new Error("kdialog returned a non-local file URL");
+  }
+  return decodeURIComponent(url.pathname);
 }
 
 function numericExitCode(error: unknown): number | undefined {

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { constants, type Dirent, type Stats } from "node:fs";
+import { constants, type BigIntStats, type Dirent, type Stats } from "node:fs";
 import {
   lstat,
   link,
@@ -51,6 +51,7 @@ import {
   type ManagedTrustedRootBoundary,
   assertManagedTrustedRootBoundary,
   captureManagedTrustedRootBoundary,
+  isManagedPathAtOrWithin,
   readManagedFile,
   readManagedFileSnapshot,
   removeManagedFile,
@@ -111,11 +112,56 @@ interface ProjectIndex {
   externalFileAuthorizations: ProjectExternalFileAuthorization[];
 }
 
+export interface ExternalFileAuthorizationLease {
+  path: string;
+  identity: ExternalFileSystemIdentity;
+}
+
+interface ExternalFileAuthorizationObservation {
+  path: string;
+  identity?: ExternalFileSystemIdentity;
+}
+
+export interface ExternalFileSystemIdentity {
+  /** Decimal device/volume id captured from bigint fs metadata. */
+  dev: string;
+  /** Decimal inode/file id captured from bigint fs metadata. */
+  ino: string;
+}
+
 interface ProjectExternalFileAuthorization {
   /** Canonical project root. Kept outside portable project metadata on purpose. */
   projectRoot: string;
+  /** Identity of the project root when this local authorization was committed. */
+  projectRootIdentity?: ExternalFileSystemIdentity;
   /** Canonical external paths explicitly approved for this project. */
   paths: string[];
+  /** File identities captured for short-lived revalidation leases. */
+  pathIdentities?: Array<{ path: string; identity: ExternalFileSystemIdentity }>;
+}
+
+interface ProjectSelectionSnapshot {
+  projectRoot: string | undefined;
+  currentProject: CanvasProjectSummary | undefined;
+  state: WorkspaceState;
+  stateLoaded: boolean;
+  branchCounter: number;
+  resourceCounter: number;
+  projectRootBoundary: ProjectRootBoundary | undefined;
+  trustedExternalFilePaths: Set<string> | undefined;
+  trustedExternalFileIdentities: Map<string, ExternalFileSystemIdentity> | undefined;
+}
+
+interface ProjectIndexCommit {
+  previousSnapshot: ManagedFileSnapshot | undefined;
+  committedSnapshot: ManagedFileSnapshot;
+}
+
+interface CanvasProjectOpenTransaction {
+  workspace: WorkspaceProject;
+  openedRevision: WorkspaceProjectRevision;
+  previousSelection: ProjectSelectionSnapshot;
+  indexCommit: ProjectIndexCommit;
 }
 
 interface WorkDocumentationContext {
@@ -218,6 +264,7 @@ export class WorkspaceManager {
   private projectRootBoundary?: ProjectRootBoundary;
   /** Canonical paths loaded from the local project authorization index. */
   private trustedExternalFilePaths?: Set<string>;
+  private trustedExternalFileIdentities?: Map<string, ExternalFileSystemIdentity>;
   private projectsRootBoundary?: ManagedTrustedRootBoundary;
   private documentationPrepareChain: Promise<void> = Promise.resolve();
   private projectMutationChain: Promise<void> = Promise.resolve();
@@ -262,10 +309,18 @@ export class WorkspaceManager {
       : undefined;
   }
 
+  currentTrustedExternalFileAuthorizations(): ExternalFileAuthorizationLease[] | undefined {
+    if (!this.trustedExternalFilePaths) return undefined;
+    return [...this.trustedExternalFilePaths].flatMap((filePath) => {
+      const identity = this.trustedExternalFileIdentities?.get(filePath);
+      return identity ? [{ path: filePath, identity }] : [];
+    });
+  }
+
   async trustExternalFilePaths(paths: string[]): Promise<string[]> {
     return await this.withExternalFileAuthorization(
       paths,
-      async (canonicalPaths) => canonicalPaths,
+      async (authorizations) => authorizations.map(({ path: filePath }) => filePath),
     );
   }
 
@@ -276,48 +331,59 @@ export class WorkspaceManager {
    */
   async withExternalFileAuthorization<T>(
     paths: string[],
-    apply: (canonicalPaths: string[]) => Promise<T>,
+    apply: (authorizations: ExternalFileAuthorizationLease[]) => Promise<T>,
   ): Promise<T> {
     return await this.queueProjectMutation(async () => {
       await this.ensureProjectOpen();
       const revision = this.captureProjectRevision();
-      const canonicalPaths = await canonicalizeExplicitExternalFilePaths(paths);
+      const authorizations = await canonicalizeExplicitExternalFilePaths(paths);
       this.assertProjectRevision(revision);
       await this.validateCurrentProjectRoot();
 
       const boundary = this.currentProjectRootBoundary();
+      const projectRootIdentity = await captureExternalFileSystemIdentity(boundary.realPath);
       const { index, snapshot } = await this.readProjectIndexSnapshot();
       this.assertProjectRevision(revision);
       await assertProjectRootBoundary(this.requireProjectRoot(), boundary);
 
-      const mergedPaths = uniqueCanonicalPaths([
-        ...projectExternalFileAuthorizationPaths(index, boundary.realPath),
-        ...(this.trustedExternalFilePaths ?? []),
-        ...canonicalPaths,
+      const mergedAuthorizations = uniqueExternalFileAuthorizations([
+        ...projectExternalFileAuthorizations(index, boundary.realPath, projectRootIdentity),
+        ...(this.currentTrustedExternalFileAuthorizations() ?? []),
+        ...authorizations,
       ]);
       const committedSnapshot = await this.writeProjectIndex(
-        withProjectExternalFileAuthorization(index, boundary.realPath, mergedPaths),
+        withProjectExternalFileAuthorization(
+          index,
+          boundary.realPath,
+          projectRootIdentity,
+          mergedAuthorizations,
+        ),
         snapshot ?? null,
       );
-      this.trustedExternalFilePaths = new Set(mergedPaths);
+      this.setTrustedExternalFileAuthorizations(mergedAuthorizations);
       try {
         this.assertProjectRevision(revision);
         await assertProjectRootBoundary(this.requireProjectRoot(), boundary);
-        return await apply(canonicalPaths);
+        return await apply(authorizations);
       } catch (error) {
         try {
           await this.restoreProjectIndexSnapshot(snapshot, committedSnapshot);
-          this.trustedExternalFilePaths = new Set(
-            projectExternalFileAuthorizationPaths(index, boundary.realPath),
+          this.setTrustedExternalFileAuthorizations(
+            projectExternalFileAuthorizations(index, boundary.realPath, projectRootIdentity),
           );
         } catch (rollbackError) {
           try {
             const { index: currentIndex } = await this.readProjectIndexSnapshot();
-            this.trustedExternalFilePaths = new Set(
-              projectExternalFileAuthorizationPaths(currentIndex, boundary.realPath),
+            this.setTrustedExternalFileAuthorizations(
+              projectExternalFileAuthorizations(
+                currentIndex,
+                boundary.realPath,
+                projectRootIdentity,
+              ),
             );
           } catch {
             this.trustedExternalFilePaths = undefined;
+            this.trustedExternalFileIdentities = undefined;
           }
           throw new AggregateError(
             [error, rollbackError],
@@ -439,6 +505,7 @@ export class WorkspaceManager {
       resourceCounter: this.resourceCounter,
       projectRootBoundary: this.projectRootBoundary,
       trustedExternalFilePaths: this.trustedExternalFilePaths,
+      trustedExternalFileIdentities: this.trustedExternalFileIdentities,
     };
     let selected = false;
     try {
@@ -457,6 +524,7 @@ export class WorkspaceManager {
       this.resourceCounter = previousSelection.resourceCounter;
       this.projectRootBoundary = previousSelection.projectRootBoundary;
       this.trustedExternalFilePaths = previousSelection.trustedExternalFilePaths;
+      this.trustedExternalFileIdentities = previousSelection.trustedExternalFileIdentities;
       const rollbackErrors: unknown[] = [];
       for (const directory of [...createdProjectDirectories].reverse()) {
         await collectRollbackError(rollbackErrors, () => removeCreatedDirectory(directory));
@@ -472,7 +540,42 @@ export class WorkspaceManager {
   }
 
   async openCanvasProject(input: OpenCanvasProjectInput): Promise<WorkspaceProject> {
-    return await this.queueProjectMutation(() => this.openCanvasProjectInternal(input));
+    const transaction = await this.queueProjectMutation(() =>
+      this.openCanvasProjectInternal(input),
+    );
+    return transaction.workspace;
+  }
+
+  async withCanvasProjectOpen<T>(
+    input: OpenCanvasProjectInput,
+    apply: (workspace: WorkspaceProject) => Promise<T>,
+  ): Promise<T> {
+    const transaction = await this.queueProjectMutation(() =>
+      this.openCanvasProjectInternal(input),
+    );
+    try {
+      const result = await apply(transaction.workspace);
+      await this.queueProjectMutation(() =>
+        this.commitCanvasProjectOpen(transaction),
+      );
+      return result;
+    } catch (error) {
+      let rollbackErrors: unknown[];
+      try {
+        rollbackErrors = await this.queueProjectMutation(() =>
+          this.rollbackCanvasProjectOpen(transaction),
+        );
+      } catch (rollbackError) {
+        rollbackErrors = [rollbackError];
+      }
+      if (rollbackErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...rollbackErrors],
+          `Canvas project open failed and rollback was incomplete: ${errorMessage(error)}`,
+        );
+      }
+      throw error;
+    }
   }
 
   async closeCanvasProject(): Promise<void> {
@@ -486,12 +589,13 @@ export class WorkspaceManager {
       this.resourceCounter = 0;
       this.projectRootBoundary = undefined;
       this.trustedExternalFilePaths = undefined;
+      this.trustedExternalFileIdentities = undefined;
     });
   }
 
   private async openCanvasProjectInternal(
     input: OpenCanvasProjectInput,
-  ): Promise<WorkspaceProject> {
+  ): Promise<CanvasProjectOpenTransaction> {
     const projectRoot = normalizeOptionalProjectRoot(input.projectRoot);
     // Opening must stay read-only until every external reference has been
     // checked. Otherwise a failed first attempt could register the project and
@@ -518,27 +622,34 @@ export class WorkspaceManager {
         (candidate) => normalizedRootKey(candidate.projectRoot) === normalizedRootKey(resolvedRoot),
       );
     const openingBoundary = await captureProjectRootBoundary(resolvedRoot);
+    const openingRootIdentity = await captureExternalFileSystemIdentity(openingBoundary.realPath);
     const document = await this.readWorkspaceDocument(resolvedRoot, undefined, openingBoundary);
     const externalFileReferences = await inspectCanvasExternalFileReferences(
       resolvedRoot,
       openingBoundary,
     );
     await assertProjectRootBoundary(resolvedRoot, openingBoundary);
-    const explicitlyTrustedPaths = await canonicalizeExplicitExternalFilePaths(
+    const explicitlyTrustedFiles = await canonicalizeExplicitExternalFilePaths(
       input.trustedExternalFilePaths ?? [],
     );
     const referencedPathKeys = new Set(
-      externalFileReferences.map((reference) => normalizedRootKey(reference.path)),
+      externalFileReferences.map((reference) => externalAuthorizationPathKey(reference.path)),
     );
-    const trustedExternalFilePaths = uniqueCanonicalPaths([
-      ...projectExternalFileAuthorizationPaths(index, openingBoundary.realPath),
-      ...explicitlyTrustedPaths.filter((filePath) =>
-        referencedPathKeys.has(normalizedRootKey(filePath))),
-    ]);
+    const trustedExternalFiles = await refreshExternalFileAuthorizationLeases(
+      uniqueExternalFileAuthorizations([
+        ...projectExternalFileAuthorizations(
+          index,
+          openingBoundary.realPath,
+          openingRootIdentity,
+        ),
+        ...explicitlyTrustedFiles.filter(({ path: filePath }) =>
+          referencedPathKeys.has(externalAuthorizationPathKey(filePath))),
+      ]),
+    );
     assertExternalFileReferencesTrusted(
       resolvedRoot,
       externalFileReferences,
-      trustedExternalFilePaths,
+      trustedExternalFiles,
     );
     const relocated = relocateWorkspace(document, resolvedRoot, {
       requireExternalTrust: !registered,
@@ -557,7 +668,7 @@ export class WorkspaceManager {
       project = { ...project, id: projectIdFromExplicitRoot(resolvedRoot) };
     }
     const opened = { ...project, projectRoot: resolvedRoot, openedAt: this.now() };
-    const previousSelection = {
+    const previousSelection: ProjectSelectionSnapshot = {
       projectRoot: this.projectRoot,
       currentProject: this.currentProject,
       state: this.state,
@@ -565,29 +676,125 @@ export class WorkspaceManager {
       branchCounter: this.branchCounter,
       resourceCounter: this.resourceCounter,
       projectRootBoundary: this.projectRootBoundary,
-      trustedExternalFilePaths: this.trustedExternalFilePaths,
+      trustedExternalFilePaths: this.trustedExternalFilePaths
+        ? new Set(this.trustedExternalFilePaths)
+        : undefined,
+      trustedExternalFileIdentities: this.trustedExternalFileIdentities
+        ? new Map(this.trustedExternalFileIdentities)
+        : undefined,
     };
     try {
       await this.selectProject(
         opened,
         { ...relocated.state, project: opened },
         openingBoundary,
-        trustedExternalFilePaths,
+        trustedExternalFiles,
       );
-      await this.saveState();
-      return this.snapshot();
+      const indexCommit = await this.saveState();
+      if (!indexCommit) throw new Error("Canvas project index was not committed during open");
+      return {
+        workspace: this.snapshot(),
+        openedRevision: this.captureProjectRevision(),
+        previousSelection,
+        indexCommit,
+      };
     } catch (error) {
       this.advanceProjectGeneration();
-      this.projectRoot = previousSelection.projectRoot;
-      this.currentProject = previousSelection.currentProject;
-      this.state = previousSelection.state;
-      this.stateLoaded = previousSelection.stateLoaded;
-      this.branchCounter = previousSelection.branchCounter;
-      this.resourceCounter = previousSelection.resourceCounter;
-      this.projectRootBoundary = previousSelection.projectRootBoundary;
-      this.trustedExternalFilePaths = previousSelection.trustedExternalFilePaths;
+      this.restoreProjectSelection(previousSelection);
       throw error;
     }
+  }
+
+  private async commitCanvasProjectOpen(
+    transaction: CanvasProjectOpenTransaction,
+  ): Promise<void> {
+    this.assertProjectRevision(transaction.openedRevision);
+    await this.validateCurrentProjectRoot();
+    const { snapshot } = await this.readProjectIndexSnapshot();
+    this.assertProjectRevision(transaction.openedRevision);
+    if (!sameManagedFileSnapshot(snapshot, transaction.indexCommit.committedSnapshot)) {
+      throw new ManagedFileSafetyError(
+        "Canvas project index changed while canvas project state was loading",
+      );
+    }
+  }
+
+  private async rollbackCanvasProjectOpen(
+    transaction: CanvasProjectOpenTransaction,
+  ): Promise<unknown[]> {
+    const rollbackErrors: unknown[] = [];
+    let openedSelectionStillCurrent = true;
+    try {
+      this.assertProjectRevision(transaction.openedRevision);
+    } catch (error) {
+      openedSelectionStillCurrent = false;
+      rollbackErrors.push(error);
+    }
+
+    try {
+      await this.restoreProjectIndexSnapshot(
+        transaction.indexCommit.previousSnapshot,
+        transaction.indexCommit.committedSnapshot,
+      );
+    } catch (error) {
+      rollbackErrors.push(error);
+    }
+
+    if (openedSelectionStillCurrent) {
+      this.advanceProjectGeneration();
+      this.restoreProjectSelection(transaction.previousSelection);
+      if (rollbackErrors.length > 0) {
+        await this.refreshCurrentProjectExternalFileAuthorization();
+      }
+    }
+    return rollbackErrors;
+  }
+
+  private restoreProjectSelection(selection: ProjectSelectionSnapshot): void {
+    this.projectRoot = selection.projectRoot;
+    this.currentProject = selection.currentProject;
+    this.state = selection.state;
+    this.stateLoaded = selection.stateLoaded;
+    this.branchCounter = selection.branchCounter;
+    this.resourceCounter = selection.resourceCounter;
+    this.projectRootBoundary = selection.projectRootBoundary;
+    this.trustedExternalFilePaths = selection.trustedExternalFilePaths
+      ? new Set(selection.trustedExternalFilePaths)
+      : undefined;
+    this.trustedExternalFileIdentities = selection.trustedExternalFileIdentities
+      ? new Map(selection.trustedExternalFileIdentities)
+      : undefined;
+  }
+
+  private async refreshCurrentProjectExternalFileAuthorization(): Promise<void> {
+    const boundary = this.projectRootBoundary;
+    if (!this.currentProject || !this.projectRoot || !boundary) {
+      this.trustedExternalFilePaths = undefined;
+      this.trustedExternalFileIdentities = undefined;
+      return;
+    }
+    try {
+      const { index } = await this.readProjectIndexSnapshot();
+      const projectRootIdentity = await captureExternalFileSystemIdentity(boundary.realPath);
+      this.setTrustedExternalFileAuthorizations(
+        await refreshExternalFileAuthorizationLeases(
+          projectExternalFileAuthorizations(index, boundary.realPath, projectRootIdentity),
+        ),
+      );
+    } catch {
+      this.trustedExternalFilePaths = undefined;
+      this.trustedExternalFileIdentities = undefined;
+    }
+  }
+
+  private setTrustedExternalFileAuthorizations(
+    authorizations: ExternalFileAuthorizationLease[],
+  ): void {
+    const unique = uniqueExternalFileAuthorizations(authorizations);
+    this.trustedExternalFilePaths = new Set(unique.map(({ path: filePath }) => filePath));
+    this.trustedExternalFileIdentities = new Map(
+      unique.map(({ path: filePath, identity }) => [filePath, identity] as const),
+    );
   }
 
   async inspectCanvasProject(projectRoot: string): Promise<CanvasProjectInspection> {
@@ -655,8 +862,8 @@ export class WorkspaceManager {
           ),
           externalFileAuthorizations: index.externalFileAuthorizations.filter(
             (authorization) =>
-              normalizedRootKey(authorization.projectRoot) !==
-              normalizedRootKey(boundary.realPath),
+              externalAuthorizationPathKey(authorization.projectRoot) !==
+              externalAuthorizationPathKey(boundary.realPath),
           ),
         },
         indexSnapshot ?? null,
@@ -1783,7 +1990,7 @@ export class WorkspaceManager {
     project: CanvasProjectSummary,
     state?: WorkspaceState,
     boundary?: ProjectRootBoundary,
-    trustedExternalFilePaths: string[] = [],
+    trustedExternalFiles: ExternalFileAuthorizationLease[] = [],
   ): Promise<void> {
     const resolvedRoot = path.resolve(project.projectRoot);
     const selectedBoundary = boundary ?? await captureProjectRootBoundary(resolvedRoot);
@@ -1792,7 +1999,7 @@ export class WorkspaceManager {
     this.currentProject = { ...project, projectRoot: resolvedRoot };
     this.projectRoot = this.currentProject.projectRoot;
     this.projectRootBoundary = selectedBoundary;
-    this.trustedExternalFilePaths = new Set(uniqueCanonicalPaths(trustedExternalFilePaths));
+    this.setTrustedExternalFileAuthorizations(trustedExternalFiles);
     this.state = state ?? { branches: [], sharedResources: [] };
     this.stateLoaded = state !== undefined;
     this.branchCounter = maxNumericSuffix(this.state.branches.map((branch) => branch.id));
@@ -1804,6 +2011,7 @@ export class WorkspaceManager {
   private clearSelectedProject(): void {
     this.projectRootBoundary = undefined;
     this.trustedExternalFilePaths = undefined;
+    this.trustedExternalFileIdentities = undefined;
     this.projectRoot = undefined;
     this.currentProject = undefined;
     this.state = { branches: [], sharedResources: [] };
@@ -1826,22 +2034,26 @@ export class WorkspaceManager {
       }
       if (!this.trustedExternalFilePaths) {
         const boundary = this.currentProjectRootBoundary();
+        const projectRootIdentity = await captureExternalFileSystemIdentity(boundary.realPath);
         const { index } = await this.readProjectIndexSnapshot();
         const references = await inspectCanvasExternalFileReferences(
           this.projectRoot,
           boundary,
         );
         await assertProjectRootBoundary(this.projectRoot, boundary);
-        const authorizedPaths = projectExternalFileAuthorizationPaths(
-          index,
-          boundary.realPath,
+        const authorizedFiles = await refreshExternalFileAuthorizationLeases(
+          projectExternalFileAuthorizations(
+            index,
+            boundary.realPath,
+            projectRootIdentity,
+          ),
         );
         assertExternalFileReferencesTrusted(
           this.projectRoot,
           references,
-          authorizedPaths,
+          authorizedFiles,
         );
-        this.trustedExternalFilePaths = new Set(authorizedPaths);
+        this.setTrustedExternalFileAuthorizations(authorizedFiles);
       }
       return;
     }
@@ -1955,7 +2167,9 @@ export class WorkspaceManager {
     ]);
   }
 
-  private async saveState(state: WorkspaceState = this.state): Promise<void> {
+  private async saveState(
+    state: WorkspaceState = this.state,
+  ): Promise<ProjectIndexCommit | undefined> {
     const projectsRootBoundary = await this.ensureProjectsRootBoundary();
     const [workspaceSnapshot, indexSnapshot] = await Promise.all([
       readManagedFileSnapshot(this.statePath(), {
@@ -1987,12 +2201,22 @@ export class WorkspaceManager {
               normalizedRootKey(this.currentProject!.projectRoot),
         ),
       ];
+      const boundary = this.currentProjectRootBoundary();
+      const projectRootIdentity = await captureExternalFileSystemIdentity(boundary.realPath);
       const indexWithAuthorization = withProjectExternalFileAuthorization(
         { ...index, projects },
-        this.currentProjectRootBoundary().realPath,
-        [...(this.trustedExternalFilePaths ?? [])],
+        boundary.realPath,
+        projectRootIdentity,
+        this.currentTrustedExternalFileAuthorizations() ?? [],
       );
-      await this.writeProjectIndex(indexWithAuthorization, indexSnapshot ?? null);
+      const committedSnapshot = await this.writeProjectIndex(
+        indexWithAuthorization,
+        indexSnapshot ?? null,
+      );
+      return {
+        previousSnapshot: indexSnapshot,
+        committedSnapshot,
+      };
     } catch (error) {
       try {
         if (workspaceSnapshot) {
@@ -3055,9 +3279,7 @@ export class WorkspaceManager {
     const excludePath = await gitPath(this.runGit, workspace.worktreePath, "info/exclude");
     const projectRoot = this.requireProjectRoot();
     const normalized = patterns.map((pattern) => normalizeIgnorePattern(pattern));
-    const key = process.platform === "win32"
-      ? path.resolve(excludePath).toLowerCase()
-      : path.resolve(excludePath);
+    const key = resolvedFilesystemPathKey(excludePath);
     const previous = this.ignoreWriteChains.get(key) ?? Promise.resolve();
     const append = async () => {
       const parent = path.dirname(excludePath);
@@ -3503,11 +3725,7 @@ async function assertSameRealPath(
 }
 
 function sameFileSystemPath(left: string, right: string): boolean {
-  const normalizedLeft = path.resolve(left);
-  const normalizedRight = path.resolve(right);
-  return process.platform === "win32"
-    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
-    : normalizedLeft === normalizedRight;
+  return resolvedFilesystemPathKey(left) === resolvedFilesystemPathKey(right);
 }
 
 function parseProjectIndex(content: string | undefined): ProjectIndex {
@@ -3530,9 +3748,30 @@ function parseProjectIndex(content: string | undefined): ProjectIndex {
               typeof filePath === "string" && path.isAbsolute(filePath),
           );
           if (authorizedPaths.length === 0) return [];
+          const resolvedPaths = uniqueExternalAuthorizationPaths(authorizedPaths);
+          const pathSet = new Set(resolvedPaths);
+          const pathIdentities = Array.isArray(candidate.pathIdentities)
+            ? candidate.pathIdentities.flatMap((entry) => {
+                if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+                const parsedEntry = entry as {
+                  path?: unknown;
+                  identity?: unknown;
+                };
+                if (typeof parsedEntry.path !== "string" || !path.isAbsolute(parsedEntry.path)) {
+                  return [];
+                }
+                const resolvedPath = path.resolve(parsedEntry.path);
+                const identity = parseExternalFileSystemIdentity(parsedEntry.identity);
+                return identity && pathSet.has(resolvedPath)
+                  ? [{ path: resolvedPath, identity }]
+                  : [];
+              })
+            : [];
           return [{
             projectRoot: path.resolve(candidate.projectRoot),
-            paths: uniqueCanonicalPaths(authorizedPaths),
+            projectRootIdentity: parseExternalFileSystemIdentity(candidate.projectRootIdentity),
+            paths: resolvedPaths,
+            ...(pathIdentities.length > 0 ? { pathIdentities } : {}),
           }];
         })
       : [];
@@ -3550,33 +3789,69 @@ function parseProjectIndex(content: string | undefined): ProjectIndex {
   }
 }
 
-function projectExternalFileAuthorizationPaths(
+function projectExternalFileAuthorizations(
   index: ProjectIndex,
   canonicalProjectRoot: string,
-): string[] {
-  const key = normalizedRootKey(canonicalProjectRoot);
-  return uniqueCanonicalPaths(
-    index.externalFileAuthorizations
-      .filter((authorization) => normalizedRootKey(authorization.projectRoot) === key)
-      .flatMap((authorization) => authorization.paths),
+  projectRootIdentity: ExternalFileSystemIdentity,
+): ExternalFileAuthorizationLease[] {
+  const projectRootKey = externalAuthorizationPathKey(canonicalProjectRoot);
+  return uniqueExternalFileAuthorizations(
+    index.externalFileAuthorizations.flatMap((authorization) => {
+      if (externalAuthorizationPathKey(authorization.projectRoot) !== projectRootKey) return [];
+      if (
+        !authorization.projectRootIdentity ||
+        !sameManagedFileIdentity(authorization.projectRootIdentity, projectRootIdentity)
+      ) {
+        return [];
+      }
+      const identities = new Map(
+        (authorization.pathIdentities ?? []).map(({ path: filePath, identity }) => [
+          externalAuthorizationPathKey(filePath),
+          identity,
+        ]),
+      );
+      return authorization.paths.flatMap((filePath) => {
+        const canonicalPath = externalAuthorizationPathKey(filePath);
+        const identity = identities.get(canonicalPath);
+        // Path-only records predate identity-bound authorization. They cannot be upgraded from
+        // whatever object happens to occupy that path now without repeating explicit consent.
+        return identity ? [{ path: canonicalPath, identity }] : [];
+      });
+    }),
   );
 }
 
 function withProjectExternalFileAuthorization(
   index: ProjectIndex,
   canonicalProjectRoot: string,
-  authorizedPaths: string[],
+  projectRootIdentity: ExternalFileSystemIdentity,
+  authorizedFiles: ExternalFileAuthorizationLease[],
 ): ProjectIndex {
-  const resolvedProjectRoot = path.resolve(canonicalProjectRoot);
-  const projectRootKey = normalizedRootKey(resolvedProjectRoot);
+  const resolvedProjectRoot = externalAuthorizationPathKey(canonicalProjectRoot);
   const remaining = index.externalFileAuthorizations.filter(
-    (authorization) => normalizedRootKey(authorization.projectRoot) !== projectRootKey,
+    (authorization) =>
+      externalAuthorizationPathKey(authorization.projectRoot) !== resolvedProjectRoot ||
+      (authorization.projectRootIdentity !== undefined &&
+        !sameManagedFileIdentity(authorization.projectRootIdentity, projectRootIdentity)),
   );
-  const paths = uniqueCanonicalPaths(authorizedPaths);
+  const uniqueFiles = uniqueExternalFileAuthorizations(authorizedFiles);
+  const paths = uniqueFiles.map(({ path: filePath }) => filePath);
+  const pathIdentities = uniqueFiles.map(({ path: filePath, identity }) => ({
+    path: filePath,
+    identity,
+  }));
   return {
     projects: index.projects,
     externalFileAuthorizations: paths.length > 0
-      ? [...remaining, { projectRoot: resolvedProjectRoot, paths }]
+      ? [
+          ...remaining,
+          {
+            projectRoot: resolvedProjectRoot,
+            projectRootIdentity: { ...projectRootIdentity },
+            paths,
+            ...(pathIdentities.length > 0 ? { pathIdentities } : {}),
+          },
+        ]
       : remaining,
   };
 }
@@ -3586,38 +3861,275 @@ function mergeProjectExternalFileAuthorizations(
 ): ProjectExternalFileAuthorization[] {
   const byRoot = new Map<string, ProjectExternalFileAuthorization>();
   for (const authorization of authorizations) {
-    const projectRoot = path.resolve(authorization.projectRoot);
-    const key = normalizedRootKey(projectRoot);
+    const projectRoot = externalAuthorizationPathKey(authorization.projectRoot);
+    const key = `${projectRoot}\u0000${managedFileIdentityKey(authorization.projectRootIdentity)}`;
     const existing = byRoot.get(key);
+    const files = uniqueExternalFileAuthorizations([
+      ...projectExternalFileLeases(existing),
+      ...projectExternalFileLeases(authorization),
+    ]);
     byRoot.set(key, {
       projectRoot: existing?.projectRoot ?? projectRoot,
-      paths: uniqueCanonicalPaths([
-        ...(existing?.paths ?? []),
-        ...authorization.paths,
-      ]),
+      projectRootIdentity: existing?.projectRootIdentity ?? authorization.projectRootIdentity,
+      paths: files.map(({ path: filePath }) => filePath),
+      pathIdentities: files.map(({ path: filePath, identity }) => ({
+        path: filePath,
+        identity,
+      })),
     });
   }
   return [...byRoot.values()];
 }
 
-function uniqueCanonicalPaths(paths: Iterable<string>): string[] {
+function uniqueExternalAuthorizationPaths(paths: Iterable<string>): string[] {
   const byKey = new Map<string, string>();
   for (const filePath of paths) {
-    const resolved = path.resolve(filePath);
-    const key = normalizedRootKey(resolved);
+    const resolved = externalAuthorizationPathKey(filePath);
+    const key = resolved;
     if (!byKey.has(key)) byKey.set(key, resolved);
   }
   return [...byKey.values()];
 }
 
-async function canonicalizeExplicitExternalFilePaths(paths: string[]): Promise<string[]> {
-  const canonicalPaths = await Promise.all(paths.map(async (filePath) => {
+function uniqueExternalFileAuthorizations(
+  authorizations: Iterable<ExternalFileAuthorizationLease>,
+): ExternalFileAuthorizationLease[] {
+  const byPath = new Map<string, ExternalFileAuthorizationLease>();
+  for (const authorization of authorizations) {
+    const canonicalPath = externalAuthorizationPathKey(authorization.path);
+    byPath.set(canonicalPath, {
+      path: canonicalPath,
+      identity: authorization.identity,
+    });
+  }
+  return [...byPath.values()];
+}
+
+async function canonicalizeExplicitExternalFilePaths(
+  paths: string[],
+): Promise<ExternalFileAuthorizationLease[]> {
+  const canonicalFiles = await Promise.all(paths.map(async (filePath) => {
     if (typeof filePath !== "string" || !path.isAbsolute(filePath)) {
       throw new Error(`External file authorization path must be absolute: ${String(filePath)}`);
     }
-    return await canonicalizeExternalFilePath(filePath);
+    return await captureExternalFileAuthorization(filePath);
   }));
-  return uniqueCanonicalPaths(canonicalPaths);
+  return uniqueExternalFileAuthorizations(canonicalFiles);
+}
+
+async function refreshExternalFileAuthorizationLeases(
+  authorizations: ExternalFileAuthorizationLease[],
+): Promise<ExternalFileAuthorizationLease[]> {
+  return uniqueExternalFileAuthorizations(await Promise.all(authorizations.map(async (value) => {
+    await captureExternalFileAuthorization(value.path, {
+      allowUnavailable: true,
+    });
+    // A refresh may observe a different object at the same path. Keep the identity that was
+    // explicitly authorized so downstream file loading can reject that replacement; only a new
+    // explicit authorization is allowed to bind the path to a new filesystem object.
+    return {
+      path: externalAuthorizationPathKey(value.path),
+      identity: value.identity,
+    };
+  })));
+}
+
+async function captureExternalFileAuthorization(
+  filePath: string,
+): Promise<ExternalFileAuthorizationLease>;
+async function captureExternalFileAuthorization(
+  filePath: string,
+  options: { allowUnavailable: true },
+): Promise<ExternalFileAuthorizationObservation>;
+async function captureExternalFileAuthorization(
+  filePath: string,
+  options: { allowUnavailable?: boolean } = {},
+): Promise<ExternalFileAuthorizationObservation> {
+  const requestedPath = path.resolve(filePath);
+  try {
+    return await captureStableExternalFileSystemObject(requestedPath, "file");
+  } catch (error) {
+    if (!options.allowUnavailable || !isUnavailableExternalAuthorizationError(error)) throw error;
+    let unavailablePath = requestedPath;
+    try {
+      unavailablePath = await canonicalizeExternalFilePath(requestedPath);
+    } catch (canonicalError) {
+      if (!isUnavailableExternalAuthorizationError(canonicalError)) throw canonicalError;
+    }
+    return { path: externalAuthorizationPathKey(unavailablePath) };
+  }
+}
+
+async function captureExternalFileSystemIdentity(
+  filePath: string,
+): Promise<ExternalFileSystemIdentity> {
+  const captured = await captureStableExternalFileSystemObject(filePath, "directory");
+  if (externalAuthorizationPathKey(captured.path) !== externalAuthorizationPathKey(filePath)) {
+    throw new ManagedFileSafetyError(
+      `Filesystem directory changed its canonical target while capturing identity: ${filePath}`,
+    );
+  }
+  return captured.identity!;
+}
+
+class ExternalAuthorizationUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ExternalAuthorizationUnavailableError";
+  }
+}
+
+async function captureStableExternalFileSystemObject(
+  filePath: string,
+  kind: "file" | "directory",
+): Promise<ExternalFileAuthorizationLease> {
+  const requestedPath = path.resolve(filePath);
+  const requestedBefore = await lstat(requestedPath, { bigint: true });
+  assertExternalAuthorizationObjectType(requestedBefore, requestedPath, kind);
+  const canonicalBefore = externalAuthorizationPathKey(await realpath(requestedPath));
+  const canonicalBeforeStat = await lstat(canonicalBefore, { bigint: true });
+  assertExternalAuthorizationObjectType(canonicalBeforeStat, canonicalBefore, kind);
+  assertSameExternalFileSystemIdentity(
+    requestedBefore,
+    canonicalBeforeStat,
+    requestedPath,
+    "changed while resolving its canonical path",
+  );
+
+  const noFollow = process.platform === "win32" ? 0 : constants.O_NOFOLLOW;
+  const handle = await open(canonicalBefore, constants.O_RDONLY | noFollow);
+  try {
+    const opened = await handle.stat({ bigint: true });
+    assertExternalAuthorizationObjectType(opened, canonicalBefore, kind);
+    assertSameExternalFileSystemIdentity(
+      canonicalBeforeStat,
+      opened,
+      canonicalBefore,
+      "changed before its identity handle was opened",
+    );
+
+    const requestedAfter = await lstat(requestedPath, { bigint: true });
+    assertExternalAuthorizationObjectType(requestedAfter, requestedPath, kind);
+    assertSameExternalFileSystemIdentity(
+      opened,
+      requestedAfter,
+      requestedPath,
+      "changed while its identity was captured",
+    );
+    const canonicalAfter = externalAuthorizationPathKey(await realpath(requestedPath));
+    if (canonicalAfter !== canonicalBefore) {
+      throw new ManagedFileSafetyError(
+        `External ${kind} changed its canonical target while its identity was captured: ${requestedPath}`,
+      );
+    }
+    const canonicalAfterStat = await lstat(canonicalAfter, { bigint: true });
+    assertExternalAuthorizationObjectType(canonicalAfterStat, canonicalAfter, kind);
+    assertSameExternalFileSystemIdentity(
+      opened,
+      canonicalAfterStat,
+      canonicalAfter,
+      "changed while its canonical identity was captured",
+    );
+    const openedAfter = await handle.stat({ bigint: true });
+    assertExternalAuthorizationObjectType(openedAfter, canonicalBefore, kind);
+    assertSameExternalFileSystemIdentity(
+      opened,
+      openedAfter,
+      canonicalBefore,
+      "changed while its identity handle was open",
+    );
+    return {
+      path: canonicalBefore,
+      identity: {
+        dev: opened.dev.toString(),
+        ino: opened.ino.toString(),
+      },
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+function assertExternalAuthorizationObjectType(
+  stat: BigIntStats,
+  filePath: string,
+  kind: "file" | "directory",
+): void {
+  const expectedType = kind === "file" ? stat.isFile() : stat.isDirectory();
+  if (!expectedType || stat.isSymbolicLink() || (kind === "file" && stat.nlink !== 1n)) {
+    throw new ExternalAuthorizationUnavailableError(
+      `External authorization requires a regular non-symbolic-link ${kind}: ${filePath}`,
+    );
+  }
+}
+
+function assertSameExternalFileSystemIdentity(
+  expected: Pick<BigIntStats, "dev" | "ino">,
+  actual: Pick<BigIntStats, "dev" | "ino">,
+  filePath: string,
+  message: string,
+): void {
+  if (expected.dev !== actual.dev || expected.ino !== actual.ino) {
+    throw new ManagedFileSafetyError(`External filesystem object ${message}: ${filePath}`);
+  }
+}
+
+function isUnavailableExternalAuthorizationError(error: unknown): boolean {
+  if (error instanceof ExternalAuthorizationUnavailableError) return true;
+  return ["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(
+    (error as NodeJS.ErrnoException | undefined)?.code ?? "",
+  );
+}
+
+function externalAuthorizationPathKey(filePath: string): string {
+  return path.resolve(filePath);
+}
+
+function projectExternalFileLeases(
+  authorization: ProjectExternalFileAuthorization | undefined,
+): ExternalFileAuthorizationLease[] {
+  if (!authorization) return [];
+  const identities = new Map(
+    (authorization.pathIdentities ?? []).map(({ path: filePath, identity }) => [
+      externalAuthorizationPathKey(filePath),
+      identity,
+    ]),
+  );
+  return authorization.paths.flatMap((filePath) => {
+    const canonicalPath = externalAuthorizationPathKey(filePath);
+    const identity = identities.get(canonicalPath);
+    return identity ? [{ path: canonicalPath, identity }] : [];
+  });
+}
+
+function parseExternalFileSystemIdentity(
+  value: unknown,
+): ExternalFileSystemIdentity | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const candidate = value as { dev?: unknown; ino?: unknown };
+  const dev = decimalFileIdentityPart(candidate.dev);
+  const ino = decimalFileIdentityPart(candidate.ino);
+  return dev !== undefined && ino !== undefined ? { dev, ino } : undefined;
+}
+
+function decimalFileIdentityPart(value: unknown): string | undefined {
+  if (typeof value === "string" && /^\d+$/u.test(value)) return value;
+  // Older indexes stored number-valued fs metadata. Preserve compatibility and migrate them on
+  // the next successful write; new records always come from bigint stats and are lossless.
+  return typeof value === "number" && value >= 0 && Number.isSafeInteger(value)
+    ? value.toString()
+    : undefined;
+}
+
+function managedFileIdentityKey(identity: ExternalFileSystemIdentity | undefined): string {
+  return identity ? `${identity.dev}:${identity.ino}` : "legacy";
+}
+
+function sameManagedFileIdentity(
+  left: ExternalFileSystemIdentity,
+  right: ExternalFileSystemIdentity,
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
 }
 
 async function canonicalizeExternalFilePath(filePath: string): Promise<string> {
@@ -4089,8 +4601,7 @@ async function collectRollbackError(
 }
 
 function managedPathKey(filePath: string): string {
-  const resolved = path.resolve(filePath);
-  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  return resolvedFilesystemPathKey(filePath);
 }
 
 function sameManagedFileSnapshot(
@@ -4360,8 +4871,7 @@ function normalizeIgnorePattern(value: string): string {
 }
 
 function isPathInside(candidate: string, root: string): boolean {
-  const relative = path.relative(root, candidate);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  return isManagedPathAtOrWithin(root, candidate);
 }
 
 function safePathPart(value: string): string {
@@ -4539,13 +5049,13 @@ async function inspectCanvasExternalFileReferences(
 function assertExternalFileReferencesTrusted(
   projectRoot: string,
   references: CanvasProjectInspection["externalFileReferences"],
-  trustedPaths: string[],
+  trustedFiles: ExternalFileAuthorizationLease[],
 ): void {
   const trusted = new Set(
-    trustedPaths.map((filePath) => normalizedRootKey(path.resolve(filePath))),
+    trustedFiles.map(({ path: filePath }) => externalAuthorizationPathKey(filePath)),
   );
   for (const reference of references) {
-    if (!trusted.has(normalizedRootKey(reference.path))) {
+    if (!trusted.has(externalAuthorizationPathKey(reference.path))) {
       throw new Error(`外部文件引用需要重新授权: ${reference.path}`);
     }
   }
@@ -4738,8 +5248,20 @@ function uniqueProjectIds(projects: CanvasProjectSummary[]): CanvasProjectSummar
 }
 
 function normalizedRootKey(root: string): string {
-  const resolved = path.resolve(root);
-  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  return resolvedFilesystemPathKey(root);
+}
+
+/**
+ * Produces an exact lexical key for a filesystem path. Windows can host
+ * case-sensitive directories, so security and ownership keys must never use
+ * a process-wide lower-case transform. Callers that need alias resolution
+ * first pass a path returned by realpath and bind it to a filesystem identity.
+ */
+export function resolvedFilesystemPathKey(
+  filePath: string,
+  pathApi: Pick<typeof path, "resolve"> = path,
+): string {
+  return pathApi.resolve(filePath);
 }
 
 function normalizeRepositoryIdentity(identity: string): string {
@@ -4761,16 +5283,11 @@ function normalizeRepositoryIdentity(identity: string): string {
     // identities are the only identities whose case semantics depend on the host platform.
     return trimmed.toLowerCase();
   }
-  const normalized = path.normalize(trimmed);
-  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+  return path.normalize(trimmed);
 }
 
 function isPathWithin(candidate: string, parent: string): boolean {
-  const relative = path.relative(path.resolve(parent), path.resolve(candidate));
-  return (
-    relative === "" ||
-    (!path.isAbsolute(relative) && !relative.startsWith(`..${path.sep}`) && relative !== "..")
-  );
+  return isManagedPathAtOrWithin(parent, candidate);
 }
 
 function nonEmptyString(value: unknown): string | undefined {

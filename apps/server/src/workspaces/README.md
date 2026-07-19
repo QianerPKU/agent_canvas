@@ -46,6 +46,8 @@ Linux:   ~/.local/share/agent_canvas/projects/index.json
 ## Git 与 GitHub
 
 - `GET/POST /api/canvas-projects` 管理 canvas 项目；`POST /api/canvas-projects/inspect` 在不登记、不改写的前提下校验待导入目录并列出外部共享资源；`POST /api/canvas-projects/open` 可按已登记 id 或任意项目文件夹打开项目；`DELETE /api/canvas-projects/:id` 会永久删除项目目录。删除要求受信任 Origin 与 `X-Agent-Canvas-Intent: delete-project`，当前项目仍有非终态 agent 时返回 409；删除前会清空 agent、文件、提示词、commit、PR/sync 和布局内存状态。打开项目不会自动连接 GitHub repo。
+- 项目打开采用 begin/load/commit 三段式事务：外部授权暂存后必须等完整 `canvas-state.json` 导入成功才提交；失败使用实际 index 提交前后 snapshot 的 content+identity CAS 恢复，并恢复前一项目选择和内存授权。CAS 冲突只报告 rollback incomplete，不覆盖并发 writer。授权索引以精确 canonical project root 和 bigint `dev/ino` 十进制身份区分项目根，避免大小写敏感 Windows 目录或同路径根替换继承旧授权。
+- 项目根、托管文件、提示词、共享资源与工作文档的本地路径键和 containment 使用精确 resolved/canonical casing 与目录分段前缀，不采用 Win32 全局大小写折叠；普通大小写不敏感卷由 `realpath` 自然收敛，大小写敏感 NTFS 中的 case-twin 目录保持不同安全边界。
 - 后端固定监听 `127.0.0.1`。浏览器写请求和 WebSocket 只接受 `AGENT_CANVAS_ALLOWED_ORIGINS` 中的本机 Origin；启动脚本会按实际 Web 端口设置该变量，非浏览器的本机 CLI/API 调用可不带 Origin。
 - `POST /api/workspace/connect` 使用远端 URL 或本地路径 clone 到 AppData 项目目录。
 - 默认 branch 直接使用 AppData clone；其他 branch 不会在连接时全部拉取。只有创建 Agent 或切换 Agent branch 选中了某个尚未创建 workspace 的 branch 时，才会 `fetch` 该 branch 并执行 `git worktree add -B <branch> <path> <startPoint>`。

@@ -16,9 +16,11 @@ import type {
 import {
   isMissingFileError,
   assertManagedTrustedRootBoundary,
+  isManagedPathAtOrWithin,
   readManagedFileSnapshot,
   readManagedFileSnapshotSync,
   removeManagedFile,
+  resolvedManagedPathKey,
   writeManagedFileAtomically,
   type ManagedFileSnapshot,
   type ManagedTrustedRootBoundary,
@@ -389,6 +391,9 @@ export class PromptManager {
 
   private importPath(id: string): string {
     const promptPath = path.resolve(this.promptRoot, id, "prompt.txt");
+    if (!isManagedPathAtOrWithin(this.promptRoot, promptPath)) {
+      throw new Error(`Persisted prompt path escapes the prompt root: ${id}`);
+    }
     const relative = path.relative(this.promptRoot, promptPath);
     if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
       throw new Error(`Persisted prompt path escapes the prompt root: ${id}`);
@@ -404,18 +409,18 @@ export class PromptManager {
     let root = this.trustedRoot ?? path.parse(managedFilePath).root;
     if (this.trustedRootBoundary) {
       await assertManagedTrustedRootBoundary(this.trustedRootBoundary, label);
-      const relative = path.relative(this.trustedRootBoundary.path, managedFilePath);
-      if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      if (!isManagedPathAtOrWithin(this.trustedRootBoundary.path, managedFilePath)) {
         throw new Error(`${label} path escapes its trusted root: ${filePath}`);
       }
+      const relative = path.relative(this.trustedRootBoundary.path, managedFilePath);
       managedFilePath = path.join(this.trustedRootBoundary.realPath, relative);
       root = this.trustedRootBoundary.realPath;
     }
     const parent = path.dirname(managedFilePath);
-    const relativeToRoot = path.relative(root, parent);
-    if (relativeToRoot.startsWith("..") || path.isAbsolute(relativeToRoot)) {
+    if (!isManagedPathAtOrWithin(root, parent)) {
       throw new Error(`${label} path escapes its trusted root: ${filePath}`);
     }
+    const relativeToRoot = path.relative(root, parent);
     const missingDirectories: string[] = [];
     let current = root;
     let ancestorMissing = false;
@@ -612,7 +617,7 @@ function defaultPromptRoot(workspaceRoot: string): string {
   const localDataRoot =
     process.env.LOCALAPPDATA ?? path.join(os.homedir(), ".local", "share");
   const workspaceKey = createHash("sha256")
-    .update(process.platform === "win32" ? workspaceRoot.toLowerCase() : workspaceRoot)
+    .update(resolvedManagedPathKey(workspaceRoot))
     .digest("hex")
     .slice(0, 12);
   return path.join(localDataRoot, "agent_canvas", "prompts", workspaceKey);

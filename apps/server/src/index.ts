@@ -39,3 +39,18 @@ httpServer.listen(PORT, "127.0.0.1", () => {
   console.log(`[agent-canvas] default cwd ${WORKSPACE_ROOT}`);
   console.log(`[agent-canvas] project root ${workspaceManager.root()}`);
 });
+
+let signalShutdownStarted = false;
+const closeForSignal = (signal: NodeJS.Signals): void => {
+  if (signalShutdownStarted) return;
+  signalShutdownStarted = true;
+  console.log(`[agent-canvas] ${signal} received; waiting for provider and file cleanup`);
+  httpServer.close((error?: Error) => {
+    if (!error) return;
+    process.exitCode = 1;
+    console.error(`[agent-canvas] graceful shutdown failed: ${error.message}`);
+  });
+};
+
+process.once("SIGINT", () => closeForSignal("SIGINT"));
+process.once("SIGTERM", () => closeForSignal("SIGTERM"));

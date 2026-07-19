@@ -17,6 +17,9 @@
 - `readPreview` 为画布节点提供最多 256 KiB 的快速预览；`readContent` 为独立窗口读取完整文本。
 - `VscodeFileOpener` 通过 VS Code CLI 打开任意格式的真实文件或目录；文件节点复用当前窗口打开真实文件，agent 工作区快捷入口在新窗口打开对应 branch worktree 目录，避免替换用户已有的工作区。Windows 使用 `code.cmd`，并通过隐藏的 `cmd.exe` 进行参数转发；等待 CLI 退出后才向前端报告成功，非零退出码和 stderr 会返回为接口错误。
 - Windows 支持标准安装路径、PATH 中的 `bin` 目录以及 `AGENT_CANVAS_VSCODE_PATH` 覆盖。覆盖值可以是 `code.cmd`，也可以是能解析到同目录 `bin\code.cmd` 的 `Code.exe`。
-- `DirectoryPicker` 在 Windows 使用 PowerShell Forms，在 Linux 有图形会话时尝试 `zenity`/`kdialog`；远程无 GUI 环境会提示手动输入路径。
+- `FilePicker` 在 Windows 使用 PowerShell Forms，在 Linux 有图形会话时尝试 `zenity`/`kdialog`；Zenity 多选使用不可出现在合法路径中的结构化边界，KDialog 使用 percent-encoded `file:` URL，因此路径内换行不会被伪造成额外选择。远程无 GUI 环境会提示手动输入路径。
+- 外部引用授权使用精确 canonical path，而不是 Windows 平台级大小写折叠。项目打开、持久状态导入和 relink 会传递由 bigint `dev/ino` 生成的十进制身份租约；普通大小写不敏感目录由 `realpath` 自然收敛，大小写敏感目录中的 case-twin 文件保持隔离。refresh 只接受原租约的精确 canonical location 和文件身份；同路径原子替换或 canonical casing 漂移都会转为 `missing`，必须显式 relink 才能重新授权。
+- Agent 不会收到外部引用的原路径。每次业务派发会把经单句柄身份与读中稳定性校验的字节原子写入 canonical 系统临时目录中的独立只读快照 scope，画布状态和项目目录仍只保存引用。result/error 使用单调 sequence checkpoint 在项目事务队列中回收安全结束的轮次；`stop` 的 interrupt 不被误当作 provider 已停止，显式 terminate、项目切换和服务关闭会先等待 current/detached transport 再清理。删除失败会保留精确账本供重试，close 后准备 gate 永久关闭。单文件/批次限制之外还设有每 Agent 与全局 retained scope/byte 上限，防止长 turn 或重复 steer 无界占用临时磁盘。
+- 快照清理将绑定 `dev/ino` 的 root/scope 原子隔离到同父目录的随机 tombstone，复验父目录与 tombstone 身份后才递归删除；目录替换或未知条目会 fail closed。该跨平台方案的威胁边界假设同一操作系统用户下没有专门监视临时目录并在最终复验与递归删除之间抢占随机 tombstone 的恶意进程；若需抵御该同 UID 主动攻击，应另行使用平台专属的 handle-bound 目录删除机制。
 
 当前与其他 M1 状态一致，节点元数据保存在内存中；真实文件保留在磁盘。

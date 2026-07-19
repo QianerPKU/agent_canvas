@@ -2,7 +2,17 @@ import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import http from "node:http";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
-import { link, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  link,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import WebSocket, { type RawData } from "ws";
@@ -22,7 +32,8 @@ import { PullRequestFlowManager } from "./pullRequests/PullRequestFlowManager.js
 import { BranchReviewQueue } from "./reviews/BranchReviewQueue.js";
 import { CodexAuthManager } from "./sdk/CodexAuthManager.js";
 import { SyncFlowManager, type SyncFlowAgentHost } from "./sync/SyncFlowManager.js";
-import type { QueryFn, SdkUserInput } from "./sdk/types.js";
+import type { QueryFn, SdkMessage, SdkUserInput } from "./sdk/types.js";
+import { AsyncMessageQueue } from "./util/AsyncMessageQueue.js";
 import { WorkspaceManager, type GitRunner } from "./workspaces/WorkspaceManager.js";
 import { writeManagedFileAtomically } from "./workspaces/safeManagedFile.js";
 
@@ -31,6 +42,7 @@ const emptyQuery: QueryFn = () => ({
   async *[Symbol.asyncIterator]() {
     // 无消息，迭代立即结束
   },
+  terminate: async () => undefined,
 });
 
 interface Resp {
@@ -373,8 +385,10 @@ describe("HTTP server", () => {
   let projectRoot = "";
   let trackedWorkDocumentationCwd: string | undefined;
   let beforeNextProjectStatePromptImport: (() => Promise<void>) | undefined;
+  let beforeNextAccessSnapshotRemoval: ((targetPath: string) => Promise<void>) | undefined;
   let resolveTurnContextForTest: () => Promise<{ baseCommitSha?: string }> = async () => ({});
   let workspaceManager: WorkspaceManager;
+  let fileManager: FileManager;
   let syncHost: FakeSyncHost;
   let pullRequestFlowManager: PullRequestFlowManager;
   let syncFlowManager: SyncFlowManager;
@@ -430,9 +444,15 @@ describe("HTTP server", () => {
       runGit,
     });
     await workspaceManager.connect({ localPath: root });
-    const fileManager = new FileManager({
+    fileManager = new FileManager({
       workspaceRoot: root,
       isolatedRoot: path.join(root, "isolated"),
+      accessSnapshotPathRemover: async (targetPath) => {
+        const beforeRemoval = beforeNextAccessSnapshotRemoval;
+        beforeNextAccessSnapshotRemoval = undefined;
+        if (beforeRemoval) return await beforeRemoval(targetPath);
+        await rm(targetPath, { recursive: true, force: true });
+      },
     });
     const promptManager = new PromptManager({
       workspaceRoot: root,
@@ -520,6 +540,659 @@ describe("HTTP server", () => {
     const { status, json } = await request(port, "GET", "/api/health");
     expect(status).toBe(200);
     expect(json.ok).toBe(true);
+  });
+
+  it("prepares immutable snapshots and waits for active transports before close cleanup", async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-access-server-"));
+    const sourcePath = path.join(isolatedRoot, "external-reference.txt");
+    await writeFile(sourcePath, "authorized bytes", "utf-8");
+    let dispatchedPath: string | undefined;
+    let releaseQuery!: () => void;
+    let markTerminationStarted!: () => void;
+    let releaseTermination!: () => void;
+    let markDisposalStarted!: () => void;
+    const queryHold = new Promise<void>((resolve) => {
+      releaseQuery = resolve;
+    });
+    const terminationStarted = new Promise<void>((resolve) => {
+      markTerminationStarted = resolve;
+    });
+    const terminationRelease = new Promise<void>((resolve) => {
+      releaseTermination = resolve;
+    });
+    const disposalStarted = new Promise<void>((resolve) => {
+      markDisposalStarted = resolve;
+    });
+    const lifecycleOrder: string[] = [];
+    const isolatedQuery: QueryFn = ({ options }) => {
+      dispatchedPath = options?.fileAccess?.readableFiles[0]?.path;
+      return {
+        async *[Symbol.asyncIterator]() {
+          await queryHold;
+        },
+        terminate: async () => {
+          lifecycleOrder.push("terminate-start");
+          markTerminationStarted();
+          await terminationRelease;
+          lifecycleOrder.push("terminate-end");
+          releaseQuery();
+        },
+      };
+    };
+    const isolatedManager = new AgentManager({
+      query: isolatedQuery,
+      defaultCwd: isolatedRoot,
+    });
+    const isolatedFileManager = new FileManager({
+      workspaceRoot: isolatedRoot,
+      isolatedRoot: path.join(isolatedRoot, "managed-files"),
+    });
+    const isolatedWorkspaceManager = new WorkspaceManager({
+      defaultSourcePath: isolatedRoot,
+    });
+    const agent = isolatedManager.create({ systemPrompt: "preserve close state" });
+    isolatedManager.updateAppSettings({ fullPermissionMode: true });
+    const preparationOrder: string[] = [];
+    const originalWorkspacePrepare = isolatedWorkspaceManager.prepareAgentWorkspace.bind(
+      isolatedWorkspaceManager,
+    );
+    const workspacePrepareSpy = vi
+      .spyOn(isolatedWorkspaceManager, "prepareAgentWorkspace")
+      .mockImplementation(async (...args) => {
+        const prepared = await originalWorkspacePrepare(...args);
+        preparationOrder.push("workspace");
+        return prepared;
+      });
+    const originalFilePrepare = isolatedFileManager.prepareAccessFor.bind(isolatedFileManager);
+    const prepareSpy = vi
+      .spyOn(isolatedFileManager, "prepareAccessFor")
+      .mockImplementation(async (...args) => {
+        preparationOrder.push("file");
+        await originalFilePrepare(...args);
+      });
+    const originalDispose = isolatedFileManager.disposeAccessSnapshots.bind(isolatedFileManager);
+    let disposal: Promise<void> | undefined;
+    const disposeSpy = vi
+      .spyOn(isolatedFileManager, "disposeAccessSnapshots")
+      .mockImplementation(() => {
+        lifecycleOrder.push("dispose");
+        markDisposalStarted();
+        return (disposal ??= originalDispose());
+      });
+    const { httpServer: isolatedServer } = createServer(
+      isolatedManager,
+      isolatedFileManager,
+      { defaultCwd: isolatedRoot, workspaceManager: isolatedWorkspaceManager },
+    );
+    await new Promise<void>((resolve) => isolatedServer.listen(0, resolve));
+    const isolatedPort = (isolatedServer.address() as AddressInfo).port;
+    const socket = new WebSocket(`ws://127.0.0.1:${isolatedPort}/ws`);
+    await once(socket, "open");
+    const socketClosed = once(socket, "close");
+    const selection = await isolatedFileManager.stagePickedFiles([sourcePath]);
+    const [referenced] = await isolatedFileManager.importPicked(
+      selection.id,
+      "reference",
+      "normal",
+    );
+    isolatedFileManager.connect(referenced!.id, agent.id, "read");
+
+    let closing: Promise<void> | undefined;
+    let closeResolved = false;
+    try {
+      await isolatedManager.startAgent(agent.id, {
+        prompt: "inspect the referenced file",
+        cwd: isolatedRoot,
+      });
+      expect(workspacePrepareSpy).toHaveBeenCalledWith(
+        agent.id,
+        expect.objectContaining({ cwd: isolatedRoot }),
+        expect.any(Object),
+      );
+      expect(prepareSpy).toHaveBeenCalledWith(agent.id);
+      expect(preparationOrder).toEqual(["workspace", "file"]);
+      expect(dispatchedPath).toBeTruthy();
+      expect(dispatchedPath).not.toBe(await realpath(sourcePath));
+      await expect(readFile(dispatchedPath!, "utf-8")).resolves.toBe("authorized bytes");
+
+      await rename(sourcePath, `${sourcePath}.replaced`);
+      await writeFile(sourcePath, "replacement bytes", "utf-8");
+      await expect(readFile(dispatchedPath!, "utf-8")).resolves.toBe("authorized bytes");
+
+      closing = new Promise<void>((resolve, reject) =>
+        isolatedServer.close((error) => error ? reject(error) : resolve()),
+      ).then(() => {
+        closeResolved = true;
+      });
+      await terminationStarted;
+      await socketClosed;
+      expect(socket.readyState).toBe(WebSocket.CLOSED);
+      expect(closeResolved).toBe(false);
+      expect(disposeSpy).not.toHaveBeenCalled();
+      await expect(readFile(dispatchedPath!, "utf-8")).resolves.toBe("authorized bytes");
+      expect(isolatedManager.list()).toHaveLength(1);
+
+      releaseTermination();
+      await closing;
+      expect(closeResolved).toBe(true);
+      await disposalStarted;
+      await disposal;
+    } finally {
+      releaseTermination();
+      releaseQuery();
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+        socket.terminate();
+      }
+      if (!closing && isolatedServer.listening) {
+        closing = new Promise<void>((resolve) => isolatedServer.close(() => resolve()));
+      }
+      await closing;
+      await disposal;
+    }
+
+    expect(disposeSpy).toHaveBeenCalledTimes(1);
+    expect(lifecycleOrder).toEqual(["terminate-start", "terminate-end", "dispose"]);
+    await expect(readFile(dispatchedPath!, "utf-8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(isolatedManager.list()).toHaveLength(1);
+    expect(isolatedManager.list()[0]).toMatchObject({
+      id: agent.id,
+      status: "terminated",
+      config: expect.objectContaining({ systemPrompt: "preserve close state" }),
+    });
+    expect(isolatedManager.historyOf(agent.id).length).toBeGreaterThan(0);
+    expect(isolatedManager.appSettings().fullPermissionMode).toBe(true);
+    await removeTempRoot(isolatedRoot);
+  });
+
+  it("does not dispose snapshots after a failed provider termination and exposes a retryable shutdown", async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-shutdown-retry-"));
+    const output = new AsyncMessageQueue<SdkMessage>();
+    let terminationAttempts = 0;
+    const isolatedManager = new AgentManager({
+      defaultCwd: isolatedRoot,
+      query: () => ({
+        [Symbol.asyncIterator]: () => output[Symbol.asyncIterator](),
+        terminate: async () => {
+          terminationAttempts += 1;
+          if (terminationAttempts === 1) throw new Error("provider close failed");
+          output.close();
+        },
+      }),
+    });
+    const isolatedFileManager = new FileManager({
+      workspaceRoot: isolatedRoot,
+      isolatedRoot: path.join(isolatedRoot, "managed-files"),
+    });
+    const disposeSpy = vi.spyOn(isolatedFileManager, "disposeAccessSnapshots");
+    const isolatedWorkspaceManager = new WorkspaceManager({ defaultSourcePath: isolatedRoot });
+    const agent = isolatedManager.create();
+    const serverResult = createServer(isolatedManager, isolatedFileManager, {
+      defaultCwd: isolatedRoot,
+      workspaceManager: isolatedWorkspaceManager,
+    });
+    await new Promise<void>((resolve) => serverResult.httpServer.listen(0, resolve));
+
+    try {
+      await isolatedManager.startAgent(agent.id, { prompt: "active", cwd: isolatedRoot });
+      output.push({
+        type: "system",
+        subtype: "init",
+        session_id: "shutdown-retry-session",
+        model: "test-model",
+        cwd: isolatedRoot,
+        tools: [],
+      });
+      await vi.waitFor(() => expect(isolatedManager.get(agent.id)?.getStatus()).toBe("running"));
+
+      await expect(serverResult.shutdown()).rejects.toThrow(/Failed to terminate all agent transports/u);
+      expect(disposeSpy).not.toHaveBeenCalled();
+      expect(terminationAttempts).toBe(1);
+
+      await expect(serverResult.shutdown()).resolves.toBeUndefined();
+      expect(terminationAttempts).toBe(2);
+      expect(disposeSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      output.close();
+      await new Promise<void>((resolve, reject) =>
+        serverResult.httpServer.close((error) => error ? reject(error) : resolve()),
+      );
+      await removeTempRoot(isolatedRoot);
+    }
+  });
+
+  it("closes through a hanging best-effort interrupt by using the exact terminate barrier", async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-hanging-stop-"));
+    const output = new AsyncMessageQueue<SdkMessage>();
+    let markInterruptStarted!: () => void;
+    const interruptStarted = new Promise<void>((resolve) => {
+      markInterruptStarted = resolve;
+    });
+    const neverInterrupts = new Promise<void>(() => undefined);
+    let terminated = false;
+    const isolatedManager = new AgentManager({
+      defaultCwd: isolatedRoot,
+      query: () => ({
+        [Symbol.asyncIterator]: () => output[Symbol.asyncIterator](),
+        interrupt: async () => {
+          markInterruptStarted();
+          await neverInterrupts;
+        },
+        terminate: async () => {
+          terminated = true;
+          output.close();
+        },
+      }),
+    });
+    const isolatedFileManager = new FileManager({
+      workspaceRoot: isolatedRoot,
+      isolatedRoot: path.join(isolatedRoot, "managed-files"),
+    });
+    const isolatedWorkspaceManager = new WorkspaceManager({ defaultSourcePath: isolatedRoot });
+    const serverResult = createServer(isolatedManager, isolatedFileManager, {
+      defaultCwd: isolatedRoot,
+      workspaceManager: isolatedWorkspaceManager,
+    });
+    const agent = isolatedManager.create();
+    await new Promise<void>((resolve) => serverResult.httpServer.listen(0, resolve));
+
+    try {
+      await isolatedManager.startAgent(agent.id, { prompt: "active", cwd: isolatedRoot });
+      output.push({
+        type: "system",
+        subtype: "init",
+        session_id: "hanging-stop-session",
+        model: "test-model",
+        cwd: isolatedRoot,
+        tools: [],
+      });
+      await vi.waitFor(() => expect(isolatedManager.get(agent.id)?.getStatus()).toBe("running"));
+      await isolatedManager.get(agent.id)!.stop();
+      await interruptStarted;
+
+      await expect(
+        Promise.race([
+          new Promise<string>((resolve, reject) =>
+            serverResult.httpServer.close((error) =>
+              error ? reject(error) : resolve("closed"),
+            ),
+          ),
+          new Promise<string>((resolve) => setTimeout(() => resolve("timed out"), 500)),
+        ]),
+      ).resolves.toBe("closed");
+      expect(terminated).toBe(true);
+      expect(isolatedManager.get(agent.id)?.getStatus()).toBe("terminated");
+    } finally {
+      output.close();
+      if (serverResult.httpServer.listening) {
+        await new Promise<void>((resolve) => serverResult.httpServer.close(() => resolve()));
+      }
+      await removeTempRoot(isolatedRoot);
+    }
+  });
+
+  it("starts exact termination before the project queue when a native steer RPC hangs", async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-hanging-steer-"));
+    const output = new AsyncMessageQueue<SdkMessage>();
+    let markSteerStarted!: () => void;
+    const steerStarted = new Promise<void>((resolve) => {
+      markSteerStarted = resolve;
+    });
+    let rejectSteer: ((error: Error) => void) | undefined;
+    const isolatedManager = new AgentManager({
+      defaultCwd: isolatedRoot,
+      query: () => ({
+        [Symbol.asyncIterator]: () => output[Symbol.asyncIterator](),
+        steer: async () => {
+          markSteerStarted();
+          await new Promise<void>((_resolve, reject) => {
+            rejectSteer = reject;
+          });
+        },
+        terminate: async () => {
+          rejectSteer?.(new Error("transport closed"));
+          output.close();
+        },
+      }),
+    });
+    const isolatedFileManager = new FileManager({
+      workspaceRoot: isolatedRoot,
+      isolatedRoot: path.join(isolatedRoot, "managed-files"),
+    });
+    const isolatedWorkspaceManager = new WorkspaceManager({ defaultSourcePath: isolatedRoot });
+    const serverResult = createServer(isolatedManager, isolatedFileManager, {
+      defaultCwd: isolatedRoot,
+      workspaceManager: isolatedWorkspaceManager,
+    });
+    await new Promise<void>((resolve) => serverResult.httpServer.listen(0, resolve));
+    const isolatedPort = (serverResult.httpServer.address() as AddressInfo).port;
+    const revision = isolatedWorkspaceManager.captureProjectRevision();
+    const headers = {
+      "X-Agent-Canvas-Project-Id": revision.projectId,
+      "X-Agent-Canvas-Project-Revision": String(revision.generation),
+    };
+
+    try {
+      const initialized = await rawRequest(
+        isolatedPort,
+        "POST",
+        "/api/files",
+        { name: "initialize-state", extension: "txt", kind: "normal" },
+        headers,
+      );
+      expect(initialized.status, JSON.stringify(initialized.json)).toBe(201);
+      const agentId = isolatedManager.create().id;
+      await expect(rawRequest(
+        isolatedPort,
+        "POST",
+        `/api/agents/${agentId}/start`,
+        { prompt: "start", cwd: isolatedRoot },
+        headers,
+      )).resolves.toMatchObject({ status: 202 });
+      output.push({
+        type: "system",
+        subtype: "init",
+        session_id: "hanging-steer-session",
+        model: "test-model",
+        cwd: isolatedRoot,
+        tools: [],
+      });
+      await vi.waitFor(() => expect(isolatedManager.get(agentId)?.getStatus()).toBe("running"));
+
+      const steering = rawRequest(
+        isolatedPort,
+        "POST",
+        `/api/agents/${agentId}/steer`,
+        { text: "hang in provider RPC" },
+        headers,
+      );
+      await steerStarted;
+      const closing = new Promise<void>((resolve, reject) =>
+        serverResult.httpServer.close((error) => error ? reject(error) : resolve()),
+      );
+
+      await expect(steering).resolves.toMatchObject({ status: 409 });
+      serverResult.httpServer.closeIdleConnections?.();
+      await expect(closing).resolves.toBeUndefined();
+      expect(isolatedManager.get(agentId)?.getStatus()).toBe("terminated");
+    } finally {
+      rejectSteer?.(new Error("test cleanup"));
+      output.close();
+      if (serverResult.httpServer.listening) {
+        await new Promise<void>((resolve) => serverResult.httpServer.close(() => resolve()));
+      }
+      await removeTempRoot(isolatedRoot);
+    }
+  });
+
+  it("rejects a native picker that finishes after shutdown without staging its selection", async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-shutdown-picker-"));
+    const isolatedManager = new AgentManager({ query: emptyQuery, defaultCwd: isolatedRoot });
+    const isolatedFileManager = new FileManager({
+      workspaceRoot: isolatedRoot,
+      isolatedRoot: path.join(isolatedRoot, "managed-files"),
+    });
+    const isolatedWorkspaceManager = new WorkspaceManager({ defaultSourcePath: isolatedRoot });
+    let markPickerStarted!: () => void;
+    let finishPicker!: (paths: string[]) => void;
+    const pickerStarted = new Promise<void>((resolve) => {
+      markPickerStarted = resolve;
+    });
+    const pickFiles = vi.fn<PickFiles>(() => {
+      markPickerStarted();
+      return new Promise<string[]>((resolve) => {
+        finishPicker = resolve;
+      });
+    });
+    const stageSpy = vi.spyOn(isolatedFileManager, "stagePickedFiles");
+    const serverResult = createServer(isolatedManager, isolatedFileManager, {
+      defaultCwd: isolatedRoot,
+      workspaceManager: isolatedWorkspaceManager,
+      pickFiles,
+    });
+    await new Promise<void>((resolve) => serverResult.httpServer.listen(0, resolve));
+    const isolatedPort = (serverResult.httpServer.address() as AddressInfo).port;
+    const revision = isolatedWorkspaceManager.captureProjectRevision();
+    const headers = {
+      "X-Agent-Canvas-Project-Id": revision.projectId,
+      "X-Agent-Canvas-Project-Revision": String(revision.generation),
+    };
+
+    try {
+      const response = rawRequest(isolatedPort, "POST", "/api/files/pick", {}, headers);
+      await pickerStarted;
+      const closing = new Promise<void>((resolve, reject) =>
+        serverResult.httpServer.close((error) => error ? reject(error) : resolve()),
+      );
+      finishPicker([path.join(isolatedRoot, "must-not-be-staged.txt")]);
+
+      await expect(response).resolves.toEqual({
+        status: 503,
+        json: { error: "Agent Canvas server is shutting down" },
+      });
+      await closing;
+      expect(stageSpy).not.toHaveBeenCalled();
+    } finally {
+      finishPicker?.([]);
+      if (serverResult.httpServer.listening) {
+        await new Promise<void>((resolve) => serverResult.httpServer.close(() => resolve()));
+      }
+      await removeTempRoot(isolatedRoot);
+    }
+  });
+
+  it("retires a prepared snapshot when provider initialization fails", async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-access-error-"));
+    const sourcePath = path.join(isolatedRoot, "external-reference.txt");
+    await writeFile(sourcePath, "error snapshot", "utf-8");
+    let dispatchedPath: string | undefined;
+    const isolatedQuery: QueryFn = ({ options }) => {
+      dispatchedPath = options?.fileAccess?.readableFiles[0]?.path;
+      throw new Error("injected provider initialization failure");
+    };
+    const isolatedManager = new AgentManager({
+      query: isolatedQuery,
+      defaultCwd: isolatedRoot,
+    });
+    const isolatedFileManager = new FileManager({
+      workspaceRoot: isolatedRoot,
+      isolatedRoot: path.join(isolatedRoot, "managed-files"),
+    });
+    const isolatedWorkspaceManager = new WorkspaceManager({
+      defaultSourcePath: isolatedRoot,
+    });
+    const agent = isolatedManager.create();
+    const { httpServer: isolatedServer } = createServer(
+      isolatedManager,
+      isolatedFileManager,
+      { defaultCwd: isolatedRoot, workspaceManager: isolatedWorkspaceManager },
+    );
+    await new Promise<void>((resolve) => isolatedServer.listen(0, resolve));
+    const selection = await isolatedFileManager.stagePickedFiles([sourcePath]);
+    const [referenced] = await isolatedFileManager.importPicked(
+      selection.id,
+      "reference",
+      "normal",
+    );
+    isolatedFileManager.connect(referenced!.id, agent.id, "read");
+
+    try {
+      await expect(
+        isolatedManager.startAgent(agent.id, {
+          prompt: "fail after snapshot preparation",
+          cwd: isolatedRoot,
+        }),
+      ).rejects.toThrow(/injected provider initialization failure/u);
+      expect(dispatchedPath).toBeTruthy();
+      await vi.waitFor(async () => {
+        await expect(readFile(dispatchedPath!)).rejects.toMatchObject({ code: "ENOENT" });
+      });
+      expect(isolatedFileManager.accessFor(agent.id).readableFiles).toEqual([]);
+      expect(isolatedManager.get(agent.id)?.getStatus()).toBe("error");
+    } finally {
+      await isolatedFileManager.disposeAccessSnapshots();
+      await new Promise<void>((resolve) => isolatedServer.close(() => resolve()));
+      await removeTempRoot(isolatedRoot);
+    }
+  });
+
+  it("keeps stopped-turn snapshots until the provider settles, then retires them", async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-access-stop-"));
+    const sourcePath = path.join(isolatedRoot, "external-reference.txt");
+    await writeFile(sourcePath, "stopped snapshot", "utf-8");
+    let dispatchedPath: string | undefined;
+    let interrupted = false;
+    let releaseQuery!: () => void;
+    const queryHold = new Promise<void>((resolve) => {
+      releaseQuery = resolve;
+    });
+    const isolatedQuery: QueryFn = ({ options }) => {
+      dispatchedPath = options?.fileAccess?.readableFiles[0]?.path;
+      return {
+        async *[Symbol.asyncIterator]() {
+          await queryHold;
+        },
+        interrupt: async () => {
+          interrupted = true;
+        },
+        terminate: async () => releaseQuery(),
+      };
+    };
+    const isolatedManager = new AgentManager({
+      query: isolatedQuery,
+      defaultCwd: isolatedRoot,
+    });
+    const isolatedFileManager = new FileManager({
+      workspaceRoot: isolatedRoot,
+      isolatedRoot: path.join(isolatedRoot, "managed-files"),
+    });
+    const isolatedWorkspaceManager = new WorkspaceManager({
+      defaultSourcePath: isolatedRoot,
+    });
+    const agent = isolatedManager.create();
+    const { httpServer: isolatedServer } = createServer(
+      isolatedManager,
+      isolatedFileManager,
+      { defaultCwd: isolatedRoot, workspaceManager: isolatedWorkspaceManager },
+    );
+    await new Promise<void>((resolve) => isolatedServer.listen(0, resolve));
+    const selection = await isolatedFileManager.stagePickedFiles([sourcePath]);
+    const [referenced] = await isolatedFileManager.importPicked(
+      selection.id,
+      "reference",
+      "normal",
+    );
+    isolatedFileManager.connect(referenced!.id, agent.id, "read");
+
+    try {
+      await isolatedManager.startAgent(agent.id, {
+        prompt: "hold the referenced file",
+        cwd: isolatedRoot,
+      });
+      expect(dispatchedPath).toBeTruthy();
+      await isolatedManager.get(agent.id)!.stop();
+      expect(interrupted).toBe(true);
+      await expect(readFile(dispatchedPath!, "utf-8")).resolves.toBe("stopped snapshot");
+      expect(isolatedFileManager.accessFor(agent.id).readableFiles[0]?.path).toBe(
+        dispatchedPath,
+      );
+
+      releaseQuery();
+      await vi.waitFor(async () => {
+        await expect(readFile(dispatchedPath!)).rejects.toMatchObject({ code: "ENOENT" });
+      });
+      expect(isolatedManager.get(agent.id)?.getStatus()).toBe("stopped");
+      expect(isolatedFileManager.accessFor(agent.id).readableFiles).toEqual([]);
+    } finally {
+      releaseQuery();
+      await isolatedFileManager.disposeAccessSnapshots();
+      await new Promise<void>((resolve) => isolatedServer.close(() => resolve()));
+      await removeTempRoot(isolatedRoot);
+    }
+  });
+
+  it("retires the previous snapshot when a queued turn dispatches with no file grants", async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-access-empty-next-"));
+    const sourcePath = path.join(isolatedRoot, "external-reference.txt");
+    await writeFile(sourcePath, "first turn only", "utf-8");
+    const output = new AsyncMessageQueue<SdkMessage>();
+    const inputs: SdkUserInput[] = [];
+    const isolatedQuery: QueryFn = ({ prompt }) => {
+      if (typeof prompt !== "string") {
+        void (async () => {
+          for await (const input of prompt) inputs.push(input);
+        })();
+      }
+      return {
+        [Symbol.asyncIterator]: () => output[Symbol.asyncIterator](),
+        terminate: async () => output.close(),
+      };
+    };
+    const isolatedManager = new AgentManager({
+      query: isolatedQuery,
+      defaultCwd: isolatedRoot,
+    });
+    const isolatedFileManager = new FileManager({
+      workspaceRoot: isolatedRoot,
+      isolatedRoot: path.join(isolatedRoot, "managed-files"),
+    });
+    const isolatedWorkspaceManager = new WorkspaceManager({
+      defaultSourcePath: isolatedRoot,
+    });
+    const agent = isolatedManager.create();
+    const { httpServer: isolatedServer } = createServer(
+      isolatedManager,
+      isolatedFileManager,
+      { defaultCwd: isolatedRoot, workspaceManager: isolatedWorkspaceManager },
+    );
+    await new Promise<void>((resolve) => isolatedServer.listen(0, resolve));
+    const selection = await isolatedFileManager.stagePickedFiles([sourcePath]);
+    const [referenced] = await isolatedFileManager.importPicked(
+      selection.id,
+      "reference",
+      "normal",
+    );
+    const connection = isolatedFileManager.connect(referenced!.id, agent.id, "read");
+
+    try {
+      await isolatedManager.startAgent(agent.id, {
+        prompt: "first turn",
+        cwd: isolatedRoot,
+      });
+      await vi.waitFor(() => expect(inputs).toHaveLength(1));
+      const firstPath = inputs[0]!.fileAccess!.readableFiles[0]!.path;
+      await expect(readFile(firstPath, "utf-8")).resolves.toBe("first turn only");
+      output.push({
+        type: "system",
+        subtype: "init",
+        session_id: "empty-next-session",
+        model: "test-model",
+        cwd: isolatedRoot,
+        tools: [],
+      });
+      await vi.waitFor(() => expect(isolatedManager.get(agent.id)?.getStatus()).toBe("running"));
+      await isolatedManager.get(agent.id)!.send("queued second turn");
+      isolatedFileManager.disconnect(connection.id);
+
+      output.push({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        session_id: "empty-next-session",
+      });
+      await vi.waitFor(() => expect(inputs).toHaveLength(2));
+      expect(inputs[1]!.fileAccess?.readableFiles).toEqual([]);
+      await vi.waitFor(async () => {
+        await expect(readFile(firstPath)).rejects.toMatchObject({ code: "ENOENT" });
+      });
+      expect(isolatedManager.get(agent.id)?.getStatus()).toBe("running");
+      expect(isolatedFileManager.accessFor(agent.id).readableFiles).toEqual([]);
+    } finally {
+      output.close();
+      await new Promise<void>((resolve, reject) =>
+        isolatedServer.close((error) => error ? reject(error) : resolve()),
+      );
+      await removeTempRoot(isolatedRoot);
+    }
   });
 
   it("exposes default cwd and directory picker", async () => {
@@ -2224,6 +2897,34 @@ describe("HTTP server", () => {
       extension: "txt",
       kind: "normal",
     });
+    const externalPath = path.join(root, "open-rollback-reference.txt");
+    await writeFile(externalPath, "external reference", "utf-8");
+    const projectAStatePath = path.join(projectA.json.project.projectRoot, "canvas-state.json");
+    const projectAState = JSON.parse(await readFile(projectAStatePath, "utf-8"));
+    projectAState.files.files.push({
+      id: `file_${projectAState.files.files.length + 1}`,
+      name: "open-rollback-reference",
+      extension: "txt",
+      filename: "open-rollback-reference.txt",
+      path: externalPath,
+      storage: "referenced",
+      availability: "available",
+      kind: "normal",
+      sharedRead: false,
+      sharedWrite: false,
+      previewKind: "text",
+      mimeType: "text/plain; charset=utf-8",
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    await writeFile(
+      projectAStatePath,
+      `${JSON.stringify(projectAState, undefined, 2)}\n`,
+      "utf-8",
+    );
+    const projectIndexPath = path.join(root, "projects-index", "index.json");
+    const projectIndexBefore = await readFile(projectIndexPath, "utf-8");
+    const trustedBefore = workspaceManager.currentTrustedExternalFilePaths();
 
     const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`);
     const initialHello = nextWebSocketFrame(socket, "hello");
@@ -2238,6 +2939,7 @@ describe("HTTP server", () => {
 
     const failed = await request(port, "POST", "/api/canvas-projects/open", {
       id: projectA.json.project.id,
+      trustedExternalFilePaths: [externalPath],
     });
     expect(failed.status).toBe(404);
     expect(failed.json.error).toContain("injected prompt import failure");
@@ -2251,6 +2953,16 @@ describe("HTTP server", () => {
     expect((await request(port, "GET", "/api/files")).json.files).toEqual([
       expect.objectContaining({ id: fileB.json.file.id, name: "file-from-b" }),
     ]);
+    await expect(readFile(projectIndexPath, "utf-8")).resolves.toBe(projectIndexBefore);
+    expect(workspaceManager.currentTrustedExternalFilePaths()).toEqual(trustedBefore);
+
+    const rejectedRetry = await request(port, "POST", "/api/canvas-projects/open", {
+      id: projectA.json.project.id,
+    });
+    expect(rejectedRetry.status).toBe(404);
+    expect((await request(port, "GET", "/api/workspace")).json.canvasProject.id).toBe(
+      projectB.json.project.id,
+    );
     socket.close();
 
     await request(
@@ -2266,6 +2978,93 @@ describe("HTTP server", () => {
       `/api/canvas-projects/${encodeURIComponent(projectB.json.project.id)}`,
       undefined,
       { "X-Agent-Canvas-Intent": "delete-project" },
+    );
+  });
+
+  it("revokes target files when project-open recovery and snapshot cleanup both fail", async () => {
+    const target = await request(port, "POST", "/api/canvas-projects", {
+      name: "open-double-failure-target",
+    });
+    const externalPath = path.join(root, "open-double-failure-secret.txt");
+    await writeFile(externalPath, "target external secret", "utf-8");
+    pickFiles.mockResolvedValueOnce([externalPath]);
+    const picked = await request(port, "POST", "/api/files/pick", {});
+    const imported = await request(port, "POST", "/api/files/import-picked", {
+      selectionId: picked.json.selection.id,
+      mode: "reference",
+      kind: "shared",
+    });
+    const targetFile = imported.json.files[0];
+    expect(imported.status).toBe(201);
+    expect((await request(port, "PATCH", `/api/files/${targetFile.id}`, {
+      sharedRead: true,
+    })).status).toBe(200);
+
+    const previous = await request(port, "POST", "/api/canvas-projects", {
+      name: "open-double-failure-previous",
+    });
+    const previousFile = await request(port, "POST", "/api/files", {
+      name: "previous-file",
+      extension: "txt",
+      kind: "normal",
+    });
+    expect(previousFile.status).toBe(201);
+
+    let retainedSnapshotPath = "";
+    beforeNextProjectStatePromptImport = async () => {
+      await fileManager.prepareAccessFor("double-failure-audit-agent");
+      retainedSnapshotPath =
+        fileManager.accessFor("double-failure-audit-agent").readableFiles[0]!.path;
+      throw new Error("injected target prompt import failure");
+    };
+    const originalManagerImport = manager.importState.bind(manager);
+    let managerImportCalls = 0;
+    const managerImportSpy = vi.spyOn(manager, "importState").mockImplementation(async (state) => {
+      managerImportCalls += 1;
+      if (managerImportCalls === 2) {
+        throw new Error("injected previous manager recovery failure");
+      }
+      await originalManagerImport(state);
+    });
+    beforeNextAccessSnapshotRemoval = async () => {
+      throw Object.assign(new Error("injected recovery snapshot cleanup EBUSY"), {
+        code: "EBUSY",
+      });
+    };
+
+    try {
+      const failed = await request(port, "POST", "/api/canvas-projects/open", {
+        id: target.json.project.id,
+      });
+      expect(failed.status).toBe(404);
+      expect(failed.json.error).toContain(
+        "Project open, previous-project recovery, and unsafe-state cleanup all failed",
+      );
+      expect(managerImportCalls).toBe(2);
+      expect((await request(port, "GET", "/api/workspace")).json.canvasProject.id).toBe(
+        previous.json.project.id,
+      );
+      expect((await request(port, "GET", "/api/files")).json.files).toEqual([]);
+      expect((await request(port, "GET", `/api/files/${targetFile.id}/content`)).status).toBe(404);
+      await expect(readFile(retainedSnapshotPath, "utf-8")).resolves.toBe(
+        "target external secret",
+      );
+
+      await expect(fileManager.importState(undefined)).resolves.toBeUndefined();
+      await expect(readFile(retainedSnapshotPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      beforeNextProjectStatePromptImport = undefined;
+      beforeNextAccessSnapshotRemoval = undefined;
+      managerImportSpy.mockRestore();
+    }
+
+    await request(port, "GET", "/api/workspace");
+    const restored = await request(port, "POST", "/api/canvas-projects/open", {
+      id: previous.json.project.id,
+    });
+    expect(restored.status).toBe(200);
+    expect((await request(port, "GET", "/api/files")).json.files).toContainEqual(
+      expect.objectContaining({ id: previousFile.json.file.id }),
     );
   });
 
@@ -3250,14 +4049,13 @@ describe("HTTP server", () => {
     const projectOpenRelease = new Promise<void>((resolve) => {
       releaseProjectOpen = resolve;
     });
-    const originalOpen = workspaceManager.openCanvasProject.bind(workspaceManager);
-    const openSpy = vi.spyOn(workspaceManager, "openCanvasProject").mockImplementationOnce(
-      async (input) => {
-        const opened = await originalOpen(input);
+    const originalOpen = workspaceManager.withCanvasProjectOpen.bind(workspaceManager);
+    const openSpy = vi.spyOn(workspaceManager, "withCanvasProjectOpen").mockImplementationOnce(
+      async (input, apply) => await originalOpen(input, async (workspace) => {
         markProjectSelected();
         await projectOpenRelease;
-        return opened;
-      },
+        return await apply(workspace);
+      }),
     );
 
     try {

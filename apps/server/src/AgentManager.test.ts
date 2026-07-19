@@ -22,6 +22,7 @@ function makeQuery(sessionId = "sess-1") {
           tools: [],
         };
       },
+      terminate: async () => undefined,
     };
   };
   return { query, calls };
@@ -34,6 +35,7 @@ function makeWaitingQuery() {
     lastOptions = options;
     return {
       [Symbol.asyncIterator]: () => out[Symbol.asyncIterator](),
+      terminate: async () => out.close(),
     };
   };
   return { query, out, getOptions: () => lastOptions };
@@ -373,6 +375,86 @@ describe("AgentManager fork", () => {
       fullPermissionMode: false,
       workDocumentationEnabled: false,
     });
+  });
+
+  it("terminates every transport without clearing agents, history, config, or settings", async () => {
+    const outputs: AsyncMessageQueue<SdkMessage>[] = [];
+    let terminationCount = 0;
+    let markAllTerminationsStarted!: () => void;
+    let releaseTerminations!: () => void;
+    const allTerminationsStarted = new Promise<void>((resolve) => {
+      markAllTerminationsStarted = resolve;
+    });
+    const terminationRelease = new Promise<void>((resolve) => {
+      releaseTerminations = resolve;
+    });
+    const query: QueryFn = () => {
+      const output = new AsyncMessageQueue<SdkMessage>();
+      outputs.push(output);
+      return {
+        [Symbol.asyncIterator]: () => output[Symbol.asyncIterator](),
+        terminate: async () => {
+          terminationCount += 1;
+          if (terminationCount === 2) markAllTerminationsStarted();
+          await terminationRelease;
+          output.close();
+        },
+      };
+    };
+    const manager = new AgentManager({ query });
+    const first = manager.create({ systemPrompt: "first preserved config" });
+    const second = manager.create({ systemPrompt: "second preserved config" });
+    manager.updateAppSettings({
+      fullPermissionMode: true,
+      workDocumentationEnabled: true,
+    });
+    await Promise.all([
+      manager.startAgent(first.id, { prompt: "first turn" }),
+      manager.startAgent(second.id, { prompt: "second turn" }),
+    ]);
+    await flush();
+    const historyBefore = new Map(
+      manager.list().map((agent) => [agent.id, [...manager.historyOf(agent.id)]]),
+    );
+    let shutdownResolved = false;
+
+    const shutdown = manager.terminateAll().then(() => {
+      shutdownResolved = true;
+    });
+    await allTerminationsStarted;
+
+    expect(shutdownResolved).toBe(false);
+    expect(manager.list().map((agent) => agent.id)).toEqual([first.id, second.id]);
+    expect(manager.list().map((agent) => agent.config.systemPrompt)).toEqual([
+      "first preserved config",
+      "second preserved config",
+    ]);
+    expect(manager.list().map((agent) => agent.status)).toEqual([
+      "terminated",
+      "terminated",
+    ]);
+    expect(manager.appSettings()).toEqual({
+      fullPermissionMode: true,
+      workDocumentationEnabled: true,
+    });
+    for (const agent of manager.list()) {
+      expect(manager.historyOf(agent.id).slice(0, historyBefore.get(agent.id)!.length)).toEqual(
+        historyBefore.get(agent.id),
+      );
+      expect(manager.historyOf(agent.id).at(-1)?.event).toEqual({
+        kind: "status",
+        status: "terminated",
+      });
+    }
+
+    releaseTerminations();
+    await shutdown;
+    expect(shutdownResolved).toBe(true);
+    const historyLengths = manager.list().map((agent) => manager.historyOf(agent.id).length);
+    await expect(manager.terminateAll()).resolves.toBeUndefined();
+    expect(manager.list().map((agent) => manager.historyOf(agent.id).length)).toEqual(
+      historyLengths,
+    );
   });
 
   it("currentTurnIndex follows completed result turns", async () => {
