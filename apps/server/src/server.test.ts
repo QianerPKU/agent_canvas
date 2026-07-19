@@ -6,7 +6,11 @@ import { link, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "
 import os from "node:os";
 import path from "node:path";
 import WebSocket, { type RawData } from "ws";
-import type { AgentEventEnvelope, AgentSnapshot } from "@agent-canvas/shared";
+import type {
+  AgentEventEnvelope,
+  AgentSnapshot,
+  PullRequestFlowSnapshot,
+} from "@agent-canvas/shared";
 import { AgentManager } from "./AgentManager.js";
 import { CommitManager } from "./commits/CommitManager.js";
 import { createServer } from "./server.js";
@@ -18,7 +22,7 @@ import { PullRequestFlowManager } from "./pullRequests/PullRequestFlowManager.js
 import { BranchReviewQueue } from "./reviews/BranchReviewQueue.js";
 import { CodexAuthManager } from "./sdk/CodexAuthManager.js";
 import { SyncFlowManager, type SyncFlowAgentHost } from "./sync/SyncFlowManager.js";
-import type { QueryFn } from "./sdk/types.js";
+import type { QueryFn, SdkUserInput } from "./sdk/types.js";
 import { WorkspaceManager, type GitRunner } from "./workspaces/WorkspaceManager.js";
 import { writeManagedFileAtomically } from "./workspaces/safeManagedFile.js";
 
@@ -691,11 +695,14 @@ describe("HTTP server", () => {
     });
     expect(resource.status).toBe(201);
 
+    const retryBranch = vi.spyOn(syncFlowManager.getReviewQueue(), "retryBranch");
     const created = await request(port, "POST", "/api/agents", {
       branchWorkspaceId: feature.json.branch.id,
       systemPrompt: "branch rules",
     });
     expect(created.status).toBe(201);
+    expect(retryBranch).toHaveBeenCalledWith("feature/server-test");
+    retryBranch.mockRestore();
 
     const listed = await request(port, "GET", "/api/agents");
     const snapshot = listed.json.agents.find(
@@ -721,11 +728,14 @@ describe("HTTP server", () => {
     });
     expect(created.status).toBe(201);
 
+    const retryBranch = vi.spyOn(syncFlowManager.getReviewQueue(), "retryBranch");
     const updated = await request(port, "PATCH", `/api/agents/${created.json.id}/settings`, {
       branchWorkspaceId: feature.json.branch.id,
       systemPrompt: "switchable",
     });
     expect(updated.status).toBe(200);
+    expect(retryBranch).toHaveBeenCalledWith("feature/settings-switch");
+    retryBranch.mockRestore();
     expect(updated.json.config).toMatchObject({
       branchWorkspaceId: feature.json.branch.id,
       branch: "feature/settings-switch",
@@ -898,6 +908,206 @@ describe("HTTP server", () => {
       isolatedSyncManager.cancel(syncFlow.id);
       await new Promise((resolve) => setTimeout(resolve, 10));
     } finally {
+      await new Promise<void>((resolve) => isolatedServer.close(() => resolve()));
+      await isolatedManager.clear();
+      await removeTempRoot(isolatedRoot);
+    }
+  });
+
+  it("wakes a deferred target PR review when an idle fork is created on the target branch", async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-fork-review-retry-"));
+    const isolatedProjectRoot = path.join(isolatedRoot, "project");
+    const isolatedRunGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return "https://github.com/acme/fork-review-retry.git";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        await writeFile(path.join(String(args[2]), ".gitkeep"), "");
+        return "";
+      }
+      if (args[0] === "worktree" && args[1] === "add") {
+        await mkdir(path.join(String(args[4]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "worktree" && args[1] === "move") {
+        await rename(String(args[2]), String(args[3]));
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        if (args[1] === "--verify") return "a".repeat(40);
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      return "";
+    };
+    const isolatedWorkspaceManager = new WorkspaceManager({
+      defaultSourcePath: isolatedRoot,
+      projectRoot: isolatedProjectRoot,
+      projectsRoot: path.join(isolatedRoot, "projects-index"),
+      runGit: isolatedRunGit,
+    });
+    const isolatedProject = await isolatedWorkspaceManager.connect({
+      localPath: isolatedRoot,
+    });
+    const mainBranch = isolatedProject.branches[0]!;
+    const sourceBranch = await isolatedWorkspaceManager.createBranch({
+      branch: "feature/fork-review-source",
+    });
+    const querySessions: Array<{
+      cwd?: string;
+      inputs: SdkUserInput[];
+      close: () => void;
+    }> = [];
+    const isolatedQuery: QueryFn = ({ prompt, options }) => {
+      let close!: () => void;
+      const closed = new Promise<void>((resolve) => {
+        close = () => resolve();
+      });
+      const session = { cwd: options?.cwd, inputs: [] as SdkUserInput[], close };
+      querySessions.push(session);
+      if (typeof prompt !== "string") {
+        void (async () => {
+          for await (const input of prompt) session.inputs.push(input);
+        })();
+      }
+      return {
+        async *[Symbol.asyncIterator]() {
+          yield {
+            type: "system" as const,
+            subtype: "init" as const,
+            session_id: `session-fork-review-${querySessions.length}`,
+            model: "codex-test",
+            cwd: options?.cwd ?? isolatedRoot,
+            tools: [],
+          };
+          await closed;
+        },
+        terminate: async () => close(),
+      };
+    };
+    const isolatedManager = new AgentManager({ query: isolatedQuery });
+    const isolatedReviewQueue = new BranchReviewQueue();
+    const retryBranch = vi.spyOn(isolatedReviewQueue, "retryBranch");
+    const isolatedPrManager = new PullRequestFlowManager({
+      host: isolatedManager,
+      reviewQueue: isolatedReviewQueue,
+    });
+    const isolatedSyncManager = new SyncFlowManager({
+      host: isolatedManager,
+      reviewQueue: isolatedReviewQueue,
+    });
+    const { httpServer: isolatedServer } = createServer(isolatedManager, undefined, {
+      defaultCwd: isolatedRoot,
+      workspaceManager: isolatedWorkspaceManager,
+      reviewQueue: isolatedReviewQueue,
+      pullRequestFlowManager: isolatedPrManager,
+      syncFlowManager: isolatedSyncManager,
+    });
+
+    try {
+      await new Promise<void>((resolve) => isolatedServer.listen(0, resolve));
+      const isolatedPort = (isolatedServer.address() as AddressInfo).port;
+      const workspace = await rawRequest(isolatedPort, "GET", "/api/workspace");
+      const projectHeaders = {
+        "X-Agent-Canvas-Project-Id": workspace.json.canvasProject.id as string,
+        "X-Agent-Canvas-Project-Revision": String(workspace.json.revision),
+      };
+      const createdParent = await rawRequest(
+        isolatedPort,
+        "POST",
+        "/api/agents",
+        { branchWorkspaceId: sourceBranch.id },
+        projectHeaders,
+      );
+      expect(createdParent.status).toBe(201);
+      const parentId = createdParent.json.id as string;
+      const startedParent = await rawRequest(
+        isolatedPort,
+        "POST",
+        `/api/agents/${parentId}/start`,
+        { prompt: "establish a forkable source session" },
+        projectHeaders,
+      );
+      expect(startedParent.status).toBe(202);
+      await vi.waitFor(() => {
+        expect(isolatedManager.snapshot(parentId)).toMatchObject({
+          status: "running",
+          sessionId: expect.stringContaining("session-fork-review-"),
+        });
+      });
+
+      const createdAt = Date.now();
+      const queuedPr: PullRequestFlowSnapshot = {
+        id: "pr_flow_99",
+        proposerAgentId: parentId,
+        sourceBranch: sourceBranch.branch,
+        targetBranch: mainBranch.branch,
+        title: "Wake target review from fork",
+        summary: "The target review needs an idle fork on main",
+        files: ["src/fork-review.ts"],
+        fileChanges: [{ status: "M", path: "src/fork-review.ts" }],
+        status: "queued",
+        createdAt,
+        updatedAt: createdAt,
+        currentStage: "target_merge",
+        reviewRequests: [],
+        pr: {
+          prNumber: 99,
+          files: ["src/fork-review.ts"],
+          fileChanges: [{ status: "M", path: "src/fork-review.ts" }],
+          createdAt,
+        },
+      };
+      isolatedPrManager.importState([queuedPr]);
+      await vi.waitFor(() => {
+        expect(isolatedPrManager.get(queuedPr.id)).toMatchObject({
+          status: "queued",
+          currentStage: "target_merge",
+          failureReason: expect.stringContaining("active reviewer"),
+        });
+      });
+
+      const forked = await rawRequest(
+        isolatedPort,
+        "POST",
+        `/api/agents/${parentId}/fork`,
+        {
+          anchorUuid: "fork-review-anchor",
+          branchWorkspaceId: mainBranch.id,
+        },
+        projectHeaders,
+      );
+      expect(forked.status).toBe(201);
+      const forkedId = forked.json.id as string;
+      await vi.waitFor(() => {
+        expect(isolatedPrManager.get(queuedPr.id)).toMatchObject({
+          status: "target_review_collecting",
+          currentStage: "target_merge",
+          failureReason: undefined,
+        });
+        expect(isolatedManager.snapshot(forkedId)?.status).toBe("running");
+      });
+      const forkSession = querySessions.find(
+        (session) => path.resolve(session.cwd ?? "") === path.resolve(mainBranch.worktreePath),
+      );
+      expect(forkSession).toBeDefined();
+      await vi.waitFor(() => expect(forkSession?.inputs).toHaveLength(1));
+      expect(forkSession?.inputs[0]?.message.content).toContain(`flowId: ${queuedPr.id}`);
+      expect(forkSession?.inputs[0]?.message.content).toContain('"stage": "target_merge"');
+
+      // Starting the idle fork emits a later `running` status, which retries the branch again.
+      // The already-active reservation must prevent that wake-up from delivering a duplicate.
+      await vi.waitFor(() => {
+        expect(
+          retryBranch.mock.calls.filter(([branch]) => branch === mainBranch.branch).length,
+        ).toBeGreaterThanOrEqual(2);
+      });
+      expect(forkSession?.inputs).toHaveLength(1);
+      expect(isolatedPrManager.get(queuedPr.id)?.reviewRequests).toHaveLength(1);
+
+      isolatedPrManager.cancel(queuedPr.id);
+    } finally {
+      retryBranch.mockRestore();
+      for (const session of querySessions) session.close();
       await new Promise<void>((resolve) => isolatedServer.close(() => resolve()));
       await isolatedManager.clear();
       await removeTempRoot(isolatedRoot);
