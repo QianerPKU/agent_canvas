@@ -79,6 +79,12 @@ const featureOption: BranchOption = {
   isDefault: false,
 };
 
+const remoteOnlyOption: BranchOption = {
+  branch: "remote/only",
+  hasWorkspace: false,
+  isDefault: false,
+};
+
 function send(socket: FakeWebSocket, frame: ServerFrame): void {
   socket.onmessage?.call(
     socket as unknown as WebSocket,
@@ -167,7 +173,7 @@ afterEach(() => {
 });
 
 describe("App workspace metadata updates", () => {
-  it("does not let an older branch-options response overwrite newer workspace metadata", async () => {
+  it("merges remote-only response options with newer workspace metadata", async () => {
     let resolveStaleOptions!: (options: BranchOption[]) => void;
     const staleOptions = new Promise<BranchOption[]>((resolve) => {
       resolveStaleOptions = resolve;
@@ -194,11 +200,11 @@ describe("App workspace metadata updates", () => {
         syncFlows: [],
         commits: [],
       });
-      send(socket, workspaceFrame([mainWorkspace]));
+      send(socket, workspaceFrame([]));
     });
     await waitFor(() => expect(api.listBranchOptions).toHaveBeenCalledTimes(1));
 
-    act(() => send(socket, workspaceFrame([mainWorkspace, featureWorkspace])));
+    act(() => send(socket, workspaceFrame([featureWorkspace])));
     fireEvent.click(screen.getByText("新建 Agent"));
     const branchValues = () =>
       Array.from(
@@ -208,12 +214,13 @@ describe("App workspace metadata updates", () => {
     await waitFor(() => expect(branchValues()).toContain(featureWorkspace.branch));
 
     await act(async () => {
-      resolveStaleOptions([mainOption]);
+      resolveStaleOptions([remoteOnlyOption]);
       await staleOptions;
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
     });
 
     expect(branchValues()).toContain(featureWorkspace.branch);
+    expect(branchValues()).toContain(remoteOnlyOption.branch);
   });
 
   it("keeps the graph and Agent dialog mounted when a branch broadcast precedes HTTP 201", async () => {

@@ -205,6 +205,7 @@ describe("useAgentCanvas", () => {
       workspace: { branches: [createdBranch] },
       workDocumentation: { ready: false, error: "documentation status changed" },
     });
+    expect(result.current.currentWorkspaceSnapshot()?.branches).toEqual([createdBranch]);
     expect(Object.keys(result.current.agents)).toEqual(["agent_existing"]);
 
     act(() =>
@@ -217,6 +218,7 @@ describe("useAgentCanvas", () => {
       firstSnapshotGeneration + 2,
     );
     expect(result.current.currentWorkspaceEventIdentity()).toBe("project:project_old@2");
+    expect(result.current.currentWorkspaceSnapshot()?.revision).toBe(2);
     const highRevisionGeneration = result.current.currentWorkspaceEventGeneration();
     const highRevisionSnapshotGeneration =
       result.current.currentWorkspaceSnapshotGeneration();
@@ -236,6 +238,7 @@ describe("useAgentCanvas", () => {
     );
     expect(result.current.workspaceUpdate).toBe(highRevisionUpdate);
     expect(result.current.currentWorkspaceEventIdentity()).toBe("project:project_old@2");
+    expect(result.current.currentWorkspaceSnapshot()?.revision).toBe(2);
     unmount();
   });
 
@@ -249,11 +252,16 @@ describe("useAgentCanvas", () => {
     const firstSocket = FakeWebSocket.instances[0]!;
     act(() => sendWorkspaceFrame(firstSocket, "project_same"));
     const firstGeneration = result.current.currentWorkspaceEventGeneration();
+    const firstSnapshotGeneration = result.current.currentWorkspaceSnapshotGeneration();
     const firstUpdate = result.current.workspaceUpdate;
 
     act(() => {
       firstSocket.onclose?.call(firstSocket as unknown as WebSocket, {} as CloseEvent);
     });
+    expect(result.current.currentWorkspaceSnapshot()).toBeUndefined();
+    expect(result.current.currentWorkspaceSnapshotGeneration()).toBe(
+      firstSnapshotGeneration + 1,
+    );
     act(() => vi.advanceTimersByTime(1_000));
     const reconnectedSocket = FakeWebSocket.instances[1]!;
     act(() => sendWorkspaceFrame(reconnectedSocket, "project_same"));
@@ -264,6 +272,9 @@ describe("useAgentCanvas", () => {
       workspace: { canvasProject: { id: "project_same" } },
     });
     expect(result.current.workspaceMetadataUpdate).toBeUndefined();
+    expect(result.current.currentWorkspaceSnapshotGeneration()).toBe(
+      firstSnapshotGeneration + 2,
+    );
     const reconnectGeneration = result.current.currentWorkspaceEventGeneration();
     act(() => sendWorkspaceFrame(reconnectedSocket, "project_same"));
     expect(result.current.currentWorkspaceEventGeneration()).toBe(reconnectGeneration);

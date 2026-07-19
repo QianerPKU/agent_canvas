@@ -228,7 +228,21 @@ export function reconcileWorkspaceBranchOptions(
 
 interface LoadedBranchOptions {
   options: BranchOption[];
+  workspaceEventGeneration: number;
   workspaceSnapshotGeneration: number;
+  workspaceScope: string;
+}
+
+function branchOptionsWorkspaceScope(workspace: WorkspaceProject | undefined): string {
+  const revision = workspace?.revision;
+  return JSON.stringify([
+    workspace?.canvasProject?.id?.trim() ?? "",
+    Number.isSafeInteger(revision) ? revision : null,
+    workspace?.projectRoot?.trim() ?? "",
+    workspace?.repo?.id ?? "",
+    workspace?.repo?.remoteUrl ?? "",
+    workspace?.repo?.localRepoPath ?? "",
+  ]);
 }
 
 export function adoptDeletedCurrentProject(
@@ -1091,6 +1105,7 @@ export default function App(): React.ReactElement {
     workspaceMetadataUpdate,
     currentWorkspaceEventGeneration,
     currentWorkspaceSnapshotGeneration,
+    currentWorkspaceSnapshot,
     currentWorkspaceEventIdentity,
     invalidateWorkspaceRefresh,
     connected,
@@ -1293,25 +1308,70 @@ export default function App(): React.ReactElement {
   }, [refreshCodexUsage, showingSettings]);
 
   const loadBranchOptions = useCallback(
-    async (enabled = true): Promise<LoadedBranchOptions> => {
+    async (
+      enabled = true,
+      workspaceAtRequest = currentWorkspaceSnapshot(),
+    ): Promise<LoadedBranchOptions> => {
+      const workspaceEventGeneration = currentWorkspaceEventGeneration();
       const workspaceSnapshotGeneration = currentWorkspaceSnapshotGeneration();
+      const workspaceScope = branchOptionsWorkspaceScope(workspaceAtRequest);
       const options = enabled ? await api.listBranchOptions() : [];
-      return { options, workspaceSnapshotGeneration };
+      return {
+        options,
+        workspaceEventGeneration,
+        workspaceSnapshotGeneration,
+        workspaceScope,
+      };
     },
-    [currentWorkspaceSnapshotGeneration],
+    [
+      currentWorkspaceEventGeneration,
+      currentWorkspaceSnapshot,
+      currentWorkspaceSnapshotGeneration,
+    ],
   );
 
   const commitBranchOptions = useCallback(
     (loaded: LoadedBranchOptions): boolean => {
+      if (loaded.workspaceSnapshotGeneration === currentWorkspaceSnapshotGeneration()) {
+        setBranches(loaded.options);
+        return true;
+      }
+
+      // Same-identity metadata can overtake an in-flight branch list. Keep only the response's
+      // remote-only knowledge, then overlay the synchronously captured authoritative workspace.
+      // A project/revision/root/repo replacement crosses this scope and must discard the result.
+      if (loaded.workspaceEventGeneration !== currentWorkspaceEventGeneration()) return false;
+      const latestWorkspace = currentWorkspaceSnapshot();
       if (
-        loaded.workspaceSnapshotGeneration !== currentWorkspaceSnapshotGeneration()
+        !latestWorkspace ||
+        loaded.workspaceScope !== branchOptionsWorkspaceScope(latestWorkspace)
       ) {
         return false;
       }
-      setBranches(loaded.options);
+      if (
+        latestWorkspace.branches.some(
+          (branch) => branch.repoId !== latestWorkspace.repo?.id,
+        )
+      ) {
+        return false;
+      }
+      const defaultBranch = latestWorkspace.repo?.defaultBranch;
+      const remoteOnlyOptions = loaded.options
+        .filter((option) => !option.hasWorkspace)
+        .map((option) => ({
+          ...option,
+          isDefault: option.branch === defaultBranch,
+        }));
+      setBranches(
+        reconcileWorkspaceBranchOptions(remoteOnlyOptions, latestWorkspace),
+      );
       return true;
     },
-    [currentWorkspaceSnapshotGeneration],
+    [
+      currentWorkspaceEventGeneration,
+      currentWorkspaceSnapshot,
+      currentWorkspaceSnapshotGeneration,
+    ],
   );
 
   const refreshBranchOptions = useCallback(async () => {
@@ -1389,7 +1449,7 @@ export default function App(): React.ReactElement {
       api.canvasLayout(),
       api.settings(),
       api.listCanvasProjects(),
-      loadBranchOptions(Boolean(nextWorkspace.repo)),
+      loadBranchOptions(Boolean(nextWorkspace.repo), nextWorkspace),
       refresh(),
     ]).then(
       ([nextLayout, nextSettings, nextProjects, nextBranches]) => {
@@ -1483,7 +1543,7 @@ export default function App(): React.ReactElement {
         const projectLists = await resolveCurrentProjectOpenStep(
           Promise.all([
             api.listCanvasProjects(),
-            loadBranchOptions(Boolean(nextWorkspace.repo)),
+            loadBranchOptions(Boolean(nextWorkspace.repo), nextWorkspace),
           ]),
           isCurrent,
         );
@@ -1658,7 +1718,7 @@ export default function App(): React.ReactElement {
         api.setWorkspaceContext(nextWorkspace);
         setWorkspace(nextWorkspace);
         const nextBranches = await resolveCurrentProjectOpenStep(
-          loadBranchOptions(),
+          loadBranchOptions(true, nextWorkspace),
           isCurrent,
         );
         if (!nextBranches) return;
@@ -1728,7 +1788,7 @@ export default function App(): React.ReactElement {
       }
       setWorkspace(currentWorkspace);
       const nextBranches = await resolveCurrentProjectOpenStep(
-        loadBranchOptions(),
+        loadBranchOptions(true, currentWorkspace),
         isCurrent,
       );
       if (!nextBranches) throw new Error("项目已切换；已忽略旧项目的分支列表");

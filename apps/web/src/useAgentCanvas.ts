@@ -100,6 +100,8 @@ export interface UseAgentCanvas {
   currentWorkspaceEventGeneration: () => number;
   /** 每个已接受 workspace 帧递增，用于丢弃早于最新快照的异步结果。 */
   currentWorkspaceSnapshotGeneration: () => number;
+  /** WebSocket 回调中同步保存的最新已接受 workspace 快照。 */
+  currentWorkspaceSnapshot: () => WorkspaceProject | undefined;
   currentWorkspaceEventIdentity: () => string | undefined;
   invalidateWorkspaceRefresh: () => void;
   connected: boolean;
@@ -179,6 +181,7 @@ export function useAgentCanvas(): UseAgentCanvas {
   const refreshGenerationRef = useRef(0);
   const workspaceEventGenerationRef = useRef(0);
   const workspaceSnapshotGenerationRef = useRef(0);
+  const workspaceSnapshotRef = useRef<WorkspaceProject>();
   const workspaceEventIdentityRef = useRef<string>();
   const workspaceProjectRootRef = useRef<string>();
   const latestWorkspaceVersionRef = useRef<{ projectId: string; revision: number }>();
@@ -190,6 +193,7 @@ export function useAgentCanvas(): UseAgentCanvas {
     () => workspaceSnapshotGenerationRef.current,
     [],
   );
+  const currentWorkspaceSnapshot = useCallback(() => workspaceSnapshotRef.current, []);
   const currentWorkspaceEventIdentity = useCallback(
     () => workspaceEventIdentityRef.current,
     [],
@@ -272,6 +276,8 @@ export function useAgentCanvas(): UseAgentCanvas {
       ws.onclose = () => {
         if (!isCurrentSocket()) return;
         wsRef.current = null;
+        workspaceSnapshotRef.current = undefined;
+        workspaceSnapshotGenerationRef.current += 1;
         api.setWorkspaceContext(undefined);
         setConnected(false);
         scheduleConnect(1000);
@@ -318,6 +324,7 @@ export function useAgentCanvas(): UseAgentCanvas {
           // This ref advances synchronously in the socket callback, before React effects run.
           // Consumers can therefore reject an older REST response even in the narrow window
           // between accepting newer workspace metadata and committing it to component state.
+          workspaceSnapshotRef.current = frame.workspace;
           workspaceSnapshotGenerationRef.current += 1;
           if (projectId && Number.isSafeInteger(revision)) {
             latestWorkspaceVersionRef.current = { projectId, revision: revision! };
@@ -670,6 +677,7 @@ export function useAgentCanvas(): UseAgentCanvas {
     workspaceMetadataUpdate,
     currentWorkspaceEventGeneration,
     currentWorkspaceSnapshotGeneration,
+    currentWorkspaceSnapshot,
     currentWorkspaceEventIdentity,
     invalidateWorkspaceRefresh,
     connected,
