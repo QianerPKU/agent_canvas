@@ -37,7 +37,6 @@ import {
   applyHello,
   emptyMap,
   insertForked,
-  newAgentView,
   recordAgentSettings,
   recordCompact,
   recordInput,
@@ -93,8 +92,15 @@ export interface UseAgentCanvas {
   prFlows: PullRequestFlowSnapshot[];
   syncFlows: SyncFlowSnapshot[];
   commits: AgentCommitSnapshot[];
+  /** 首帧、重连或 project/revision 变化；消费者必须替换项目级快照。 */
   workspaceUpdate?: WorkspaceUpdate;
+  /** 同一 project/revision 的 branch/shared-resource 等元数据更新。 */
+  workspaceMetadataUpdate?: WorkspaceUpdate;
   currentWorkspaceEventGeneration: () => number;
+  /** 每个已接受 workspace 帧递增，用于丢弃早于最新快照的异步结果。 */
+  currentWorkspaceSnapshotGeneration: () => number;
+  /** WebSocket 回调中同步保存的最新已接受 workspace 快照。 */
+  currentWorkspaceSnapshot: () => WorkspaceProject | undefined;
   currentWorkspaceEventIdentity: () => string | undefined;
   invalidateWorkspaceRefresh: () => void;
   connected: boolean;
@@ -168,16 +174,29 @@ export function useAgentCanvas(): UseAgentCanvas {
   const [syncFlows, setSyncFlows] = useState<SyncFlowSnapshot[]>([]);
   const [commits, setCommits] = useState<AgentCommitSnapshot[]>([]);
   const [workspaceUpdate, setWorkspaceUpdate] = useState<WorkspaceUpdate>();
+  const [workspaceMetadataUpdate, setWorkspaceMetadataUpdate] = useState<WorkspaceUpdate>();
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const refreshGenerationRef = useRef(0);
+  const agentMutationGenerationRef = useRef(0);
+  const agentMutationGenerationsRef = useRef(new Map<string, number>());
+  const agentRuntimeGenerationsRef = useRef(new Map<string, number>());
+  const helloSnapshotGenerationRef = useRef(0);
   const workspaceEventGenerationRef = useRef(0);
+  const workspaceSnapshotGenerationRef = useRef(0);
+  const workspaceSnapshotRef = useRef<WorkspaceProject>();
   const workspaceEventIdentityRef = useRef<string>();
+  const workspaceProjectRootRef = useRef<string>();
   const latestWorkspaceVersionRef = useRef<{ projectId: string; revision: number }>();
   const currentWorkspaceEventGeneration = useCallback(
     () => workspaceEventGenerationRef.current,
     [],
   );
+  const currentWorkspaceSnapshotGeneration = useCallback(
+    () => workspaceSnapshotGenerationRef.current,
+    [],
+  );
+  const currentWorkspaceSnapshot = useCallback(() => workspaceSnapshotRef.current, []);
   const currentWorkspaceEventIdentity = useCallback(
     () => workspaceEventIdentityRef.current,
     [],
@@ -185,7 +204,18 @@ export function useAgentCanvas(): UseAgentCanvas {
   const invalidateWorkspaceRefresh = useCallback(() => {
     refreshGenerationRef.current += 1;
   }, []);
+  const markAgentMutation = useCallback((agentId: string) => {
+    const generation = ++agentMutationGenerationRef.current;
+    agentMutationGenerationsRef.current.set(agentId, generation);
+  }, []);
+  const markAgentRuntimeMutation = useCallback((agentId: string) => {
+    const generations = agentRuntimeGenerationsRef.current;
+    generations.set(agentId, (generations.get(agentId) ?? 0) + 1);
+  }, []);
   const clearProjectScopedState = useCallback(() => {
+    helloSnapshotGenerationRef.current += 1;
+    agentMutationGenerationsRef.current.clear();
+    agentRuntimeGenerationsRef.current.clear();
     setAgents(emptyMap);
     setFiles([]);
     setFileConnections([]);
@@ -201,6 +231,8 @@ export function useAgentCanvas(): UseAgentCanvas {
 
   const refresh = useCallback(async () => {
     const generation = ++refreshGenerationRef.current;
+    const agentMutationGeneration = agentMutationGenerationRef.current;
+    const helloSnapshotGeneration = helloSnapshotGenerationRef.current;
     const [
       nextAgents,
       nextFiles,
@@ -224,14 +256,24 @@ export function useAgentCanvas(): UseAgentCanvas {
       nextAgents.map(async (agent) => [agent.id, await api.history(agent.id)] as const),
     );
     if (generation !== refreshGenerationRef.current) return;
-    setAgents(applyHello(nextAgents, Object.fromEntries(historyEntries)));
+    const refreshedAgents = applyHello(nextAgents, Object.fromEntries(historyEntries));
+    if (helloSnapshotGeneration === helloSnapshotGenerationRef.current) {
+      setAgents((current) =>
+        mergeRefreshedAgents(
+          current,
+          refreshedAgents,
+          agentMutationGenerationsRef.current,
+          agentMutationGeneration,
+        ),
+      );
+      setPrFlows((current) => mergeRefreshedFlows(current, nextPrFlows));
+      setSyncFlows((current) => mergeRefreshedFlows(current, nextSyncFlows));
+      setCommits((current) => mergeRefreshedCommits(current, nextCommits));
+    }
     setFiles(nextFiles);
     setFileConnections(nextConnections);
     setPrompts(nextPrompts);
     setPromptConnections(nextPromptConnections);
-    setPrFlows(nextPrFlows);
-    setSyncFlows(nextSyncFlows);
-    setCommits(nextCommits);
   }, []);
 
   useEffect(() => {
@@ -246,6 +288,8 @@ export function useAgentCanvas(): UseAgentCanvas {
       api.setWorkspaceContext(undefined);
       refreshGenerationRef.current += 1;
       latestWorkspaceVersionRef.current = undefined;
+      workspaceProjectRootRef.current = undefined;
+      setWorkspaceMetadataUpdate(undefined);
       clearProjectScopedState();
       const ws = new WebSocket(wsUrl());
       wsRef.current = ws;
@@ -258,6 +302,8 @@ export function useAgentCanvas(): UseAgentCanvas {
       ws.onclose = () => {
         if (!isCurrentSocket()) return;
         wsRef.current = null;
+        workspaceSnapshotRef.current = undefined;
+        workspaceSnapshotGenerationRef.current += 1;
         api.setWorkspaceContext(undefined);
         setConnected(false);
         scheduleConnect(1000);
@@ -275,11 +321,16 @@ export function useAgentCanvas(): UseAgentCanvas {
           return;
         }
         if (frame.type === "hello") {
+          helloSnapshotGenerationRef.current += 1;
           setAgents(applyHello(frame.agents, frame.histories));
           setPrFlows(frame.prFlows ?? []);
           setSyncFlows(frame.syncFlows ?? []);
           setCommits(frame.commits ?? []);
         } else if (frame.type === "event") {
+          if (frame.envelope.event.kind === "system_init") {
+            markAgentRuntimeMutation(frame.envelope.agentId);
+          }
+          markAgentMutation(frame.envelope.agentId);
           setAgents((prev) => applyEnvelope(prev, frame.envelope));
         } else if (frame.type === "pr_flow") {
           setPrFlows((prev) => upsertFlow(prev, frame.flow));
@@ -301,26 +352,50 @@ export function useAgentCanvas(): UseAgentCanvas {
           ) {
             return;
           }
+          // This ref advances synchronously in the socket callback, before React effects run.
+          // Consumers can therefore reject an older REST response even in the narrow window
+          // between accepting newer workspace metadata and committing it to component state.
+          workspaceSnapshotRef.current = frame.workspace;
+          workspaceSnapshotGenerationRef.current += 1;
           if (projectId && Number.isSafeInteger(revision)) {
             latestWorkspaceVersionRef.current = { projectId, revision: revision! };
           }
-          // Invalidate an old project's in-flight refresh before React schedules the App effect
-          // that starts the authoritative project's replacement refresh.
           const nextUpdate: WorkspaceUpdate = {
             workspace: frame.workspace,
             partialSuccess: frame.partialSuccess,
             workDocumentation: frame.workDocumentation,
           };
           const nextIdentity = workspaceEventIdentity(frame.workspace);
+          const nextProjectRoot = frame.workspace?.projectRoot?.trim();
+          const isMetadataUpdate =
+            acceptedWorkspaceInEpoch &&
+            !!projectId &&
+            !!nextProjectRoot &&
+            Number.isSafeInteger(revision) &&
+            latestVersion?.projectId === projectId &&
+            latestVersion.revision === revision &&
+            workspaceProjectRootRef.current === nextProjectRoot &&
+            workspaceEventIdentityRef.current === nextIdentity;
           api.setWorkspaceContext(frame.workspace);
-          refreshGenerationRef.current += 1;
-          workspaceEventGenerationRef.current += 1;
           workspaceEventIdentityRef.current = nextIdentity;
-          // The epoch was already cleared before its hello frame. Later workspace frames are
-          // live authoritative updates and must clear the prior project-scoped snapshot here.
-          if (acceptedWorkspaceInEpoch) clearProjectScopedState();
+          workspaceProjectRootRef.current = nextProjectRoot;
+          if (isMetadataUpdate) {
+            // Branch/shared-resource mutations broadcast an updated workspace snapshot without
+            // changing project identity. Publish that metadata independently so it cannot cancel
+            // an in-flight project replacement refresh or blank the existing graph.
+            setWorkspaceMetadataUpdate(nextUpdate);
+          } else {
+            // Invalidate an old project's in-flight refresh before React schedules the App effect
+            // that starts the authoritative project's replacement refresh.
+            refreshGenerationRef.current += 1;
+            workspaceEventGenerationRef.current += 1;
+            // The epoch was already cleared before its hello frame. A later identity change is a
+            // real project replacement and must discard the prior project-scoped snapshot.
+            if (acceptedWorkspaceInEpoch) clearProjectScopedState();
+            setWorkspaceMetadataUpdate(undefined);
+            setWorkspaceUpdate(nextUpdate);
+          }
           acceptedWorkspaceInEpoch = true;
-          setWorkspaceUpdate(nextUpdate);
         }
       };
     };
@@ -362,13 +437,14 @@ export function useAgentCanvas(): UseAgentCanvas {
       closed = true;
       api.setWorkspaceContext(undefined);
       latestWorkspaceVersionRef.current = undefined;
+      workspaceProjectRootRef.current = undefined;
       if (promptTimer) window.clearTimeout(promptTimer);
       if (connectTimer) clearTimeout(connectTimer);
       const currentSocket = wsRef.current;
       wsRef.current = null;
       currentSocket?.close();
     };
-  }, [clearProjectScopedState, refresh]);
+  }, [clearProjectScopedState, markAgentMutation, markAgentRuntimeMutation, refresh]);
 
   const actions = useMemo<AgentActions>(
     () => ({
@@ -376,44 +452,27 @@ export function useAgentCanvas(): UseAgentCanvas {
         const workspaceGeneration = workspaceEventGenerationRef.current;
         const id = await api.create(settings);
         if (workspaceGeneration !== workspaceEventGenerationRef.current) return id;
-        // 后端 create 不发事件，乐观插入一个 idle 节点
-        setAgents((prev) =>
-          prev[id]
-            ? prev
-            : {
-                ...prev,
-                [id]: newAgentView(id, {
-                  provider: settings.provider,
-                  model: settings.model,
-                  reasoningEffort: settings.reasoningEffort,
-                  branchWorkspaceId: settings.branchWorkspaceId,
-                  branch: settings.branch,
-                  cwd: settings.cwd,
-                  scratchDirectory: settings.scratchDirectory,
-                  systemPrompt: settings.systemPrompt,
-                  allowSharedResourceWrites: settings.allowSharedResourceWrites,
-                }),
-              },
-        );
+        // The backend normally creates an idle node, but an automation retry can start it before
+        // this response arrives. Merge settings into either the optimistic node or that live node
+        // without overwriting status/history received over WebSocket.
+        markAgentMutation(id);
+        setAgents((prev) => recordAgentSettings(prev, id, definedAgentSettings(settings)));
         return id;
       },
       updateSettings: async (agentId, settings) => {
         const workspaceGeneration = workspaceEventGenerationRef.current;
+        const agentRuntimeGeneration = agentRuntimeGenerationsRef.current.get(agentId) ?? 0;
         const snapshot = await api.updateAgentSettings(agentId, settings);
         if (workspaceGeneration !== workspaceEventGenerationRef.current) return;
-        setAgents((prev) =>
-          recordAgentSettings(prev, agentId, {
-            provider: snapshot.config.provider,
-            model: snapshot.config.model,
-            reasoningEffort: snapshot.config.reasoningEffort,
-            branchWorkspaceId: snapshot.config.branchWorkspaceId,
-            branch: snapshot.config.branch,
-            cwd: snapshot.config.cwd,
-            scratchDirectory: snapshot.config.scratchDirectory,
-            systemPrompt: snapshot.config.systemPrompt,
-            allowSharedResourceWrites: snapshot.config.allowSharedResourceWrites,
-          }),
+        const runtimeChangedDuringRequest =
+          (agentRuntimeGenerationsRef.current.get(agentId) ?? 0) > agentRuntimeGeneration;
+        const responseSettings = settingsFromUpdateSnapshot(
+          settings,
+          snapshot.config,
+          runtimeChangedDuringRequest,
         );
+        markAgentMutation(agentId);
+        setAgents((prev) => recordAgentSettings(prev, agentId, responseSettings));
       },
       submit: async (agentId, text) => {
         const view = agentsRef.current[agentId];
@@ -422,6 +481,7 @@ export function useAgentCanvas(): UseAgentCanvas {
         const startReasoningEffort = view?.reasoningEffort;
         // 首轮（idle）用 start（fork 出来的 agent 由后端合并 fork 配置）；续轮用 send
         if (!view || view.status === "idle") {
+          markAgentMutation(agentId);
           setAgents((prev) => recordInput(prev, agentId, text, startProvider, startModel));
           await api.start(agentId, {
             prompt: text,
@@ -439,6 +499,7 @@ export function useAgentCanvas(): UseAgentCanvas {
           view.status === "stopped" ||
           view.status === "terminated"
         ) {
+          markAgentMutation(agentId);
           setAgents((prev) => recordInput(prev, agentId, text, startProvider, startModel));
           await api.send(agentId, text);
         } else {
@@ -452,6 +513,7 @@ export function useAgentCanvas(): UseAgentCanvas {
         api.answerApproval(agentId, requestId, response).then(() => undefined),
       stop: (agentId) => api.stop(agentId).then(() => undefined),
       compact: async (agentId) => {
+        markAgentMutation(agentId);
         setAgents((prev) => recordCompact(prev, agentId));
         await api.compact(agentId);
       },
@@ -461,6 +523,7 @@ export function useAgentCanvas(): UseAgentCanvas {
         const workspaceGeneration = workspaceEventGenerationRef.current;
         const { id, origin } = await api.fork(agentId, anchorUuid, options);
         if (workspaceGeneration !== workspaceEventGenerationRef.current) return;
+        markAgentMutation(id);
         setAgents((prev) => insertForked(prev, id, origin, options));
         const [nextFileConnections, nextPromptConnections] = await Promise.all([
           api.listFileConnections(),
@@ -471,7 +534,7 @@ export function useAgentCanvas(): UseAgentCanvas {
         setPromptConnections(nextPromptConnections);
       },
     }),
-    [],
+    [markAgentMutation],
   );
 
   const fileActions = useMemo<FileActions>(
@@ -631,7 +694,10 @@ export function useAgentCanvas(): UseAgentCanvas {
     syncFlows,
     commits,
     workspaceUpdate,
+    workspaceMetadataUpdate,
     currentWorkspaceEventGeneration,
+    currentWorkspaceSnapshotGeneration,
+    currentWorkspaceSnapshot,
     currentWorkspaceEventIdentity,
     invalidateWorkspaceRefresh,
     connected,
@@ -644,11 +710,102 @@ export function useAgentCanvas(): UseAgentCanvas {
   };
 }
 
+function mergeRefreshedAgents(
+  current: AgentMap,
+  refreshed: AgentMap,
+  mutationGenerations: ReadonlyMap<string, number>,
+  refreshStartedAtGeneration: number,
+): AgentMap {
+  const merged: AgentMap = { ...refreshed };
+  for (const [agentId, currentAgent] of Object.entries(current)) {
+    const refreshedAgent = refreshed[agentId];
+    const changedDuringRefresh =
+      (mutationGenerations.get(agentId) ?? 0) > refreshStartedAtGeneration;
+    if (changedDuringRefresh) {
+      merged[agentId] = currentAgent;
+      continue;
+    }
+    if (refreshedAgent && refreshedAgent.lastSeq > currentAgent.lastSeq) continue;
+    if (refreshedAgent && currentAgent.lastSeq > refreshedAgent.lastSeq) {
+      merged[agentId] = currentAgent;
+    }
+  }
+  return merged;
+}
+
+function mergeRefreshedFlows<T extends { id: string; updatedAt: number }>(
+  current: T[],
+  refreshed: T[],
+): T[] {
+  const refreshedById = new Map(refreshed.map((flow) => [flow.id, flow]));
+  const currentIds = new Set(current.map((flow) => flow.id));
+  return [
+    ...current.map((flow) => {
+      const snapshot = refreshedById.get(flow.id);
+      return snapshot && snapshot.updatedAt > flow.updatedAt ? snapshot : flow;
+    }),
+    ...refreshed.filter((flow) => !currentIds.has(flow.id)),
+  ];
+}
+
+function mergeRefreshedCommits(
+  current: AgentCommitSnapshot[],
+  refreshed: AgentCommitSnapshot[],
+): AgentCommitSnapshot[] {
+  const currentIds = new Set(current.map((commit) => commit.id));
+  return [
+    ...current,
+    ...refreshed.filter((commit) => !currentIds.has(commit.id)),
+  ].sort((left, right) => right.createdAt - left.createdAt);
+}
+
+function definedAgentSettings(settings: AgentSettings): AgentSettings {
+  return Object.fromEntries(
+    Object.entries(settings).filter(([, value]) => value !== undefined),
+  ) as AgentSettings;
+}
+
+function settingsFromUpdateSnapshot(
+  input: UpdateAgentSettingsInput,
+  snapshot: AgentSettings,
+  preserveRuntimeModel: boolean,
+): AgentSettings {
+  const settings: AgentSettings = {};
+  if (input.model !== undefined && !preserveRuntimeModel) {
+    settings.model = snapshot.model ?? input.model ?? undefined;
+  }
+  if (input.reasoningEffort !== undefined) {
+    settings.reasoningEffort =
+      snapshot.reasoningEffort ?? input.reasoningEffort ?? undefined;
+  }
+  if (input.systemPrompt !== undefined) {
+    settings.systemPrompt = snapshot.systemPrompt ?? input.systemPrompt;
+  }
+  if (input.allowSharedResourceWrites !== undefined) {
+    settings.allowSharedResourceWrites =
+      snapshot.allowSharedResourceWrites ?? input.allowSharedResourceWrites;
+  }
+  if (
+    input.branchWorkspaceId !== undefined ||
+    input.branch !== undefined ||
+    input.cwd !== undefined ||
+    input.scratchDirectory !== undefined
+  ) {
+    settings.branchWorkspaceId = snapshot.branchWorkspaceId ?? input.branchWorkspaceId;
+    settings.branch = snapshot.branch ?? input.branch;
+    settings.cwd = snapshot.cwd ?? input.cwd;
+    settings.scratchDirectory = snapshot.scratchDirectory ?? input.scratchDirectory;
+  }
+  return settings;
+}
+
 function upsertFlow(
   flows: PullRequestFlowSnapshot[],
   flow: PullRequestFlowSnapshot,
 ): PullRequestFlowSnapshot[] {
-  return flows.some((candidate) => candidate.id === flow.id)
+  const existing = flows.find((candidate) => candidate.id === flow.id);
+  if (existing && existing.updatedAt > flow.updatedAt) return flows;
+  return existing
     ? flows.map((candidate) => (candidate.id === flow.id ? flow : candidate))
     : [flow, ...flows];
 }
@@ -672,7 +829,9 @@ function upsertSyncFlow(
   flows: SyncFlowSnapshot[],
   flow: SyncFlowSnapshot,
 ): SyncFlowSnapshot[] {
-  return flows.some((candidate) => candidate.id === flow.id)
+  const existing = flows.find((candidate) => candidate.id === flow.id);
+  if (existing && existing.updatedAt > flow.updatedAt) return flows;
+  return existing
     ? flows.map((candidate) => (candidate.id === flow.id ? flow : candidate))
     : [flow, ...flows];
 }

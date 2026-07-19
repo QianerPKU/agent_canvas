@@ -160,23 +160,32 @@ export function insertForked(
   origin: ForkOrigin,
   options: Omit<ForkAgentInput, "anchorUuid"> = {},
 ): AgentMap {
-  if (map[id]) return map;
   const parent = map[origin.parentAgentId];
+  const live = map[id];
+  const base = live ?? newAgentView(id);
   return {
     ...map,
-    [id]: newAgentView(id, {
-      provider: parent?.provider,
-      model: options.model ?? parent?.model,
-      reasoningEffort: options.reasoningEffort ?? parent?.reasoningEffort,
-      branchWorkspaceId: options.branchWorkspaceId ?? parent?.branchWorkspaceId,
-      branch: options.branch ?? parent?.branch,
-      cwd: options.cwd ?? parent?.cwd,
-      scratchDirectory: options.scratchDirectory ?? parent?.scratchDirectory,
-      systemPrompt: parent?.systemPrompt,
+    [id]: {
+      ...base,
+      provider: live?.provider ?? parent?.provider,
+      // A system_init event can beat the HTTP fork response. Its runtime model/session are
+      // authoritative; requested and inherited settings only fill metadata that has not arrived.
+      model: live?.model ?? options.model ?? parent?.model,
+      reasoningEffort:
+        options.reasoningEffort ?? live?.reasoningEffort ?? parent?.reasoningEffort,
+      branchWorkspaceId:
+        options.branchWorkspaceId ?? live?.branchWorkspaceId ?? parent?.branchWorkspaceId,
+      branch: options.branch ?? live?.branch ?? parent?.branch,
+      cwd: options.cwd ?? live?.cwd ?? parent?.cwd,
+      scratchDirectory:
+        options.scratchDirectory ?? live?.scratchDirectory ?? parent?.scratchDirectory,
+      systemPrompt: live?.systemPrompt ?? parent?.systemPrompt,
       allowSharedResourceWrites:
-        options.allowSharedResourceWrites ?? parent?.allowSharedResourceWrites,
+        options.allowSharedResourceWrites ??
+        live?.allowSharedResourceWrites ??
+        parent?.allowSharedResourceWrites,
       forkOrigin: origin,
-    }),
+    },
   };
 }
 

@@ -443,6 +443,64 @@ describe("agentStore 轮次模型", () => {
     expect(v.allowSharedResourceWrites).toBe(false);
   });
 
+  it("insertForked 为早到的 live fork 节点补元数据而不覆盖运行态", () => {
+    const liveTurns = [
+      {
+        index: 0,
+        status: "running" as const,
+        lines: [{ kind: "system" as const, text: "会话建立 · runtime-model" }],
+      },
+    ];
+    let map: AgentMap = {
+      a1: newAgentView("a1", {
+        provider: "codex",
+        model: "parent-model",
+        reasoningEffort: "high",
+        branchWorkspaceId: "branch_main",
+        branch: "main",
+        cwd: "E:\\repo\\main",
+        scratchDirectory: "E:\\repo\\main\\.agent-tmp\\a1",
+        systemPrompt: "parent policy",
+        allowSharedResourceWrites: true,
+      }),
+      a2: newAgentView("a2", {
+        status: "running",
+        sessionId: "session-a2",
+        model: "runtime-model",
+        allowSharedResourceWrites: true,
+        turns: liveTurns,
+        lastSeq: 3,
+      }),
+    };
+
+    map = insertForked(map, "a2", { parentAgentId: "a1", anchorUuid: "u1" }, {
+      model: "requested-model",
+      reasoningEffort: "medium",
+      branchWorkspaceId: "branch_feature",
+      branch: "feature/a",
+      cwd: "E:\\repo\\feature-a",
+      scratchDirectory: "E:\\repo\\feature-a\\.agent-tmp\\a2",
+      allowSharedResourceWrites: false,
+    });
+
+    expect(get(map, "a2")).toMatchObject({
+      status: "running",
+      sessionId: "session-a2",
+      model: "runtime-model",
+      lastSeq: 3,
+      provider: "codex",
+      reasoningEffort: "medium",
+      branchWorkspaceId: "branch_feature",
+      branch: "feature/a",
+      cwd: "E:\\repo\\feature-a",
+      scratchDirectory: "E:\\repo\\feature-a\\.agent-tmp\\a2",
+      systemPrompt: "parent policy",
+      allowSharedResourceWrites: false,
+      forkOrigin: { parentAgentId: "a1", anchorUuid: "u1" },
+    });
+    expect(get(map, "a2").turns).toBe(liveTurns);
+  });
+
   it("applyHello 携带 forkOrigin", () => {
     const map = applyHello([
       {
