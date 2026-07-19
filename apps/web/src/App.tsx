@@ -188,6 +188,44 @@ export function isCurrentWorkspaceUpdate(
   return workspaceEventIdentity(workspace) === currentWorkspaceIdentity;
 }
 
+export function reconcileWorkspaceBranchOptions(
+  current: BranchOption[],
+  workspace: WorkspaceProject,
+): BranchOption[] {
+  const workspaces = new Map(workspace.branches.map((branch) => [branch.branch, branch]));
+  const next = current.map((option) => {
+    const branch = workspaces.get(option.branch);
+    if (!branch) {
+      return option.hasWorkspace
+        ? {
+            ...option,
+            branchWorkspaceId: undefined,
+            worktreePath: undefined,
+            hasWorkspace: false,
+          }
+        : option;
+    }
+    workspaces.delete(option.branch);
+    return {
+      branch: option.branch,
+      branchWorkspaceId: branch.id,
+      worktreePath: branch.worktreePath,
+      hasWorkspace: true,
+      isDefault: branch.isDefault,
+    };
+  });
+  for (const branch of workspaces.values()) {
+    next.push({
+      branch: branch.branch,
+      branchWorkspaceId: branch.id,
+      worktreePath: branch.worktreePath,
+      hasWorkspace: true,
+      isDefault: branch.isDefault,
+    });
+  }
+  return next.sort((left, right) => left.branch.localeCompare(right.branch));
+}
+
 export function adoptDeletedCurrentProject(
   deletedProjectId: string,
   currentWorkspace: WorkspaceProject | undefined,
@@ -1045,6 +1083,7 @@ export default function App(): React.ReactElement {
     syncFlows,
     commits,
     workspaceUpdate,
+    workspaceMetadataUpdate,
     currentWorkspaceEventGeneration,
     currentWorkspaceEventIdentity,
     invalidateWorkspaceRefresh,
@@ -1347,6 +1386,26 @@ export default function App(): React.ReactElement {
     workspaceUpdate,
   ]);
 
+  useEffect(() => {
+    if (
+      !workspaceMetadataUpdate?.workspace ||
+      !isCurrentWorkspaceUpdate(
+        workspaceMetadataUpdate.workspace,
+        currentWorkspaceEventIdentity(),
+      )
+    ) {
+      return;
+    }
+    const nextWorkspace: CanvasProjectOpenResult = {
+      ...workspaceMetadataUpdate.workspace,
+      partialSuccess: workspaceMetadataUpdate.partialSuccess,
+      workDocumentation: workspaceMetadataUpdate.workDocumentation,
+    };
+    setWorkspace(nextWorkspace);
+    setProjectError(workDocumentationMutationWarning(nextWorkspace));
+    setBranches((current) => reconcileWorkspaceBranchOptions(current, nextWorkspace));
+  }, [currentWorkspaceEventIdentity, workspaceMetadataUpdate]);
+
   const openProject = useCallback(
     async (
       id?: string,
@@ -1601,7 +1660,7 @@ export default function App(): React.ReactElement {
 
   const createBranch = useCallback(
     async (branch: string, baseBranch?: string) => {
-      const ownership = beginProjectOperation();
+      const ownership = captureProjectOperation();
       const expectedWorkspaceIdentity = workspaceEventIdentity(workspaceRef.current);
       const isCurrent = () =>
         projectOperationIsCurrent(ownership, expectedWorkspaceIdentity);
@@ -1641,7 +1700,7 @@ export default function App(): React.ReactElement {
       }
       return currentBranch;
     },
-    [beginProjectOperation, projectOperationIsCurrent],
+    [captureProjectOperation, projectOperationIsCurrent],
   );
 
   useEffect(() => {

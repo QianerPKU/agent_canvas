@@ -93,7 +93,10 @@ export interface UseAgentCanvas {
   prFlows: PullRequestFlowSnapshot[];
   syncFlows: SyncFlowSnapshot[];
   commits: AgentCommitSnapshot[];
+  /** 首帧、重连或 project/revision 变化；消费者必须替换项目级快照。 */
   workspaceUpdate?: WorkspaceUpdate;
+  /** 同一 project/revision 的 branch/shared-resource 等元数据更新。 */
+  workspaceMetadataUpdate?: WorkspaceUpdate;
   currentWorkspaceEventGeneration: () => number;
   currentWorkspaceEventIdentity: () => string | undefined;
   invalidateWorkspaceRefresh: () => void;
@@ -168,11 +171,13 @@ export function useAgentCanvas(): UseAgentCanvas {
   const [syncFlows, setSyncFlows] = useState<SyncFlowSnapshot[]>([]);
   const [commits, setCommits] = useState<AgentCommitSnapshot[]>([]);
   const [workspaceUpdate, setWorkspaceUpdate] = useState<WorkspaceUpdate>();
+  const [workspaceMetadataUpdate, setWorkspaceMetadataUpdate] = useState<WorkspaceUpdate>();
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const refreshGenerationRef = useRef(0);
   const workspaceEventGenerationRef = useRef(0);
   const workspaceEventIdentityRef = useRef<string>();
+  const workspaceProjectRootRef = useRef<string>();
   const latestWorkspaceVersionRef = useRef<{ projectId: string; revision: number }>();
   const currentWorkspaceEventGeneration = useCallback(
     () => workspaceEventGenerationRef.current,
@@ -246,6 +251,8 @@ export function useAgentCanvas(): UseAgentCanvas {
       api.setWorkspaceContext(undefined);
       refreshGenerationRef.current += 1;
       latestWorkspaceVersionRef.current = undefined;
+      workspaceProjectRootRef.current = undefined;
+      setWorkspaceMetadataUpdate(undefined);
       clearProjectScopedState();
       const ws = new WebSocket(wsUrl());
       wsRef.current = ws;
@@ -304,23 +311,42 @@ export function useAgentCanvas(): UseAgentCanvas {
           if (projectId && Number.isSafeInteger(revision)) {
             latestWorkspaceVersionRef.current = { projectId, revision: revision! };
           }
-          // Invalidate an old project's in-flight refresh before React schedules the App effect
-          // that starts the authoritative project's replacement refresh.
           const nextUpdate: WorkspaceUpdate = {
             workspace: frame.workspace,
             partialSuccess: frame.partialSuccess,
             workDocumentation: frame.workDocumentation,
           };
           const nextIdentity = workspaceEventIdentity(frame.workspace);
+          const nextProjectRoot = frame.workspace?.projectRoot?.trim();
+          const isMetadataUpdate =
+            acceptedWorkspaceInEpoch &&
+            !!projectId &&
+            !!nextProjectRoot &&
+            Number.isSafeInteger(revision) &&
+            latestVersion?.projectId === projectId &&
+            latestVersion.revision === revision &&
+            workspaceProjectRootRef.current === nextProjectRoot &&
+            workspaceEventIdentityRef.current === nextIdentity;
           api.setWorkspaceContext(frame.workspace);
-          refreshGenerationRef.current += 1;
-          workspaceEventGenerationRef.current += 1;
           workspaceEventIdentityRef.current = nextIdentity;
-          // The epoch was already cleared before its hello frame. Later workspace frames are
-          // live authoritative updates and must clear the prior project-scoped snapshot here.
-          if (acceptedWorkspaceInEpoch) clearProjectScopedState();
+          workspaceProjectRootRef.current = nextProjectRoot;
+          if (isMetadataUpdate) {
+            // Branch/shared-resource mutations broadcast an updated workspace snapshot without
+            // changing project identity. Publish that metadata independently so it cannot cancel
+            // an in-flight project replacement refresh or blank the existing graph.
+            setWorkspaceMetadataUpdate(nextUpdate);
+          } else {
+            // Invalidate an old project's in-flight refresh before React schedules the App effect
+            // that starts the authoritative project's replacement refresh.
+            refreshGenerationRef.current += 1;
+            workspaceEventGenerationRef.current += 1;
+            // The epoch was already cleared before its hello frame. A later identity change is a
+            // real project replacement and must discard the prior project-scoped snapshot.
+            if (acceptedWorkspaceInEpoch) clearProjectScopedState();
+            setWorkspaceMetadataUpdate(undefined);
+            setWorkspaceUpdate(nextUpdate);
+          }
           acceptedWorkspaceInEpoch = true;
-          setWorkspaceUpdate(nextUpdate);
         }
       };
     };
@@ -362,6 +388,7 @@ export function useAgentCanvas(): UseAgentCanvas {
       closed = true;
       api.setWorkspaceContext(undefined);
       latestWorkspaceVersionRef.current = undefined;
+      workspaceProjectRootRef.current = undefined;
       if (promptTimer) window.clearTimeout(promptTimer);
       if (connectTimer) clearTimeout(connectTimer);
       const currentSocket = wsRef.current;
@@ -629,6 +656,7 @@ export function useAgentCanvas(): UseAgentCanvas {
     syncFlows,
     commits,
     workspaceUpdate,
+    workspaceMetadataUpdate,
     currentWorkspaceEventGeneration,
     currentWorkspaceEventIdentity,
     invalidateWorkspaceRefresh,
