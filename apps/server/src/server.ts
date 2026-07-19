@@ -1079,6 +1079,8 @@ async function handleHttp(
           defaultCwd,
         );
         const runner = manager.create(settings);
+        const branch = manager.configOf(runner.id)?.branch?.trim();
+        if (branch) await reviewQueue.retryBranch(branch);
         canvasState.saveSoon();
         return sendJson(res, 201, { id: runner.id });
       } catch (error) {
@@ -1403,7 +1405,10 @@ async function handleHttp(
           const snapshot = manager.updateSettings(id, settings, {
             branchSwitchPrompt: branchChanged ? branchSwitchPrompt(diff) : undefined,
           });
-          if (branchChanged && snapshot.status === "waiting_input") {
+          if (
+            branchChanged &&
+            (snapshot.status === "idle" || snapshot.status === "waiting_input")
+          ) {
             const destinationBranch = snapshot.config?.branch?.trim();
             if (destinationBranch) {
               await reviewQueue.retryBranch(destinationBranch);
@@ -1476,6 +1481,8 @@ async function handleHttp(
         if (!forked) return sendJson(res, 409, { error: "源会话尚未建立，无法 fork" });
         fileManager.copyAgentConnections(id, forked.id);
         promptManager.copyAgentConnections(id, forked.id);
+        const branch = manager.configOf(forked.id)?.branch?.trim();
+        if (branch) await reviewQueue.retryBranch(branch);
         canvasState.saveSoon();
         return sendJson(res, 201, { id: forked.id, origin: forked.origin });
       } catch (error) {
