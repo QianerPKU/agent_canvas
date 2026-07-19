@@ -20,6 +20,8 @@ export interface OpenCanvasProjectInput {
   projectRoot?: string;
   /** External shared-resource paths explicitly approved while importing this project. */
   trustedExternalResourcePaths?: string[];
+  /** External file paths explicitly approved while opening this project. Paths are canonicalized before trust is persisted. */
+  trustedExternalFilePaths?: string[];
 }
 
 export interface CanvasProjectInspection {
@@ -27,6 +29,12 @@ export interface CanvasProjectInspection {
   externalSharedResources: Array<
     Pick<SharedResourceMount, "id" | "name" | "sourcePath" | "access">
   >;
+  externalFileReferences: Array<{
+    id: string;
+    name: string;
+    /** Canonical filesystem path after resolving existing symlink/junction components. */
+    path: string;
+  }>;
 }
 
 export interface GitHubConnection {

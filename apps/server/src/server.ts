@@ -1,7 +1,7 @@
 import http from "node:http";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readFile, stat } from "node:fs/promises";
-import path from "node:path";
+import path, { dirname as pathDirname } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import type {
   AgentApprovalResponse,
@@ -13,6 +13,8 @@ import type {
   AgentSettings,
   AgentStartConfig,
   BranchDiffSummary,
+  CanvasFileImportMode,
+  CanvasFileKind,
   CanvasFileNode,
   CanvasLayoutSnapshot,
   CanvasNodeLayout,
@@ -26,6 +28,7 @@ import type {
   CreateSharedResourceInput,
   CreateSyncFlowInput,
   ForkAgentInput,
+  ImportPickedCanvasFilesInput,
   OpenCanvasProjectInput,
   PullRequestCreatedInput,
   CreatePullRequestFlowInput,
@@ -37,13 +40,18 @@ import type {
   UpdateCanvasFileInput,
   UpdateCanvasPromptInput,
 } from "@agent-canvas/shared";
-import { isTerminalStatus } from "@agent-canvas/shared";
+import { isTerminalStatus, PICKED_FILE_SELECTION_EXPIRED_CODE } from "@agent-canvas/shared";
 import { AgentManager } from "./AgentManager.js";
 import { detectCodexModels, type CodexModelDetection } from "./codexModels.js";
 import { readCodexUsage } from "./codexUsage.js";
 import { CommitManager } from "./commits/CommitManager.js";
 import { pickDirectory as defaultPickDirectory, type PickDirectory } from "./files/DirectoryPicker.js";
-import { FileManager } from "./files/FileManager.js";
+import {
+  pickFiles as defaultPickFiles,
+  type PickFiles,
+  type PickFilesOptions,
+} from "./files/FilePicker.js";
+import { FileManager, PickedFileSelectionExpiredError } from "./files/FileManager.js";
 import {
   openFileInVscode,
   type OpenInVscodeOptions,
@@ -89,6 +97,9 @@ export interface CreateServerOptions {
   allowedOrigins?: string[];
   openFile?: (filePath: string, options?: OpenInVscodeOptions) => Promise<void>;
   pickDirectory?: PickDirectory;
+  pickFiles?: PickFiles;
+  /** Test/deployment override; defaults to 100 MiB. */
+  maxFileUploadBytes?: number;
   promptManager?: PromptManager;
   workspaceManager?: WorkspaceManager;
   pullRequestFlowManager?: PullRequestFlowManager;
@@ -129,7 +140,10 @@ interface WorkDocumentationLoadStatus {
 }
 
 const CANVAS_STATE_FILE = "canvas-state.json";
+const MAX_FILE_UPLOAD_BYTES = 100 * 1024 * 1024;
 const requestJsonBodies = new WeakMap<http.IncomingMessage, Promise<unknown | undefined>>();
+const requestRawBodies = new WeakMap<http.IncomingMessage, Promise<Buffer>>();
+const requestPickedFilePaths = new WeakMap<http.IncomingMessage, Promise<string[]>>();
 
 /**
  * 组装 HTTP（REST 命令）+ WebSocket（事件广播）服务。
@@ -144,6 +158,7 @@ export function createServer(
   const codexModels = codexModelDetectionSource(options.codexModelDetection);
   fileManager ??= new FileManager({
     workspaceRoot: defaultCwd,
+    maxPickedFileBytes: options.maxFileUploadBytes ?? MAX_FILE_UPLOAD_BYTES,
   });
   const workspaceManager =
     options.workspaceManager ?? new WorkspaceManager({ defaultSourcePath: defaultCwd });
@@ -194,6 +209,8 @@ export function createServer(
   const commitManager = options.commitManager ?? new CommitManager();
   const codexAuthManager = options.codexAuthManager ?? new CodexAuthManager();
   const allowedOrigins = resolveAllowedOrigins(options.allowedOrigins);
+  const pickFiles = options.pickFiles ?? defaultPickFiles;
+  const maxFileUploadBytes = options.maxFileUploadBytes ?? MAX_FILE_UPLOAD_BYTES;
   manager.setPromptAccessResolver((agentId) => promptManager.accessFor(agentId));
   const canvasState = createCanvasStateController({
     manager,
@@ -223,6 +240,9 @@ export function createServer(
       }
     }
     const expectedNoProject = projectScoped && !expectedProjectRevision;
+    const hasMatchingProjectHeaders =
+      expectedProjectRevision !== undefined &&
+      requestProjectHeadersMatch(req, expectedProjectRevision);
     const operation = async () => {
       if (projectScoped) {
         try {
@@ -263,6 +283,8 @@ export function createServer(
         codexModels,
         options.openFile ?? openFileInVscode,
         options.pickDirectory ?? defaultPickDirectory,
+        pickFiles,
+        maxFileUploadBytes,
         canvasState,
         broadcastHello,
         broadcastFrame,
@@ -282,11 +304,21 @@ export function createServer(
         throw error;
       }
     };
-    const result = shouldPreloadProjectRequestBody(req, allowedOrigins)
-      ? preloadRequestJsonBody(req).then(invoke)
-      : invoke();
+    const nativeFileSelection =
+      hasMatchingProjectHeaders
+        ? preloadNativeFileSelection(req, allowedOrigins, fileManager, pickFiles)
+        : undefined;
+    const result = nativeFileSelection
+      ? nativeFileSelection.then(invoke, invoke)
+      : shouldPreloadProjectRequestBody(req, allowedOrigins)
+        ? preloadRequestJsonBody(req).then(invoke)
+        : hasMatchingProjectHeaders && shouldPreloadFileUploadBody(req, allowedOrigins)
+          ? preloadRequestRawBody(req, maxFileUploadBytes).then(invoke)
+          : invoke();
     result.catch((err) => {
-      sendJson(res, 500, { error: errMsg(err) });
+      if (!res.headersSent) {
+        sendJson(res, err instanceof FileUploadTooLargeError ? 413 : 500, { error: errMsg(err) });
+      }
     });
   });
 
@@ -414,6 +446,8 @@ async function handleHttp(
   codexModels: () => Promise<CodexModelDetection>,
   openFile: (filePath: string, options?: OpenInVscodeOptions) => Promise<void>,
   pickDirectory: PickDirectory,
+  pickFiles: PickFiles,
+  maxFileUploadBytes: number,
   canvasState: CanvasStateController,
   broadcastHello: () => void,
   broadcastFrame: (frame: ServerFrame) => void,
@@ -1091,6 +1125,79 @@ async function handleHttp(
     return sendJson(res, 200, { files: fileManager.list() });
   }
 
+  if (method === "POST" && path === "/api/files/pick") {
+    let paths: string[];
+    try {
+      paths = await preloadPickedFilePaths(req, pickFiles);
+    } catch (error) {
+      return sendJson(res, 501, { error: errMsg(error) });
+    }
+    if (paths.length === 0) return sendJson(res, 200, { selection: null });
+    try {
+      return sendJson(res, 200, {
+        selection: await fileManager.stagePickedFiles(paths),
+      });
+    } catch (error) {
+      return sendJson(res, 400, { error: errMsg(error) });
+    }
+  }
+
+  if (method === "POST" && path === "/api/files/import-picked") {
+    const body = await readJson<ImportPickedCanvasFilesInput>(req);
+    if (
+      !body?.selectionId?.trim() ||
+      !isCanvasFileImportMode(body.mode) ||
+      !isCanvasFileKind(body.kind)
+    ) {
+      return sendJson(res, 400, {
+        error: "缺少文件选择、导入方式或节点类型",
+      });
+    }
+    try {
+      if (body.mode === "reference") {
+        await workspaceManager.trustExternalFilePaths(
+          fileManager.pickedSelectionPaths(body.selectionId),
+        );
+      }
+      const files = await fileManager.importPicked(body.selectionId, body.mode, body.kind);
+      canvasState.saveSoon();
+      return sendJson(res, 201, { files });
+    } catch (error) {
+      if (error instanceof PickedFileSelectionExpiredError) {
+        return sendJson(res, 410, {
+          code: PICKED_FILE_SELECTION_EXPIRED_CODE,
+          error: errMsg(error),
+        });
+      }
+      return sendJson(res, 400, { error: errMsg(error) });
+    }
+  }
+
+  const pickedSelectionMatch = path.match(/^\/api\/files\/pick\/([^/]+)$/u);
+  if (method === "DELETE" && pickedSelectionMatch) {
+    const selectionId = decodeURIComponent(pickedSelectionMatch[1]!);
+    fileManager.releasePickedSelection(selectionId);
+    return sendJson(res, 204, undefined);
+  }
+
+  if (method === "POST" && path === "/api/files/import-upload") {
+    const filename = url.searchParams.get("filename");
+    const kind = url.searchParams.get("kind");
+    if (filename === null || filename.length === 0 || !isCanvasFileKind(kind)) {
+      return sendJson(res, 400, { error: "缺少文件名或节点类型" });
+    }
+    try {
+      const data = await preloadRequestRawBody(req, maxFileUploadBytes);
+      const file = await fileManager.createUploaded(filename, data, kind);
+      canvasState.saveSoon();
+      return sendJson(res, 201, { file });
+    } catch (error) {
+      return sendJson(res, error instanceof FileUploadTooLargeError ? 413 : 400, {
+        error: errMsg(error),
+      });
+    }
+  }
+
   if (method === "POST" && path === "/api/files") {
     const body = await readJson<CreateCanvasFileInput>(req);
     if (
@@ -1156,6 +1263,41 @@ async function handleHttp(
     const id = decodeURIComponent(fileMatch[1]!);
     const action = fileMatch[2];
     if (!fileManager.get(id)) return sendJson(res, 404, { error: `未知文件节点: ${id}` });
+    if (method === "POST" && action === "relink") {
+      const current = fileManager.get(id)!;
+      if (current.storage !== "referenced") {
+        return sendJson(res, 400, { error: "只有外部引用文件可以重新定位" });
+      }
+      let selected: string[];
+      try {
+        selected = await preloadPickedFilePaths(req, pickFiles, {
+          initialDirectory: pathDirname(current.path),
+          multiple: false,
+        });
+      } catch (error) {
+        return sendJson(res, 501, { error: errMsg(error) });
+      }
+      if (!selected[0]) return sendJson(res, 200, { file: null });
+      try {
+        const [canonicalPath] = await workspaceManager.trustExternalFilePaths([selected[0]]);
+        if (!canonicalPath) throw new Error("未能授权重新定位的文件路径");
+        const file = await fileManager.relinkReferenced(id, canonicalPath);
+        canvasState.saveSoon();
+        return sendJson(res, 200, { file });
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
+    }
+    if (method === "POST" && action === "refresh") {
+      try {
+        const current = fileManager.get(id)!;
+        const file = await fileManager.refreshAvailability(id);
+        if (file !== current) canvasState.saveSoon();
+        return sendJson(res, 200, { file });
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
+    }
     if (method === "PATCH" && !action) {
       const body = await readJson<UpdateCanvasFileInput>(req);
       try {
@@ -1190,10 +1332,13 @@ async function handleHttp(
       return;
     }
     if (method === "POST" && action === "open") {
+      const current = fileManager.get(id)!;
       try {
-        await openFile(fileManager.get(id)!.path, { windowMode: "reuse" });
+        const filePath = await fileManager.validatedOpenPath(id);
+        await openFile(filePath, { windowMode: "reuse" });
         return sendJson(res, 202, { ok: true });
       } catch (error) {
+        if (fileManager.get(id) !== current) canvasState.saveSoon();
         return sendJson(res, 500, { error: errMsg(error) });
       }
     }
@@ -1655,7 +1800,8 @@ function requiresExpectedProjectMutation(req: http.IncomingMessage): boolean {
     pathname === "/api/agents" ||
     /^\/api\/agents\/[^/]+(?:\/[^/]+(?:\/[^/]+)?)?$/u.test(pathname) ||
     pathname === "/api/files" ||
-    /^\/api\/files\/[^/]+$/u.test(pathname) ||
+    /^\/api\/files\/pick\/[^/]+$/u.test(pathname) ||
+    /^\/api\/files\/[^/]+(?:\/(?:open|relink|refresh))?$/u.test(pathname) ||
     pathname === "/api/prompts" ||
     /^\/api\/prompts\/[^/]+$/u.test(pathname) ||
     pathname === "/api/file-connections" ||
@@ -1669,17 +1815,76 @@ function singleHeader(value: string | string[] | undefined): string | undefined 
   return Array.isArray(value) ? value[0] : value;
 }
 
+function requestProjectHeadersMatch(
+  req: http.IncomingMessage,
+  expected: WorkspaceProjectRevision,
+): boolean {
+  const projectId = singleHeader(req.headers["x-agent-canvas-project-id"]);
+  const revisionText = singleHeader(req.headers["x-agent-canvas-project-revision"]);
+  const revision = Number(revisionText);
+  return (
+    projectId === expected.projectId &&
+    !!revisionText &&
+    Number.isSafeInteger(revision) &&
+    revision === expected.generation
+  );
+}
+
 function shouldPreloadProjectRequestBody(
   req: http.IncomingMessage,
   allowedOrigins: Set<string>,
 ): boolean {
   const method = req.method ?? "GET";
+  const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
   return (
     method !== "GET" &&
     method !== "HEAD" &&
     method !== "OPTIONS" &&
+    pathname !== "/api/files/import-upload" &&
     isProjectScopedHttpRequest(req) &&
     isTrustedBrowserRequest(req, allowedOrigins)
+  );
+}
+
+function shouldPreloadFileUploadBody(
+  req: http.IncomingMessage,
+  allowedOrigins: Set<string>,
+): boolean {
+  return (
+    req.method === "POST" &&
+    new URL(req.url ?? "/", "http://localhost").pathname === "/api/files/import-upload" &&
+    isTrustedBrowserRequest(req, allowedOrigins)
+  );
+}
+
+function preloadNativeFileSelection(
+  req: http.IncomingMessage,
+  allowedOrigins: Set<string>,
+  fileManager: FileManager,
+  pickFiles: PickFiles,
+): Promise<string[]> | undefined {
+  if (req.method !== "POST" || !isTrustedBrowserRequest(req, allowedOrigins)) {
+    return undefined;
+  }
+  const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+  if (pathname === "/api/files/pick") {
+    return preloadRequestJsonBody(req).then(() => preloadPickedFilePaths(req, pickFiles));
+  }
+  const relinkMatch = pathname.match(/^\/api\/files\/([^/]+)\/relink$/u);
+  if (!relinkMatch) return undefined;
+  let id: string;
+  try {
+    id = decodeURIComponent(relinkMatch[1]!);
+  } catch {
+    return undefined;
+  }
+  const file = fileManager.get(id);
+  if (file?.storage !== "referenced") return undefined;
+  return preloadRequestJsonBody(req).then(() =>
+    preloadPickedFilePaths(req, pickFiles, {
+      initialDirectory: pathDirname(file.path),
+      multiple: false,
+    }),
   );
 }
 
@@ -1714,6 +1919,76 @@ async function readJsonBody(req: http.IncomingMessage): Promise<unknown | undefi
   } catch {
     return undefined;
   }
+}
+
+class FileUploadTooLargeError extends Error {}
+
+async function readRawBody(req: http.IncomingMessage, maxBytes: number): Promise<Buffer> {
+  const declaredLength = Number(singleHeader(req.headers["content-length"]));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    req.resume();
+    throw new FileUploadTooLargeError(uploadLimitMessage(maxBytes));
+  }
+
+  const chunks: Buffer[] = [];
+  let total = 0;
+  let tooLarge = false;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buffer.length;
+    if (total > maxBytes) {
+      tooLarge = true;
+      chunks.length = 0;
+      continue;
+    }
+    if (!tooLarge) chunks.push(buffer);
+  }
+  if (tooLarge) throw new FileUploadTooLargeError(uploadLimitMessage(maxBytes));
+  return Buffer.concat(chunks, total);
+}
+
+function preloadRequestRawBody(req: http.IncomingMessage, maxBytes: number): Promise<Buffer> {
+  const existing = requestRawBodies.get(req);
+  if (existing) return existing;
+  const pending = readRawBody(req, maxBytes);
+  requestRawBodies.set(req, pending);
+  return pending;
+}
+
+function preloadPickedFilePaths(
+  req: http.IncomingMessage,
+  pickFiles: PickFiles,
+  options?: PickFilesOptions,
+): Promise<string[]> {
+  const existing = requestPickedFilePaths.get(req);
+  if (existing) return existing;
+  const pending = options
+    ? pickFiles(options)
+    : readJson<{ initialDirectory?: string }>(req).then((body) =>
+        pickFiles({
+          initialDirectory:
+            typeof body?.initialDirectory === "string" && body.initialDirectory.length > 0
+              ? body.initialDirectory
+              : undefined,
+          multiple: true,
+        }),
+      );
+  requestPickedFilePaths.set(req, pending);
+  return pending;
+}
+
+function uploadLimitMessage(maxBytes: number): string {
+  return maxBytes >= 1024 * 1024
+    ? `上传文件不能超过 ${Math.floor(maxBytes / (1024 * 1024))} MiB`
+    : `上传文件不能超过 ${maxBytes} bytes`;
+}
+
+function isCanvasFileKind(value: unknown): value is CanvasFileKind {
+  return value === "normal" || value === "shared";
+}
+
+function isCanvasFileImportMode(value: unknown): value is CanvasFileImportMode {
+  return value === "copy" || value === "reference";
 }
 
 function send(ws: WebSocket, frame: ServerFrame): void {
@@ -1877,7 +2152,12 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
 
     await deps.manager.importState(state?.agents);
     await deps.workspaceManager.validateCurrentProjectRoot();
-    await deps.fileManager.importState(state?.files);
+    await deps.fileManager.importState(state?.files, {
+      // WorkspaceManager loads only the canonical external paths authorized in the local project
+      // index. FileManager compares the persisted state against that independently trusted set,
+      // which also catches a canvas-state or parent-mapping swap during project loading.
+      trustedReferencedPaths: deps.workspaceManager.currentTrustedExternalFilePaths(),
+    });
     await deps.workspaceManager.validateCurrentProjectRoot();
     await deps.promptManager.importState(state?.prompts);
     await deps.workspaceManager.validateCurrentProjectRoot();

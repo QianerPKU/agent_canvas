@@ -1,4 +1,4 @@
-import { api } from "./api.js";
+import { ApiError, api, isPickedFileSelectionExpiredError } from "./api.js";
 
 describe("workspace partial-success responses", () => {
   afterEach(() => {
@@ -246,5 +246,119 @@ describe("workspace partial-success responses", () => {
     headers = new Headers((fetchMock.mock.calls[1]?.[1] as RequestInit).headers);
     expect(headers.get("X-Agent-Canvas-Project-Id")).toBe("project_b");
     expect(headers.get("X-Agent-Canvas-Project-Revision")).toBe("1");
+  });
+});
+
+describe("file import API", () => {
+  afterEach(() => {
+    api.setWorkspaceContext(undefined);
+    vi.unstubAllGlobals();
+  });
+
+  it("sends dropped file bytes as an octet stream while preserving the filename", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ file: { id: "file_1" } }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const upload = new Blob(["hello"], { type: "text/plain" }) as File;
+    Object.defineProperty(upload, "name", { value: "my notes.txt" });
+
+    await api.importUploadedFile(upload, "shared");
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/files/import-upload?filename=my%20notes.txt&kind=shared",
+    );
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(init.body).toBe(upload);
+    expect(new Headers(init.headers).get("Content-Type")).toBe("application/octet-stream");
+  });
+
+  it("passes the staged selection, import mode and node range", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ files: [] }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.importPickedFiles({
+      selectionId: "file_selection_1",
+      mode: "reference",
+      kind: "normal",
+    });
+
+    expect(JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body))).toEqual({
+      selectionId: "file_selection_1",
+      mode: "reference",
+      kind: "normal",
+    });
+  });
+
+  it("exposes a structured expired-selection response without parsing its message", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            code: "picked_selection_expired",
+            error: "localized server detail can change",
+          }),
+          {
+            status: 410,
+            headers: { "Content-Type": "application/json" },
+          },
+        ),
+      ),
+    );
+
+    let caught: unknown;
+    try {
+      await api.importPickedFiles({
+        selectionId: "file_selection_expired",
+        mode: "copy",
+        kind: "normal",
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(ApiError);
+    expect(caught).toMatchObject({ status: 410, code: "picked_selection_expired" });
+    expect(isPickedFileSelectionExpiredError(caught)).toBe(true);
+  });
+
+  it("keeps an upload on its captured workspace after the active project changes", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ file: { id: "file_1" } }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const workspace = (id: string, revision: number) => ({
+      canvasProject: {
+        id,
+        name: id,
+        projectRoot: `/projects/${id}`,
+        createdAt: 1,
+      },
+      revision,
+      projectRoot: `/projects/${id}`,
+      branches: [],
+      sharedResources: [],
+    });
+    api.setWorkspaceContext(workspace("project_a", 4));
+    const captured = api.captureWorkspaceContext();
+    api.setWorkspaceContext(workspace("project_b", 1));
+
+    await api.importUploadedFile(new File(["hello"], "notes.txt"), "normal", captured);
+
+    const headers = new Headers((fetchMock.mock.calls[0]?.[1] as RequestInit).headers);
+    expect(headers.get("X-Agent-Canvas-Project-Id")).toBe("project_a");
+    expect(headers.get("X-Agent-Canvas-Project-Revision")).toBe("4");
   });
 });

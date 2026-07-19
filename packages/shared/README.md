@@ -49,7 +49,7 @@ npm test --workspace packages/shared        # vitest
 
 `src/files.ts` 定义 `CanvasFileNode`、`CanvasFileConnection`、创建/更新输入，以及服务端解析后的 `AgentFileAccess`。普通节点通过 `read/write` 连线授权，共享节点通过全局读写开关授权。
 
-文件节点固定使用 `isolated` 存储，由后端放在用户本地数据目录的单节点隔离目录中。`CanvasFileKind="shared"` 只表示画布级全局文件引用授权，不等同于 `SharedResourceMount` 的跨 branch 共享资源映射。
+文件节点支持 `isolated` 与 `referenced` 两种存储：前者由后端复制或创建在 Canvas 项目的单节点隔离目录中；后者仅保存经原生文件选择器确认的外部文件路径，并用 `available/missing` 表示可用性。`PickedCanvasFileSelection` 是一次性的多文件选择凭据，`ImportPickedCanvasFilesInput.mode` 决定复制还是引用。引用节点只读，不允许写连线或 `sharedWrite`。`CanvasFileKind="shared"` 只表示画布级全局文件授权，不等同于 `SharedResourceMount` 的跨 branch 共享资源映射。
 
 ## Agent 设置模型
 

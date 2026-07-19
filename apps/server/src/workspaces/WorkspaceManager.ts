@@ -108,6 +108,14 @@ interface RelocatedWorkspace {
 
 interface ProjectIndex {
   projects: CanvasProjectSummary[];
+  externalFileAuthorizations: ProjectExternalFileAuthorization[];
+}
+
+interface ProjectExternalFileAuthorization {
+  /** Canonical project root. Kept outside portable project metadata on purpose. */
+  projectRoot: string;
+  /** Canonical external paths explicitly approved for this project. */
+  paths: string[];
 }
 
 interface WorkDocumentationContext {
@@ -191,6 +199,7 @@ interface BranchRefSnapshot {
 
 const DEFAULT_REPO_ID = "repo_1";
 const WORKSPACE_STATE_FILE = "workspace.json";
+const CANVAS_STATE_FILE = "canvas-state.json";
 const PROJECT_INDEX_FILE = "index.json";
 const WORKSPACE_SCHEMA = "agent-canvas/workspace";
 const WORKSPACE_VERSION = 1;
@@ -207,6 +216,8 @@ export class WorkspaceManager {
   private branchCounter = 0;
   private resourceCounter = 0;
   private projectRootBoundary?: ProjectRootBoundary;
+  /** Canonical paths loaded from the local project authorization index. */
+  private trustedExternalFilePaths?: Set<string>;
   private projectsRootBoundary?: ManagedTrustedRootBoundary;
   private documentationPrepareChain: Promise<void> = Promise.resolve();
   private projectMutationChain: Promise<void> = Promise.resolve();
@@ -245,6 +256,39 @@ export class WorkspaceManager {
     return this.currentProject?.id;
   }
 
+  currentTrustedExternalFilePaths(): string[] | undefined {
+    return this.trustedExternalFilePaths
+      ? [...this.trustedExternalFilePaths]
+      : undefined;
+  }
+
+  async trustExternalFilePaths(paths: string[]): Promise<string[]> {
+    return await this.queueProjectMutation(async () => {
+      await this.ensureProjectOpen();
+      const revision = this.captureProjectRevision();
+      const canonicalPaths = await canonicalizeExplicitExternalFilePaths(paths);
+      this.assertProjectRevision(revision);
+      await this.validateCurrentProjectRoot();
+
+      const boundary = this.currentProjectRootBoundary();
+      const { index, snapshot } = await this.readProjectIndexSnapshot();
+      this.assertProjectRevision(revision);
+      await assertProjectRootBoundary(this.requireProjectRoot(), boundary);
+
+      const mergedPaths = uniqueCanonicalPaths([
+        ...projectExternalFileAuthorizationPaths(index, boundary.realPath),
+        ...(this.trustedExternalFilePaths ?? []),
+        ...canonicalPaths,
+      ]);
+      await this.writeProjectIndex(
+        withProjectExternalFileAuthorization(index, boundary.realPath, mergedPaths),
+        snapshot ?? null,
+      );
+      this.trustedExternalFilePaths = new Set(mergedPaths);
+      return canonicalPaths;
+    });
+  }
+
   captureProjectRevision(): WorkspaceProjectRevision {
     const project = this.currentProject;
     const projectRoot = this.projectRoot;
@@ -271,6 +315,15 @@ export class WorkspaceManager {
   async listCanvasProjects(): Promise<CanvasProjectSummary[]> {
     if (this.currentProject) await this.ensureProjectOpen();
     const { index, snapshot: indexSnapshot } = await this.readProjectIndexSnapshot();
+    const projects = await this.collectCanvasProjects(index, true);
+    await this.writeProjectIndex({ ...index, projects }, indexSnapshot ?? null);
+    return projects;
+  }
+
+  private async collectCanvasProjects(
+    index: ProjectIndex,
+    refreshCurrentProject: boolean,
+  ): Promise<CanvasProjectSummary[]> {
     const byRoot = new Map<string, CanvasProjectSummary>();
     for (const indexed of index.projects) {
       try {
@@ -285,11 +338,14 @@ export class WorkspaceManager {
       const key = normalizedRootKey(discovered.projectRoot);
       if (!byRoot.has(key)) byRoot.set(key, discovered);
     }
-    if (this.currentProject) {
-      let current = this.currentProject;
+    const selectedProject = this.currentProject;
+    if (selectedProject) {
+      let current = selectedProject;
       try {
         current = await this.readProjectSummary(current.projectRoot);
-        this.currentProject = current;
+        if (refreshCurrentProject && this.currentProject === selectedProject) {
+          this.currentProject = current;
+        }
       } catch (error) {
         if (error instanceof ManagedFileSafetyError) throw error;
         // A configured project root may be intentionally empty until its first save.
@@ -300,7 +356,6 @@ export class WorkspaceManager {
     const projects = uniqueProjectIds([...byRoot.values()]).sort(
       (a, b) => (b.openedAt ?? b.createdAt) - (a.openedAt ?? a.createdAt),
     );
-    await this.writeProjectIndex(projects, indexSnapshot ?? null);
     return projects;
   }
 
@@ -343,6 +398,7 @@ export class WorkspaceManager {
       branchCounter: this.branchCounter,
       resourceCounter: this.resourceCounter,
       projectRootBoundary: this.projectRootBoundary,
+      trustedExternalFilePaths: this.trustedExternalFilePaths,
     };
     let selected = false;
     try {
@@ -360,6 +416,7 @@ export class WorkspaceManager {
       this.branchCounter = previousSelection.branchCounter;
       this.resourceCounter = previousSelection.resourceCounter;
       this.projectRootBoundary = previousSelection.projectRootBoundary;
+      this.trustedExternalFilePaths = previousSelection.trustedExternalFilePaths;
       const rollbackErrors: unknown[] = [];
       for (const directory of [...createdProjectDirectories].reverse()) {
         await collectRollbackError(rollbackErrors, () => removeCreatedDirectory(directory));
@@ -388,6 +445,7 @@ export class WorkspaceManager {
       this.branchCounter = 0;
       this.resourceCounter = 0;
       this.projectRootBoundary = undefined;
+      this.trustedExternalFilePaths = undefined;
     });
   }
 
@@ -395,7 +453,11 @@ export class WorkspaceManager {
     input: OpenCanvasProjectInput,
   ): Promise<WorkspaceProject> {
     const projectRoot = normalizeOptionalProjectRoot(input.projectRoot);
-    const projects = await this.listCanvasProjects();
+    // Opening must stay read-only until every external reference has been
+    // checked. Otherwise a failed first attempt could register the project and
+    // accidentally change the trust decision on retry.
+    const { index } = await this.readProjectIndexSnapshot();
+    const projects = await this.collectCanvasProjects(index, false);
     const indexed = input.id
       ? projects.find((candidate) => candidate.id === input.id)
       : undefined;
@@ -417,7 +479,27 @@ export class WorkspaceManager {
       );
     const openingBoundary = await captureProjectRootBoundary(resolvedRoot);
     const document = await this.readWorkspaceDocument(resolvedRoot, undefined, openingBoundary);
+    const externalFileReferences = await inspectCanvasExternalFileReferences(
+      resolvedRoot,
+      openingBoundary,
+    );
     await assertProjectRootBoundary(resolvedRoot, openingBoundary);
+    const explicitlyTrustedPaths = await canonicalizeExplicitExternalFilePaths(
+      input.trustedExternalFilePaths ?? [],
+    );
+    const referencedPathKeys = new Set(
+      externalFileReferences.map((reference) => normalizedRootKey(reference.path)),
+    );
+    const trustedExternalFilePaths = uniqueCanonicalPaths([
+      ...projectExternalFileAuthorizationPaths(index, openingBoundary.realPath),
+      ...explicitlyTrustedPaths.filter((filePath) =>
+        referencedPathKeys.has(normalizedRootKey(filePath))),
+    ]);
+    assertExternalFileReferencesTrusted(
+      resolvedRoot,
+      externalFileReferences,
+      trustedExternalFilePaths,
+    );
     const relocated = relocateWorkspace(document, resolvedRoot, {
       requireExternalTrust: !registered,
       trustedExternalResourcePaths: input.trustedExternalResourcePaths,
@@ -443,9 +525,15 @@ export class WorkspaceManager {
       branchCounter: this.branchCounter,
       resourceCounter: this.resourceCounter,
       projectRootBoundary: this.projectRootBoundary,
+      trustedExternalFilePaths: this.trustedExternalFilePaths,
     };
-    await this.selectProject(opened, { ...relocated.state, project: opened }, openingBoundary);
     try {
+      await this.selectProject(
+        opened,
+        { ...relocated.state, project: opened },
+        openingBoundary,
+        trustedExternalFilePaths,
+      );
       await this.saveState();
       return this.snapshot();
     } catch (error) {
@@ -457,6 +545,7 @@ export class WorkspaceManager {
       this.branchCounter = previousSelection.branchCounter;
       this.resourceCounter = previousSelection.resourceCounter;
       this.projectRootBoundary = previousSelection.projectRootBoundary;
+      this.trustedExternalFilePaths = previousSelection.trustedExternalFilePaths;
       throw error;
     }
   }
@@ -468,10 +557,15 @@ export class WorkspaceManager {
     const relocated = relocateWorkspace(document, resolvedRoot, {
       requireExternalTrust: false,
     });
+    const externalFileReferences = await inspectCanvasExternalFileReferences(
+      resolvedRoot,
+      boundary,
+    );
     await validateRelocatedWorkspaceRoots(resolvedRoot, relocated.state);
     return {
       project: relocated.project,
       externalSharedResources: relocated.externalSharedResources,
+      externalFileReferences,
     };
   }
 
@@ -513,11 +607,18 @@ export class WorkspaceManager {
     });
     try {
       await this.writeProjectIndex(
-        index.projects.filter(
-          (candidate) =>
-            candidate.id !== id &&
-            normalizedRootKey(candidate.projectRoot) !== normalizedRootKey(projectRoot),
-        ),
+        {
+          projects: index.projects.filter(
+            (candidate) =>
+              candidate.id !== id &&
+              normalizedRootKey(candidate.projectRoot) !== normalizedRootKey(projectRoot),
+          ),
+          externalFileAuthorizations: index.externalFileAuthorizations.filter(
+            (authorization) =>
+              normalizedRootKey(authorization.projectRoot) !==
+              normalizedRootKey(boundary.realPath),
+          ),
+        },
         indexSnapshot ?? null,
       );
     } catch (error) {
@@ -1642,6 +1743,7 @@ export class WorkspaceManager {
     project: CanvasProjectSummary,
     state?: WorkspaceState,
     boundary?: ProjectRootBoundary,
+    trustedExternalFilePaths: string[] = [],
   ): Promise<void> {
     const resolvedRoot = path.resolve(project.projectRoot);
     const selectedBoundary = boundary ?? await captureProjectRootBoundary(resolvedRoot);
@@ -1650,6 +1752,7 @@ export class WorkspaceManager {
     this.currentProject = { ...project, projectRoot: resolvedRoot };
     this.projectRoot = this.currentProject.projectRoot;
     this.projectRootBoundary = selectedBoundary;
+    this.trustedExternalFilePaths = new Set(uniqueCanonicalPaths(trustedExternalFilePaths));
     this.state = state ?? { branches: [], sharedResources: [] };
     this.stateLoaded = state !== undefined;
     this.branchCounter = maxNumericSuffix(this.state.branches.map((branch) => branch.id));
@@ -1660,6 +1763,7 @@ export class WorkspaceManager {
 
   private clearSelectedProject(): void {
     this.projectRootBoundary = undefined;
+    this.trustedExternalFilePaths = undefined;
     this.projectRoot = undefined;
     this.currentProject = undefined;
     this.state = { branches: [], sharedResources: [] };
@@ -1679,6 +1783,25 @@ export class WorkspaceManager {
         this.projectRootBoundary = await captureProjectRootBoundary(this.projectRoot);
       } else {
         await assertProjectRootBoundary(this.projectRoot, this.projectRootBoundary);
+      }
+      if (!this.trustedExternalFilePaths) {
+        const boundary = this.currentProjectRootBoundary();
+        const { index } = await this.readProjectIndexSnapshot();
+        const references = await inspectCanvasExternalFileReferences(
+          this.projectRoot,
+          boundary,
+        );
+        await assertProjectRootBoundary(this.projectRoot, boundary);
+        const authorizedPaths = projectExternalFileAuthorizationPaths(
+          index,
+          boundary.realPath,
+        );
+        assertExternalFileReferencesTrusted(
+          this.projectRoot,
+          references,
+          authorizedPaths,
+        );
+        this.trustedExternalFilePaths = new Set(authorizedPaths);
       }
       return;
     }
@@ -1824,7 +1947,12 @@ export class WorkspaceManager {
               normalizedRootKey(this.currentProject!.projectRoot),
         ),
       ];
-      await this.writeProjectIndex(projects, indexSnapshot ?? null);
+      const indexWithAuthorization = withProjectExternalFileAuthorization(
+        { ...index, projects },
+        this.currentProjectRootBoundary().realPath,
+        [...(this.trustedExternalFilePaths ?? [])],
+      );
+      await this.writeProjectIndex(indexWithAuthorization, indexSnapshot ?? null);
     } catch (error) {
       try {
         if (workspaceSnapshot) {
@@ -2964,13 +3092,13 @@ export class WorkspaceManager {
   }
 
   private async writeProjectIndex(
-    projects: CanvasProjectSummary[],
+    index: ProjectIndex,
     expectedSnapshot?: ManagedFileSnapshot | null,
   ): Promise<ManagedFileSnapshot> {
     const projectsRootBoundary = await this.ensureProjectsRootBoundary();
     return await writeManagedFileAtomically(
       this.projectIndexPath(),
-      `${JSON.stringify({ projects }, undefined, 2)}\n`,
+      `${JSON.stringify(index, undefined, 2)}\n`,
       {
         label: "Canvas project index",
         trustedRootBoundary: projectsRootBoundary,
@@ -3317,13 +3445,133 @@ function sameFileSystemPath(left: string, right: string): boolean {
 }
 
 function parseProjectIndex(content: string | undefined): ProjectIndex {
-  if (content === undefined) return { projects: [] };
+  if (content === undefined) return { projects: [], externalFileAuthorizations: [] };
   try {
-    const parsed = JSON.parse(content) as ProjectIndex;
-    return { projects: Array.isArray(parsed.projects) ? parsed.projects : [] };
+    const parsed = JSON.parse(content) as Partial<ProjectIndex>;
+    const externalFileAuthorizations = Array.isArray(parsed.externalFileAuthorizations)
+      ? parsed.externalFileAuthorizations.flatMap((value): ProjectExternalFileAuthorization[] => {
+          if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+          const candidate = value as Partial<ProjectExternalFileAuthorization>;
+          if (
+            typeof candidate.projectRoot !== "string" ||
+            !path.isAbsolute(candidate.projectRoot) ||
+            !Array.isArray(candidate.paths)
+          ) {
+            return [];
+          }
+          const authorizedPaths = candidate.paths.filter(
+            (filePath): filePath is string =>
+              typeof filePath === "string" && path.isAbsolute(filePath),
+          );
+          if (authorizedPaths.length === 0) return [];
+          return [{
+            projectRoot: path.resolve(candidate.projectRoot),
+            paths: uniqueCanonicalPaths(authorizedPaths),
+          }];
+        })
+      : [];
+    return {
+      projects: Array.isArray(parsed.projects) ? parsed.projects : [],
+      externalFileAuthorizations: mergeProjectExternalFileAuthorizations(
+        externalFileAuthorizations,
+      ),
+    };
   } catch (error) {
-    if (error instanceof SyntaxError) return { projects: [] };
+    if (error instanceof SyntaxError) {
+      return { projects: [], externalFileAuthorizations: [] };
+    }
     throw error;
+  }
+}
+
+function projectExternalFileAuthorizationPaths(
+  index: ProjectIndex,
+  canonicalProjectRoot: string,
+): string[] {
+  const key = normalizedRootKey(canonicalProjectRoot);
+  return uniqueCanonicalPaths(
+    index.externalFileAuthorizations
+      .filter((authorization) => normalizedRootKey(authorization.projectRoot) === key)
+      .flatMap((authorization) => authorization.paths),
+  );
+}
+
+function withProjectExternalFileAuthorization(
+  index: ProjectIndex,
+  canonicalProjectRoot: string,
+  authorizedPaths: string[],
+): ProjectIndex {
+  const resolvedProjectRoot = path.resolve(canonicalProjectRoot);
+  const projectRootKey = normalizedRootKey(resolvedProjectRoot);
+  const remaining = index.externalFileAuthorizations.filter(
+    (authorization) => normalizedRootKey(authorization.projectRoot) !== projectRootKey,
+  );
+  const paths = uniqueCanonicalPaths(authorizedPaths);
+  return {
+    projects: index.projects,
+    externalFileAuthorizations: paths.length > 0
+      ? [...remaining, { projectRoot: resolvedProjectRoot, paths }]
+      : remaining,
+  };
+}
+
+function mergeProjectExternalFileAuthorizations(
+  authorizations: ProjectExternalFileAuthorization[],
+): ProjectExternalFileAuthorization[] {
+  const byRoot = new Map<string, ProjectExternalFileAuthorization>();
+  for (const authorization of authorizations) {
+    const projectRoot = path.resolve(authorization.projectRoot);
+    const key = normalizedRootKey(projectRoot);
+    const existing = byRoot.get(key);
+    byRoot.set(key, {
+      projectRoot: existing?.projectRoot ?? projectRoot,
+      paths: uniqueCanonicalPaths([
+        ...(existing?.paths ?? []),
+        ...authorization.paths,
+      ]),
+    });
+  }
+  return [...byRoot.values()];
+}
+
+function uniqueCanonicalPaths(paths: Iterable<string>): string[] {
+  const byKey = new Map<string, string>();
+  for (const filePath of paths) {
+    const resolved = path.resolve(filePath);
+    const key = normalizedRootKey(resolved);
+    if (!byKey.has(key)) byKey.set(key, resolved);
+  }
+  return [...byKey.values()];
+}
+
+async function canonicalizeExplicitExternalFilePaths(paths: string[]): Promise<string[]> {
+  const canonicalPaths = await Promise.all(paths.map(async (filePath) => {
+    if (typeof filePath !== "string" || !path.isAbsolute(filePath)) {
+      throw new Error(`External file authorization path must be absolute: ${String(filePath)}`);
+    }
+    return await canonicalizeExternalFilePath(filePath);
+  }));
+  return uniqueCanonicalPaths(canonicalPaths);
+}
+
+async function canonicalizeExternalFilePath(filePath: string): Promise<string> {
+  let existingAncestor = path.resolve(filePath);
+  const missingSegments: string[] = [];
+  while (true) {
+    try {
+      const canonicalAncestor = await realpath(existingAncestor);
+      return path.resolve(canonicalAncestor, ...missingSegments);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = path.dirname(existingAncestor);
+      if (parent === existingAncestor) {
+        // Offline drives and unavailable network shares may not expose any existing ancestor.
+        // Keep the absolute lexical path so the node can load as missing after explicit trust.
+        return path.resolve(existingAncestor, ...missingSegments);
+      }
+      missingSegments.unshift(path.basename(existingAncestor));
+      existingAncestor = parent;
+    }
   }
 }
 
@@ -4177,6 +4425,64 @@ function parseSharedResource(value: unknown, projectRoot: string): SharedResourc
     access,
     createdAt: requiredTimestamp(record.createdAt, "sharedResource.createdAt", projectRoot),
   };
+}
+
+async function inspectCanvasExternalFileReferences(
+  projectRoot: string,
+  trustedRootBoundary: ManagedTrustedRootBoundary,
+): Promise<CanvasProjectInspection["externalFileReferences"]> {
+  const snapshot = await readManagedFileSnapshot(path.join(projectRoot, CANVAS_STATE_FILE), {
+    allowMissing: true,
+    allowParentMapping: true,
+    label: "canvas state",
+    trustedRootBoundary,
+  });
+  if (!snapshot) return [];
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(snapshot.content) as unknown;
+  } catch {
+    throw invalidWorkspace(projectRoot, "canvas-state.json 不是有效 JSON");
+  }
+  const state = requiredRecord(parsed, "canvas state", projectRoot);
+  if (state.version !== 1) {
+    throw invalidWorkspace(projectRoot, "canvas-state.json version 必须为 1");
+  }
+  if (state.files === undefined) return [];
+  const fileState = requiredRecord(state.files, "canvas file state", projectRoot);
+  if (fileState.files === undefined) return [];
+  if (!Array.isArray(fileState.files)) {
+    throw invalidWorkspace(projectRoot, "canvas files 必须为数组");
+  }
+
+  const references: CanvasProjectInspection["externalFileReferences"] = [];
+  for (const value of fileState.files) {
+    const file = requiredRecord(value, "canvas file", projectRoot);
+    if (file.storage !== "referenced") continue;
+    const storedPath = requiredAbsolutePath(file.path, "canvasFile.path", projectRoot);
+    references.push({
+      id: requiredIdentifier(file.id, "canvasFile.id", projectRoot),
+      name: requiredString(file.name, "canvasFile.name", projectRoot),
+      path: await canonicalizeExternalFilePath(storedPath),
+    });
+  }
+  return references;
+}
+
+function assertExternalFileReferencesTrusted(
+  projectRoot: string,
+  references: CanvasProjectInspection["externalFileReferences"],
+  trustedPaths: string[],
+): void {
+  const trusted = new Set(
+    trustedPaths.map((filePath) => normalizedRootKey(path.resolve(filePath))),
+  );
+  for (const reference of references) {
+    if (!trusted.has(normalizedRootKey(reference.path))) {
+      throw new Error(`外部文件引用需要重新授权: ${reference.path}`);
+    }
+  }
 }
 
 function relocateWorkspace(

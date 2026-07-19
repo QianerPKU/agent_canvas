@@ -11,6 +11,7 @@ import type {
   AgentQuestionResponse,
   AgentSettings,
   CanvasFileConnection,
+  CanvasFileKind,
   CanvasFileNode,
   CanvasPromptConnection,
   CanvasPromptNode,
@@ -20,6 +21,8 @@ import type {
   CreatePullRequestFlowInput,
   CreateSyncFlowInput,
   FileConnectionAccess,
+  ImportPickedCanvasFilesInput,
+  PickedCanvasFileSelection,
   PullRequestCreatedInput,
   PullRequestFlowSnapshot,
   PromptConnectionAccess,
@@ -31,7 +34,7 @@ import type {
   UpdateAgentSettingsInput,
   WorkspaceProject,
 } from "@agent-canvas/shared";
-import { api } from "./api.js";
+import { api, type WorkspaceRequestContext } from "./api.js";
 import {
   applyEnvelope,
   applyHello,
@@ -119,6 +122,16 @@ export function workspaceEventIdentity(workspace?: WorkspaceProject): string {
 
 export interface FileActions {
   create: (input: CreateCanvasFileInput) => Promise<CanvasFileNode>;
+  pick: () => Promise<PickedCanvasFileSelection | null>;
+  releasePickedSelection: (selectionId: string) => Promise<void>;
+  importPicked: (input: ImportPickedCanvasFilesInput) => Promise<CanvasFileNode[]>;
+  importDropped: (
+    files: File[],
+    kind: CanvasFileKind,
+    onImported?: (file: CanvasFileNode, sourceIndex: number) => void,
+  ) => Promise<DroppedFileImportResult>;
+  relink: (id: string) => Promise<CanvasFileNode | null>;
+  refresh: (id: string) => Promise<CanvasFileNode | null>;
   update: (id: string, input: UpdateCanvasFileInput) => Promise<void>;
   connect: (
     fileId: string,
@@ -126,6 +139,16 @@ export interface FileActions {
     access: FileConnectionAccess,
   ) => Promise<void>;
   disconnect: (connectionId: string) => Promise<void>;
+}
+
+export interface DroppedFileImportFailure {
+  file: File;
+  reason: string;
+}
+
+export interface DroppedFileImportResult {
+  imported: CanvasFileNode[];
+  failures: DroppedFileImportFailure[];
 }
 
 export interface PromptActions {
@@ -174,6 +197,9 @@ export function useAgentCanvas(): UseAgentCanvas {
   const workspaceEventGenerationRef = useRef(0);
   const workspaceEventIdentityRef = useRef<string>();
   const latestWorkspaceVersionRef = useRef<{ projectId: string; revision: number }>();
+  const pickedSelectionContextsRef = useRef(
+    new Map<string, WorkspaceRequestContext>(),
+  );
   const currentWorkspaceEventGeneration = useCallback(
     () => workspaceEventGenerationRef.current,
     [],
@@ -481,6 +507,92 @@ export function useAgentCanvas(): UseAgentCanvas {
           setFiles((current) => upsertFile(current, file));
         }
         return file;
+      },
+      pick: async () => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
+        const workspaceContext = api.captureWorkspaceContext();
+        if (!workspaceContext) throw new Error("当前项目上下文尚未就绪，请稍后重试");
+        const selection = await api.pickFiles(workspaceContext);
+        if (!selection) return null;
+        if (workspaceGeneration !== workspaceEventGenerationRef.current) {
+          await api.releasePickedSelection(selection.id, workspaceContext).catch(() => undefined);
+          throw new Error("文件选择期间项目已切换，请在当前项目中重新浏览");
+        }
+        pickedSelectionContextsRef.current.set(selection.id, workspaceContext);
+        return selection;
+      },
+      releasePickedSelection: async (selectionId) => {
+        const workspaceContext = pickedSelectionContextsRef.current.get(selectionId);
+        pickedSelectionContextsRef.current.delete(selectionId);
+        await api.releasePickedSelection(selectionId, workspaceContext);
+      },
+      importPicked: async (input) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
+        const workspaceContext =
+          pickedSelectionContextsRef.current.get(input.selectionId) ??
+          api.captureWorkspaceContext();
+        const imported = await api.importPickedFiles(input, workspaceContext);
+        pickedSelectionContextsRef.current.delete(input.selectionId);
+        if (workspaceGeneration === workspaceEventGenerationRef.current) {
+          setFiles((current) => imported.reduce(upsertFile, current));
+        }
+        return imported;
+      },
+      importDropped: async (dropped, kind, onImported) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
+        const workspaceContext = api.captureWorkspaceContext();
+        const imported: CanvasFileNode[] = [];
+        const failures: DroppedFileImportFailure[] = [];
+        if (!workspaceContext) {
+          return {
+            imported,
+            failures: dropped.map((file) => ({
+              file,
+              reason: "当前项目上下文尚未就绪，请稍后重试",
+            })),
+          };
+        }
+
+        for (let index = 0; index < dropped.length; index += 1) {
+          const file = dropped[index]!;
+          if (workspaceGeneration !== workspaceEventGenerationRef.current) {
+            for (const remaining of dropped.slice(index)) {
+              failures.push({ file: remaining, reason: "项目已切换，请在当前项目中重新拖入" });
+            }
+            break;
+          }
+          try {
+            const created = await api.importUploadedFile(file, kind, workspaceContext);
+            imported.push(created);
+            if (workspaceGeneration === workspaceEventGenerationRef.current) {
+              setFiles((current) => upsertFile(current, created));
+              onImported?.(created, index);
+            }
+          } catch (reason) {
+            failures.push({
+              file,
+              reason: reason instanceof Error ? reason.message : String(reason),
+            });
+          }
+        }
+        return { imported, failures };
+      },
+      relink: async (id) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
+        const file = await api.relinkFile(id);
+        if (file && workspaceGeneration === workspaceEventGenerationRef.current) {
+          setFiles((current) => upsertFile(current, file));
+        }
+        return file;
+      },
+      refresh: async (id) => {
+        const workspaceGeneration = workspaceEventGenerationRef.current;
+        const file = await api.refreshFile(id);
+        if (workspaceGeneration === workspaceEventGenerationRef.current) {
+          setFiles((current) => upsertFile(current, file));
+          return file;
+        }
+        return null;
       },
       update: async (id, input) => {
         const workspaceGeneration = workspaceEventGenerationRef.current;

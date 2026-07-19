@@ -18,6 +18,7 @@ import type {
   CodexLoginSession,
   CanvasProjectSummary,
   CanvasFileConnection,
+  CanvasFileKind,
   CanvasFileNode,
   CanvasPromptConnection,
   CanvasPromptNode,
@@ -29,6 +30,8 @@ import type {
   CreatePullRequestFlowInput,
   CreateSyncFlowInput,
   FileConnectionAccess,
+  ImportPickedCanvasFilesInput,
+  PickedCanvasFileSelection,
   ForkAgentInput,
   ForkOrigin,
   OpenCanvasProjectInput,
@@ -42,6 +45,7 @@ import type {
   UpdateCanvasPromptInput,
   WorkspaceProject,
 } from "@agent-canvas/shared";
+import { PICKED_FILE_SELECTION_EXPIRED_CODE } from "@agent-canvas/shared";
 
 const BASE = "/api";
 
@@ -61,14 +65,45 @@ let activeWorkspaceContext:
   | { canvasProjectId: string; revision: number }
   | undefined;
 
-async function call<T>(path: string, init?: RequestInit): Promise<T> {
+export interface WorkspaceRequestContext {
+  canvasProjectId: string;
+  revision: number;
+}
+
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code?: string;
+  readonly responseText: string;
+
+  constructor(status: number, responseText: string, code?: string) {
+    super(`${status} ${responseText}`);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+    this.responseText = responseText;
+  }
+}
+
+export function isPickedFileSelectionExpiredError(error: unknown): error is ApiError {
+  return (
+    error instanceof ApiError &&
+    error.status === 410 &&
+    error.code === PICKED_FILE_SELECTION_EXPIRED_CODE
+  );
+}
+
+async function call<T>(
+  path: string,
+  init?: RequestInit,
+  workspaceContext: WorkspaceRequestContext | undefined = activeWorkspaceContext,
+): Promise<T> {
   const headers = new Headers(init?.headers);
   if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-  if (activeWorkspaceContext) {
-    headers.set("X-Agent-Canvas-Project-Id", activeWorkspaceContext.canvasProjectId);
+  if (workspaceContext) {
+    headers.set("X-Agent-Canvas-Project-Id", workspaceContext.canvasProjectId);
     headers.set(
       "X-Agent-Canvas-Project-Revision",
-      String(activeWorkspaceContext.revision),
+      String(workspaceContext.revision),
     );
   }
   const res = await fetch(BASE + path, {
@@ -76,14 +111,25 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
     headers,
   });
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`${res.status} ${text}`);
+    const responseText = await res.text().catch(() => "");
+    throw new ApiError(res.status, responseText, responseErrorCode(responseText));
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
 }
 
+function responseErrorCode(responseText: string): string | undefined {
+  try {
+    const parsed = JSON.parse(responseText) as { code?: unknown };
+    return typeof parsed?.code === "string" ? parsed.code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export const api = {
+  captureWorkspaceContext: (): WorkspaceRequestContext | undefined =>
+    activeWorkspaceContext ? { ...activeWorkspaceContext } : undefined,
   setWorkspaceContext: (workspace?: WorkspaceProject) => {
     const canvasProjectId = workspace?.canvasProject?.id?.trim();
     const revision = workspace?.revision;
@@ -268,6 +314,50 @@ export const api = {
     call<{ file: CanvasFileNode }>("/files", {
       method: "POST",
       body: JSON.stringify(input),
+    }).then((r) => r.file),
+  pickFiles: (workspaceContext?: WorkspaceRequestContext) =>
+    call<{ selection: PickedCanvasFileSelection | null }>("/files/pick", {
+      method: "POST",
+      body: JSON.stringify({}),
+    }, workspaceContext).then((r) => r.selection),
+  releasePickedSelection: (
+    selectionId: string,
+    workspaceContext?: WorkspaceRequestContext,
+  ) =>
+    call<void>(`/files/pick/${encodeURIComponent(selectionId)}`, {
+      method: "DELETE",
+    }, workspaceContext),
+  importPickedFiles: (
+    input: ImportPickedCanvasFilesInput,
+    workspaceContext?: WorkspaceRequestContext,
+  ) =>
+    call<{ files: CanvasFileNode[] }>("/files/import-picked", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }, workspaceContext).then((r) => r.files),
+  importUploadedFile: (
+    file: File,
+    kind: CanvasFileKind,
+    workspaceContext?: WorkspaceRequestContext,
+  ) =>
+    call<{ file: CanvasFileNode }>(
+      `/files/import-upload?filename=${encodeURIComponent(file.name)}&kind=${encodeURIComponent(kind)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: file,
+      },
+      workspaceContext,
+    ).then((r) => r.file),
+  refreshFile: (id: string) =>
+    call<{ file: CanvasFileNode }>(`/files/${encodeURIComponent(id)}/refresh`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }).then((r) => r.file),
+  relinkFile: (id: string) =>
+    call<{ file: CanvasFileNode | null }>(`/files/${encodeURIComponent(id)}/relink`, {
+      method: "POST",
+      body: JSON.stringify({}),
     }).then((r) => r.file),
   updateFile: (id: string, input: UpdateCanvasFileInput) =>
     call<{ file: CanvasFileNode }>(`/files/${id}`, {

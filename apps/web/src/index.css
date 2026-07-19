@@ -797,6 +797,10 @@ button:disabled {
   gap: 4px;
 }
 
+.file-node__rename--referenced {
+  grid-template-columns: minmax(70px, 1fr) 28px 28px;
+}
+
 .file-node__rename input {
   min-width: 0;
   height: 28px;
@@ -815,6 +819,10 @@ button:disabled {
   background: #fff;
   cursor: pointer;
   outline: none;
+}
+
+.file-node__preview--missing {
+  cursor: default;
 }
 
 .file-node__preview:focus-visible {
@@ -860,6 +868,57 @@ button:disabled {
   display: block;
   padding: 10px;
   color: #b91c1c;
+  font-size: 11px;
+}
+
+.file-node__reference-error {
+  min-height: 100%;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 7px;
+  padding: 14px;
+  color: #991b1b;
+  background: #fef2f2;
+  text-align: center;
+}
+
+.file-node__binary--error {
+  color: #b91c1c;
+  background: #fef2f2;
+}
+
+.file-node__binary--error strong {
+  font-size: 12px;
+}
+
+.file-node__reference-error strong {
+  font-size: 12px;
+}
+
+.file-node__reference-error span {
+  max-width: 260px;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.file-node__reference-error button,
+.file-dialog__selection button,
+.file-dialog__browse {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border: 1px solid #cbd5e1;
+  border-radius: 5px;
+  color: #334155;
+  background: #fff;
+  cursor: pointer;
+}
+
+.file-node__reference-error button {
+  min-height: 28px;
+  padding: 4px 8px;
   font-size: 11px;
 }
 
@@ -1158,6 +1217,97 @@ button:disabled {
   gap: 6px;
 }
 
+.file-dialog__filename--browse {
+  grid-template-columns: minmax(0, 1fr) 90px auto;
+}
+
+.file-dialog__browse {
+  min-width: 76px;
+  height: 34px;
+  padding: 5px 9px;
+  font-size: 12px;
+}
+
+.file-dialog__selection {
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px 0;
+}
+
+.file-dialog__selection > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #475569;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.file-dialog__selection button {
+  min-height: 28px;
+  padding: 4px 8px;
+  font-size: 11px;
+}
+
+.file-dialog__selection ul {
+  max-height: 180px;
+  overflow: auto;
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.file-dialog__selection li {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: #f1f5f9;
+  font-size: 11px;
+}
+
+.file-dialog__selection li strong {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-dialog__selection li span {
+  flex: none;
+  color: #64748b;
+}
+
+.file-dialog__hint {
+  margin: 0;
+  color: #64748b;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.file-dialog__drop-mode {
+  display: grid;
+  gap: 4px;
+  margin: 14px 16px 0;
+  padding: 9px 10px;
+  border: 1px solid #bfdbfe;
+  border-radius: 5px;
+  color: #1e3a8a;
+  background: #eff6ff;
+  font-size: 11px;
+}
+
+.file-dialog__drop-mode span {
+  color: #475569;
+  line-height: 1.45;
+}
+
 .file-dialog__path {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 34px;
@@ -1297,6 +1447,7 @@ button:disabled {
   color: #991b1b;
   background: #fef2f2;
   font-size: 11px;
+  white-space: pre-wrap;
 }
 
 .file-dialog > footer {

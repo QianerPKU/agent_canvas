@@ -11,6 +11,7 @@ import { AgentManager } from "./AgentManager.js";
 import { CommitManager } from "./commits/CommitManager.js";
 import { createServer } from "./server.js";
 import { FileManager } from "./files/FileManager.js";
+import type { PickFiles } from "./files/FilePicker.js";
 import type { OpenInVscodeOptions } from "./files/VscodeFileOpener.js";
 import { PromptManager } from "./prompts/PromptManager.js";
 import { PullRequestFlowManager } from "./pullRequests/PullRequestFlowManager.js";
@@ -235,6 +236,49 @@ function rawRequest(
   });
 }
 
+async function uploadRequest(
+  port: number,
+  requestPath: string,
+  data: Buffer,
+  extraHeaders: Record<string, string> = {},
+): Promise<Resp> {
+  if (!requestWorkspaceContext) await request(port, "GET", "/api/workspace");
+  const response = await new Promise<Resp>((resolve, reject) => {
+    const req = http.request(
+      {
+        host: "127.0.0.1",
+        port,
+        method: "POST",
+        path: requestPath,
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "Content-Length": String(data.length),
+          ...(requestWorkspaceContext
+            ? {
+                "X-Agent-Canvas-Project-Id": requestWorkspaceContext.canvasProjectId,
+                "X-Agent-Canvas-Project-Revision": String(requestWorkspaceContext.revision),
+              }
+            : {}),
+          ...extraHeaders,
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf-8");
+          resolve({ status: res.statusCode ?? 0, json: text ? JSON.parse(text) : undefined });
+        });
+      },
+    );
+    req.on("error", reject);
+    if (data.length > 0) req.write(data);
+    req.end();
+  });
+  updateTestWorkspaceContext(response.json);
+  return response;
+}
+
 function requiresTestProjectContext(method: string, requestPath: string): boolean {
   if (["GET", "HEAD", "OPTIONS"].includes(method)) return false;
   const pathname = new URL(requestPath, "http://localhost").pathname;
@@ -336,6 +380,7 @@ describe("HTTP server", () => {
   const pickDirectory = vi
     .fn<(initialDirectory?: string) => Promise<string | undefined>>()
     .mockResolvedValue("C:\\picked");
+  const pickFiles = vi.fn<PickFiles>().mockResolvedValue([]);
 
   beforeAll(async () => {
     manager = new AgentManager({
@@ -402,6 +447,8 @@ describe("HTTP server", () => {
       defaultCwd: root,
       openFile,
       pickDirectory,
+      pickFiles,
+      maxFileUploadBytes: 16,
       promptManager,
       workspaceManager,
       syncFlowManager,
@@ -1195,6 +1242,306 @@ describe("HTTP server", () => {
     expect(rejected.status).toBe(400);
   });
 
+  it("stages a multi-file native selection and imports an exact copy", async () => {
+    const firstPath = path.join(root, "picked-one.txt");
+    const secondPath = path.join(root, "picked-two.png");
+    await Promise.all([
+      writeFile(firstPath, "picked text", "utf-8"),
+      writeFile(secondPath, Buffer.from([0, 1, 2, 255])),
+    ]);
+    pickFiles.mockResolvedValueOnce([firstPath, secondPath]);
+
+    const picked = await request(port, "POST", "/api/files/pick", {
+      initialDirectory: root,
+    });
+    expect(picked.status).toBe(200);
+    expect(picked.json.selection).toMatchObject({
+      id: expect.any(String),
+      files: [
+        { name: "picked-one", extension: "txt", filename: "picked-one.txt", size: 11 },
+        { name: "picked-two", extension: "png", filename: "picked-two.png", size: 4 },
+      ],
+    });
+    expect(picked.json.selection.files[0]).not.toHaveProperty("path");
+    expect(pickFiles).toHaveBeenLastCalledWith({
+      initialDirectory: root,
+      multiple: true,
+    });
+
+    const imported = await request(port, "POST", "/api/files/import-picked", {
+      selectionId: picked.json.selection.id,
+      mode: "copy",
+      kind: "shared",
+    });
+    expect(imported.status).toBe(201);
+    expect(imported.json.files).toHaveLength(2);
+    expect(imported.json.files[0]).toMatchObject({
+      filename: "picked-one.txt",
+      storage: "isolated",
+      kind: "shared",
+      availability: "available",
+    });
+    await expect(readFile(imported.json.files[0].path, "utf-8")).resolves.toBe("picked text");
+    await expect(readFile(imported.json.files[1].path)).resolves.toEqual(
+      Buffer.from([0, 1, 2, 255]),
+    );
+  });
+
+  it("returns null when native file selection is cancelled", async () => {
+    pickFiles.mockResolvedValueOnce([]);
+
+    const picked = await request(port, "POST", "/api/files/pick", {});
+
+    expect(picked).toEqual({ status: 200, json: { selection: null } });
+  });
+
+  it("does not hold the project transaction while the native picker is open", async () => {
+    let finishPicking!: (paths: string[]) => void;
+    const previousPickCalls = pickFiles.mock.calls.length;
+    pickFiles.mockReturnValueOnce(new Promise<string[]>((resolve) => {
+      finishPicking = resolve;
+    }));
+
+    const pendingPick = request(port, "POST", "/api/files/pick", {});
+    await vi.waitFor(() => expect(pickFiles).toHaveBeenCalledTimes(previousPickCalls + 1));
+    let workspaceWhilePicking: Resp;
+    try {
+      workspaceWhilePicking = await Promise.race([
+        request(port, "GET", "/api/workspace"),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("workspace request was blocked by native picker")), 200),
+        ),
+      ]);
+    } finally {
+      finishPicking([]);
+    }
+    expect(workspaceWhilePicking.status).toBe(200);
+
+    await expect(pendingPick).resolves.toEqual({ status: 200, json: { selection: null } });
+  });
+
+  it("does not open a native picker before project headers are validated", async () => {
+    const previousPickCalls = pickFiles.mock.calls.length;
+
+    const rejected = await rawRequest(port, "POST", "/api/files/pick", {});
+
+    expect(rejected.status).toBe(409);
+    expect(pickFiles).toHaveBeenCalledTimes(previousPickCalls);
+  });
+
+  it("imports and relinks a read-only referenced file with a single-file picker", async () => {
+    const sourcePath = path.join(root, "reference-source.txt");
+    const replacementPath = path.join(root, "reference-replacement.txt");
+    await Promise.all([
+      writeFile(sourcePath, "source", "utf-8"),
+      writeFile(replacementPath, "replacement", "utf-8"),
+    ]);
+    pickFiles.mockResolvedValueOnce([sourcePath]);
+    const picked = await request(port, "POST", "/api/files/pick", {});
+    const imported = await request(port, "POST", "/api/files/import-picked", {
+      selectionId: picked.json.selection.id,
+      mode: "reference",
+      kind: "normal",
+    });
+    expect(imported.status).toBe(201);
+    const referenced = imported.json.files[0];
+    expect(referenced).toMatchObject({
+      path: sourcePath,
+      storage: "referenced",
+      availability: "available",
+    });
+    expect(workspaceManager.currentTrustedExternalFilePaths()).toContain(path.resolve(sourcePath));
+
+    let finishRelink!: (paths: string[]) => void;
+    const previousRelinkPickCalls = pickFiles.mock.calls.length;
+    pickFiles.mockReturnValueOnce(new Promise<string[]>((resolve) => {
+      finishRelink = resolve;
+    }));
+    const pendingRelink = request(
+      port,
+      "POST",
+      `/api/files/${encodeURIComponent(referenced.id)}/relink`,
+    );
+    await vi.waitFor(() =>
+      expect(pickFiles).toHaveBeenCalledTimes(previousRelinkPickCalls + 1),
+    );
+    let workspaceWhileRelinking: Resp;
+    try {
+      workspaceWhileRelinking = await Promise.race([
+        request(port, "GET", "/api/workspace"),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("workspace request was blocked by relink picker")), 200),
+        ),
+      ]);
+    } finally {
+      finishRelink([]);
+    }
+    expect(workspaceWhileRelinking.status).toBe(200);
+    const cancelled = await pendingRelink;
+    expect(cancelled).toEqual({ status: 200, json: { file: null } });
+
+    pickFiles.mockResolvedValueOnce([replacementPath]);
+    const relinked = await request(
+      port,
+      "POST",
+      `/api/files/${encodeURIComponent(referenced.id)}/relink`,
+    );
+    expect(relinked.status).toBe(200);
+    expect(relinked.json.file).toMatchObject({
+      id: referenced.id,
+      path: replacementPath,
+      filename: "reference-source.txt",
+      storage: "referenced",
+      availability: "available",
+    });
+    expect(workspaceManager.currentTrustedExternalFilePaths()).toContain(
+      path.resolve(replacementPath),
+    );
+    expect(pickFiles).toHaveBeenLastCalledWith({
+      initialDirectory: path.dirname(sourcePath),
+      multiple: false,
+    });
+
+    await rm(replacementPath);
+    const refreshed = await request(
+      port,
+      "POST",
+      `/api/files/${encodeURIComponent(referenced.id)}/refresh`,
+    );
+    expect(refreshed.status).toBe(200);
+    expect(refreshed.json.file).toMatchObject({
+      id: referenced.id,
+      storage: "referenced",
+      availability: "missing",
+    });
+
+    openFile.mockClear();
+    const unavailableOpen = await request(
+      port,
+      "POST",
+      `/api/files/${encodeURIComponent(referenced.id)}/open`,
+    );
+    expect(unavailableOpen.status).toBe(500);
+    expect(unavailableOpen.json.error).toContain("missing");
+    expect(openFile).not.toHaveBeenCalled();
+  });
+
+  it("releases an unused native selection token", async () => {
+    const sourcePath = path.join(root, "released-selection.txt");
+    await writeFile(sourcePath, "unused", "utf-8");
+    pickFiles.mockResolvedValueOnce([sourcePath]);
+    const picked = await request(port, "POST", "/api/files/pick", {});
+
+    const released = await request(
+      port,
+      "DELETE",
+      `/api/files/pick/${encodeURIComponent(picked.json.selection.id)}`,
+    );
+    expect(released.status).toBe(204);
+
+    const rejected = await request(port, "POST", "/api/files/import-picked", {
+      selectionId: picked.json.selection.id,
+      mode: "copy",
+      kind: "normal",
+    });
+    expect(rejected.status).toBe(410);
+    expect(rejected.json).toMatchObject({ code: "picked_selection_expired" });
+    expect(rejected.json.error).toContain("Unknown or expired");
+  });
+
+  it("preserves raw upload bytes without JSON preloading and enforces the upload limit", async () => {
+    const bytes = Buffer.from([0, 123, 34, 255, 10]);
+    const uploaded = await uploadRequest(
+      port,
+      "/api/files/import-upload?filename=raw.bin&kind=normal",
+      bytes,
+    );
+    expect(uploaded.status).toBe(201);
+    expect(uploaded.json.file).toMatchObject({
+      filename: "raw.bin",
+      storage: "isolated",
+      kind: "normal",
+      availability: "available",
+    });
+    await expect(readFile(uploaded.json.file.path)).resolves.toEqual(bytes);
+
+    const unusualName = await uploadRequest(
+      port,
+      "/api/files/import-upload?filename=%20notes.long%2BEXT&kind=normal",
+      Buffer.from("named"),
+    );
+    expect(unusualName.status).toBe(201);
+    expect(unusualName.json.file).toMatchObject({
+      name: " notes",
+      extension: "long+EXT",
+      filename: " notes.long+EXT",
+      previewKind: "none",
+    });
+    expect(path.basename(unusualName.json.file.path)).toBe(" notes.long+EXT");
+
+    const oversized = await uploadRequest(
+      port,
+      "/api/files/import-upload?filename=too-large.bin&kind=normal",
+      Buffer.alloc(17),
+    );
+    expect(oversized.status).toBe(413);
+    expect(oversized.json.error).toContain("16 bytes");
+  });
+
+  it("reads a slow chunked upload before entering the global project transaction", async () => {
+    if (!requestWorkspaceContext) await request(port, "GET", "/api/workspace");
+    let slowRequest!: http.ClientRequest;
+    let socketAssigned!: Promise<unknown[]>;
+    const slowResponse = new Promise<Resp>((resolve, reject) => {
+      slowRequest = http.request(
+        {
+          host: "127.0.0.1",
+          port,
+          method: "POST",
+          path: "/api/files/import-upload?filename=slow.bin&kind=normal",
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "X-Agent-Canvas-Project-Id": requestWorkspaceContext!.canvasProjectId,
+            "X-Agent-Canvas-Project-Revision": String(requestWorkspaceContext!.revision),
+          },
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (chunk: Buffer) => chunks.push(chunk));
+          res.on("end", () => {
+            const text = Buffer.concat(chunks).toString("utf-8");
+            resolve({ status: res.statusCode ?? 0, json: text ? JSON.parse(text) : undefined });
+          });
+        },
+      );
+      socketAssigned = once(slowRequest, "socket");
+      slowRequest.on("error", reject);
+      slowRequest.write(Buffer.from([1]));
+      setTimeout(() => slowRequest.end(Buffer.from([2])), 250);
+    });
+    await socketAssigned;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    const workspaceWhileUploading = await Promise.race([
+      request(port, "GET", "/api/workspace"),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("workspace request was blocked by upload body")), 200),
+      ),
+    ]);
+    expect(workspaceWhileUploading.status).toBe(200);
+    const uploaded = await slowResponse;
+    expect(uploaded.status).toBe(201);
+    await expect(readFile(uploaded.json.file.path)).resolves.toEqual(Buffer.from([1, 2]));
+  });
+
+  it("surfaces an unavailable native file picker without staging a selection", async () => {
+    pickFiles.mockRejectedValueOnce(new Error("picker unavailable"));
+
+    const picked = await request(port, "POST", "/api/files/pick", {});
+
+    expect(picked).toEqual({ status: 501, json: { error: "picker unavailable" } });
+  });
+
   it("文件节点 REST 支持创建、重命名、预览与普通读连线", async () => {
     const agent = await request(port, "POST", "/api/agents");
     const created = await request(port, "POST", "/api/files", {
@@ -1242,6 +1589,15 @@ describe("HTTP server", () => {
     expect(openFile).toHaveBeenCalledWith(updated.json.file.path, {
       windowMode: "reuse",
     });
+
+    const openCalls = openFile.mock.calls.length;
+    const missingProjectContext = await rawRequest(
+      port,
+      "POST",
+      `/api/files/${created.json.file.id}/open`,
+    );
+    expect(missingProjectContext.status).toBe(409);
+    expect(openFile).toHaveBeenCalledTimes(openCalls);
 
     const connection = await request(port, "POST", "/api/file-connections", {
       fileId: created.json.file.id,

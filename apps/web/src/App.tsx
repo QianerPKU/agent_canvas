@@ -232,6 +232,21 @@ type AgentSettingsTarget =
   | { mode: "edit"; agentId: string };
 type NodePosition = { x: number; y: number };
 type NodePlacementOverrides = Record<string, NodePosition>;
+type FileDialogState = {
+  droppedFiles?: File[];
+  placement?: NodePosition;
+};
+
+export function staggeredNodePositions(
+  first: NodePosition,
+  count: number,
+  offset = 28,
+): NodePosition[] {
+  return Array.from({ length: count }, (_, index) => ({
+    x: first.x + index * offset,
+    y: first.y + index * offset,
+  }));
+}
 
 function nodeId(agentId: string, turnIndex: number): string {
   return `${agentId}#${turnIndex}`;
@@ -1071,7 +1086,7 @@ export default function App(): React.ReactElement {
   const [historyTarget, setHistoryTarget] = useState<HistoryTarget>();
   const [openFileId, setOpenFileId] = useState<string>();
   const [fileOpenError, setFileOpenError] = useState<string>();
-  const [creatingFile, setCreatingFile] = useState(false);
+  const [creatingFile, setCreatingFile] = useState<FileDialogState>();
   const [creatingPrompt, setCreatingPrompt] = useState(false);
   const [showingPullRequests, setShowingPullRequests] = useState(false);
   const [showingSyncFlows, setShowingSyncFlows] = useState(false);
@@ -1126,7 +1141,7 @@ export default function App(): React.ReactElement {
     setOpenPullRequestId(undefined);
     setOpenSyncFlowId(undefined);
     setAgentSettingsTarget(undefined);
-    setCreatingFile(false);
+    setCreatingFile(undefined);
     setCreatingPrompt(false);
     setShowingPullRequests(false);
     setShowingSyncFlows(false);
@@ -1146,6 +1161,19 @@ export default function App(): React.ReactElement {
     );
   }, []);
 
+  const captureScreenPlacement = useCallback(
+    (screenPosition: NodePosition, width: number, height: number) => {
+      const flow = flowRef.current;
+      if (!flow) return undefined;
+      return centeredNodePosition(
+        flow.screenToFlowPosition(screenPosition),
+        width,
+        height,
+      );
+    },
+    [],
+  );
+
   const rememberNodePlacement = useCallback((id: string, position?: NodePosition) => {
     if (!position) return;
     setPendingPlacements((current) => ({
@@ -1153,6 +1181,21 @@ export default function App(): React.ReactElement {
       [id]: position,
     }));
   }, []);
+
+  const rememberFilePlacements = useCallback(
+    (createdFiles: CanvasFileNode[], first?: NodePosition) => {
+      if (!first) return;
+      const positions = staggeredNodePositions(first, createdFiles.length);
+      setPendingPlacements((current) => {
+        const next = { ...current };
+        createdFiles.forEach((file, index) => {
+          next[fileNodeId(file.id)] = positions[index]!;
+        });
+        return next;
+      });
+    },
+    [],
+  );
 
   const captureProjectOperation = useCallback(
     (): ProjectOperationOwnership => ({
@@ -1352,6 +1395,7 @@ export default function App(): React.ReactElement {
       id?: string,
       projectRoot?: string,
       trustedExternalResourcePaths?: string[],
+      trustedExternalFilePaths?: string[],
       ownership = beginProjectOperation(),
     ) => {
       setProjectError(undefined);
@@ -1361,6 +1405,7 @@ export default function App(): React.ReactElement {
           id,
           projectRoot,
           trustedExternalResourcePaths,
+          trustedExternalFilePaths,
         });
         expectedWorkspaceIdentity = workspaceEventIdentity(nextWorkspace);
         const isCurrent = () =>
@@ -1418,16 +1463,33 @@ export default function App(): React.ReactElement {
       try {
         const inspection = await api.inspectCanvasProject(projectRoot);
         if (!projectOperationIsCurrent(ownership)) return;
-        const externalPaths = inspection.externalSharedResources.map(
+        const externalResourcePaths = inspection.externalSharedResources.map(
           (resource) => resource.sourcePath,
         );
-        if (externalPaths.length > 0) {
+        const externalFilePaths = inspection.externalFileReferences.map(
+          (file) => file.path,
+        );
+        if (externalResourcePaths.length > 0 || externalFilePaths.length > 0) {
+          const sections = [
+            externalResourcePaths.length > 0
+              ? `外部共享资源：\n${externalResourcePaths.join("\n")}`
+              : "",
+            externalFilePaths.length > 0
+              ? `只读外部文件引用：\n${externalFilePaths.join("\n")}`
+              : "",
+          ].filter(Boolean);
           const approved = window.confirm(
-            `该项目引用了项目目录外的共享资源。是否授权加载以下路径？\n\n${externalPaths.join("\n")}`,
+            `该项目引用了项目目录外的本机路径。是否授权加载？\n\n${sections.join("\n\n")}`,
           );
           if (!approved) return;
         }
-        await openProject(undefined, projectRoot, externalPaths, ownership);
+        await openProject(
+          undefined,
+          projectRoot,
+          externalResourcePaths,
+          externalFilePaths,
+          ownership,
+        );
       } catch (error) {
         if (projectOperationIsCurrent(ownership)) {
           setProjectError(error instanceof Error ? error.message : String(error));
@@ -1883,7 +1945,7 @@ export default function App(): React.ReactElement {
           <MessageSquarePlus size={15} />
           新建提示词
         </button>
-        <button className="header-button header-button--secondary" onClick={() => setCreatingFile(true)}>
+        <button className="header-button header-button--secondary" onClick={() => setCreatingFile({})}>
           <FilePlus2 size={15} />
           新建文件
         </button>
@@ -1924,6 +1986,24 @@ export default function App(): React.ReactElement {
           }}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
+          onDragOver={(event) => {
+            if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "copy";
+          }}
+          onDrop={(event) => {
+            const droppedFiles = Array.from(event.dataTransfer.files);
+            if (droppedFiles.length === 0) return;
+            event.preventDefault();
+            setCreatingFile({
+              droppedFiles,
+              placement: captureScreenPlacement(
+                { x: event.clientX, y: event.clientY },
+                FILE_NODE_WIDTH,
+                FILE_NODE_HEIGHT,
+              ),
+            });
+          }}
           onConnect={(connection) => void connect(connection)}
           onEdgesDelete={(deleted) => {
             for (const edge of deleted) {
@@ -1948,6 +2028,7 @@ export default function App(): React.ReactElement {
 
       {creatingFile && (
         <CreateFileDialog
+          droppedFiles={creatingFile.droppedFiles}
           onCreate={async (input) => {
             const ownership = captureProjectOperation();
             const expectedWorkspaceIdentity = workspaceEventIdentity(workspaceRef.current);
@@ -1957,7 +2038,44 @@ export default function App(): React.ReactElement {
               rememberNodePlacement(fileNodeId(file.id), placement);
             }
           }}
-          onClose={() => setCreatingFile(false)}
+          onPick={fileActions.pick}
+          onReleasePickedSelection={fileActions.releasePickedSelection}
+          onImportPicked={async (input) => {
+            const ownership = captureProjectOperation();
+            const expectedWorkspaceIdentity = workspaceEventIdentity(workspaceRef.current);
+            const placement =
+              creatingFile.placement ??
+              captureViewportPlacement(FILE_NODE_WIDTH, FILE_NODE_HEIGHT);
+            const imported = await fileActions.importPicked(input);
+            if (projectOperationIsCurrent(ownership, expectedWorkspaceIdentity)) {
+              rememberFilePlacements(imported, placement);
+            }
+          }}
+          onImportDropped={async (droppedFiles, kind, placementIndexes) => {
+            const ownership = captureProjectOperation();
+            const expectedWorkspaceIdentity = workspaceEventIdentity(workspaceRef.current);
+            const placement =
+              creatingFile.placement ??
+              captureViewportPlacement(FILE_NODE_WIDTH, FILE_NODE_HEIGHT);
+            const positions = placement
+              ? staggeredNodePositions(
+                  placement,
+                  Math.max(...placementIndexes, -1) + 1,
+                )
+              : [];
+            return await fileActions.importDropped(
+              droppedFiles,
+              kind,
+              (file, sourceIndex) => {
+                if (!projectOperationIsCurrent(ownership, expectedWorkspaceIdentity)) return;
+                rememberNodePlacement(
+                  fileNodeId(file.id),
+                  positions[placementIndexes[sourceIndex] ?? sourceIndex],
+                );
+              },
+            );
+          }}
+          onClose={() => setCreatingFile(undefined)}
         />
       )}
       {agentSettingsTarget?.mode === "create" && (

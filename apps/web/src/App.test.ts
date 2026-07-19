@@ -21,6 +21,7 @@ import {
   isSameBranchWorkspace,
   ownsProjectOperation,
   resolveCurrentProjectOpenStep,
+  staggeredNodePositions,
   workDocumentationMutationWarning,
 } from "./App.js";
 import { SelectionMode } from "@xyflow/react";
@@ -74,6 +75,16 @@ describe("canvasInteractionForTool", () => {
       selectionOnDrag: false,
       selectionMode: SelectionMode.Partial,
     });
+  });
+});
+
+describe("staggeredNodePositions", () => {
+  it("keeps a multi-file drop anchored while offsetting each following node", () => {
+    expect(staggeredNodePositions({ x: 320, y: 180 }, 3)).toEqual([
+      { x: 320, y: 180 },
+      { x: 348, y: 208 },
+      { x: 376, y: 236 },
+    ]);
   });
 });
 
@@ -591,6 +602,7 @@ describe("computeFileEdges", () => {
       extension: "md",
       path: "/tmp/metrics.md",
       storage: "isolated" as const,
+      availability: "available" as const,
       kind: "normal" as const,
       sharedRead: false,
       sharedWrite: false,
@@ -663,6 +675,7 @@ describe("computeFileEdges", () => {
           extension: "md",
           path: "/tmp/brief.md",
           storage: "isolated",
+          availability: "available",
           kind: "normal",
           sharedRead: false,
           sharedWrite: false,
@@ -771,6 +784,7 @@ describe("computeFileEdges", () => {
           extension: "md",
           path: "/tmp/brief.md",
           storage: "isolated",
+          availability: "available",
           kind: "normal",
           sharedRead: false,
           sharedWrite: false,
@@ -847,6 +861,7 @@ describe("computeFileEdges", () => {
       extension: "md",
       path: "/tmp/brief.md",
       storage: "isolated" as const,
+      availability: "available" as const,
       kind: "normal" as const,
       sharedRead: false,
       sharedWrite: false,

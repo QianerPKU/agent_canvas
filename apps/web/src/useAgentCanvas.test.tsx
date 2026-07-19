@@ -283,6 +283,7 @@ describe("useAgentCanvas", () => {
               filename: "old.txt",
               path: "/old/file.txt",
               storage: "isolated",
+              availability: "available",
               kind: "normal",
               sharedRead: false,
               sharedWrite: false,
@@ -356,6 +357,7 @@ describe("useAgentCanvas", () => {
         filename: "old.txt",
         path: "/old/file.txt",
         storage: "isolated",
+        availability: "available",
         kind: "normal",
         sharedRead: false,
         sharedWrite: false,
@@ -368,6 +370,147 @@ describe("useAgentCanvas", () => {
     });
 
     expect(result.current.files).toEqual([]);
+    unmount();
+  });
+
+  it("adds every file returned by a picked-file import", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+    const imported = ["brief.md", "photo.png"].map((filename, index) => ({
+      id: `file_${index + 1}`,
+      name: filename.slice(0, filename.lastIndexOf(".")),
+      extension: filename.slice(filename.lastIndexOf(".") + 1),
+      filename,
+      path: `/files/${filename}`,
+      storage: "isolated" as const,
+      availability: "available" as const,
+      kind: "normal" as const,
+      sharedRead: false,
+      sharedWrite: false,
+      previewKind: "none" as const,
+      mimeType: "application/octet-stream",
+      createdAt: index + 1,
+      updatedAt: index + 1,
+    }));
+    vi.spyOn(api, "importPickedFiles").mockResolvedValue(imported);
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    act(() => vi.runOnlyPendingTimers());
+    await act(async () => {
+      await result.current.fileActions.importPicked({
+        selectionId: "file_selection_1",
+        mode: "copy",
+        kind: "normal",
+      });
+    });
+
+    expect(result.current.files.map((file) => file.filename)).toEqual([
+      "brief.md",
+      "photo.png",
+    ]);
+    unmount();
+  });
+
+  it("keeps successful dropped files when a later upload fails", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+    const dropped = [new File(["ok"], "ok.txt"), new File(["bad"], "bad.txt")];
+    const created = {
+      id: "file_1",
+      name: "ok",
+      extension: "txt",
+      filename: "ok.txt",
+      path: "/files/ok.txt",
+      storage: "isolated" as const,
+      availability: "available" as const,
+      kind: "normal" as const,
+      sharedRead: false,
+      sharedWrite: false,
+      previewKind: "text" as const,
+      mimeType: "text/plain",
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    const upload = vi
+      .spyOn(api, "importUploadedFile")
+      .mockResolvedValueOnce(created)
+      .mockRejectedValueOnce(new Error("413 too large"));
+    const onImported = vi.fn();
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    act(() => vi.runOnlyPendingTimers());
+    act(() => sendWorkspaceFrame(FakeWebSocket.instances[0]!, "project_a", undefined, 7));
+    let outcome!: Awaited<ReturnType<typeof result.current.fileActions.importDropped>>;
+    await act(async () => {
+      outcome = await result.current.fileActions.importDropped(
+        dropped,
+        "normal",
+        onImported,
+      );
+    });
+
+    expect(result.current.files.map((file) => file.id)).toEqual(["file_1"]);
+    expect(onImported).toHaveBeenCalledWith(created, 0);
+    expect(outcome.imported).toEqual([created]);
+    expect(outcome.failures).toMatchObject([{ file: dropped[1], reason: "413 too large" }]);
+    expect(upload.mock.calls[0]?.[2]).toEqual({ canvasProjectId: "project_a", revision: 7 });
+    expect(upload.mock.calls[1]?.[2]).toEqual({ canvasProjectId: "project_a", revision: 7 });
+    unmount();
+  });
+
+  it("stops a dropped-file batch after a project switch", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+    const dropped = [new File(["one"], "one.txt"), new File(["two"], "two.txt")];
+    const created = {
+      id: "file_1",
+      name: "one",
+      extension: "txt",
+      filename: "one.txt",
+      path: "/files/one.txt",
+      storage: "isolated" as const,
+      availability: "available" as const,
+      kind: "normal" as const,
+      sharedRead: false,
+      sharedWrite: false,
+      previewKind: "text" as const,
+      mimeType: "text/plain",
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    let resolveFirst!: (file: typeof created) => void;
+    const upload = vi.spyOn(api, "importUploadedFile").mockReturnValue(
+      new Promise((resolve) => {
+        resolveFirst = resolve;
+      }),
+    );
+    const onImported = vi.fn();
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    act(() => vi.runOnlyPendingTimers());
+    const socket = FakeWebSocket.instances[0]!;
+    act(() => sendWorkspaceFrame(socket, "project_a", undefined, 3));
+    let pending!: ReturnType<typeof result.current.fileActions.importDropped>;
+    act(() => {
+      pending = result.current.fileActions.importDropped(dropped, "normal", onImported);
+    });
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(upload.mock.calls[0]?.[2]).toEqual({ canvasProjectId: "project_a", revision: 3 });
+
+    act(() => sendWorkspaceFrame(socket, "project_b", undefined, 1));
+    let outcome!: Awaited<typeof pending>;
+    await act(async () => {
+      resolveFirst(created);
+      outcome = await pending;
+    });
+
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(onImported).not.toHaveBeenCalled();
+    expect(result.current.files).toEqual([]);
+    expect(outcome.failures.map((failure) => failure.file.name)).toEqual(["two.txt"]);
     unmount();
   });
 
