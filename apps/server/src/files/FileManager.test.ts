@@ -1,4 +1,5 @@
 import {
+  chmod,
   lstat,
   mkdir,
   mkdtemp,
@@ -536,6 +537,62 @@ describe("FileManager", () => {
     ).rejects.toThrow(/unknown or expired/iu);
   });
 
+  it("keeps a picked selection when the same storage roots are reapplied", async () => {
+    const sourcePath = path.join(root, "same-root-staged.txt");
+    await writeFile(sourcePath, "same root", "utf-8");
+    const isolatedRoot = path.join(root, "isolated");
+    const trustedRoot = path.join(root, "trusted-project");
+    await mkdir(trustedRoot);
+    const firstBoundary = await captureManagedTrustedRootBoundary(
+      trustedRoot,
+      "project root",
+    );
+    manager.setIsolatedRoot(isolatedRoot, trustedRoot, firstBoundary);
+    const selection = await manager.stagePickedFiles([sourcePath]);
+    const equivalentBoundary = await captureManagedTrustedRootBoundary(
+      trustedRoot,
+      "project root",
+    );
+
+    manager.setIsolatedRoot(isolatedRoot, trustedRoot, equivalentBoundary);
+
+    await expect(
+      manager.importPicked(selection.id, "reference", "normal"),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        path: await realpath(sourcePath),
+        storage: "referenced",
+      }),
+    ]);
+  });
+
+  it("expires a picked selection when the trusted root identity changes in place", async () => {
+    const sourcePath = path.join(root, "replaced-root-staged.txt");
+    await writeFile(sourcePath, "replaced root", "utf-8");
+    const isolatedRoot = path.join(root, "isolated");
+    const trustedRoot = path.join(root, "replaceable-project");
+    const displacedRoot = path.join(root, "displaced-project");
+    await mkdir(trustedRoot);
+    const firstBoundary = await captureManagedTrustedRootBoundary(
+      trustedRoot,
+      "project root",
+    );
+    manager.setIsolatedRoot(isolatedRoot, trustedRoot, firstBoundary);
+    const selection = await manager.stagePickedFiles([sourcePath]);
+    await rename(trustedRoot, displacedRoot);
+    await mkdir(trustedRoot);
+    const replacementBoundary = await captureManagedTrustedRootBoundary(
+      trustedRoot,
+      "project root",
+    );
+
+    manager.setIsolatedRoot(isolatedRoot, trustedRoot, replacementBoundary);
+
+    await expect(
+      manager.importPicked(selection.id, "reference", "normal"),
+    ).rejects.toThrow(/unknown or expired/iu);
+  });
+
   it("retains a picked selection when import validation fails", async () => {
     const first = path.join(root, "first.txt");
     const second = path.join(root, "second.txt");
@@ -568,6 +625,31 @@ describe("FileManager", () => {
     }
 
     await expect(manager.stagePickedFiles([link])).rejects.toThrow(/non-symbolic-link/u);
+
+    const selection = await manager.stagePickedFiles([target]);
+    const [file] = await manager.importPicked(selection.id, "reference", "normal");
+    await expect(manager.relinkReferenced(file!.id, link)).rejects.toThrow(
+      /non-symbolic-link/u,
+    );
+    expect(manager.get(file!.id)?.path).toBe(await realpath(target));
+  });
+
+  it("strictly rejects directories selected or used to relink a reference", async () => {
+    const directory = path.join(root, "picked-directory.txt");
+    const sourcePath = path.join(root, "relink-source.txt");
+    await mkdir(directory);
+    await writeFile(sourcePath, "source", "utf-8");
+
+    await expect(manager.stagePickedFiles([directory])).rejects.toThrow(
+      /regular non-symbolic-link/u,
+    );
+
+    const selection = await manager.stagePickedFiles([sourcePath]);
+    const [file] = await manager.importPicked(selection.id, "reference", "normal");
+    await expect(manager.relinkReferenced(file!.id, directory)).rejects.toThrow(
+      /regular non-symbolic-link/u,
+    );
+    expect(manager.get(file!.id)?.path).toBe(await realpath(sourcePath));
   });
 
   it("uses unpredictable expiring picker tokens that can be explicitly released", async () => {
@@ -602,10 +684,14 @@ describe("FileManager", () => {
   });
 
   it("enforces per-file and aggregate picker copy limits without limiting references", async () => {
+    let stagedBytes = 0;
     manager = new FileManager({
       isolatedRoot: path.join(root, "isolated"),
       maxPickedFileBytes: 3,
       maxPickedBatchBytes: 5,
+      readChunkObserver: ({ purpose, bytesRead }) => {
+        if (purpose === "stage") stagedBytes += bytesRead;
+      },
     });
     const oversized = path.join(root, "oversized.bin");
     await writeFile(oversized, Buffer.from([1, 2, 3, 4]));
@@ -635,6 +721,7 @@ describe("FileManager", () => {
       /batch exceeds the 5 byte copy limit/iu,
     );
     expect(manager.releasePickedSelection(rejectedBatch.id)).toBe(true);
+    expect(stagedBytes).toBe(0);
   });
 
   it("detects same-inode picked file edits before importing", async () => {
@@ -651,6 +738,65 @@ describe("FileManager", () => {
     await expect(manager.importPicked(selection.id, "copy", "normal")).rejects.toThrow(
       /changed before import/u,
     );
+    expect(manager.list()).toEqual([]);
+    expect(manager.releasePickedSelection(selection.id)).toBe(true);
+  });
+
+  it("detects an equal-length picked file rewrite after its mtime is restored", async () => {
+    const sourcePath = path.join(root, "restored-mtime.txt");
+    const fixedTimeSeconds = 1_700_000_000;
+    await writeFile(sourcePath, "initial", "utf-8");
+    await utimes(sourcePath, fixedTimeSeconds, fixedTimeSeconds);
+    const before = await lstat(sourcePath);
+    const selection = await manager.stagePickedFiles([sourcePath]);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await writeFile(sourcePath, "changed", "utf-8");
+    await utimes(sourcePath, fixedTimeSeconds, fixedTimeSeconds);
+    const after = await lstat(sourcePath);
+    expect({
+      dev: after.dev,
+      ino: after.ino,
+      size: after.size,
+      mtimeMs: after.mtimeMs,
+    }).toEqual({
+      dev: before.dev,
+      ino: before.ino,
+      size: before.size,
+      mtimeMs: before.mtimeMs,
+    });
+    expect(after.ctimeMs).not.toBe(before.ctimeMs);
+
+    await expect(manager.importPicked(selection.id, "copy", "normal")).rejects.toThrow(
+      /changed before import/u,
+    );
+    expect(manager.list()).toEqual([]);
+    expect(manager.releasePickedSelection(selection.id)).toBe(true);
+  });
+
+  it("rejects a picked copy changed between streamed read chunks", async () => {
+    const sourcePath = path.join(root, "changed-during-copy.bin");
+    const fixedTimeSeconds = 1_700_000_000;
+    const original = Buffer.alloc(3 * 64 * 1024, 0x41);
+    const changed = Buffer.alloc(original.length, 0x42);
+    await writeFile(sourcePath, original);
+    await utimes(sourcePath, fixedTimeSeconds, fixedTimeSeconds);
+    let mutated = false;
+    manager = new FileManager({
+      isolatedRoot: path.join(root, "isolated"),
+      readChunkObserver: async ({ purpose, filePath }) => {
+        if (purpose !== "copy" || mutated) return;
+        mutated = true;
+        await writeFile(filePath, changed);
+        await utimes(filePath, fixedTimeSeconds, fixedTimeSeconds);
+      },
+    });
+    const selection = await manager.stagePickedFiles([sourcePath]);
+
+    await expect(manager.importPicked(selection.id, "copy", "normal")).rejects.toThrow(
+      /changed after it was selected|content changed/u,
+    );
+    expect(mutated).toBe(true);
     expect(manager.list()).toEqual([]);
     expect(manager.releasePickedSelection(selection.id)).toBe(true);
   });
@@ -740,6 +886,125 @@ describe("FileManager", () => {
     const restored = await manager.refreshAvailability(file!.id);
     expect(restored).not.toBe(missing);
     expect(restored.availability).toBe("available");
+  });
+
+  it("normalizes directory and ENOTDIR reference failures to persisted missing nodes", async () => {
+    const directoryPath = path.join(root, "became-directory.txt");
+    const nestedParent = path.join(root, "became-file-parent");
+    const nestedPath = path.join(nestedParent, "nested.txt");
+    await mkdir(nestedParent);
+    await Promise.all([
+      writeFile(directoryPath, "directory source", "utf-8"),
+      writeFile(nestedPath, "nested source", "utf-8"),
+    ]);
+    const selection = await manager.stagePickedFiles([directoryPath, nestedPath]);
+    const [directoryFile, nestedFile] = await manager.importPicked(
+      selection.id,
+      "reference",
+      "normal",
+    );
+    const state = manager.exportState();
+
+    await rename(directoryPath, `${directoryPath}.displaced`);
+    await mkdir(directoryPath);
+    await rename(nestedParent, `${nestedParent}-displaced`);
+    await writeFile(nestedParent, "not a directory", "utf-8");
+
+    await expect(manager.refreshAvailability(directoryFile!.id)).resolves.toMatchObject({
+      availability: "missing",
+      path: directoryFile!.path,
+    });
+    await expect(manager.refreshAvailability(nestedFile!.id)).resolves.toMatchObject({
+      availability: "missing",
+      path: nestedFile!.path,
+    });
+
+    const reloaded = new FileManager({ isolatedRoot: path.join(root, "invalid-reload") });
+    await reloaded.importState(state, {
+      trustedReferencedPaths: [directoryFile!.path, nestedFile!.path],
+    });
+    expect(reloaded.list()).toEqual([
+      expect.objectContaining({
+        id: directoryFile!.id,
+        availability: "missing",
+        path: directoryFile!.path,
+      }),
+      expect.objectContaining({
+        id: nestedFile!.id,
+        availability: "missing",
+        path: nestedFile!.path,
+      }),
+    ]);
+  });
+
+  it("normalizes a final symlink to missing but rejects an untrusted symlink alias", async (context) => {
+    const sourcePath = path.join(root, "symlink-invalid.txt");
+    const displacedPath = path.join(root, "symlink-invalid-displaced.txt");
+    const aliasPath = path.join(root, "untrusted-alias.txt");
+    await writeFile(sourcePath, "source", "utf-8");
+    const selection = await manager.stagePickedFiles([sourcePath]);
+    const [file] = await manager.importPicked(selection.id, "reference", "normal");
+    const state = manager.exportState();
+    await rename(sourcePath, displacedPath);
+    try {
+      await symlink(displacedPath, sourcePath, "file");
+      await symlink(displacedPath, aliasPath, "file");
+    } catch (error) {
+      if (["EPERM", "EACCES", "UNKNOWN"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+        context.skip();
+        return;
+      }
+      throw error;
+    }
+
+    await expect(manager.refreshAvailability(file!.id)).resolves.toMatchObject({
+      availability: "missing",
+      path: file!.path,
+    });
+    const reloaded = new FileManager({ isolatedRoot: path.join(root, "symlink-reload") });
+    await reloaded.importState(state, { trustedReferencedPaths: [file!.path] });
+    expect(reloaded.get(file!.id)).toMatchObject({
+      availability: "missing",
+      path: file!.path,
+    });
+
+    const aliasState = structuredClone(state);
+    aliasState.files[0] = { ...aliasState.files[0]!, path: aliasPath };
+    const rejected = new FileManager({ isolatedRoot: path.join(root, "alias-reload") });
+    await expect(
+      rejected.importState(aliasState, { trustedReferencedPaths: [file!.path] }),
+    ).rejects.toThrow(/not trusted/u);
+    expect(rejected.list()).toEqual([]);
+  });
+
+  it("normalizes EACCES references to missing when permissions can be enforced", async (context) => {
+    if (process.platform === "win32" || process.getuid?.() === 0) {
+      context.skip();
+      return;
+    }
+    const parent = path.join(root, "inaccessible-parent");
+    const sourcePath = path.join(parent, "inaccessible.txt");
+    await mkdir(parent);
+    await writeFile(sourcePath, "inaccessible", "utf-8");
+    const selection = await manager.stagePickedFiles([sourcePath]);
+    const [file] = await manager.importPicked(selection.id, "reference", "normal");
+    const state = manager.exportState();
+
+    await chmod(parent, 0o000);
+    try {
+      await expect(manager.refreshAvailability(file!.id)).resolves.toMatchObject({
+        availability: "missing",
+        path: file!.path,
+      });
+      const reloaded = new FileManager({ isolatedRoot: path.join(root, "eacces-reload") });
+      await reloaded.importState(state, { trustedReferencedPaths: [file!.path] });
+      expect(reloaded.get(file!.id)).toMatchObject({
+        availability: "missing",
+        path: file!.path,
+      });
+    } finally {
+      await chmod(parent, 0o700);
+    }
   });
 
   it("canonicalizes existing and missing referenced paths before trust comparison", async (context) => {
@@ -871,6 +1136,38 @@ describe("FileManager", () => {
     expect(manager.get(file!.id)?.availability).toBe("available");
   });
 
+  it("rejects a changing reference preview without misclassifying it as missing", async () => {
+    const sourcePath = path.join(root, "changed-during-preview.txt");
+    const fixedTimeSeconds = 1_700_000_000;
+    const original = Buffer.alloc(3 * 64 * 1024, 0x41);
+    const changed = Buffer.alloc(original.length, 0x42);
+    await writeFile(sourcePath, original);
+    await utimes(sourcePath, fixedTimeSeconds, fixedTimeSeconds);
+    let mutated = false;
+    manager = new FileManager({
+      isolatedRoot: path.join(root, "isolated"),
+      readChunkObserver: async ({ purpose, filePath }) => {
+        if (purpose !== "preview" || mutated) return;
+        mutated = true;
+        await writeFile(filePath, changed);
+        await utimes(filePath, fixedTimeSeconds, fixedTimeSeconds);
+      },
+    });
+    const selection = await manager.stagePickedFiles([sourcePath]);
+    const [file] = await manager.importPicked(selection.id, "reference", "normal");
+
+    await expect(manager.readPreview(file!.id)).rejects.toThrow(/changed while opening or reading/u);
+    expect(mutated).toBe(true);
+    expect(manager.get(file!.id)).toMatchObject({
+      availability: "available",
+      path: sourcePath,
+    });
+    await expect(manager.readPreview(file!.id)).resolves.toMatchObject({
+      content: changed.toString("utf-8"),
+      truncated: false,
+    });
+  });
+
   it("invalidates an in-flight picked import when its file-state root changes", async () => {
     const sourcePath = path.join(root, "generation.txt");
     await writeFile(sourcePath, "generation", "utf-8");
@@ -927,6 +1224,44 @@ describe("FileManager", () => {
     expect(manager.releasePickedSelection(selection.id)).toBe(true);
   });
 
+  it("rejects relink when its authorized canonical parent drifts to another target", async (context) => {
+    const originalPath = path.join(root, "relink-original.txt");
+    const authorizedDirectory = path.join(root, "relink-authorized-parent");
+    const displacedDirectory = path.join(root, "relink-authorized-displaced");
+    const replacementDirectory = path.join(root, "relink-authorized-replacement");
+    await Promise.all([mkdir(authorizedDirectory), mkdir(replacementDirectory)]);
+    await writeFile(originalPath, "original", "utf-8");
+    const authorizedPath = path.join(authorizedDirectory, "target.txt");
+    await writeFile(authorizedPath, "authorized", "utf-8");
+    await writeFile(path.join(replacementDirectory, "target.txt"), "replacement", "utf-8");
+    const canonicalAuthorizedPath = await realpath(authorizedPath);
+    const selection = await manager.stagePickedFiles([originalPath]);
+    const [file] = await manager.importPicked(selection.id, "reference", "normal");
+
+    await rename(authorizedDirectory, displacedDirectory);
+    try {
+      await symlink(
+        replacementDirectory,
+        authorizedDirectory,
+        process.platform === "win32" ? "junction" : "dir",
+      );
+    } catch (error) {
+      if (["EPERM", "EACCES", "UNKNOWN"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+        context.skip();
+        return;
+      }
+      throw error;
+    }
+
+    await expect(
+      manager.relinkReferenced(file!.id, canonicalAuthorizedPath),
+    ).rejects.toThrow(/canonical target/u);
+    expect(manager.get(file!.id)).toMatchObject({
+      path: await realpath(originalPath),
+      availability: "available",
+    });
+  });
+
   it("rejects persisted referenced metadata whose extension differs from its source", async () => {
     const sourcePath = path.join(root, "metadata.txt");
     await writeFile(sourcePath, "metadata", "utf-8");
@@ -942,7 +1277,7 @@ describe("FileManager", () => {
     expect(reloaded.list()).toEqual([]);
   });
 
-  it("does not let a persisted trust entry drift through a replaced parent mapping", async (context) => {
+  it("keeps an authorized lexical reference missing when its parent mapping drifts", async (context) => {
     const originalDirectory = path.join(root, "trusted-parent");
     const displacedDirectory = path.join(root, "trusted-parent-displaced");
     const replacementDirectory = path.join(root, "trusted-parent-replacement");
@@ -971,10 +1306,11 @@ describe("FileManager", () => {
     }
 
     const reloaded = new FileManager({ isolatedRoot: path.join(root, "reload-drift") });
-    await expect(
-      reloaded.importState(state, { trustedReferencedPaths: [file!.path] }),
-    ).rejects.toThrow(/not trusted/u);
-    expect(reloaded.list()).toEqual([]);
+    await reloaded.importState(state, { trustedReferencedPaths: [file!.path] });
+    expect(reloaded.get(file!.id)).toMatchObject({
+      availability: "missing",
+      path: file!.path,
+    });
   });
 
   it("loads legacy isolated nodes without persisted availability", async () => {

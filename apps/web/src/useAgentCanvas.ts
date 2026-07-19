@@ -157,6 +157,16 @@ export interface DroppedFileImportResult {
   failures: DroppedFileImportFailure[];
 }
 
+interface FileMutationGuard {
+  projectEpoch: number;
+  mutationGeneration: number;
+}
+
+interface FileRequestGuard extends FileMutationGuard {
+  fileId: string;
+  requestSequence: number;
+}
+
 export interface PromptActions {
   create: (input: CreateCanvasPromptInput) => Promise<CanvasPromptNode>;
   update: (id: string, input: UpdateCanvasPromptInput) => Promise<void>;
@@ -206,6 +216,12 @@ export function useAgentCanvas(): UseAgentCanvas {
   const agentRuntimeGenerationsRef = useRef(new Map<string, number>());
   const helloSnapshotGenerationRef = useRef(0);
   const workspaceEventGenerationRef = useRef(0);
+  const fileProjectEpochRef = useRef(0);
+  const fileMutationGenerationRef = useRef(0);
+  const fileMutationGenerationsRef = useRef(new Map<string, number>());
+  const fileMutationRequestSequencesRef = useRef(new Map<string, number | null>());
+  const fileRequestSequenceRef = useRef(0);
+  const latestSuccessfulFileRequestSequencesRef = useRef(new Map<string, number>());
   const workspaceSnapshotGenerationRef = useRef(0);
   const workspaceSnapshotRef = useRef<WorkspaceProject>();
   const workspaceEventIdentityRef = useRef<string>();
@@ -238,10 +254,83 @@ export function useAgentCanvas(): UseAgentCanvas {
     const generations = agentRuntimeGenerationsRef.current;
     generations.set(agentId, (generations.get(agentId) ?? 0) + 1);
   }, []);
+  const advanceFileProjectEpoch = useCallback(() => {
+    fileProjectEpochRef.current += 1;
+    fileMutationGenerationRef.current += 1;
+    fileMutationGenerationsRef.current.clear();
+    fileMutationRequestSequencesRef.current.clear();
+    latestSuccessfulFileRequestSequencesRef.current.clear();
+  }, []);
+  const markFileMutation = useCallback((fileId: string, requestSequence?: number) => {
+    const generation = ++fileMutationGenerationRef.current;
+    fileMutationGenerationsRef.current.set(fileId, generation);
+    fileMutationRequestSequencesRef.current.set(fileId, requestSequence ?? null);
+  }, []);
+  const captureFileMutationGuard = useCallback(
+    (): FileMutationGuard => ({
+      projectEpoch: fileProjectEpochRef.current,
+      mutationGeneration: fileMutationGenerationRef.current,
+    }),
+    [],
+  );
+  const beginFileRequest = useCallback((fileId: string): FileRequestGuard => {
+    const requestSequence = ++fileRequestSequenceRef.current;
+    return {
+      fileId,
+      requestSequence,
+      projectEpoch: fileProjectEpochRef.current,
+      mutationGeneration: fileMutationGenerationRef.current,
+    };
+  }, []);
+  const applyUnkeyedFileResults = useCallback(
+    (incoming: CanvasFileNode[], guard: FileMutationGuard): CanvasFileNode[] => {
+      if (guard.projectEpoch !== fileProjectEpochRef.current) return [];
+      const accepted = incoming.filter(
+        (file) =>
+          (fileMutationGenerationsRef.current.get(file.id) ?? 0) <=
+          guard.mutationGeneration,
+      );
+      if (accepted.length === 0) return accepted;
+      for (const file of accepted) markFileMutation(file.id);
+      setFiles((current) => accepted.reduce(upsertFile, current));
+      return accepted;
+    },
+    [markFileMutation],
+  );
+  const applyFileRequestResult = useCallback(
+    (file: CanvasFileNode, guard: FileRequestGuard): boolean => {
+      const mutationGeneration =
+        fileMutationGenerationsRef.current.get(guard.fileId) ?? 0;
+      const mutationRequestSequence =
+        fileMutationRequestSequencesRef.current.get(guard.fileId);
+      const changedAfterRequest = mutationGeneration > guard.mutationGeneration;
+      const supersededByMutation =
+        changedAfterRequest &&
+        (mutationRequestSequence == null ||
+          mutationRequestSequence > guard.requestSequence);
+      if (
+        guard.projectEpoch !== fileProjectEpochRef.current ||
+        (latestSuccessfulFileRequestSequencesRef.current.get(guard.fileId) ?? 0) >
+          guard.requestSequence ||
+        supersededByMutation
+      ) {
+        return false;
+      }
+      latestSuccessfulFileRequestSequencesRef.current.set(
+        guard.fileId,
+        guard.requestSequence,
+      );
+      markFileMutation(file.id, guard.requestSequence);
+      setFiles((current) => replaceFile(current, file));
+      return true;
+    },
+    [markFileMutation],
+  );
   const clearProjectScopedState = useCallback(() => {
     helloSnapshotGenerationRef.current += 1;
     agentMutationGenerationsRef.current.clear();
     agentRuntimeGenerationsRef.current.clear();
+    advanceFileProjectEpoch();
     setAgents(emptyMap);
     setFiles([]);
     setFileConnections([]);
@@ -250,7 +339,7 @@ export function useAgentCanvas(): UseAgentCanvas {
     setPrFlows([]);
     setSyncFlows([]);
     setCommits([]);
-  }, []);
+  }, [advanceFileProjectEpoch]);
   // 始终指向最新 agents，供 submit 判断 start/send（避免闭包过期）
   const agentsRef = useRef(agents);
   agentsRef.current = agents;
@@ -258,6 +347,8 @@ export function useAgentCanvas(): UseAgentCanvas {
   const refresh = useCallback(async () => {
     const generation = ++refreshGenerationRef.current;
     const agentMutationGeneration = agentMutationGenerationRef.current;
+    const fileProjectEpoch = fileProjectEpochRef.current;
+    const fileMutationGeneration = fileMutationGenerationRef.current;
     const helloSnapshotGeneration = helloSnapshotGenerationRef.current;
     const [
       nextAgents,
@@ -296,7 +387,16 @@ export function useAgentCanvas(): UseAgentCanvas {
       setSyncFlows((current) => mergeRefreshedFlows(current, nextSyncFlows));
       setCommits((current) => mergeRefreshedCommits(current, nextCommits));
     }
-    setFiles(nextFiles);
+    if (fileProjectEpoch === fileProjectEpochRef.current) {
+      setFiles((current) =>
+        mergeRefreshedFiles(
+          current,
+          nextFiles,
+          fileMutationGenerationsRef.current,
+          fileMutationGeneration,
+        ),
+      );
+    }
     setFileConnections(nextConnections);
     setPrompts(nextPrompts);
     setPromptConnections(nextPromptConnections);
@@ -328,6 +428,9 @@ export function useAgentCanvas(): UseAgentCanvas {
       ws.onclose = () => {
         if (!isCurrentSocket()) return;
         wsRef.current = null;
+        // Invalidate file mutations immediately. Waiting for the reconnect's first workspace
+        // frame leaves a window in which an old-project REST response can repopulate cleared data.
+        advanceFileProjectEpoch();
         workspaceSnapshotRef.current = undefined;
         workspaceSnapshotGenerationRef.current += 1;
         api.setWorkspaceContext(undefined);
@@ -365,6 +468,11 @@ export function useAgentCanvas(): UseAgentCanvas {
         } else if (frame.type === "commit") {
           setCommits((prev) => upsertCommit(prev, frame.commit));
         } else if (frame.type === "file") {
+          // File frames do not currently carry a project id/revision. Only accept them after this
+          // socket has established its workspace epoch, and record the mutation so an older REST
+          // list snapshot cannot overwrite it.
+          if (!acceptedWorkspaceInEpoch) return;
+          markFileMutation(frame.file.id);
           setFiles((prev) => upsertFile(prev, frame.file));
         } else if (frame.type === "workspace") {
           const projectId = frame.workspace?.canvasProject?.id;
@@ -417,7 +525,11 @@ export function useAgentCanvas(): UseAgentCanvas {
             workspaceEventGenerationRef.current += 1;
             // The epoch was already cleared before its hello frame. A later identity change is a
             // real project replacement and must discard the prior project-scoped snapshot.
-            if (acceptedWorkspaceInEpoch) clearProjectScopedState();
+            if (acceptedWorkspaceInEpoch) {
+              clearProjectScopedState();
+            } else {
+              advanceFileProjectEpoch();
+            }
             setWorkspaceMetadataUpdate(undefined);
             setWorkspaceUpdate(nextUpdate);
           }
@@ -468,9 +580,17 @@ export function useAgentCanvas(): UseAgentCanvas {
       if (connectTimer) clearTimeout(connectTimer);
       const currentSocket = wsRef.current;
       wsRef.current = null;
+      advanceFileProjectEpoch();
       currentSocket?.close();
     };
-  }, [clearProjectScopedState, markAgentMutation, markAgentRuntimeMutation, refresh]);
+  }, [
+    advanceFileProjectEpoch,
+    clearProjectScopedState,
+    markAgentMutation,
+    markAgentRuntimeMutation,
+    markFileMutation,
+    refresh,
+  ]);
 
   const actions = useMemo<AgentActions>(
     () => ({
@@ -566,20 +686,18 @@ export function useAgentCanvas(): UseAgentCanvas {
   const fileActions = useMemo<FileActions>(
     () => ({
       create: async (input) => {
-        const workspaceGeneration = workspaceEventGenerationRef.current;
+        const guard = captureFileMutationGuard();
         const file = await api.createFile(input);
-        if (workspaceGeneration === workspaceEventGenerationRef.current) {
-          setFiles((current) => upsertFile(current, file));
-        }
+        applyUnkeyedFileResults([file], guard);
         return file;
       },
       pick: async () => {
-        const workspaceGeneration = workspaceEventGenerationRef.current;
+        const projectEpoch = fileProjectEpochRef.current;
         const workspaceContext = api.captureWorkspaceContext();
         if (!workspaceContext) throw new Error("当前项目上下文尚未就绪，请稍后重试");
         const selection = await api.pickFiles(workspaceContext);
         if (!selection) return null;
-        if (workspaceGeneration !== workspaceEventGenerationRef.current) {
+        if (projectEpoch !== fileProjectEpochRef.current) {
           await api.releasePickedSelection(selection.id, workspaceContext).catch(() => undefined);
           throw new Error("文件选择期间项目已切换，请在当前项目中重新浏览");
         }
@@ -592,19 +710,17 @@ export function useAgentCanvas(): UseAgentCanvas {
         await api.releasePickedSelection(selectionId, workspaceContext);
       },
       importPicked: async (input) => {
-        const workspaceGeneration = workspaceEventGenerationRef.current;
+        const guard = captureFileMutationGuard();
         const workspaceContext =
           pickedSelectionContextsRef.current.get(input.selectionId) ??
           api.captureWorkspaceContext();
         const imported = await api.importPickedFiles(input, workspaceContext);
         pickedSelectionContextsRef.current.delete(input.selectionId);
-        if (workspaceGeneration === workspaceEventGenerationRef.current) {
-          setFiles((current) => imported.reduce(upsertFile, current));
-        }
+        applyUnkeyedFileResults(imported, guard);
         return imported;
       },
       importDropped: async (dropped, kind, onImported) => {
-        const workspaceGeneration = workspaceEventGenerationRef.current;
+        const projectEpoch = fileProjectEpochRef.current;
         const workspaceContext = api.captureWorkspaceContext();
         const imported: CanvasFileNode[] = [];
         const failures: DroppedFileImportFailure[] = [];
@@ -620,17 +736,17 @@ export function useAgentCanvas(): UseAgentCanvas {
 
         for (let index = 0; index < dropped.length; index += 1) {
           const file = dropped[index]!;
-          if (workspaceGeneration !== workspaceEventGenerationRef.current) {
+          if (projectEpoch !== fileProjectEpochRef.current) {
             for (const remaining of dropped.slice(index)) {
               failures.push({ file: remaining, reason: "项目已切换，请在当前项目中重新拖入" });
             }
             break;
           }
           try {
+            const guard = captureFileMutationGuard();
             const created = await api.importUploadedFile(file, kind, workspaceContext);
             imported.push(created);
-            if (workspaceGeneration === workspaceEventGenerationRef.current) {
-              setFiles((current) => upsertFile(current, created));
+            if (applyUnkeyedFileResults([created], guard).length > 0) {
               onImported?.(created, index);
             }
           } catch (reason) {
@@ -643,28 +759,23 @@ export function useAgentCanvas(): UseAgentCanvas {
         return { imported, failures };
       },
       relink: async (id) => {
-        const workspaceGeneration = workspaceEventGenerationRef.current;
+        const guard = beginFileRequest(id);
         const file = await api.relinkFile(id);
-        if (file && workspaceGeneration === workspaceEventGenerationRef.current) {
-          setFiles((current) => upsertFile(current, file));
-        }
+        if (file) applyFileRequestResult(file, guard);
         return file;
       },
       refresh: async (id) => {
-        const workspaceGeneration = workspaceEventGenerationRef.current;
+        const guard = beginFileRequest(id);
         const file = await api.refreshFile(id);
-        if (workspaceGeneration === workspaceEventGenerationRef.current) {
-          setFiles((current) => upsertFile(current, file));
+        if (applyFileRequestResult(file, guard)) {
           return file;
         }
         return null;
       },
       update: async (id, input) => {
-        const workspaceGeneration = workspaceEventGenerationRef.current;
+        const guard = beginFileRequest(id);
         const file = await api.updateFile(id, input);
-        if (workspaceGeneration === workspaceEventGenerationRef.current) {
-          setFiles((current) => upsertFile(current, file));
-        }
+        applyFileRequestResult(file, guard);
       },
       connect: async (fileId, agentId, access) => {
         const workspaceGeneration = workspaceEventGenerationRef.current;
@@ -685,7 +796,12 @@ export function useAgentCanvas(): UseAgentCanvas {
         );
       },
     }),
-    [],
+    [
+      applyFileRequestResult,
+      applyUnkeyedFileResults,
+      beginFileRequest,
+      captureFileMutationGuard,
+    ],
   );
 
   const promptActions = useMemo<PromptActions>(
@@ -845,6 +961,27 @@ function mergeRefreshedAgents(
   return merged;
 }
 
+function mergeRefreshedFiles(
+  current: CanvasFileNode[],
+  refreshed: CanvasFileNode[],
+  mutationGenerations: ReadonlyMap<string, number>,
+  refreshStartedAtGeneration: number,
+): CanvasFileNode[] {
+  const currentById = new Map(current.map((file) => [file.id, file]));
+  const refreshedIds = new Set(refreshed.map((file) => file.id));
+  const merged = refreshed.map((file) => {
+    const changedDuringRefresh =
+      (mutationGenerations.get(file.id) ?? 0) > refreshStartedAtGeneration;
+    return changedDuringRefresh ? (currentById.get(file.id) ?? file) : file;
+  });
+  for (const file of current) {
+    const changedDuringRefresh =
+      (mutationGenerations.get(file.id) ?? 0) > refreshStartedAtGeneration;
+    if (!refreshedIds.has(file.id) && changedDuringRefresh) merged.push(file);
+  }
+  return merged;
+}
+
 function mergeRefreshedFlows<T extends { id: string; updatedAt: number }>(
   current: T[],
   refreshed: T[],
@@ -928,7 +1065,14 @@ function upsertCommit(
 }
 
 function upsertFile(files: CanvasFileNode[], file: CanvasFileNode): CanvasFileNode[] {
-  return files.some((candidate) => candidate.id === file.id)
+  const existing = files.find((candidate) => candidate.id === file.id);
+  if (existing && existing.updatedAt > file.updatedAt) return files;
+  return replaceFile(files, file);
+}
+
+function replaceFile(files: CanvasFileNode[], file: CanvasFileNode): CanvasFileNode[] {
+  const existing = files.some((candidate) => candidate.id === file.id);
+  return existing
     ? files.map((candidate) => (candidate.id === file.id ? file : candidate))
     : [...files, file];
 }

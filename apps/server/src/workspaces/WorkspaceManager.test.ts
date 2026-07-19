@@ -1190,6 +1190,137 @@ describe("WorkspaceManager", () => {
     }
   });
 
+  it("commits external file authorization when its guarded mutation succeeds", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-file-trust-commit-"));
+    const projectsRoot = path.join(root, "projects");
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+      const project = await manager.createCanvasProject({
+        name: "Committed file trust",
+        projectRoot: path.join(root, "project"),
+      });
+      const externalFile = path.join(root, "committed.txt");
+      await writeFile(externalFile, "committed", "utf-8");
+      const canonicalFile = await realpath(externalFile);
+
+      await expect(manager.withExternalFileAuthorization(
+        [externalFile],
+        async (canonicalPaths) => {
+          expect(canonicalPaths).toEqual([canonicalFile]);
+          return "published";
+        },
+      )).resolves.toBe("published");
+
+      expect(manager.currentTrustedExternalFilePaths()).toEqual([canonicalFile]);
+      const index = JSON.parse(
+        await readFile(path.join(projectsRoot, "index.json"), "utf-8"),
+      ) as {
+        externalFileAuthorizations: Array<{ projectRoot: string; paths: string[] }>;
+      };
+      expect(index.externalFileAuthorizations).toContainEqual({
+        projectRoot: await realpath(project.projectRoot),
+        paths: [canonicalFile],
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("restores the exact authorization snapshot and rebuilds stale in-memory trust on failure", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-file-trust-reject-"));
+    const projectsRoot = path.join(root, "projects");
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+      await manager.createCanvasProject({
+        name: "Rejected file trust",
+        projectRoot: path.join(root, "project"),
+      });
+      const existingFile = path.join(root, "existing.txt");
+      const diskOnlyFile = path.join(root, "disk-only.txt");
+      const rejectedFile = path.join(root, "rejected.txt");
+      await Promise.all([
+        writeFile(existingFile, "existing", "utf-8"),
+        writeFile(diskOnlyFile, "disk only", "utf-8"),
+        writeFile(rejectedFile, "rejected", "utf-8"),
+      ]);
+      await manager.trustExternalFilePaths([existingFile]);
+      const indexPath = path.join(projectsRoot, "index.json");
+      const canonicalExistingFile = await realpath(existingFile);
+      const canonicalDiskOnlyFile = await realpath(diskOnlyFile);
+      const index = JSON.parse(await readFile(indexPath, "utf-8")) as {
+        externalFileAuthorizations: Array<{ paths: string[] }>;
+      };
+      index.externalFileAuthorizations[0]!.paths.push(canonicalDiskOnlyFile);
+      const indexBefore = `${JSON.stringify(index, undefined, 2)}\n`;
+      await writeFile(indexPath, indexBefore, "utf-8");
+      expect(manager.currentTrustedExternalFilePaths()).toEqual([canonicalExistingFile]);
+
+      await expect(manager.withExternalFileAuthorization(
+        [rejectedFile],
+        async () => {
+          throw new Error("final validation failed");
+        },
+      )).rejects.toThrow("final validation failed");
+
+      await expect(readFile(indexPath, "utf-8")).resolves.toBe(indexBefore);
+      expect(manager.currentTrustedExternalFilePaths()).toEqual([
+        canonicalExistingFile,
+        canonicalDiskOnlyFile,
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not overwrite a concurrent project-index change when authorization rollback loses CAS", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-file-trust-conflict-"));
+    const projectsRoot = path.join(root, "projects");
+    try {
+      const manager = new WorkspaceManager({
+        defaultSourcePath: root,
+        projectsRoot,
+        autoOpenDefault: false,
+      });
+      await manager.createCanvasProject({
+        name: "Conflicting file trust",
+        projectRoot: path.join(root, "project"),
+      });
+      const externalFile = path.join(root, "conflict.txt");
+      await writeFile(externalFile, "conflict", "utf-8");
+      const indexPath = path.join(projectsRoot, "index.json");
+      let concurrentContent = "";
+
+      let rejected: unknown;
+      try {
+        await manager.withExternalFileAuthorization([externalFile], async () => {
+          const concurrentIndex = JSON.parse(await readFile(indexPath, "utf-8")) as {
+            projects: Array<{ name: string }>;
+          };
+          concurrentIndex.projects[0]!.name = "Concurrent index writer";
+          concurrentContent = `${JSON.stringify(concurrentIndex, undefined, 2)}\n`;
+          await writeFile(indexPath, concurrentContent, "utf-8");
+          throw new Error("publish failed after concurrent index change");
+        });
+      } catch (error) {
+        rejected = error;
+      }
+
+      expect(rejected).toBeInstanceOf(AggregateError);
+      expect((rejected as Error).message).toContain("rollback was incomplete");
+      await expect(readFile(indexPath, "utf-8")).resolves.toBe(concurrentContent);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("canonicalizes and persists native-picker authorization through a directory mapping", async (context) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-picker-file-trust-"));
     const projectsRoot = path.join(root, "projects");

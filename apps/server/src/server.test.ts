@@ -1497,6 +1497,42 @@ describe("HTTP server", () => {
     );
   });
 
+  it("rolls back every external authorization when a referenced batch fails validation", async () => {
+    const firstPath = path.join(root, "reference-batch-first.txt");
+    const secondPath = path.join(root, "reference-batch-second.txt");
+    await Promise.all([
+      writeFile(firstPath, "first", "utf-8"),
+      writeFile(secondPath, "second", "utf-8"),
+    ]);
+    pickFiles.mockResolvedValueOnce([firstPath, secondPath]);
+    const picked = await request(port, "POST", "/api/files/pick", {});
+    expect(picked.status).toBe(200);
+
+    const indexPath = path.join(root, "projects-index", "index.json");
+    const indexBefore = await readFile(indexPath, "utf-8");
+    const trustedBefore = workspaceManager.currentTrustedExternalFilePaths();
+    const filesBefore = (await request(port, "GET", "/api/files")).json.files;
+    await rm(secondPath);
+    await mkdir(secondPath);
+
+    const rejected = await request(port, "POST", "/api/files/import-picked", {
+      selectionId: picked.json.selection.id,
+      mode: "reference",
+      kind: "normal",
+    });
+
+    expect(rejected.status).toBe(400);
+    await expect(readFile(indexPath, "utf-8")).resolves.toBe(indexBefore);
+    expect(workspaceManager.currentTrustedExternalFilePaths()).toEqual(trustedBefore);
+    expect((await request(port, "GET", "/api/files")).json.files).toEqual(filesBefore);
+    const released = await request(
+      port,
+      "DELETE",
+      `/api/files/pick/${encodeURIComponent(picked.json.selection.id)}`,
+    );
+    expect(released.status).toBe(204);
+  });
+
   it("returns null when native file selection is cancelled", async () => {
     pickFiles.mockResolvedValueOnce([]);
 
@@ -1634,6 +1670,80 @@ describe("HTTP server", () => {
     expect(unavailableOpen.status).toBe(500);
     expect(unavailableOpen.json.error).toContain("missing");
     expect(openFile).not.toHaveBeenCalled();
+  });
+
+  it("does not retain authorization when a referenced-file relink fails validation", async () => {
+    const sourcePath = path.join(root, "relink-rollback-source.txt");
+    const invalidReplacement = path.join(root, "relink-rollback-directory");
+    await writeFile(sourcePath, "source", "utf-8");
+    await mkdir(invalidReplacement);
+    pickFiles.mockResolvedValueOnce([sourcePath]);
+    const picked = await request(port, "POST", "/api/files/pick", {});
+    const imported = await request(port, "POST", "/api/files/import-picked", {
+      selectionId: picked.json.selection.id,
+      mode: "reference",
+      kind: "normal",
+    });
+    expect(imported.status).toBe(201);
+    const referenced = imported.json.files[0];
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    const indexPath = path.join(root, "projects-index", "index.json");
+    const indexBefore = await readFile(indexPath, "utf-8");
+    const trustedBefore = workspaceManager.currentTrustedExternalFilePaths();
+    pickFiles.mockResolvedValueOnce([invalidReplacement]);
+
+    const rejected = await request(
+      port,
+      "POST",
+      `/api/files/${encodeURIComponent(referenced.id)}/relink`,
+    );
+
+    expect(rejected.status).toBe(400);
+    await expect(readFile(indexPath, "utf-8")).resolves.toBe(indexBefore);
+    expect(workspaceManager.currentTrustedExternalFilePaths()).toEqual(trustedBefore);
+    const current = (await request(port, "GET", "/api/files")).json.files.find(
+      (file: { id: string }) => file.id === referenced.id,
+    );
+    expect(current).toEqual(referenced);
+  });
+
+  it("persists a referenced file that becomes missing during a content read", async () => {
+    const sourcePath = path.join(root, "content-missing-reference.txt");
+    const displacedPath = `${sourcePath}.displaced`;
+    await writeFile(sourcePath, "source", "utf-8");
+    pickFiles.mockResolvedValueOnce([sourcePath]);
+    const picked = await request(port, "POST", "/api/files/pick", {});
+    const imported = await request(port, "POST", "/api/files/import-picked", {
+      selectionId: picked.json.selection.id,
+      mode: "reference",
+      kind: "normal",
+    });
+    expect(imported.status).toBe(201);
+    const referenced = imported.json.files[0];
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    await rename(sourcePath, displacedPath);
+    await mkdir(sourcePath);
+    const unavailable = await request(
+      port,
+      "GET",
+      `/api/files/${encodeURIComponent(referenced.id)}/content`,
+    );
+    expect(unavailable.status).toBe(415);
+    expect(unavailable.json.error).toContain("missing or unavailable");
+    const inMemory = (await request(port, "GET", "/api/files")).json.files.find(
+      (file: { id: string }) => file.id === referenced.id,
+    );
+    expect(inMemory).toMatchObject({ availability: "missing", path: sourcePath });
+    await vi.waitFor(async () => {
+      const persisted = JSON.parse(
+        await readFile(path.join(projectRoot, "canvas-state.json"), "utf-8"),
+      );
+      expect(
+        persisted.files.files.find((file: { id: string }) => file.id === referenced.id),
+      ).toMatchObject({ availability: "missing", path: sourcePath });
+    }, { timeout: 2_000, interval: 25 });
   });
 
   it("releases an unused native selection token", async () => {

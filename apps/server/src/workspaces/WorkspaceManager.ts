@@ -263,6 +263,21 @@ export class WorkspaceManager {
   }
 
   async trustExternalFilePaths(paths: string[]): Promise<string[]> {
+    return await this.withExternalFileAuthorization(
+      paths,
+      async (canonicalPaths) => canonicalPaths,
+    );
+  }
+
+  /**
+   * Persist external-path trust only when the guarded file-state mutation succeeds. The exact
+   * prior index bytes are restored with a compare-and-swap guard so rollback cannot overwrite an
+   * unrelated writer that changed the project index after authorization was staged.
+   */
+  async withExternalFileAuthorization<T>(
+    paths: string[],
+    apply: (canonicalPaths: string[]) => Promise<T>,
+  ): Promise<T> {
     return await this.queueProjectMutation(async () => {
       await this.ensureProjectOpen();
       const revision = this.captureProjectRevision();
@@ -280,12 +295,37 @@ export class WorkspaceManager {
         ...(this.trustedExternalFilePaths ?? []),
         ...canonicalPaths,
       ]);
-      await this.writeProjectIndex(
+      const committedSnapshot = await this.writeProjectIndex(
         withProjectExternalFileAuthorization(index, boundary.realPath, mergedPaths),
         snapshot ?? null,
       );
       this.trustedExternalFilePaths = new Set(mergedPaths);
-      return canonicalPaths;
+      try {
+        this.assertProjectRevision(revision);
+        await assertProjectRootBoundary(this.requireProjectRoot(), boundary);
+        return await apply(canonicalPaths);
+      } catch (error) {
+        try {
+          await this.restoreProjectIndexSnapshot(snapshot, committedSnapshot);
+          this.trustedExternalFilePaths = new Set(
+            projectExternalFileAuthorizationPaths(index, boundary.realPath),
+          );
+        } catch (rollbackError) {
+          try {
+            const { index: currentIndex } = await this.readProjectIndexSnapshot();
+            this.trustedExternalFilePaths = new Set(
+              projectExternalFileAuthorizationPaths(currentIndex, boundary.realPath),
+            );
+          } catch {
+            this.trustedExternalFilePaths = undefined;
+          }
+          throw new AggregateError(
+            [error, rollbackError],
+            "External file authorization failed and project index rollback was incomplete",
+          );
+        }
+        throw error;
+      }
     });
   }
 
@@ -3110,6 +3150,32 @@ export class WorkspaceManager {
           : {}),
       },
     );
+  }
+
+  private async restoreProjectIndexSnapshot(
+    previousSnapshot: ManagedFileSnapshot | undefined,
+    committedSnapshot: ManagedFileSnapshot,
+  ): Promise<void> {
+    const projectsRootBoundary = await this.ensureProjectsRootBoundary();
+    if (previousSnapshot) {
+      await writeManagedFileAtomically(
+        this.projectIndexPath(),
+        previousSnapshot.content,
+        {
+          label: "Canvas project index rollback",
+          trustedRootBoundary: projectsRootBoundary,
+          expectedContent: committedSnapshot.content,
+          expectedIdentity: committedSnapshot.identity,
+        },
+      );
+      return;
+    }
+    await removeManagedFile(this.projectIndexPath(), {
+      label: "Canvas project index rollback",
+      trustedRootBoundary: projectsRootBoundary,
+      expectedContent: committedSnapshot.content,
+      expectedIdentity: committedSnapshot.identity,
+    });
   }
 
   private async discoverProjects(): Promise<CanvasProjectSummary[]> {

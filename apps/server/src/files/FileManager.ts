@@ -38,6 +38,12 @@ export interface FileManagerOptions {
   maxPickedFileBytes?: number;
   maxPickedBatchBytes?: number;
   pickedSelectionTtlMs?: number;
+  /** Internal observation hook used to deterministically exercise concurrent file changes. */
+  readChunkObserver?: (event: {
+    purpose: "stage" | "copy" | "preview";
+    filePath: string;
+    bytesRead: number;
+  }) => void | Promise<void>;
 }
 
 export interface ImportFileStateOptions {
@@ -49,6 +55,8 @@ interface StagedPickedFile {
   identity: ManagedFileIdentity;
   size: number;
   modifiedAt: number;
+  changedAt: number;
+  contentDigest?: string;
   file: PickedCanvasFile;
 }
 
@@ -92,6 +100,7 @@ export class FileManager {
   private readonly maxPickedFileBytes: number;
   private readonly maxPickedBatchBytes: number;
   private readonly pickedSelectionTtlMs: number;
+  private readonly readChunkObserver: FileManagerOptions["readChunkObserver"];
   private fileStateGeneration = 0;
   private activeStateImports = 0;
   private fileCounter = 0;
@@ -120,6 +129,7 @@ export class FileManager {
       DEFAULT_PICKED_SELECTION_TTL_MS,
       "pickedSelectionTtlMs",
     );
+    this.readChunkObserver = options.readChunkObserver;
   }
 
   list(): CanvasFileNode[] {
@@ -131,10 +141,19 @@ export class FileManager {
     trustedRoot?: string,
     trustedRootBoundary?: ManagedTrustedRootBoundary,
   ): void {
+    const nextIsolatedRoot = path.resolve(isolatedRoot);
+    const nextTrustedRoot = trustedRoot ? path.resolve(trustedRoot) : undefined;
+    if (
+      sameResolvedPath(this.isolatedRoot, nextIsolatedRoot) &&
+      sameOptionalResolvedPath(this.trustedRoot, nextTrustedRoot) &&
+      sameTrustedRootBoundary(this.trustedRootBoundary, trustedRootBoundary)
+    ) {
+      return;
+    }
     this.fileStateGeneration += 1;
     this.pickedFileSelections.clear();
-    this.isolatedRoot = path.resolve(isolatedRoot);
-    this.trustedRoot = trustedRoot ? path.resolve(trustedRoot) : undefined;
+    this.isolatedRoot = nextIsolatedRoot;
+    this.trustedRoot = nextTrustedRoot;
     this.trustedRootBoundary = trustedRootBoundary;
   }
 
@@ -199,20 +218,32 @@ export class FileManager {
             throw new Error(`Invalid persisted referenced file path: ${id}`);
           }
           const persistedPath = path.resolve(file.path);
-          const inspected = await inspectReferencedFile(persistedPath, {
-            allowMissing: true,
-            label: `persisted referenced file ${id}`,
-          });
-          if (!trustedReferencedPaths.has(normalizedFilePathKey(inspected.path))) {
+          const lexicalPathTrusted = trustedReferencedPaths.has(
+            normalizedFilePathKey(persistedPath),
+          );
+          let inspected: InspectedReferencedFile | undefined;
+          try {
+            inspected = await inspectReferencedFile(persistedPath, {
+              allowMissing: true,
+              label: `persisted referenced file ${id}`,
+            });
+          } catch (error) {
+            if (!isReferencedUnavailableError(error)) throw error;
+          }
+          const inspectedPathTrusted =
+            inspected !== undefined &&
+            trustedReferencedPaths.has(normalizedFilePathKey(inspected.path));
+          if (!inspectedPathTrusted && !lexicalPathTrusted) {
             throw new Error(`Persisted referenced file path is not trusted: ${persistedPath}`);
           }
-          const source = filenameParts(path.basename(inspected.path));
+          const useInspectedPath = inspectedPathTrusted;
+          filePath = useInspectedPath ? inspected!.path : persistedPath;
+          availability = useInspectedPath ? inspected!.availability : "missing";
+          identity = availability === "available" ? inspected!.identity : undefined;
+          const source = filenameParts(path.basename(filePath));
           if (extension !== source.extension) {
             throw new Error(`Persisted referenced file extension does not match its source: ${id}`);
           }
-          filePath = inspected.path;
-          availability = inspected.availability;
-          identity = inspected.identity;
         }
         this.assertFileStateGeneration(importGeneration);
         nextFiles.set(id, {
@@ -297,11 +328,25 @@ export class FileManager {
         identity: inspected.identity!,
         size: inspected.size!,
         modifiedAt: inspected.modifiedAt!,
+        changedAt: inspected.changedAt!,
         file: {
           ...parts,
           size: inspected.size!,
         },
       });
+    }
+    const copyEligible =
+      staged.every(({ size }) => size <= this.maxPickedFileBytes) &&
+      staged.reduce((total, { size }) => total + size, 0) <= this.maxPickedBatchBytes;
+    if (copyEligible) {
+      for (const picked of staged) {
+        picked.contentDigest = await digestPickedFile(
+          picked.path,
+          picked,
+          this.readChunkObserver,
+        );
+        this.assertFileStateGeneration(generation);
+      }
     }
     this.assertFileStateGeneration(generation);
     const id = `file_selection_${randomUUID()}`;
@@ -386,6 +431,7 @@ export class FileManager {
               item.inspected.path,
               item.picked,
               this.maxPickedFileBytes,
+              this.readChunkObserver,
             );
             this.assertFileStateGeneration(generation);
             const candidate = await this.createIsolatedCandidate(
@@ -455,6 +501,9 @@ export class FileManager {
       label: `referenced file ${id}`,
     });
     this.assertCurrentFileState(generation, current);
+    if (normalizedFilePathKey(sourcePath) !== normalizedFilePathKey(inspected.path)) {
+      throw new Error(`Referenced file ${id} changed its canonical target before relinking`);
+    }
     const source = filenameParts(path.basename(inspected.path));
     const updated: CanvasFileNode = {
       ...current,
@@ -495,10 +544,19 @@ export class FileManager {
       return updated;
     }
 
-    const inspected = await inspectReferencedFile(current.path, {
-      allowMissing: true,
-      label: `referenced file ${id}`,
-    });
+    let inspected: InspectedReferencedFile;
+    try {
+      inspected = await inspectReferencedFile(current.path, {
+        allowMissing: true,
+        label: `referenced file ${id}`,
+      });
+    } catch (error) {
+      this.assertCurrentFileState(generation, current);
+      if (isReferencedUnavailableError(error)) {
+        return this.markReferencedMissing(current);
+      }
+      throw error;
+    }
     this.assertCurrentFileState(generation, current);
     if (normalizedFilePathKey(current.path) !== normalizedFilePathKey(inspected.path)) {
       return this.markReferencedMissing(current);
@@ -1036,12 +1094,18 @@ export class FileManager {
           if (bytesRead === 0) break;
           total += bytesRead;
           chunks.push(chunk.subarray(0, bytesRead));
+          await this.readChunkObserver?.({
+            purpose: "preview",
+            filePath: file.path,
+            bytesRead: total,
+          });
         }
-        assertOpenFileIdentity(await handle.stat(), before, options.label);
+        assertUnchangedOpenFile(await handle.stat(), opened, options.label);
         const after = await validateManagedFile(file.path, options);
         if (!sameIdentity(before, after)) {
           throw new ManagedFileSafetyError(`${options.label} changed while reading preview`);
         }
+        assertUnchangedOpenFile(await lstat(file.path), opened, options.label);
         if (file.storage === "isolated") this.fileIdentities.set(file.id, after);
         return Buffer.concat(chunks, total);
       } finally {
@@ -1107,6 +1171,7 @@ interface InspectedReferencedFile {
   identity?: ManagedFileIdentity;
   size?: number;
   modifiedAt?: number;
+  changedAt?: number;
 }
 
 async function inspectReferencedFile(
@@ -1130,7 +1195,9 @@ async function inspectReferencedFile(
     throw error;
   }
   if (!requestedStat.isFile() || requestedStat.isSymbolicLink()) {
-    throw new Error(`${options.label} must be a regular non-symbolic-link file: ${requestedPath}`);
+    throw new ManagedFileSafetyError(
+      `${options.label} must be a regular non-symbolic-link file: ${requestedPath}`,
+    );
   }
   const canonicalPath = await realpath(requestedPath);
   const canonicalStat = await lstat(canonicalPath);
@@ -1139,7 +1206,9 @@ async function inspectReferencedFile(
     canonicalStat.isSymbolicLink() ||
     !sameIdentity(requestedStat, canonicalStat)
   ) {
-    throw new Error(`${options.label} must resolve to a regular file: ${requestedPath}`);
+    throw new ManagedFileSafetyError(
+      `${options.label} must resolve to a regular file: ${requestedPath}`,
+    );
   }
   const identity = await validateManagedFile(canonicalPath, { label: options.label });
   const validatedStat = await lstat(canonicalPath);
@@ -1149,7 +1218,9 @@ async function inspectReferencedFile(
     !sameIdentity(requestedStat, validatedStat) ||
     !sameIdentity(identity, validatedStat)
   ) {
-    throw new Error(`${options.label} changed while it was being inspected: ${requestedPath}`);
+    throw new ManagedFileSafetyError(
+      `${options.label} changed while it was being inspected: ${requestedPath}`,
+    );
   }
   return {
     path: canonicalPath,
@@ -1157,6 +1228,7 @@ async function inspectReferencedFile(
     identity,
     size: validatedStat.size,
     modifiedAt: validatedStat.mtimeMs,
+    changedAt: validatedStat.ctimeMs,
   };
 }
 
@@ -1229,7 +1301,9 @@ async function canonicalizeMissingReferencedPath(
         !canonicalStat.isDirectory() ||
         canonicalStat.isSymbolicLink()
       ) {
-        throw new Error(`${label} missing path has a non-directory ancestor: ${ancestor}`);
+        throw new ManagedFileSafetyError(
+          `${label} missing path has a non-directory ancestor: ${ancestor}`,
+        );
       }
       const canonicalPath = path.join(canonicalAncestor, ...missingSegments);
       try {
@@ -1269,6 +1343,7 @@ async function readPickedFileWithinLimit(
   filePath: string,
   expected: StagedPickedFile,
   maxBytes: number,
+  observer?: FileManagerOptions["readChunkObserver"],
 ): Promise<Buffer> {
   const label = `picked file ${expected.file.filename}`;
   const before = await lstat(filePath);
@@ -1276,11 +1351,15 @@ async function readPickedFileWithinLimit(
   if (before.size > maxBytes) {
     throw new Error(`${label} exceeds the ${maxBytes} byte copy limit`);
   }
+  if (!expected.contentDigest) {
+    throw new Error(`${label} was not staged for copying`);
+  }
   const handle = await open(filePath, constants.O_RDONLY | pickedNoFollowFlag());
   try {
     const opened = await handle.stat();
     assertPickedFileStat(opened, expected, label);
     const chunks: Buffer[] = [];
+    const digest = createHash("sha256");
     let total = 0;
     for (;;) {
       const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes - total + 1));
@@ -1290,13 +1369,55 @@ async function readPickedFileWithinLimit(
       if (total > maxBytes) {
         throw new Error(`${label} exceeds the ${maxBytes} byte copy limit`);
       }
-      chunks.push(chunk.subarray(0, bytesRead));
+      const bytes = chunk.subarray(0, bytesRead);
+      chunks.push(bytes);
+      digest.update(bytes);
+      await observer?.({ purpose: "copy", filePath, bytesRead: total });
     }
     const afterHandle = await handle.stat();
     assertPickedFileStat(afterHandle, expected, label);
     const afterPath = await lstat(filePath);
     assertPickedFileStat(afterPath, expected, label);
+    if (digest.digest("hex") !== expected.contentDigest) {
+      throw new Error(`${label} content changed after it was selected`);
+    }
     return Buffer.concat(chunks, total);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function digestPickedFile(
+  filePath: string,
+  expected: StagedPickedFile,
+  observer?: FileManagerOptions["readChunkObserver"],
+): Promise<string> {
+  const label = `picked file ${expected.file.filename}`;
+  const before = await lstat(filePath);
+  assertPickedFileStat(before, expected, label);
+  const handle = await open(filePath, constants.O_RDONLY | pickedNoFollowFlag());
+  try {
+    const opened = await handle.stat();
+    assertPickedFileStat(opened, expected, label);
+    const digest = createHash("sha256");
+    let total = 0;
+    for (;;) {
+      const chunk = Buffer.allocUnsafe(64 * 1024);
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > expected.size) {
+        throw new Error(`${label} changed while its content was being staged`);
+      }
+      digest.update(chunk.subarray(0, bytesRead));
+      await observer?.({ purpose: "stage", filePath, bytesRead: total });
+    }
+    if (total !== expected.size) {
+      throw new Error(`${label} changed while its content was being staged`);
+    }
+    assertPickedFileStat(await handle.stat(), expected, label);
+    assertPickedFileStat(await lstat(filePath), expected, label);
+    return digest.digest("hex");
   } finally {
     await handle.close();
   }
@@ -1313,9 +1434,35 @@ function assertPickedFileStat(
     stat.nlink !== 1 ||
     !sameIdentity(expected.identity, stat) ||
     stat.size !== expected.size ||
-    stat.mtimeMs !== expected.modifiedAt
+    stat.mtimeMs !== expected.modifiedAt ||
+    stat.ctimeMs !== expected.changedAt
   ) {
     throw new Error(`${label} changed after it was selected`);
+  }
+}
+
+function assertUnchangedOpenFile(stat: Stats, expected: Stats, label: string): void {
+  if (
+    !stat.isFile() ||
+    stat.isSymbolicLink() ||
+    stat.nlink !== 1 ||
+    !sameIdentity(expected, stat)
+  ) {
+    throw new ManagedFileSafetyError(`${label} changed while opening or reading`);
+  }
+  if (
+    stat.size !== expected.size ||
+    stat.mtimeMs !== expected.mtimeMs ||
+    stat.ctimeMs !== expected.ctimeMs
+  ) {
+    throw new FileSnapshotChangedError(`${label} changed while opening or reading`);
+  }
+}
+
+class FileSnapshotChangedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "FileSnapshotChangedError";
   }
 }
 
@@ -1342,6 +1489,7 @@ function samePickedFingerprint(
     actual.identity !== undefined &&
     actual.size === expected.size &&
     actual.modifiedAt === expected.modifiedAt &&
+    actual.changedAt === expected.changedAt &&
     sameIdentity(expected.identity, actual.identity)
   );
 }
@@ -1374,6 +1522,32 @@ function normalizedFilePathKey(value: string): string {
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
+function sameResolvedPath(left: string, right: string): boolean {
+  return normalizedFilePathKey(left) === normalizedFilePathKey(right);
+}
+
+function sameOptionalResolvedPath(
+  left: string | undefined,
+  right: string | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return sameResolvedPath(left, right);
+}
+
+function sameTrustedRootBoundary(
+  left: ManagedTrustedRootBoundary | undefined,
+  right: ManagedTrustedRootBoundary | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return (
+    sameResolvedPath(left.path, right.path) &&
+    left.logicalMapping === right.logicalMapping &&
+    sameIdentity(left.logicalIdentity, right.logicalIdentity) &&
+    sameResolvedPath(left.realPath, right.realPath) &&
+    sameIdentity(left.realIdentity, right.realIdentity)
+  );
+}
+
 function sameIdentity(left: ManagedFileIdentity, right: ManagedFileIdentity): boolean {
   return left.dev === right.dev && left.ino === right.ino;
 }
@@ -1389,6 +1563,7 @@ function isReferencedUnavailableError(error: unknown): boolean {
     code === "UNSAFE_MANAGED_FILE" ||
     code === "ENOENT" ||
     code === "ENOTDIR" ||
+    code === "ELOOP" ||
     code === "EACCES" ||
     code === "EPERM" ||
     code === "EBUSY" ||

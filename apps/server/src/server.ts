@@ -1156,12 +1156,13 @@ async function handleHttp(
       });
     }
     try {
-      if (body.mode === "reference") {
-        await workspaceManager.trustExternalFilePaths(
-          fileManager.pickedSelectionPaths(body.selectionId),
-        );
-      }
-      const files = await fileManager.importPicked(body.selectionId, body.mode, body.kind);
+      const files = body.mode === "reference"
+        ? await workspaceManager.withExternalFileAuthorization(
+            fileManager.pickedSelectionPaths(body.selectionId),
+            async () =>
+              await fileManager.importPicked(body.selectionId, body.mode, body.kind),
+          )
+        : await fileManager.importPicked(body.selectionId, body.mode, body.kind);
       canvasState.saveSoon();
       return sendJson(res, 201, { files });
     } catch (error) {
@@ -1281,9 +1282,13 @@ async function handleHttp(
       }
       if (!selected[0]) return sendJson(res, 200, { file: null });
       try {
-        const [canonicalPath] = await workspaceManager.trustExternalFilePaths([selected[0]]);
-        if (!canonicalPath) throw new Error("未能授权重新定位的文件路径");
-        const file = await fileManager.relinkReferenced(id, canonicalPath);
+        const file = await workspaceManager.withExternalFileAuthorization(
+          [selected[0]],
+          async ([canonicalPath]) => {
+            if (!canonicalPath) throw new Error("未能授权重新定位的文件路径");
+            return await fileManager.relinkReferenced(id, canonicalPath);
+          },
+        );
         canvasState.saveSoon();
         return sendJson(res, 200, { file });
       } catch (error) {
@@ -1311,6 +1316,7 @@ async function handleHttp(
       }
     }
     if (method === "GET" && action === "content") {
+      const current = fileManager.get(id)!;
       try {
         return sendJson(
           res,
@@ -1320,18 +1326,25 @@ async function handleHttp(
             : await fileManager.readPreview(id),
         );
       } catch (error) {
+        if (fileManager.get(id) !== current) canvasState.saveSoon();
         return sendJson(res, 415, { error: errMsg(error) });
       }
     }
     if (method === "GET" && action === "raw") {
-      const { file, data } = await fileManager.readRaw(id);
-      res.writeHead(200, {
-        "Content-Type": file.mimeType,
-        "Content-Length": data.length,
-        "Cache-Control": "no-store",
-      });
-      res.end(data);
-      return;
+      const current = fileManager.get(id)!;
+      try {
+        const { file, data } = await fileManager.readRaw(id);
+        res.writeHead(200, {
+          "Content-Type": file.mimeType,
+          "Content-Length": data.length,
+          "Cache-Control": "no-store",
+        });
+        res.end(data);
+        return;
+      } catch (error) {
+        if (fileManager.get(id) !== current) canvasState.saveSoon();
+        throw error;
+      }
     }
     if (method === "POST" && action === "open") {
       const current = fileManager.get(id)!;
