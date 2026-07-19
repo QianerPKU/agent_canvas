@@ -781,6 +781,10 @@ function settingsFromUpdateSnapshot(
   if (input.systemPrompt !== undefined) {
     settings.systemPrompt = snapshot.systemPrompt ?? input.systemPrompt;
   }
+  if (input.allowSharedResourceWrites !== undefined) {
+    settings.allowSharedResourceWrites =
+      snapshot.allowSharedResourceWrites ?? input.allowSharedResourceWrites;
+  }
   if (
     input.branchWorkspaceId !== undefined ||
     input.branch !== undefined ||

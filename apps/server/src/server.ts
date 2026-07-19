@@ -22,7 +22,6 @@ import type {
   CanvasProjectState,
   ConnectGitHubInput,
   CreateBranchWorkspaceInput,
-  CreateAgentInput,
   CreateCanvasProjectInput,
   CreateCanvasFileInput,
   CreateCanvasPromptInput,
@@ -1201,12 +1200,20 @@ async function handleHttp(
   }
 
   if (method === "POST" && path === "/api/agents") {
-    const body = await readJson<CreateAgentInput>(req);
+    const body = await readJson<unknown>(req);
+    let requestedSettings: AgentSettings;
+    try {
+      requestedSettings = normalizeAgentSettings(body, defaultCwd);
+    } catch (error) {
+      return sendJson(res, 400, { error: errMsg(error) });
+    }
     return await canvasState.runProjectTransaction(async () => {
       try {
-        const settings = normalizeAgentSettings(
-          await resolveAgentWorkspaceSettings(workspaceManager, body, defaultCwd, true),
+        const settings = await resolveAgentWorkspaceSettings(
+          workspaceManager,
+          requestedSettings,
           defaultCwd,
+          true,
         );
         const runner = manager.create(settings);
         const branch = manager.configOf(runner.id)?.branch?.trim();
@@ -1501,30 +1508,38 @@ async function handleHttp(
       return sendJson(res, 200, publicAgentSnapshot(manager.snapshot(id)!));
     }
     if (method === "PATCH" && action === "settings") {
-      const body = await readJson<UpdateAgentSettingsInput>(req);
+      const body = await readJson<unknown>(req);
+      let requestedSettings: UpdateAgentSettingsInput;
+      try {
+        requestedSettings = normalizeUpdateAgentSettingsInput(body);
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
       try {
         let branchToRetry: string | undefined;
         const snapshot = await canvasState.runProjectTransaction(async () => {
+          manager.validateSettingsUpdate(id, requestedSettings);
           const currentConfig = manager.configOf(id);
           const branchChanged =
-            body?.branchWorkspaceId !== undefined || body?.branch !== undefined;
+            requestedSettings.branchWorkspaceId !== undefined ||
+            requestedSettings.branch !== undefined;
           const resolvedWorkspaceSettings = branchChanged
             ? await resolveAgentWorkspaceSettings(
                 workspaceManager,
-                settingsForWorkspaceResolution(currentConfig, body),
+                settingsForWorkspaceResolution(currentConfig, requestedSettings),
                 defaultCwd,
                 true,
               )
             : undefined;
           const settings = branchChanged
             ? {
-                ...(body ?? {}),
+                ...requestedSettings,
                 branchWorkspaceId: resolvedWorkspaceSettings?.branchWorkspaceId,
                 branch: resolvedWorkspaceSettings?.branch,
                 cwd: resolvedWorkspaceSettings?.cwd,
                 scratchDirectory: resolvedWorkspaceSettings?.scratchDirectory,
               }
-            : body ?? {};
+            : requestedSettings;
           if (branchChanged && manager.appSettings().workDocumentationEnabled) {
             await workspaceManager.prepareAgentWorkspace(id, settings, {
               workDocumentationEnabled: true,
@@ -1578,6 +1593,11 @@ async function handleHttp(
     if (method === "POST" && action === "start") {
       const body = await readJson<AgentStartConfig>(req);
       if (!body?.prompt) return sendJson(res, 400, { error: "缺少 prompt" });
+      if (body.allowSharedResourceWrites !== undefined) {
+        return sendJson(res, 400, {
+          error: "共享目录写权限只能通过 Agent 设置修改",
+        });
+      }
       await workspaceManager.prepareAgentWorkspace(
         id,
         {
@@ -1592,32 +1612,43 @@ async function handleHttp(
       return sendJson(res, 202, { ok: true });
     }
     if (method === "POST" && action === "fork") {
-      const body = await readJson<Partial<ForkAgentInput>>(req);
-      if (!body?.anchorUuid) return sendJson(res, 400, { error: "缺少 anchorUuid" });
+      const body = await readJson<unknown>(req);
+      let forkInput: ForkAgentInput;
+      try {
+        forkInput = normalizeForkAgentInput(body);
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
+      try {
+        manager.validateFork(id, forkInput.anchorUuid);
+      } catch (error) {
+        return sendJson(res, 409, { error: errMsg(error) });
+      }
       try {
         const branchChanged =
-          body.branchWorkspaceId !== undefined || body.branch !== undefined;
+          forkInput.branchWorkspaceId !== undefined || forkInput.branch !== undefined;
         const branchSettings = branchChanged
           ? await resolveAgentWorkspaceSettings(
               workspaceManager,
               {
-                branchWorkspaceId: body.branchWorkspaceId,
-                branch: body.branch,
-                cwd: body.cwd,
-                scratchDirectory: body.scratchDirectory,
-                reasoningEffort: body.reasoningEffort,
+                branchWorkspaceId: forkInput.branchWorkspaceId,
+                branch: forkInput.branch,
+                cwd: forkInput.cwd,
+                scratchDirectory: forkInput.scratchDirectory,
+                reasoningEffort: forkInput.reasoningEffort,
               },
               defaultCwd,
               true,
             )
           : undefined;
-        const forked = manager.fork(id, body.anchorUuid, {
-          model: body.model,
-          reasoningEffort: body.reasoningEffort,
+        const forked = manager.fork(id, forkInput.anchorUuid, {
+          model: forkInput.model,
+          reasoningEffort: forkInput.reasoningEffort,
           branchWorkspaceId: branchSettings?.branchWorkspaceId,
           branch: branchSettings?.branch,
           cwd: branchSettings?.cwd,
           scratchDirectory: branchSettings?.scratchDirectory,
+          allowSharedResourceWrites: forkInput.allowSharedResourceWrites,
         });
         if (!forked) return sendJson(res, 409, { error: "源会话尚未建立，无法 fork" });
         fileManager.copyAgentConnections(id, forked.id);
@@ -2432,20 +2463,88 @@ function branchSwitchPrompt(diff: BranchDiffSummary | undefined): AgentPromptRef
 }
 
 function normalizeAgentSettings(
-  input: CreateAgentInput | undefined,
+  input: unknown,
   defaultCwd: string,
 ): AgentSettings {
-  const provider = input?.provider === "codex" ? "codex" : "claude";
+  if (input !== undefined && input !== null && !isRecord(input)) {
+    throw new Error("Agent 设置必须是对象");
+  }
+  const settings = isRecord(input) ? input : {};
+  const requestedProvider = optionalStringSetting(settings.provider, "Agent provider");
+  if (
+    requestedProvider !== undefined &&
+    requestedProvider !== "claude" &&
+    requestedProvider !== "codex"
+  ) {
+    throw new Error("Agent provider 必须是 claude 或 codex");
+  }
+  const model = optionalStringSetting(settings.model, "模型");
+  const reasoningEffort = optionalStringSetting(settings.reasoningEffort, "推理强度");
+  const cwd = optionalStringSetting(settings.cwd, "工作目录");
   return {
-    provider,
-    model: input?.model?.trim() || undefined,
-    reasoningEffort: input?.reasoningEffort?.trim() || undefined,
-    branchWorkspaceId: input?.branchWorkspaceId,
-    branch: input?.branch,
-    cwd: input?.cwd?.trim() || defaultCwd,
-    scratchDirectory: input?.scratchDirectory,
-    systemPrompt: input?.systemPrompt ?? "",
+    provider: requestedProvider ?? "claude",
+    model: model?.trim() || undefined,
+    reasoningEffort: reasoningEffort?.trim() || undefined,
+    branchWorkspaceId: optionalStringSetting(settings.branchWorkspaceId, "Branch workspace id"),
+    branch: optionalStringSetting(settings.branch, "Branch"),
+    cwd: cwd?.trim() || defaultCwd,
+    scratchDirectory: optionalStringSetting(settings.scratchDirectory, "临时文件目录"),
+    systemPrompt: optionalStringSetting(settings.systemPrompt, "系统提示词") ?? "",
+    allowSharedResourceWrites: optionalBooleanSetting(
+      settings.allowSharedResourceWrites,
+      "共享目录写权限设置",
+    ) ?? false,
   };
+}
+
+function normalizeForkAgentInput(input: unknown): ForkAgentInput {
+  if (!isRecord(input)) throw new Error("Fork 设置必须是对象");
+  const anchorUuid = optionalStringSetting(input.anchorUuid, "anchorUuid")?.trim();
+  if (!anchorUuid) throw new Error("缺少 anchorUuid");
+  return {
+    anchorUuid,
+    model: optionalStringSetting(input.model, "模型"),
+    reasoningEffort: optionalStringSetting(input.reasoningEffort, "推理强度"),
+    branchWorkspaceId: optionalStringSetting(input.branchWorkspaceId, "Branch workspace id"),
+    branch: optionalStringSetting(input.branch, "Branch"),
+    cwd: optionalStringSetting(input.cwd, "工作目录"),
+    scratchDirectory: optionalStringSetting(input.scratchDirectory, "临时文件目录"),
+    allowSharedResourceWrites: optionalBooleanSetting(
+      input.allowSharedResourceWrites,
+      "共享目录写权限设置",
+    ),
+  };
+}
+
+function normalizeUpdateAgentSettingsInput(input: unknown): UpdateAgentSettingsInput {
+  if (input === undefined) return {};
+  if (!isRecord(input)) throw new Error("Agent 设置更新必须是对象");
+  const normalized: UpdateAgentSettingsInput = {};
+  const systemPrompt = optionalStringSetting(input.systemPrompt, "系统提示词");
+  const model = optionalNullableStringSetting(input.model, "模型");
+  const reasoningEffort = optionalNullableStringSetting(input.reasoningEffort, "推理强度");
+  const branchWorkspaceId = optionalStringSetting(
+    input.branchWorkspaceId,
+    "Branch workspace id",
+  );
+  const branch = optionalStringSetting(input.branch, "Branch");
+  const cwd = optionalStringSetting(input.cwd, "工作目录");
+  const scratchDirectory = optionalStringSetting(input.scratchDirectory, "临时文件目录");
+  const allowSharedResourceWrites = optionalBooleanSetting(
+    input.allowSharedResourceWrites,
+    "共享目录写权限设置",
+  );
+  if (systemPrompt !== undefined) normalized.systemPrompt = systemPrompt;
+  if (model !== undefined) normalized.model = model;
+  if (reasoningEffort !== undefined) normalized.reasoningEffort = reasoningEffort;
+  if (branchWorkspaceId !== undefined) normalized.branchWorkspaceId = branchWorkspaceId;
+  if (branch !== undefined) normalized.branch = branch;
+  if (cwd !== undefined) normalized.cwd = cwd;
+  if (scratchDirectory !== undefined) normalized.scratchDirectory = scratchDirectory;
+  if (allowSharedResourceWrites !== undefined) {
+    normalized.allowSharedResourceWrites = allowSharedResourceWrites;
+  }
+  return normalized;
 }
 
 function settingsForWorkspaceResolution(
@@ -2464,7 +2563,29 @@ function settingsForWorkspaceResolution(
     cwd: input?.cwd ?? currentConfig?.cwd,
     scratchDirectory: input?.scratchDirectory ?? currentConfig?.scratchDirectory,
     systemPrompt: input?.systemPrompt ?? currentConfig?.systemPrompt,
+    allowSharedResourceWrites:
+      input?.allowSharedResourceWrites ?? currentConfig?.allowSharedResourceWrites,
   };
+}
+
+function optionalBooleanSetting(value: unknown, label: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw new Error(`${label}必须是 boolean`);
+  return value;
+}
+
+function optionalStringSetting(value: unknown, label: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") throw new Error(`${label}必须是 string`);
+  return value;
+}
+
+function optionalNullableStringSetting(
+  value: unknown,
+  label: string,
+): string | null | undefined {
+  if (value === null) return null;
+  return optionalStringSetting(value, label);
 }
 
 async function createAgentResultFile(

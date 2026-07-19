@@ -191,6 +191,7 @@ export class AgentRunner {
         | "branch"
         | "cwd"
         | "scratchDirectory"
+        | "allowSharedResourceWrites"
       >
     > & { model?: string | null; reasoningEffort?: string | null },
     pendingPrompt?: AgentPromptReference,
@@ -1129,6 +1130,7 @@ function applySettings(
         | "branch"
         | "cwd"
         | "scratchDirectory"
+        | "allowSharedResourceWrites"
       >
     > & { model?: string | null; reasoningEffort?: string | null },
 ): AgentStartConfig {

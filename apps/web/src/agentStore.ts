@@ -81,6 +81,7 @@ export interface AgentView {
   cwd?: string;
   scratchDirectory?: string;
   systemPrompt?: string;
+  allowSharedResourceWrites?: boolean;
   status: AgentStatus;
   turns: Turn[];
   /** 线程最近一次 usage；最新 idle/running 节点持续展示该值。 */
@@ -157,6 +158,7 @@ export function applyHello(
       cwd: a.config.cwd,
       scratchDirectory: a.config.scratchDirectory,
       systemPrompt: a.config.systemPrompt,
+      allowSharedResourceWrites: a.config.allowSharedResourceWrites,
       forkOrigin: a.forkOrigin,
       createdAt: a.createdAt,
       latestUsage: snapshotUsage,
@@ -199,6 +201,7 @@ export function applyHello(
       cwd: a.config.cwd,
       scratchDirectory: a.config.scratchDirectory,
       systemPrompt: a.config.systemPrompt,
+      allowSharedResourceWrites: a.config.allowSharedResourceWrites,
       forkOrigin: a.forkOrigin,
       createdAt: a.createdAt,
       latestUsage,
@@ -274,6 +277,10 @@ export function insertForked(
       scratchDirectory:
         options.scratchDirectory ?? live?.scratchDirectory ?? parent?.scratchDirectory,
       systemPrompt: live?.systemPrompt ?? parent?.systemPrompt,
+      allowSharedResourceWrites:
+        options.allowSharedResourceWrites ??
+        live?.allowSharedResourceWrites ??
+        parent?.allowSharedResourceWrites,
       forkOrigin: origin,
     },
   };
@@ -301,6 +308,8 @@ export function recordAgentSettings(
       cwd: settings.cwd ?? prev.cwd,
       scratchDirectory: settings.scratchDirectory ?? prev.scratchDirectory,
       systemPrompt: settings.systemPrompt ?? prev.systemPrompt,
+      allowSharedResourceWrites:
+        settings.allowSharedResourceWrites ?? prev.allowSharedResourceWrites,
     },
   };
 }
