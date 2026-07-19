@@ -172,6 +172,7 @@ export function useAgentCanvas(): UseAgentCanvas {
   const refreshGenerationRef = useRef(0);
   const agentMutationGenerationRef = useRef(0);
   const agentMutationGenerationsRef = useRef(new Map<string, number>());
+  const agentRuntimeGenerationsRef = useRef(new Map<string, number>());
   const helloSnapshotGenerationRef = useRef(0);
   const workspaceEventGenerationRef = useRef(0);
   const workspaceEventIdentityRef = useRef<string>();
@@ -191,9 +192,14 @@ export function useAgentCanvas(): UseAgentCanvas {
     const generation = ++agentMutationGenerationRef.current;
     agentMutationGenerationsRef.current.set(agentId, generation);
   }, []);
+  const markAgentRuntimeMutation = useCallback((agentId: string) => {
+    const generations = agentRuntimeGenerationsRef.current;
+    generations.set(agentId, (generations.get(agentId) ?? 0) + 1);
+  }, []);
   const clearProjectScopedState = useCallback(() => {
     helloSnapshotGenerationRef.current += 1;
     agentMutationGenerationsRef.current.clear();
+    agentRuntimeGenerationsRef.current.clear();
     setAgents(emptyMap);
     setFiles([]);
     setFileConnections([]);
@@ -246,7 +252,7 @@ export function useAgentCanvas(): UseAgentCanvas {
       );
       setPrFlows((current) => mergeRefreshedFlows(current, nextPrFlows));
       setSyncFlows((current) => mergeRefreshedFlows(current, nextSyncFlows));
-      setCommits(nextCommits);
+      setCommits((current) => mergeRefreshedCommits(current, nextCommits));
     }
     setFiles(nextFiles);
     setFileConnections(nextConnections);
@@ -301,6 +307,9 @@ export function useAgentCanvas(): UseAgentCanvas {
           setSyncFlows(frame.syncFlows ?? []);
           setCommits(frame.commits ?? []);
         } else if (frame.type === "event") {
+          if (frame.envelope.event.kind === "system_init") {
+            markAgentRuntimeMutation(frame.envelope.agentId);
+          }
           markAgentMutation(frame.envelope.agentId);
           setAgents((prev) => applyEnvelope(prev, frame.envelope));
         } else if (frame.type === "pr_flow") {
@@ -390,7 +399,7 @@ export function useAgentCanvas(): UseAgentCanvas {
       wsRef.current = null;
       currentSocket?.close();
     };
-  }, [clearProjectScopedState, markAgentMutation, refresh]);
+  }, [clearProjectScopedState, markAgentMutation, markAgentRuntimeMutation, refresh]);
 
   const actions = useMemo<AgentActions>(
     () => ({
@@ -407,21 +416,18 @@ export function useAgentCanvas(): UseAgentCanvas {
       },
       updateSettings: async (agentId, settings) => {
         const workspaceGeneration = workspaceEventGenerationRef.current;
+        const agentRuntimeGeneration = agentRuntimeGenerationsRef.current.get(agentId) ?? 0;
         const snapshot = await api.updateAgentSettings(agentId, settings);
         if (workspaceGeneration !== workspaceEventGenerationRef.current) return;
-        markAgentMutation(agentId);
-        setAgents((prev) =>
-          recordAgentSettings(prev, agentId, {
-            provider: snapshot.config.provider,
-            model: snapshot.config.model,
-            reasoningEffort: snapshot.config.reasoningEffort,
-            branchWorkspaceId: snapshot.config.branchWorkspaceId,
-            branch: snapshot.config.branch,
-            cwd: snapshot.config.cwd,
-            scratchDirectory: snapshot.config.scratchDirectory,
-            systemPrompt: snapshot.config.systemPrompt,
-          }),
+        const runtimeChangedDuringRequest =
+          (agentRuntimeGenerationsRef.current.get(agentId) ?? 0) > agentRuntimeGeneration;
+        const responseSettings = settingsFromUpdateSnapshot(
+          settings,
+          snapshot.config,
+          runtimeChangedDuringRequest,
         );
+        markAgentMutation(agentId);
+        setAgents((prev) => recordAgentSettings(prev, agentId, responseSettings));
       },
       submit: async (agentId, text) => {
         const view = agentsRef.current[agentId];
@@ -694,10 +700,51 @@ function mergeRefreshedFlows<T extends { id: string; updatedAt: number }>(
   ];
 }
 
+function mergeRefreshedCommits(
+  current: AgentCommitSnapshot[],
+  refreshed: AgentCommitSnapshot[],
+): AgentCommitSnapshot[] {
+  const currentIds = new Set(current.map((commit) => commit.id));
+  return [
+    ...current,
+    ...refreshed.filter((commit) => !currentIds.has(commit.id)),
+  ].sort((left, right) => right.createdAt - left.createdAt);
+}
+
 function definedAgentSettings(settings: AgentSettings): AgentSettings {
   return Object.fromEntries(
     Object.entries(settings).filter(([, value]) => value !== undefined),
   ) as AgentSettings;
+}
+
+function settingsFromUpdateSnapshot(
+  input: UpdateAgentSettingsInput,
+  snapshot: AgentSettings,
+  preserveRuntimeModel: boolean,
+): AgentSettings {
+  const settings: AgentSettings = {};
+  if (input.model !== undefined && !preserveRuntimeModel) {
+    settings.model = snapshot.model ?? input.model ?? undefined;
+  }
+  if (input.reasoningEffort !== undefined) {
+    settings.reasoningEffort =
+      snapshot.reasoningEffort ?? input.reasoningEffort ?? undefined;
+  }
+  if (input.systemPrompt !== undefined) {
+    settings.systemPrompt = snapshot.systemPrompt ?? input.systemPrompt;
+  }
+  if (
+    input.branchWorkspaceId !== undefined ||
+    input.branch !== undefined ||
+    input.cwd !== undefined ||
+    input.scratchDirectory !== undefined
+  ) {
+    settings.branchWorkspaceId = snapshot.branchWorkspaceId ?? input.branchWorkspaceId;
+    settings.branch = snapshot.branch ?? input.branch;
+    settings.cwd = snapshot.cwd ?? input.cwd;
+    settings.scratchDirectory = snapshot.scratchDirectory ?? input.scratchDirectory;
+  }
+  return settings;
 }
 
 function upsertFlow(

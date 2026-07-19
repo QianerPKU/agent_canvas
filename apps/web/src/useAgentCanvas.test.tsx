@@ -2,7 +2,7 @@
 import { StrictMode, type PropsWithChildren } from "react";
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { PullRequestFlowSnapshot } from "@agent-canvas/shared";
+import type { AgentCommitSnapshot, PullRequestFlowSnapshot } from "@agent-canvas/shared";
 import { api } from "./api.js";
 import { useAgentCanvas } from "./useAgentCanvas.js";
 
@@ -127,6 +127,24 @@ function pullRequestFlow(
     updatedAt,
     currentStage: "source_preflight",
     reviewRequests: [],
+  };
+}
+
+function agentCommit(
+  id: string,
+  createdAt: number,
+  summary: string,
+): AgentCommitSnapshot {
+  return {
+    id,
+    agentId: "agent_1",
+    sourceTurnIndex: 0,
+    commitSha: `${id}-sha`,
+    shortSha: id,
+    subject: summary,
+    summary,
+    files: [],
+    createdAt,
   };
 }
 
@@ -257,6 +275,167 @@ describe("useAgentCanvas", () => {
       cwd: "C:\\repo\\main",
       systemPrompt: "review main",
       lastSeq: 3,
+    });
+    unmount();
+  });
+
+  it("keeps auto-start websocket state when a branch update response arrives later", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+    let resolveUpdate!: (snapshot: Awaited<ReturnType<typeof api.updateAgentSettings>>) => void;
+    vi.spyOn(api, "updateAgentSettings").mockReturnValue(
+      new Promise<Awaited<ReturnType<typeof api.updateAgentSettings>>>((resolve) => {
+        resolveUpdate = resolve;
+      }),
+    );
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    act(() => vi.advanceTimersByTime(0));
+    await act(async () => {
+      await result.current.refresh();
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    act(() =>
+      sendHelloFrame(socket, "agent_1", {
+        provider: "codex",
+        model: "stale-model",
+        branchWorkspaceId: "branch_source",
+        branch: "feature/source",
+        cwd: "C:\\repo\\source",
+        scratchDirectory: "C:\\repo\\source\\.agent-tmp\\agent_1",
+        systemPrompt: "keep this policy",
+      }),
+    );
+    const update = {
+      model: "stale-model",
+      branchWorkspaceId: "branch_main",
+      branch: "main",
+      cwd: "C:\\repo\\main",
+      scratchDirectory: "C:\\repo\\main\\.agent-tmp\\agent_1",
+    };
+    let pendingUpdate!: Promise<void>;
+    act(() => {
+      pendingUpdate = result.current.actions.updateSettings("agent_1", update);
+    });
+
+    act(() => {
+      sendAgentEvent(socket, "agent_1", 1, { kind: "status", status: "starting" });
+      sendAgentEvent(socket, "agent_1", 2, {
+        kind: "system_init",
+        sessionId: "session-main",
+        model: "runtime-model",
+        cwd: "C:\\repo\\main",
+        tools: [],
+      });
+      sendAgentEvent(socket, "agent_1", 3, { kind: "status", status: "running" });
+    });
+
+    await act(async () => {
+      resolveUpdate({
+        id: "agent_1",
+        status: "idle",
+        sessionId: "stale-session",
+        config: {
+          prompt: "",
+          provider: "codex",
+          ...update,
+          systemPrompt: "keep this policy",
+        },
+        createdAt: 1,
+        lastEventSeq: 0,
+      });
+      await pendingUpdate;
+    });
+
+    expect(result.current.agents.agent_1).toMatchObject({
+      status: "running",
+      sessionId: "session-main",
+      model: "runtime-model",
+      lastSeq: 3,
+      provider: "codex",
+      branchWorkspaceId: "branch_main",
+      branch: "main",
+      cwd: "C:\\repo\\main",
+      scratchDirectory: "C:\\repo\\main\\.agent-tmp\\agent_1",
+      systemPrompt: "keep this policy",
+    });
+    expect(result.current.agents.agent_1?.turns[0]?.lines).toContainEqual({
+      kind: "system",
+      text: "会话建立 · runtime-model",
+    });
+    unmount();
+  });
+
+  it("applies an explicit model update when only ordinary websocket events arrive first", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+    let resolveUpdate!: (snapshot: Awaited<ReturnType<typeof api.updateAgentSettings>>) => void;
+    vi.spyOn(api, "updateAgentSettings").mockReturnValue(
+      new Promise<Awaited<ReturnType<typeof api.updateAgentSettings>>>((resolve) => {
+        resolveUpdate = resolve;
+      }),
+    );
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    act(() => vi.advanceTimersByTime(0));
+    await act(async () => {
+      await result.current.refresh();
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    act(() =>
+      sendHelloFrame(socket, "agent_1", {
+        provider: "codex",
+        model: "old-model",
+        branchWorkspaceId: "branch_main",
+        branch: "main",
+        cwd: "C:\\repo\\main",
+      }),
+    );
+    let pendingUpdate!: Promise<void>;
+    act(() => {
+      pendingUpdate = result.current.actions.updateSettings("agent_1", {
+        model: "new-model",
+      });
+    });
+
+    act(() => {
+      sendAgentEvent(socket, "agent_1", 1, { kind: "status", status: "starting" });
+      sendAgentEvent(socket, "agent_1", 2, {
+        kind: "assistant_text",
+        text: "ordinary live output",
+        messageUuid: "message-1",
+      });
+    });
+
+    await act(async () => {
+      resolveUpdate({
+        id: "agent_1",
+        status: "idle",
+        config: {
+          prompt: "",
+          provider: "codex",
+          model: "new-model",
+          branchWorkspaceId: "branch_main",
+          branch: "main",
+          cwd: "C:\\repo\\main",
+        },
+        createdAt: 1,
+        lastEventSeq: 0,
+      });
+      await pendingUpdate;
+    });
+
+    expect(result.current.agents.agent_1).toMatchObject({
+      status: "starting",
+      model: "new-model",
+      lastSeq: 2,
+    });
+    expect(result.current.agents.agent_1?.turns[0]?.lines).toContainEqual({
+      kind: "assistant",
+      text: "ordinary live output",
+      messageUuid: "message-1",
     });
     unmount();
   });
@@ -434,6 +613,54 @@ describe("useAgentCanvas", () => {
       status: "source_review_collecting",
       updatedAt: 2,
     });
+    unmount();
+  });
+
+  it("keeps a websocket commit that arrives during a delayed commit refresh", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    act(() => vi.advanceTimersByTime(0));
+    await act(async () => {
+      await result.current.refresh();
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    let resolveOldCommits!: (commits: AgentCommitSnapshot[]) => void;
+    vi.mocked(api.listCommits).mockReturnValueOnce(
+      new Promise<AgentCommitSnapshot[]>((resolve) => {
+        resolveOldCommits = resolve;
+      }),
+    );
+    let pendingRefresh!: Promise<void>;
+    act(() => {
+      pendingRefresh = result.current.refresh();
+    });
+
+    const liveCommit = agentCommit("commit_2", 2, "new websocket commit");
+    act(() => {
+      socket.onmessage?.call(
+        socket as unknown as WebSocket,
+        {
+          data: JSON.stringify({ type: "commit", commit: liveCommit }),
+        } as MessageEvent,
+      );
+    });
+    expect(result.current.commits).toEqual([liveCommit]);
+
+    await act(async () => {
+      resolveOldCommits([
+        agentCommit("commit_1", 1, "older REST commit"),
+      ]);
+      await pendingRefresh;
+    });
+
+    expect(result.current.commits.map((commit) => commit.id)).toEqual([
+      "commit_2",
+      "commit_1",
+    ]);
+    expect(result.current.commits[0]?.summary).toBe("new websocket commit");
     unmount();
   });
 
