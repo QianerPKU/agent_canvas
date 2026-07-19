@@ -87,6 +87,8 @@ export interface AgentSettings {
   scratchDirectory?: string;
   /** 当前 agent 私有的系统提示词；按提示词节点一样拼接进业务输入。 */
   systemPrompt?: string;
+  /** 显式授权该 agent 写入当前 repo 已映射的共享资源，包括 readOnly 资源。 */
+  allowSharedResourceWrites?: boolean;
 }
 
 export interface CreateAgentInput extends AgentSettings {}
@@ -102,6 +104,7 @@ export interface UpdateAgentSettingsInput {
   branch?: string;
   cwd?: string;
   scratchDirectory?: string;
+  allowSharedResourceWrites?: boolean;
 }
 
 export interface ForkAgentInput {
@@ -112,6 +115,7 @@ export interface ForkAgentInput {
   branch?: string;
   cwd?: string;
   scratchDirectory?: string;
+  allowSharedResourceWrites?: boolean;
 }
 
 /** token 使用量（来自 SDK 的实时 usage 通知或最终 result）。 */
@@ -293,6 +297,8 @@ export interface AgentStartConfig {
   reasoningEffort?: string;
   /** 当前 agent 私有的系统提示词；由 AgentRunner 按提示词节点方式拼接。 */
   systemPrompt?: string;
+  /** 内部运行配置；HTTP start 不接受覆盖，只能由持久化 Agent 设置提供。 */
+  allowSharedResourceWrites?: boolean;
   allowedTools?: string[];
   permissionMode?: PermissionMode;
   maxTurns?: number;

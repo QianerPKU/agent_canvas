@@ -260,17 +260,29 @@ export class AgentManager {
     return this.runners.has(id) ? this.snapshotOf(id) : undefined;
   }
 
+  validateSettingsUpdate(id: string, input: UpdateAgentSettingsInput): void {
+    const runner = this.runners.get(id);
+    if (!runner) throw new Error(`未知 agent: ${id}`);
+    const status = runner.getStatus();
+    const changesBranch = input.branchWorkspaceId !== undefined || input.branch !== undefined;
+    if (changesBranch && status !== "idle" && status !== "waiting_input") {
+      throw new Error("只有待输入或尚未启动的活跃 agent 可以切换 branch");
+    }
+    const changesSharedResourceWrites =
+      input.allowSharedResourceWrites !== undefined &&
+      input.allowSharedResourceWrites !== (this.configOf(id)?.allowSharedResourceWrites === true);
+    if (changesSharedResourceWrites && (status === "starting" || status === "running")) {
+      throw new Error("Agent 正在执行当前轮次，暂时不能修改共享目录写权限");
+    }
+  }
+
   updateSettings(
     id: string,
     input: UpdateAgentSettingsInput,
     options: { branchSwitchPrompt?: AgentPromptReference } = {},
   ): AgentSnapshot {
-    const runner = this.runners.get(id);
-    if (!runner) throw new Error(`未知 agent: ${id}`);
-    const changesBranch = input.branchWorkspaceId !== undefined || input.branch !== undefined;
-    if (changesBranch && runner.getStatus() !== "idle" && runner.getStatus() !== "waiting_input") {
-      throw new Error("只有待输入或尚未启动的活跃 agent 可以切换 branch");
-    }
+    this.validateSettingsUpdate(id, input);
+    const runner = this.runners.get(id)!;
     const draft = this.draftConfigs.get(id) ?? {};
     const next = applySettings(draft, input);
     this.draftConfigs.set(id, next);
@@ -285,6 +297,13 @@ export class AgentManager {
    * 记录其来源与启动时要合并的 fork 配置（model/resume/resumeSessionAt/forkSession）。
    * 父会话尚未建立（无 sessionId）时返回 undefined。
    */
+  validateFork(parentId: string, anchorUuid: string): void {
+    const parent = this.runners.get(parentId);
+    if (!parent) throw new Error(`未知 agent: ${parentId}`);
+    if (!anchorUuid.trim()) throw new Error("缺少 anchorUuid");
+    if (!parent.snapshot().sessionId) throw new Error("源会话尚未建立，无法 fork");
+  }
+
   fork(
     parentId: string,
     anchorUuid: string,
@@ -292,6 +311,11 @@ export class AgentManager {
   ): { id: string; origin: ForkOrigin } | undefined {
     const parent = this.runners.get(parentId);
     if (!parent) return undefined;
+    try {
+      this.validateFork(parentId, anchorUuid);
+    } catch {
+      return undefined;
+    }
     const forkOptions = typeof options === "string" ? { model: options } : options ?? {};
     const parentSnapshot = parent.snapshot();
     const parentSession = parentSnapshot.sessionId;
@@ -301,6 +325,8 @@ export class AgentManager {
     const parentBranchWorkspaceId = parentSnapshot.config?.branchWorkspaceId;
     const parentBranch = parentSnapshot.config?.branch;
     const parentSystemPrompt = parentSnapshot.config?.systemPrompt;
+    const parentAllowSharedResourceWrites =
+      parentSnapshot.config?.allowSharedResourceWrites;
 
     const runner = this.create();
     const origin: ForkOrigin = { parentAgentId: parentId, anchorUuid };
@@ -314,6 +340,8 @@ export class AgentManager {
       branch: forkOptions.branch ?? parentBranch,
       scratchDirectory: forkOptions.scratchDirectory,
       systemPrompt: parentSystemPrompt,
+      allowSharedResourceWrites:
+        forkOptions.allowSharedResourceWrites ?? parentAllowSharedResourceWrites,
       resume: parentSession,
       resumeSessionAt: anchorUuid,
       forkSession: true,
@@ -538,6 +566,7 @@ function normalizeSettings(
     cwd: settings.cwd?.trim() || defaultCwd,
     scratchDirectory: settings.scratchDirectory,
     systemPrompt: settings.systemPrompt ?? "",
+    allowSharedResourceWrites: settings.allowSharedResourceWrites === true,
   };
 }
 
@@ -559,6 +588,9 @@ function applySettings(
   if (input.branch !== undefined) next.branch = input.branch;
   if (input.cwd !== undefined) next.cwd = input.cwd;
   if (input.scratchDirectory !== undefined) next.scratchDirectory = input.scratchDirectory;
+  if (input.allowSharedResourceWrites !== undefined) {
+    next.allowSharedResourceWrites = input.allowSharedResourceWrites;
+  }
   return next;
 }
 

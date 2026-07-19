@@ -2,7 +2,17 @@ import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import http from "node:http";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
-import { link, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  link,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import WebSocket, { type RawData } from "ws";
@@ -251,6 +261,16 @@ function updateTestWorkspaceContext(payload: any): void {
   const revision = workspace?.revision;
   if (typeof canvasProjectId === "string" && Number.isSafeInteger(revision)) {
     requestWorkspaceContext = { canvasProjectId, revision };
+  }
+}
+
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await lstat(targetPath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
   }
 }
 
@@ -1103,6 +1123,7 @@ describe("HTTP server", () => {
       model: "gpt-5.4-mini",
       cwd: path.join(root, "agent-work"),
       systemPrompt: "private rules",
+      allowSharedResourceWrites: true,
     });
     expect(created.status).toBe(201);
 
@@ -1115,14 +1136,400 @@ describe("HTTP server", () => {
       model: "gpt-5.4-mini",
       cwd: path.join(projectRoot, "repos", "repo_1", "repo"),
       systemPrompt: "private rules",
+      allowSharedResourceWrites: true,
     });
 
     const updated = await request(port, "PATCH", `/api/agents/${created.json.id}/settings`, {
       systemPrompt: "updated private rules",
+      allowSharedResourceWrites: false,
     });
     expect(updated.status).toBe(200);
     expect(updated.json.config.systemPrompt).toBe("updated private rules");
+    expect(updated.json.config.allowSharedResourceWrites).toBe(false);
     expect(updated.json.config.cwd).toBe(path.join(projectRoot, "repos", "repo_1", "repo"));
+  });
+
+  it("validates create settings before creating a branch workspace", async () => {
+    const targetBranch = "feature/malformed-create-settings";
+    const targetWorktree = path.join(
+      projectRoot,
+      "worktrees",
+      "repo_1",
+      "feature-malformed-create-settings",
+    );
+    const agentsBefore = manager.list().map((agent) => agent.id);
+    const createBranchSpy = vi.spyOn(workspaceManager, "createBranch");
+
+    try {
+      const created = await request(port, "POST", "/api/agents", {
+        branch: targetBranch,
+        model: 42,
+      });
+
+      expect(created.status).toBe(400);
+      expect(createBranchSpy).not.toHaveBeenCalled();
+      expect(manager.list().map((agent) => agent.id)).toEqual(agentsBefore);
+      const workspace = await request(port, "GET", "/api/workspace");
+      expect(
+        workspace.json.branches.some(
+          (branch: { branch: string }) => branch.branch === targetBranch,
+        ),
+      ).toBe(false);
+      expect(await pathExists(targetWorktree)).toBe(false);
+    } finally {
+      createBranchSpy.mockRestore();
+    }
+  });
+
+  it("validates PATCH settings before creating a branch workspace", async () => {
+    const created = await request(port, "POST", "/api/agents", {
+      model: "valid-model",
+      reasoningEffort: "high",
+    });
+    const targetBranch = "feature/malformed-patch-settings";
+    const targetWorktree = path.join(
+      projectRoot,
+      "worktrees",
+      "repo_1",
+      "feature-malformed-patch-settings",
+    );
+    const configBefore = manager.configOf(created.json.id);
+    const createBranchSpy = vi.spyOn(workspaceManager, "createBranch");
+
+    try {
+      const malformed = await request(
+        port,
+        "PATCH",
+        `/api/agents/${created.json.id}/settings`,
+        {
+          branchWorkspaceId: "branch_missing_malformed_patch",
+          branch: targetBranch,
+          model: 42,
+        },
+      );
+
+      expect(malformed.status).toBe(400);
+      expect(createBranchSpy).not.toHaveBeenCalled();
+      expect(manager.configOf(created.json.id)).toEqual(configBefore);
+      const workspace = await request(port, "GET", "/api/workspace");
+      expect(
+        workspace.json.branches.some(
+          (branch: { branch: string }) => branch.branch === targetBranch,
+        ),
+      ).toBe(false);
+      expect(await pathExists(targetWorktree)).toBe(false);
+
+      const cleared = await request(
+        port,
+        "PATCH",
+        `/api/agents/${created.json.id}/settings`,
+        { model: null, reasoningEffort: null },
+      );
+      expect(cleared.status).toBe(200);
+      expect(cleared.json.config.model).toBeUndefined();
+      expect(cleared.json.config.reasoningEffort).toBeUndefined();
+    } finally {
+      createBranchSpy.mockRestore();
+    }
+  });
+
+  it("validates fork settings and session before creating a branch workspace", async () => {
+    const parent = await request(port, "POST", "/api/agents");
+    const parentConfig = manager.configOf(parent.json.id);
+    const agentsBefore = manager.list().map((agent) => agent.id);
+    const malformedBranch = "feature/malformed-fork-settings";
+    const targetBranch = "feature/no-session-fork-settings";
+    const targetWorktrees = [
+      path.join(projectRoot, "worktrees", "repo_1", "feature-malformed-fork-settings"),
+      path.join(projectRoot, "worktrees", "repo_1", "feature-no-session-fork-settings"),
+    ];
+    const createBranchSpy = vi.spyOn(workspaceManager, "createBranch");
+
+    try {
+      const malformed = await request(port, "POST", `/api/agents/${parent.json.id}/fork`, {
+        anchorUuid: "anchor-malformed",
+        branch: malformedBranch,
+        model: 42,
+      });
+      expect(malformed.status).toBe(400);
+
+      const forked = await request(port, "POST", `/api/agents/${parent.json.id}/fork`, {
+        anchorUuid: "anchor-no-session",
+        branch: targetBranch,
+        allowSharedResourceWrites: true,
+      });
+
+      expect(forked.status).toBe(409);
+      expect(createBranchSpy).not.toHaveBeenCalled();
+      expect(manager.list().map((agent) => agent.id)).toEqual(agentsBefore);
+      expect(manager.configOf(parent.json.id)).toEqual(parentConfig);
+      const workspace = await request(port, "GET", "/api/workspace");
+      for (const branchName of [malformedBranch, targetBranch]) {
+        expect(
+          workspace.json.branches.some(
+            (branch: { branch: string }) => branch.branch === branchName,
+          ),
+        ).toBe(false);
+      }
+      for (const targetWorktree of targetWorktrees) {
+        expect(await pathExists(targetWorktree)).toBe(false);
+      }
+    } finally {
+      createBranchSpy.mockRestore();
+    }
+  });
+
+  it("rejects non-boolean shared resource write settings", async () => {
+    const invalidBranch = "feature/invalid-shared-write-setting";
+    const created = await request(port, "POST", "/api/agents", {
+      branch: invalidBranch,
+      allowSharedResourceWrites: "yes",
+    });
+    expect(created.status).toBe(400);
+    const workspace = await request(port, "GET", "/api/workspace");
+    expect(
+      workspace.json.branches.some(
+        (branch: { branch: string }) => branch.branch === invalidBranch,
+      ),
+    ).toBe(false);
+
+    const valid = await request(port, "POST", "/api/agents");
+    const updated = await request(port, "PATCH", `/api/agents/${valid.json.id}/settings`, {
+      allowSharedResourceWrites: 1,
+    });
+    expect(updated.status).toBe(400);
+
+    const forked = await request(port, "POST", `/api/agents/${valid.json.id}/fork`, {
+      anchorUuid: "u",
+      allowSharedResourceWrites: "yes",
+    });
+    expect(forked.status).toBe(400);
+  });
+
+  it.each(["starting", "running"] as const)(
+    "preflights %s agent settings before creating branch workspaces",
+    async (status) => {
+      const created = await request(port, "POST", "/api/agents");
+      const runner = manager.get(created.json.id)!;
+      const configBefore = manager.configOf(created.json.id);
+      const targetBranch = `feature/settings-preflight-${status}`;
+      const targetWorktree = path.join(
+        projectRoot,
+        "worktrees",
+        "repo_1",
+        `feature-settings-preflight-${status}`,
+      );
+      const previousWorkDocumentation = manager.appSettings().workDocumentationEnabled;
+      manager.updateAppSettings({ workDocumentationEnabled: true });
+      const statusSpy = vi.spyOn(runner, "getStatus").mockReturnValue(status);
+      const createBranchSpy = vi.spyOn(workspaceManager, "createBranch");
+      const prepareWorkspaceSpy = vi.spyOn(workspaceManager, "prepareAgentWorkspace");
+      const diffSpy = vi.spyOn(workspaceManager, "diffBetweenBranches");
+
+      try {
+        const updated = await request(
+          port,
+          "PATCH",
+          `/api/agents/${created.json.id}/settings`,
+          { branch: targetBranch, allowSharedResourceWrites: true },
+        );
+
+        expect(updated.status).toBe(400);
+        expect(createBranchSpy).not.toHaveBeenCalled();
+        expect(prepareWorkspaceSpy).not.toHaveBeenCalled();
+        expect(diffSpy).not.toHaveBeenCalled();
+        expect(manager.configOf(created.json.id)).toEqual(configBefore);
+        const workspace = await request(port, "GET", "/api/workspace");
+        expect(
+          workspace.json.branches.some(
+            (branch: { branch: string }) => branch.branch === targetBranch,
+          ),
+        ).toBe(false);
+        expect(await pathExists(targetWorktree)).toBe(false);
+      } finally {
+        diffSpy.mockRestore();
+        prepareWorkspaceSpy.mockRestore();
+        createBranchSpy.mockRestore();
+        statusSpy.mockRestore();
+        manager.updateAppSettings({ workDocumentationEnabled: previousWorkDocumentation });
+      }
+    },
+  );
+
+  it("serializes a concurrent start behind a branch settings update", async () => {
+    const created = await request(port, "POST", "/api/agents");
+    const targetBranch = "feature/settings-start-race";
+    const originalCreateBranch = workspaceManager.createBranch.bind(workspaceManager);
+    let signalCreateBranch!: () => void;
+    let releaseCreateBranch!: () => void;
+    const createBranchEntered = new Promise<void>((resolve) => {
+      signalCreateBranch = resolve;
+    });
+    const createBranchReleased = new Promise<void>((resolve) => {
+      releaseCreateBranch = resolve;
+    });
+    const createBranchSpy = vi
+      .spyOn(workspaceManager, "createBranch")
+      .mockImplementationOnce(async (input) => {
+        signalCreateBranch();
+        await createBranchReleased;
+        return await originalCreateBranch(input);
+      });
+    const startSpy = vi.spyOn(manager, "startAgent");
+
+    try {
+      const updating = request(
+        port,
+        "PATCH",
+        `/api/agents/${created.json.id}/settings`,
+        {
+          branchWorkspaceId: "branch_missing_settings_start_race",
+          branch: targetBranch,
+        },
+      );
+      await createBranchEntered;
+
+      const starting = request(port, "POST", `/api/agents/${created.json.id}/start`, {
+        prompt: "run after branch switch",
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      expect(startSpy).not.toHaveBeenCalled();
+      expect(manager.get(created.json.id)?.getStatus()).toBe("idle");
+
+      releaseCreateBranch();
+      const [updated, started] = await Promise.all([updating, starting]);
+      expect(updated.status).toBe(200);
+      expect(updated.json.config.branch).toBe(targetBranch);
+      expect(started.status).toBe(202);
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      expect(manager.configOf(created.json.id)?.branch).toBe(targetBranch);
+    } finally {
+      releaseCreateBranch?.();
+      await manager.get(created.json.id)?.terminate();
+      startSpy.mockRestore();
+      createBranchSpy.mockRestore();
+    }
+  });
+
+  it("rejects a fork queued behind a project switch before creating its branch", async () => {
+    const isolatedRoot = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-fork-switch-race-"));
+    const source = path.join(isolatedRoot, "source");
+    const projectsRoot = path.join(isolatedRoot, "projects");
+    await mkdir(source);
+    const runGit: GitRunner = async (args, options) => {
+      if (args[0] === "remote") return "https://github.com/acme/fork-switch-race.git";
+      if (args[0] === "branch") return "main";
+      if (args[0] === "clone") {
+        await mkdir(path.join(String(args[2]), ".git", "info"), { recursive: true });
+        return "";
+      }
+      if (args[0] === "rev-parse") {
+        if (args[1] === "--verify") return "a".repeat(40);
+        return path.join(options?.cwd ?? "", ".git", "info", "exclude");
+      }
+      return "";
+    };
+    const isolatedWorkspace = new WorkspaceManager({
+      defaultSourcePath: source,
+      projectsRoot,
+      autoOpenDefault: false,
+      runGit,
+    });
+    const projectA = await isolatedWorkspace.createCanvasProject({ name: "Fork source" });
+    await isolatedWorkspace.connect({ localPath: source });
+    const projectB = await isolatedWorkspace.createCanvasProject({ name: "Fork destination" });
+    await isolatedWorkspace.openCanvasProject({ id: projectA.id });
+    const isolatedManager = new AgentManager({ query: emptyQuery });
+    const isolatedServer = createServer(isolatedManager, undefined, {
+      defaultCwd: isolatedRoot,
+      workspaceManager: isolatedWorkspace,
+    }).httpServer;
+    await new Promise<void>((resolve) => isolatedServer.listen(0, resolve));
+    const isolatedPort = (isolatedServer.address() as AddressInfo).port;
+    let signalOpen!: () => void;
+    let releaseOpen!: () => void;
+    const openEntered = new Promise<void>((resolve) => {
+      signalOpen = resolve;
+    });
+    const openReleased = new Promise<void>((resolve) => {
+      releaseOpen = resolve;
+    });
+    const originalOpen = isolatedWorkspace.openCanvasProject.bind(isolatedWorkspace);
+    const openSpy = vi
+      .spyOn(isolatedWorkspace, "openCanvasProject")
+      .mockImplementationOnce(async (input) => {
+        signalOpen();
+        await openReleased;
+        return await originalOpen(input);
+      });
+    const createBranchSpy = vi.spyOn(isolatedWorkspace, "createBranch");
+
+    try {
+      const workspace = await rawRequest(isolatedPort, "GET", "/api/workspace");
+      const projectHeaders = {
+        "X-Agent-Canvas-Project-Id": workspace.json.canvasProject.id,
+        "X-Agent-Canvas-Project-Revision": String(workspace.json.revision),
+      };
+      const parent = await rawRequest(
+        isolatedPort,
+        "POST",
+        "/api/agents",
+        undefined,
+        projectHeaders,
+      );
+      const parentSnapshot = isolatedManager.snapshot(parent.json.id)!;
+      isolatedManager.get(parent.json.id)!.restore({
+        ...parentSnapshot,
+        status: "done",
+        sessionId: `session-${parent.json.id}`,
+      });
+
+      const opening = rawRequest(isolatedPort, "POST", "/api/canvas-projects/open", {
+        id: projectB.id,
+      });
+      await openEntered;
+      const targetBranch = "feature/fork-after-project-switch";
+      const targetWorktree = path.join(
+        projectA.projectRoot,
+        "worktrees",
+        "repo_1",
+        "feature-fork-after-project-switch",
+      );
+      const forking = rawRequest(
+        isolatedPort,
+        "POST",
+        `/api/agents/${parent.json.id}/fork`,
+        { anchorUuid: "fork-switch-race", branch: targetBranch },
+        projectHeaders,
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      expect(createBranchSpy).not.toHaveBeenCalled();
+
+      releaseOpen();
+      const [opened, forked] = await Promise.all([opening, forking]);
+      expect(opened.status).toBe(200);
+      expect(forked.status).toBe(409);
+      expect(createBranchSpy).not.toHaveBeenCalled();
+      expect(await pathExists(targetWorktree)).toBe(false);
+    } finally {
+      releaseOpen?.();
+      createBranchSpy.mockRestore();
+      openSpy.mockRestore();
+      await new Promise<void>((resolve) => isolatedServer.close(() => resolve()));
+      await rm(isolatedRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("does not allow start requests to override shared resource permission", async () => {
+    const created = await request(port, "POST", "/api/agents");
+    const started = await request(port, "POST", `/api/agents/${created.json.id}/start`, {
+      prompt: "run",
+      allowSharedResourceWrites: true,
+    });
+    expect(started.status).toBe(400);
+
+    const snapshot = await request(port, "GET", `/api/agents/${created.json.id}`);
+    expect(snapshot.json.config.allowSharedResourceWrites).toBe(false);
   });
 
   it("对未知 agent start → 404", async () => {
@@ -1378,6 +1785,38 @@ describe("HTTP server", () => {
     const c = await request(port, "POST", "/api/agents");
     const r = await request(port, "POST", `/api/agents/${c.json.id}/fork`, { anchorUuid: "u" });
     expect(r.status).toBe(409);
+  });
+
+  it("passes an explicit shared write override to the fork manager", async () => {
+    const parent = await request(port, "POST", "/api/agents", {
+      allowSharedResourceWrites: true,
+    });
+    const parentSnapshot = manager.snapshot(parent.json.id)!;
+    manager.get(parent.json.id)!.restore({
+      ...parentSnapshot,
+      status: "waiting_input",
+      sessionId: `session-${parent.json.id}`,
+      config: {
+        ...parentSnapshot.config,
+        resume: `session-${parent.json.id}`,
+      },
+    });
+    const forkCall = vi.spyOn(manager, "fork");
+    try {
+      const forked = await request(port, "POST", `/api/agents/${parent.json.id}/fork`, {
+        anchorUuid: "u",
+        allowSharedResourceWrites: false,
+      });
+      expect(forked.status).toBe(201);
+      expect(forkCall).toHaveBeenCalledWith(
+        parent.json.id,
+        "u",
+        expect.objectContaining({ allowSharedResourceWrites: false }),
+      );
+      expect(manager.configOf(forked.json.id)?.allowSharedResourceWrites).toBe(false);
+    } finally {
+      forkCall.mockRestore();
+    }
   });
 
   it("未知路由 → 404", async () => {
