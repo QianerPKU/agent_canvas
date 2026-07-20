@@ -1,5 +1,11 @@
+import { spawn } from "node:child_process";
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
-import type { CanUseTool, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  CanUseTool,
+  PermissionResult,
+  SpawnOptions,
+  SpawnedProcess,
+} from "@anthropic-ai/claude-agent-sdk";
 import type {
   AgentApprovalResponse,
   AgentFileAccess,
@@ -18,6 +24,19 @@ import type { QueryFn, QueryOptions, QueryPrompt, SdkUserInput } from "./types.j
 export const realQuery: QueryFn = (args) => {
   const { fileAccess, promptAccess, requestUserInput, requestApproval, ...options } =
     args.options ?? {};
+  const processExit = new ClaudeProcessExitBarrier();
+  const configuredSpawner = typeof options.spawnClaudeCodeProcess === "function"
+    ? options.spawnClaudeCodeProcess as (options: SpawnOptions) => SpawnedProcess
+    : undefined;
+  const stderr = typeof options.stderr === "function"
+    ? options.stderr as (data: string) => void
+    : undefined;
+  const spawnClaudeCodeProcess = (spawnOptions: SpawnOptions): SpawnedProcess =>
+    processExit.track(
+      configuredSpawner
+        ? configuredSpawner(spawnOptions)
+        : spawnDefaultClaudeCodeProcess(spawnOptions, stderr),
+    );
   const additionalDirectories = accessibleDirectories(fileAccess, promptAccess);
   const existingCanUseTool =
     typeof options.canUseTool === "function" ? (options.canUseTool as CanUseTool) : undefined;
@@ -40,9 +59,14 @@ export const realQuery: QueryFn = (args) => {
         additionalDirectories && additionalDirectories.length > 0
           ? additionalDirectories
           : undefined,
+      // Query.return() only waits for the Claude SDK transport for a bounded grace period. Track
+      // the concrete process ourselves so callers cannot revoke dispatch snapshots while the CLI
+      // is still alive. Wrapping (rather than replacing) a caller-provided spawner preserves VMs,
+      // containers, and other custom transports that implement SpawnedProcess.
+      spawnClaudeCodeProcess,
     },
   } as unknown as Parameters<typeof sdkQuery>[0]);
-  return adaptQuery(handle);
+  return adaptQuery(handle, processExit);
 };
 
 function createCanUseTool(
@@ -286,14 +310,148 @@ function booleanValue(value: unknown): boolean {
   return typeof value === "boolean" ? value : false;
 }
 
-function adaptQuery(handle: ReturnType<typeof sdkQuery>): ReturnType<QueryFn> {
+function adaptQuery(
+  handle: ReturnType<typeof sdkQuery>,
+  processExit: ClaudeProcessExitBarrier,
+): ReturnType<QueryFn> {
   return {
     [Symbol.asyncIterator]: () => handle,
     interrupt: () => handle.interrupt(),
     setModel: (model) => handle.setModel(model),
     terminate: async () => {
-      await handle.interrupt().catch(() => undefined);
-      await handle.return(undefined).catch(() => undefined);
+      // Interrupt is best-effort and can wait forever for an unresponsive CLI control response.
+      // Start it before return() so a responsive turn gets a graceful interrupt, but never let it
+      // delay the authoritative generator-close + exact process-exit barrier.
+      const interrupting = invokePromise(() => handle.interrupt());
+      void interrupting.catch(() => undefined);
+
+      const errors: unknown[] = [];
+      const closing = invokePromise(() => handle.return(undefined));
+      try {
+        await closing;
+      } catch (error) {
+        errors.push(error);
+      }
+      if (errors.length === 0) {
+        try {
+          await processExit.waitForExit();
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      if (errors.length === 1) throw errors[0];
+      if (errors.length > 1) {
+        throw new AggregateError(errors, "Failed to terminate Claude SDK query");
+      }
     },
   };
+}
+
+type ExitWaiter = {
+  resolve: () => void;
+  reject: (error: unknown) => void;
+};
+
+/**
+ * Tracks the exact lifecycle of the process created for one Claude Query.
+ *
+ * An error rejects the current wait attempt without being cached forever. The process and its
+ * exit listener remain retained, so AgentRunner's next termination attempt can safely retry.
+ */
+class ClaudeProcessExitBarrier {
+  private process?: SpawnedProcess;
+  private exited = false;
+  private readonly pendingErrors: unknown[] = [];
+  private readonly waiters = new Set<ExitWaiter>();
+
+  track(process: SpawnedProcess): SpawnedProcess {
+    if (this.process && this.process !== process && !this.exited) {
+      throw new Error("Claude SDK spawned a replacement process before the previous process exited");
+    }
+    this.process = process;
+    this.exited = process.exitCode !== null;
+    this.pendingErrors.length = 0;
+    if (this.exited) return process;
+
+    const onExit = (): void => {
+      if (this.process !== process) return;
+      this.exited = true;
+      this.pendingErrors.length = 0;
+      process.off("exit", onExit);
+      process.off("error", onError);
+      for (const waiter of this.waiters) waiter.resolve();
+      this.waiters.clear();
+    };
+    const onError = (error: Error): void => {
+      if (this.process !== process || this.exited) return;
+      // Node emits AbortError when ProcessTransport's forwarded abort signal performs its normal
+      // delayed kill. That is a termination request, not proof of exit and not a failed barrier;
+      // keep waiting for the authoritative exit event.
+      if (isAbortProcessError(error)) return;
+      if (this.waiters.size === 0) {
+        this.pendingErrors.push(error);
+        return;
+      }
+      for (const waiter of this.waiters) waiter.reject(error);
+      this.waiters.clear();
+    };
+    process.on("exit", onExit);
+    process.on("error", onError);
+    // A custom spawner may synchronously return an already-exited process.
+    if (process.exitCode !== null) onExit();
+    return process;
+  }
+
+  waitForExit(): Promise<void> {
+    if (!this.process || this.exited || this.process.exitCode !== null) {
+      this.exited = !!this.process;
+      this.pendingErrors.length = 0;
+      return Promise.resolve();
+    }
+    const pendingError = this.pendingErrors.shift();
+    if (pendingError !== undefined) return Promise.reject(pendingError);
+    return new Promise<void>((resolve, reject) => {
+      this.waiters.add({ resolve, reject });
+    });
+  }
+}
+
+function invokePromise(operation: () => PromiseLike<unknown>): Promise<unknown> {
+  try {
+    return Promise.resolve(operation());
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
+function spawnDefaultClaudeCodeProcess(
+  options: SpawnOptions,
+  stderr: ((data: string) => void) | undefined,
+): SpawnedProcess {
+  const debug = enabledEnvironmentFlag(options.env.DEBUG_CLAUDE_AGENT_SDK);
+  const captureStderr = debug || !!stderr;
+  const child = spawn(options.command, options.args, {
+    cwd: options.cwd,
+    env: options.env,
+    signal: options.signal,
+    stdio: ["pipe", "pipe", captureStderr ? "pipe" : "ignore"],
+    windowsHide: true,
+  });
+  if (captureStderr && child.stderr) {
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      const text = chunk.toString();
+      stderr?.(text);
+      if (debug && !stderr) process.stderr.write(text);
+    });
+  }
+  return child as unknown as SpawnedProcess;
+}
+
+function enabledEnvironmentFlag(value: string | undefined): boolean {
+  if (!value) return false;
+  return !["0", "false", "no", "off"].includes(value.trim().toLowerCase());
+}
+
+function isAbortProcessError(error: Error): boolean {
+  return error.name === "AbortError" || (error as NodeJS.ErrnoException).code === "ABORT_ERR";
 }

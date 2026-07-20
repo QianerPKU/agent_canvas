@@ -1,29 +1,164 @@
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import type { SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AsyncMessageQueue } from "../util/AsyncMessageQueue.js";
 import type { SdkUserInput } from "./types.js";
 
 const sdk = vi.hoisted(() => {
   const applyFlagSettings = vi.fn().mockResolvedValue(undefined);
+  const interrupt = vi.fn().mockResolvedValue(undefined);
+  const close = vi.fn().mockResolvedValue(undefined);
   const query = vi.fn((args: unknown) => ({
     async *[Symbol.asyncIterator]() {
       // no model messages needed
     },
-    interrupt: vi.fn().mockResolvedValue(undefined),
-    return: vi.fn().mockResolvedValue(undefined),
+    interrupt,
+    return: close,
     applyFlagSettings,
     args,
   }));
-  return { query, applyFlagSettings };
+  return { query, applyFlagSettings, interrupt, close };
 });
 
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({ query: sdk.query }));
 
 import { realQuery } from "./realQuery.js";
 
+function makeFakeClaudeProcess(): {
+  process: SpawnedProcess;
+  emitError: (error: Error) => void;
+  emitExit: () => void;
+} {
+  const emitter = new EventEmitter();
+  let exitCode: number | null = null;
+  let killed = false;
+  const process = emitter as unknown as SpawnedProcess;
+  Object.assign(process, {
+    stdin: new PassThrough(),
+    stdout: new PassThrough(),
+    kill: vi.fn(() => {
+      killed = true;
+      return true;
+    }),
+  });
+  Object.defineProperties(process, {
+    exitCode: { get: () => exitCode },
+    killed: { get: () => killed },
+  });
+  return {
+    process,
+    emitError: (error) => emitter.emit("error", error),
+    emitExit: () => {
+      exitCode = 0;
+      emitter.emit("exit", 0, null);
+    },
+  };
+}
+
+function useProcessBackedSdkQuery(): void {
+  sdk.query.mockImplementationOnce((args: unknown) => {
+    const options = (args as {
+      options?: { spawnClaudeCodeProcess?: (options: SpawnOptions) => SpawnedProcess };
+    }).options;
+    options?.spawnClaudeCodeProcess?.({
+      command: "claude",
+      args: ["--output-format", "stream-json"],
+      env: {},
+      signal: new AbortController().signal,
+    });
+    return {
+      async *[Symbol.asyncIterator]() {
+        // no model messages needed
+      },
+      interrupt: sdk.interrupt,
+      return: sdk.close,
+      applyFlagSettings: sdk.applyFlagSettings,
+      args,
+    };
+  });
+}
+
 describe("realQuery file access", () => {
   beforeEach(() => {
     sdk.query.mockClear();
     sdk.applyFlagSettings.mockClear();
+    sdk.interrupt.mockReset().mockResolvedValue(undefined);
+    sdk.close.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("attempts generator return and treats interrupt failure as best-effort", async () => {
+    sdk.interrupt.mockRejectedValueOnce(new Error("injected Claude interrupt failure"));
+    const handle = realQuery({ prompt: "x", options: {} });
+
+    await expect(handle.terminate?.()).resolves.toBeUndefined();
+    expect(sdk.close).toHaveBeenCalledWith(undefined);
+  });
+
+  it("propagates Claude generator return failures", async () => {
+    sdk.close.mockRejectedValueOnce(new Error("injected Claude return failure"));
+    const handle = realQuery({ prompt: "x", options: {} });
+
+    await expect(handle.terminate?.()).rejects.toThrow("injected Claude return failure");
+    await expect(handle.terminate?.()).resolves.toBeUndefined();
+    expect(sdk.close).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves a custom spawner and waits for exact process exit without pending interrupt", async () => {
+    const fake = makeFakeClaudeProcess();
+    const spawnClaudeCodeProcess = vi.fn(() => fake.process);
+    sdk.interrupt.mockImplementationOnce(() => new Promise<void>(() => undefined));
+    useProcessBackedSdkQuery();
+    const handle = realQuery({
+      prompt: "x",
+      options: { spawnClaudeCodeProcess },
+    });
+    let terminated = false;
+
+    const terminating = handle.terminate?.().then(() => {
+      terminated = true;
+    });
+    await vi.waitFor(() => expect(sdk.close).toHaveBeenCalledWith(undefined));
+
+    expect(spawnClaudeCodeProcess).toHaveBeenCalledWith(
+      expect.objectContaining({ command: "claude" }),
+    );
+    expect(terminated).toBe(false);
+    const abortError = Object.assign(new Error("normal forwarded abort"), {
+      name: "AbortError",
+      code: "ABORT_ERR",
+    });
+    fake.emitError(abortError);
+    await Promise.resolve();
+    expect(terminated).toBe(false);
+    fake.emitExit();
+    await terminating;
+    expect(terminated).toBe(true);
+  });
+
+  it("retains the process barrier after an error so a later terminate can retry", async () => {
+    const fake = makeFakeClaudeProcess();
+    const spawnClaudeCodeProcess = vi.fn(() => fake.process);
+    useProcessBackedSdkQuery();
+    const handle = realQuery({
+      prompt: "x",
+      options: { spawnClaudeCodeProcess },
+    });
+
+    const firstTermination = handle.terminate?.();
+    await vi.waitFor(() => expect(sdk.close).toHaveBeenCalledTimes(1));
+    fake.emitError(new Error("injected Claude process error"));
+    await expect(firstTermination).rejects.toThrow("injected Claude process error");
+
+    let retried = false;
+    const retry = handle.terminate?.().then(() => {
+      retried = true;
+    });
+    await vi.waitFor(() => expect(sdk.close).toHaveBeenCalledTimes(2));
+    expect(retried).toBe(false);
+    fake.emitExit();
+    await retry;
+    expect(retried).toBe(true);
   });
 
   it("给 Claude 每轮输入追加当时的 @ 文件引用，并动态更新额外写目录", async () => {

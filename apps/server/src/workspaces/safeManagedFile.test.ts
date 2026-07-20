@@ -64,6 +64,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 import {
   ManagedFileSafetyError,
   captureManagedTrustedRootBoundary,
+  isManagedPathAtOrWithin,
   readManagedFile,
   readManagedFileSnapshot,
   removeManagedFile,
@@ -71,6 +72,23 @@ import {
 } from "./safeManagedFile.js";
 
 describe("safeManagedFile", () => {
+  it("does not treat Windows case variants as the same containment boundary", () => {
+    expect(
+      isManagedPathAtOrWithin(
+        String.raw`C:\Canvas\Project`,
+        String.raw`C:\canvas\project\state.json`,
+        path.win32,
+      ),
+    ).toBe(false);
+    expect(
+      isManagedPathAtOrWithin(
+        String.raw`C:\Canvas\Project`,
+        String.raw`C:\Canvas\Project\state.json`,
+        path.win32,
+      ),
+    ).toBe(true);
+  });
+
   it("rejects a persisted trusted-root swap between outer validation and publication", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-managed-root-race-"));
     const originalRoot = path.join(root, "original-project");

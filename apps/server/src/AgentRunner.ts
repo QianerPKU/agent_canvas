@@ -41,6 +41,8 @@ export interface AgentRunnerDeps {
   resolveFileAccess?: (agentId: string) => AgentFileAccess;
   /** Revalidate workspace invariants immediately before every provider input dispatch. */
   prepareFileAccess?: (agentId: string) => Promise<void> | void;
+  /** Synchronously reports that a stopped provider turn can no longer consume its dispatch snapshot. */
+  onProviderTurnSettled?: (agentId: string) => void;
   resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
   fullPermissionMode?: () => boolean;
   workDocumentationEnabled?: () => boolean;
@@ -84,6 +86,7 @@ export class AgentRunner {
   private readonly now: () => number;
   private readonly resolveFileAccess?: (agentId: string) => AgentFileAccess;
   private readonly prepareFileAccess?: (agentId: string) => Promise<void> | void;
+  private readonly onProviderTurnSettled?: (agentId: string) => void;
   private readonly resolvePromptAccess?: (agentId: string) => AgentPromptAccess;
   private readonly fullPermissionMode: () => boolean;
   private readonly workDocumentationEnabled: () => boolean;
@@ -105,6 +108,8 @@ export class AgentRunner {
   private pendingInjectedPrompts: AgentPromptReference[] = [];
   private pendingQueuedInputs: PendingQueuedInput[] = [];
   private inputTransitionTail: Promise<void> = Promise.resolve();
+  private readonly detachedHandles = new Set<QueryHandle>();
+  private readonly detachedHandleTerminationAttempts = new Map<QueryHandle, Promise<void>>();
   private readonly pendingQuestions = new Map<string, PendingQuestion>();
   private readonly pendingApprovals = new Map<string, PendingApproval>();
   private questionCounter = 0;
@@ -124,6 +129,7 @@ export class AgentRunner {
     this.now = deps.now ?? Date.now;
     this.resolveFileAccess = deps.resolveFileAccess;
     this.prepareFileAccess = deps.prepareFileAccess;
+    this.onProviderTurnSettled = deps.onProviderTurnSettled;
     this.resolvePromptAccess = deps.resolvePromptAccess;
     this.fullPermissionMode = deps.fullPermissionMode ?? (() => false);
     this.workDocumentationEnabled = deps.workDocumentationEnabled ?? (() => false);
@@ -156,7 +162,9 @@ export class AgentRunner {
     this.advanceLifecycleGeneration();
     this.inputQueue?.close();
     this.abortController?.abort();
-    void this.handle?.terminate?.();
+    const handle = this.handle;
+    this.handle = undefined;
+    this.trackDetachedHandleTermination(handle);
     this.status = restorableStatus(snapshot.status);
     this.config = snapshot.config;
     this.sessionId = snapshot.sessionId;
@@ -287,59 +295,64 @@ export class AgentRunner {
     this.handle = undefined;
     this.inputQueue?.close();
     this.inputQueue = undefined;
-    void previousHandle?.terminate?.()?.catch(() => undefined);
     this.abortController = new AbortController();
     this.setStatus("starting");
     const abortController = this.abortController;
-    return this.prepareForFileAccessDispatch(
-      () => {
-        if (
-          startGeneration !== this.lifecycleGeneration ||
-          this.status !== "starting" ||
-          this.abortController !== abortController ||
-          this.handle
-        ) {
-          throw new Error(`agent ${this.id} start was cancelled before dispatch`);
-        }
-        this.inputQueue = new AsyncMessageQueue<SdkUserInput>();
-        // 首条任务同样携带文件访问；实时校验完成后才解析并授予访问。
-        const fileAccess = this.resolveFileAccess?.(this.id);
-        const promptAccess = this.promptAccessForNextInput();
-        this.inputQueue.push(toUserInput(config.prompt, fileAccess, promptAccess));
-        this.emit({ kind: "user_input", text: config.prompt });
+    const dispatch = () =>
+      this.prepareForFileAccessDispatch(
+        () => {
+          if (
+            startGeneration !== this.lifecycleGeneration ||
+            this.status !== "starting" ||
+            this.abortController !== abortController ||
+            this.handle
+          ) {
+            throw new Error(`agent ${this.id} start was cancelled before dispatch`);
+          }
+          this.inputQueue = new AsyncMessageQueue<SdkUserInput>();
+          // 首条任务同样携带文件访问；实时校验完成后才解析并授予访问。
+          const fileAccess = this.resolveFileAccess?.(this.id);
+          const promptAccess = this.promptAccessForNextInput();
+          this.inputQueue.push(toUserInput(config.prompt, fileAccess, promptAccess));
+          this.emit({ kind: "user_input", text: config.prompt });
 
-        const options: QueryOptions = {
-          cwd: config.cwd,
-          model: config.model,
-          reasoningEffort: config.reasoningEffort,
-          allowedTools: config.allowedTools,
-          permissionMode: config.permissionMode,
-          maxTurns: config.maxTurns,
-          resume: config.resume ?? extra.resumeSessionId,
-          resumeSessionAt: config.resumeSessionAt,
-          forkSession: config.forkSession,
-          abortController,
-          fileAccess,
-          promptAccess,
-          requestUserInput: (request) => this.requestUserInput(request),
-          requestApproval: (request) => this.requestApproval(request),
-        };
+          const options: QueryOptions = {
+            cwd: config.cwd,
+            model: config.model,
+            reasoningEffort: config.reasoningEffort,
+            allowedTools: config.allowedTools,
+            permissionMode: config.permissionMode,
+            maxTurns: config.maxTurns,
+            resume: config.resume ?? extra.resumeSessionId,
+            resumeSessionAt: config.resumeSessionAt,
+            forkSession: config.forkSession,
+            abortController,
+            fileAccess,
+            promptAccess,
+            requestUserInput: (request) => this.requestUserInput(request),
+            requestApproval: (request) => this.requestApproval(request),
+          };
 
-        this.handle = this.queries[provider]({ prompt: this.inputQueue!, options });
-        // 后台消费消息流（不阻塞调用方）
-        void this.consume(this.handle);
-      },
-      { generation: startGeneration, abortController },
-    );
+          this.handle = this.queries[provider]({ prompt: this.inputQueue!, options });
+          // 后台消费消息流（不阻塞调用方）
+          void this.consume(this.handle);
+        },
+        { generation: startGeneration, abortController },
+      );
+    if (previousHandle) {
+      this.trackDetachedHandleTermination(previousHandle);
+    }
+    if (this.detachedHandles.size === 0) return dispatch();
+    return this.waitForDetachedHandleTerminations().then(dispatch);
   }
 
   /** 运行中追加一条指令（流式输入干预）。 */
   send(text: string): Promise<void> {
     if (this.status === "stopped") {
-      return this.sendAfterStopped(text);
+      return this.runClosedStateInputTransition(text);
     }
     if (this.status === "terminated") {
-      return this.restartAfterClosedTurn(text);
+      return this.runClosedStateInputTransition(text);
     }
     if (
       this.status === "waiting_input" &&
@@ -490,42 +503,57 @@ export class AgentRunner {
 
   /** 尽快把输入追加到当前正在运行的一轮；Codex 使用 turn/steer，Claude 回退到流式输入通道。 */
   async steer(text: string): Promise<void> {
-    if (
-      !this.inputQueue ||
-      this.inputQueue.isClosed ||
-      isTerminalStatus(this.status) ||
-      this.status !== "running"
-    ) {
-      throw new Error(`agent ${this.id} 当前不可引导（${this.status}）`);
-    }
-    const inputQueue = this.inputQueue;
-    const handle = this.handle;
-    await this.prepareForFileAccessDispatch(async () => {
+    const generation = this.lifecycleGeneration;
+    await this.runInputTransition(async () => {
+      if (generation !== this.lifecycleGeneration) {
+        throw new Error(`agent ${this.id} steer target changed before dispatch`);
+      }
       if (
+        !this.inputQueue ||
+        this.inputQueue.isClosed ||
+        isTerminalStatus(this.status) ||
+        this.status !== "running"
+      ) {
+        throw new Error(`agent ${this.id} 当前不可引导（${this.status}）`);
+      }
+      const inputQueue = this.inputQueue;
+      const handle = this.handle;
+      await this.prepareForFileAccessDispatch(async () => {
+        if (
+          inputQueue !== this.inputQueue ||
+          inputQueue.isClosed ||
+          handle !== this.handle ||
+          this.status !== "running"
+        ) {
+          throw new Error(`agent ${this.id} steer target changed before dispatch`);
+        }
+        const input = toUserInput(
+          text,
+          this.resolveFileAccess?.(this.id),
+          this.promptAccessWithoutReadablePrompts(),
+        );
+        if (handle?.steer && (handle.canSteerNow?.() ?? true)) {
+          await handle.steer(input);
+        } else if (handle?.steer) {
+          this.pendingQueuedInputs.unshift({ text });
+        } else if (handle?.interrupt) {
+          this.pendingQueuedInputs.unshift({ text });
+          this.requestBestEffortInterrupt(handle);
+        } else {
+          inputQueue.push(input);
+        }
+      });
+      if (
+        generation !== this.lifecycleGeneration ||
         inputQueue !== this.inputQueue ||
         inputQueue.isClosed ||
         handle !== this.handle ||
         this.status !== "running"
       ) {
-        throw new Error(`agent ${this.id} steer target changed before dispatch`);
+        throw new Error(`agent ${this.id} steer target changed during dispatch`);
       }
-      const input = toUserInput(
-        text,
-        this.resolveFileAccess?.(this.id),
-        this.promptAccessWithoutReadablePrompts(),
-      );
-      if (handle?.steer && (handle.canSteerNow?.() ?? true)) {
-        await handle.steer(input);
-      } else if (handle?.steer) {
-        this.pendingQueuedInputs.unshift({ text });
-      } else if (handle?.interrupt) {
-        this.pendingQueuedInputs.unshift({ text });
-        await handle.interrupt().catch(() => undefined);
-      } else {
-        inputQueue.push(input);
-      }
+      this.emit({ kind: "user_input", text, mode: "steer" });
     });
-    this.emit({ kind: "user_input", text, mode: "steer" });
   }
 
   /** 手动压缩当前会话上下文；压缩本身作为独立一轮。 */
@@ -534,7 +562,9 @@ export class AgentRunner {
       throw new Error(`agent ${this.id} 当前不可 compact（${this.status}）`);
     }
     const inputQueue = this.inputQueue;
-    return this.prepareForFileAccessDispatch(() => {
+    // /compact never carries fileAccess. Preparing a snapshot here would create an
+    // undispatched capability with no provider result that can safely retire it.
+    return this.runInputTransition(() => {
       if (
         inputQueue !== this.inputQueue ||
         inputQueue.isClosed ||
@@ -560,7 +590,10 @@ export class AgentRunner {
     this.cancelPendingApprovals("cancel");
     this.setStatus("stopped");
     try {
-      await this.handle?.interrupt?.();
+      // Interrupt is advisory. A wedged provider control channel must not hold
+      // the HTTP stop response (or a following exact terminate barrier) open.
+      const interruption = this.handle?.interrupt?.();
+      if (interruption) void Promise.resolve(interruption).catch(() => undefined);
     } catch {
       // interrupt 尽力而为，忽略错误
     }
@@ -568,8 +601,14 @@ export class AgentRunner {
 
   /** 关闭底层 CLI / Query 进程。 */
   async terminate(): Promise<void> {
-    if (this.status === "terminated") return;
+    // Even an already-terminated runner may have a closed-state send queued on the
+    // input transition tail. Advance first so terminate remains a lifecycle barrier
+    // and that queued restart cannot dispatch in the following microtask.
     this.advanceLifecycleGeneration();
+    if (this.status === "terminated") {
+      await this.waitForDetachedHandleTerminations();
+      return;
+    }
     this.inputQueue?.close();
     this.inputQueue = undefined;
     this.compactPending = false;
@@ -582,15 +621,8 @@ export class AgentRunner {
     this.abortController?.abort();
     const handle = this.handle;
     this.handle = undefined;
-    try {
-      if (handle?.terminate) {
-        await handle.terminate();
-      } else {
-        await handle?.interrupt?.();
-      }
-    } catch {
-      // 终止尽力而为；状态仍保持 terminated
-    }
+    this.trackDetachedHandleTermination(handle);
+    await this.waitForDetachedHandleTerminations();
   }
 
   answerQuestion(requestId: string, response: AgentQuestionResponse): void {
@@ -659,6 +691,7 @@ export class AgentRunner {
         this.inputQueue = undefined;
         this.handle = undefined;
         this.interruptedTurnPending = false;
+        this.notifyProviderTurnSettled();
         return;
       }
       if (!isTerminalStatus(this.status)) {
@@ -675,10 +708,7 @@ export class AgentRunner {
         if (!isTerminalStatus(this.status)) this.setStatus("stopped");
         return;
       }
-      this.cancelPendingQuestions("cancel");
-      this.cancelPendingApprovals("cancel");
-      this.emit({ kind: "error", message: errorMessage(err) });
-      this.setStatus("error");
+      await this.settleFailedProviderTransport(handle, err);
     }
   }
 
@@ -760,7 +790,10 @@ export class AgentRunner {
       return;
     }
     if (this.interruptedTurnPending) {
-      if (event.kind === "result") this.interruptedTurnPending = false;
+      if (event.kind === "result") {
+        this.interruptedTurnPending = false;
+        this.notifyProviderTurnSettled();
+      }
       return;
     }
     switch (event.kind) {
@@ -843,6 +876,7 @@ export class AgentRunner {
           await this.prepareFileAccess?.(this.id);
         } catch (error) {
           if (
+            !handle ||
             generation !== this.lifecycleGeneration ||
             inputQueue !== this.inputQueue ||
             handle !== this.handle ||
@@ -851,9 +885,8 @@ export class AgentRunner {
             return;
           }
           this.pendingQueuedInputs = [];
-          inputQueue.close();
-          await handle?.terminate?.().catch(() => undefined);
-          throw error;
+          await this.settleFailedProviderTransport(handle, error);
+          return;
         }
         if (
           generation !== this.lifecycleGeneration ||
@@ -896,6 +929,16 @@ export class AgentRunner {
       () => undefined,
     );
     return result;
+  }
+
+  private runClosedStateInputTransition(text: string): Promise<void> {
+    const generation = this.lifecycleGeneration;
+    return this.runInputTransition(() => {
+      if (generation !== this.lifecycleGeneration) {
+        throw new Error(`agent ${this.id} closed-state input was cancelled before dispatch`);
+      }
+      return this.sendFromClosedState(text);
+    });
   }
 
   private matchesInputTransition(expected: {
@@ -1002,8 +1045,9 @@ export class AgentRunner {
     this.suppressAbortStatus = true;
     this.suppressNaturalEndStatus = true;
     this.abortController?.abort();
-    void this.handle?.terminate?.();
+    const handle = this.handle;
     this.handle = undefined;
+    this.trackDetachedHandleTermination(handle);
     this.config = {
       ...(this.config ?? { prompt: "" }),
       resume,
@@ -1013,8 +1057,13 @@ export class AgentRunner {
 
   private sendAfterStopped(text: string): Promise<void> {
     if (this.interruptedTurnPending) {
-      this.closeDetachedHandle();
-      return this.restartAfterClosedTurn(text);
+      const generation = this.lifecycleGeneration;
+      return this.closeDetachedHandle().then(() => {
+        if (generation !== this.lifecycleGeneration || this.status !== "stopped") {
+          throw new Error(`agent ${this.id} stopped restart was cancelled before dispatch`);
+        }
+        return this.restartAfterClosedTurn(text, true);
+      });
     }
     if (this.inputQueue && !this.inputQueue.isClosed && this.handle) {
       const inputQueue = this.inputQueue;
@@ -1040,7 +1089,13 @@ export class AgentRunner {
         this.emit({ kind: "user_input", text });
       });
     }
-    return this.restartAfterClosedTurn(text);
+    return this.restartAfterClosedTurn(text, true);
+  }
+
+  private sendFromClosedState(text: string): Promise<void> {
+    if (this.status === "stopped") return this.sendAfterStopped(text);
+    if (this.status === "terminated") return this.restartAfterClosedTurn(text, true);
+    return this.send(text);
   }
 
   private restartAfterClosedTurn(
@@ -1093,13 +1148,140 @@ export class AgentRunner {
     }
   }
 
-  private closeDetachedHandle(): void {
+  private async closeDetachedHandle(): Promise<void> {
     const handle = this.handle;
     this.inputQueue?.close();
     this.inputQueue = undefined;
     this.handle = undefined;
+    this.trackDetachedHandleTermination(handle);
+    await this.waitForDetachedHandleTerminations();
+    // Keep interruptedTurnPending set across a failed termination so a later
+    // stopped-state send retries this exact barrier. Only a successful close proves
+    // that the old dispatch snapshot can no longer be consumed.
     this.interruptedTurnPending = false;
-    void handle?.terminate?.()?.catch(() => undefined);
+    this.notifyProviderTurnSettled();
+  }
+
+  private requestBestEffortInterrupt(handle: QueryHandle | undefined): void {
+    try {
+      // Interrupt is advisory. A wedged control channel must not hold an
+      // HTTP/project transaction (or the exact terminate barrier behind it)
+      // open forever.
+      const interruption = handle?.interrupt?.();
+      if (interruption) void Promise.resolve(interruption).catch(() => undefined);
+    } catch {
+      // terminate() remains the exact settlement barrier.
+    }
+  }
+
+  /**
+   * A dispatch/iterator failure does not prove that the provider released its
+   * file capability. Keep the exact handle in the retryable termination ledger
+   * and publish the cleanup-triggering error status only after termination
+   * succeeds. A rejected barrier remains stopped and cannot retire snapshots.
+   */
+  private async settleFailedProviderTransport(
+    handle: QueryHandle,
+    cause: unknown,
+  ): Promise<void> {
+    if (handle !== this.handle) return;
+    this.inputQueue?.close();
+    this.inputQueue = undefined;
+    this.handle = undefined;
+    this.pendingQueuedInputs = [];
+    this.compactPending = false;
+    this.interruptedTurnPending = true;
+    this.cancelPendingQuestions("cancel");
+    this.cancelPendingApprovals("cancel");
+    this.trackDetachedHandleTermination(handle);
+
+    try {
+      await this.waitForDetachedHandleTerminations();
+    } catch (terminationError) {
+      if (this.status !== "terminated") {
+        this.emit({
+          kind: "error",
+          message: errorMessage(
+            new AggregateError(
+              [cause, terminationError],
+              `${errorMessage(cause)}; provider transport termination remains pending`,
+            ),
+          ),
+        });
+        if (this.status !== "stopped") this.setStatus("stopped");
+      }
+      return;
+    }
+
+    this.interruptedTurnPending = false;
+    this.notifyProviderTurnSettled();
+    if (this.status !== "terminated") {
+      this.emit({ kind: "error", message: errorMessage(cause) });
+      this.setStatus("error");
+    }
+  }
+
+  private async terminateDetachedQueryHandle(handle: QueryHandle | undefined): Promise<void> {
+    if (!handle) return;
+    if (typeof handle.terminate !== "function") {
+      throw new Error(`agent ${this.id} provider transport has no termination barrier`);
+    }
+    await handle.terminate();
+  }
+
+  private trackDetachedHandleTermination(handle: QueryHandle | undefined): Promise<void> {
+    if (!handle) return Promise.resolve();
+    this.detachedHandles.add(handle);
+    return this.startDetachedHandleTermination(handle);
+  }
+
+  private startDetachedHandleTermination(handle: QueryHandle): Promise<void> {
+    const existing = this.detachedHandleTerminationAttempts.get(handle);
+    if (existing) return existing;
+    const attempt = Promise.resolve().then(() => this.terminateDetachedQueryHandle(handle));
+    this.detachedHandleTerminationAttempts.set(handle, attempt);
+    // The lifecycle barrier consumes the result. Observe early rejection so a provider that
+    // fails synchronously does not produce an unhandled-rejection report before that barrier.
+    void attempt.catch(() => undefined);
+    return attempt;
+  }
+
+  private async waitForDetachedHandleTerminations(): Promise<void> {
+    const errors: unknown[] = [];
+    const attempted = new Set<QueryHandle>();
+    while (true) {
+      const handles = [...this.detachedHandles].filter((handle) => !attempted.has(handle));
+      if (handles.length === 0) break;
+      for (const handle of handles) attempted.add(handle);
+      const attempts = handles.map((handle) => this.startDetachedHandleTermination(handle));
+      const results = await Promise.allSettled(attempts);
+      for (let index = 0; index < handles.length; index++) {
+        const handle = handles[index]!;
+        const attempt = attempts[index]!;
+        if (this.detachedHandleTerminationAttempts.get(handle) === attempt) {
+          this.detachedHandleTerminationAttempts.delete(handle);
+        }
+        const result = results[index]!;
+        if (result.status === "fulfilled") {
+          this.detachedHandles.delete(handle);
+        } else {
+          // Retain the handle itself. A later lifecycle barrier retries termination instead of
+          // treating a rejected close as proof that the provider can no longer read snapshots.
+          errors.push(result.reason);
+        }
+      }
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(errors, `agent ${this.id} provider transport termination failed`);
+    }
+  }
+
+  private notifyProviderTurnSettled(): void {
+    try {
+      this.onProviderTurnSettled?.(this.id);
+    } catch {
+      // Provider consumption is already settled; notification failures must not corrupt runner state.
+    }
   }
 }
 

@@ -178,7 +178,8 @@ export interface QueryHandle extends AsyncIterable<SdkMessage> {
   /** Change Codex reasoning effort used by later provider responses when supported. */
   setReasoningEffort?(reasoningEffort?: string): Promise<void>;
   /** 关闭底层 CLI / transport，不再保留会话进程。 */
-  terminate?(): Promise<void>;
+  /** Resolve only after the provider can no longer consume dispatched file capabilities. */
+  terminate(): Promise<void>;
 }
 
 export type QueryFn = (args: {

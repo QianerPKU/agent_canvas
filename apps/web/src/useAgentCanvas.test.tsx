@@ -5,6 +5,7 @@ import type {
   AgentCommitSnapshot,
   AgentEventEnvelope,
   BranchWorkspace,
+  CanvasFileNode,
   PullRequestFlowSnapshot,
 } from "@agent-canvas/shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -113,6 +114,40 @@ function sendAgentEvent(
         type: "event",
         envelope: { agentId, seq, at: seq, event },
       }),
+    } as MessageEvent,
+  );
+}
+
+function canvasFile(
+  id: string,
+  name: string,
+  updatedAt: number,
+  overrides: Partial<CanvasFileNode> = {},
+): CanvasFileNode {
+  return {
+    id,
+    name,
+    extension: "txt",
+    filename: `${name}.txt`,
+    path: `/files/${name}.txt`,
+    storage: "isolated",
+    availability: "available",
+    kind: "normal",
+    sharedRead: false,
+    sharedWrite: false,
+    previewKind: "text",
+    mimeType: "text/plain",
+    createdAt: 1,
+    updatedAt,
+    ...overrides,
+  };
+}
+
+function sendFileFrame(socket: FakeWebSocket, file: CanvasFileNode): void {
+  socket.onmessage?.call(
+    socket as unknown as WebSocket,
+    {
+      data: JSON.stringify({ type: "file", file }),
     } as MessageEvent,
   );
 }
@@ -1036,6 +1071,7 @@ describe("useAgentCanvas", () => {
               filename: "old.txt",
               path: "/old/file.txt",
               storage: "isolated",
+              availability: "available",
               kind: "normal",
               sharedRead: false,
               sharedWrite: false,
@@ -1215,6 +1251,335 @@ describe("useAgentCanvas", () => {
     unmount();
   });
 
+
+  it("merges file mutations that land during a delayed file-list refresh", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    act(() => vi.advanceTimersByTime(0));
+    await act(async () => {
+      await result.current.refresh();
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    const stale = canvasFile("file_same", "stale", 1);
+    const untouched = canvasFile("file_removed", "removed", 1);
+    act(() => {
+      sendWorkspaceFrame(socket, "project_a");
+      sendFileFrame(socket, stale);
+      sendFileFrame(socket, untouched);
+    });
+
+    let resolveFiles!: (files: CanvasFileNode[]) => void;
+    vi.mocked(api.listFiles).mockReturnValueOnce(
+      new Promise<CanvasFileNode[]>((resolve) => {
+        resolveFiles = resolve;
+      }),
+    );
+    let pendingRefresh!: Promise<void>;
+    act(() => {
+      pendingRefresh = result.current.refresh();
+    });
+
+    const latest = canvasFile("file_same", "latest", 3);
+    const created = canvasFile("file_created", "created", 2);
+    vi.spyOn(api, "createFile").mockResolvedValue(created);
+    act(() => sendFileFrame(socket, latest));
+    await act(async () => {
+      await result.current.fileActions.create({ name: "created", kind: "normal" });
+    });
+    await act(async () => {
+      resolveFiles([stale]);
+      await pendingRefresh;
+    });
+
+    expect(result.current.files).toEqual([latest, created]);
+    unmount();
+  });
+
+  it("does not let a picked import overwrite a newer websocket file", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+    let resolveImport!: (files: CanvasFileNode[]) => void;
+    vi.spyOn(api, "importPickedFiles").mockReturnValue(
+      new Promise<CanvasFileNode[]>((resolve) => {
+        resolveImport = resolve;
+      }),
+    );
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    act(() => vi.advanceTimersByTime(0));
+    await act(async () => {
+      await result.current.refresh();
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    act(() => sendWorkspaceFrame(socket, "project_a"));
+
+    let pending!: ReturnType<typeof result.current.fileActions.importPicked>;
+    act(() => {
+      pending = result.current.fileActions.importPicked({
+        selectionId: "selection_1",
+        mode: "copy",
+        kind: "normal",
+      });
+    });
+    const websocketFile = canvasFile("file_1", "websocket", 3);
+    act(() => sendFileFrame(socket, websocketFile));
+    await act(async () => {
+      resolveImport([canvasFile("file_1", "stale-import", 99)]);
+      await pending;
+    });
+
+    expect(result.current.files).toEqual([websocketFile]);
+    unmount();
+  });
+
+  it("keeps the latest same-file REST request when responses resolve out of order", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+    let resolveRefresh!: (file: CanvasFileNode) => void;
+    let resolveRelink!: (file: CanvasFileNode | null) => void;
+    vi.spyOn(api, "refreshFile").mockReturnValue(
+      new Promise<CanvasFileNode>((resolve) => {
+        resolveRefresh = resolve;
+      }),
+    );
+    vi.spyOn(api, "relinkFile").mockReturnValue(
+      new Promise<CanvasFileNode | null>((resolve) => {
+        resolveRelink = resolve;
+      }),
+    );
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    act(() => vi.advanceTimersByTime(0));
+    await act(async () => {
+      await result.current.refresh();
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    act(() => {
+      sendWorkspaceFrame(socket, "project_a");
+      sendFileFrame(socket, canvasFile("file_1", "original", 1));
+    });
+
+    let olderRefresh!: ReturnType<typeof result.current.fileActions.refresh>;
+    let newerRelink!: ReturnType<typeof result.current.fileActions.relink>;
+    act(() => {
+      olderRefresh = result.current.fileActions.refresh("file_1");
+      newerRelink = result.current.fileActions.relink("file_1");
+    });
+    const relinked = canvasFile("file_1", "relinked", 3);
+    await act(async () => {
+      resolveRelink(relinked);
+      await newerRelink;
+    });
+    let staleRefreshResult!: CanvasFileNode | null;
+    await act(async () => {
+      resolveRefresh(canvasFile("file_1", "stale-refresh", 99));
+      staleRefreshResult = await olderRefresh;
+    });
+    expect(staleRefreshResult).toBeNull();
+    expect(result.current.files).toEqual([relinked]);
+
+    let resolveOlderUpdate!: (file: CanvasFileNode) => void;
+    let resolveNewerUpdate!: (file: CanvasFileNode) => void;
+    vi.spyOn(api, "updateFile")
+      .mockReturnValueOnce(
+        new Promise<CanvasFileNode>((resolve) => {
+          resolveOlderUpdate = resolve;
+        }),
+      )
+      .mockReturnValueOnce(
+        new Promise<CanvasFileNode>((resolve) => {
+          resolveNewerUpdate = resolve;
+        }),
+      );
+    let olderUpdate!: ReturnType<typeof result.current.fileActions.update>;
+    let newerUpdate!: ReturnType<typeof result.current.fileActions.update>;
+    act(() => {
+      olderUpdate = result.current.fileActions.update("file_1", { name: "older" });
+      newerUpdate = result.current.fileActions.update("file_1", { name: "newer" });
+    });
+    const latestUpdate = canvasFile("file_1", "newer", 4);
+    await act(async () => {
+      resolveOlderUpdate(canvasFile("file_1", "older", 200));
+      await olderUpdate;
+    });
+    expect(result.current.files).toEqual([canvasFile("file_1", "older", 200)]);
+    await act(async () => {
+      resolveNewerUpdate(latestUpdate);
+      await newerUpdate;
+    });
+    expect(result.current.files).toEqual([latestUpdate]);
+    unmount();
+  });
+
+  it("keeps an earlier successful response when a newer relink is cancelled", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+    let resolveRefresh!: (file: CanvasFileNode) => void;
+    let resolveRelink!: (file: CanvasFileNode | null) => void;
+    vi.spyOn(api, "refreshFile").mockReturnValue(
+      new Promise<CanvasFileNode>((resolve) => {
+        resolveRefresh = resolve;
+      }),
+    );
+    vi.spyOn(api, "relinkFile").mockReturnValue(
+      new Promise<CanvasFileNode | null>((resolve) => {
+        resolveRelink = resolve;
+      }),
+    );
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    act(() => vi.advanceTimersByTime(0));
+    await act(async () => {
+      await result.current.refresh();
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    act(() => {
+      sendWorkspaceFrame(socket, "project_a");
+      sendFileFrame(socket, canvasFile("file_1", "original", 1));
+    });
+
+    const olderRefresh = result.current.fileActions.refresh("file_1");
+    const newerRelink = result.current.fileActions.relink("file_1");
+    const refreshed = canvasFile("file_1", "refreshed", 5);
+    await act(async () => {
+      resolveRefresh(refreshed);
+      await olderRefresh;
+    });
+    expect(result.current.files).toEqual([refreshed]);
+    await act(async () => {
+      resolveRelink(null);
+      await newerRelink;
+    });
+
+    expect(result.current.files).toEqual([refreshed]);
+    unmount();
+  });
+
+  it("applies an earlier successful response after a newer request rejects", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+    let resolveRefresh!: (file: CanvasFileNode) => void;
+    let rejectRelink!: (reason: Error) => void;
+    vi.spyOn(api, "refreshFile").mockReturnValue(
+      new Promise<CanvasFileNode>((resolve) => {
+        resolveRefresh = resolve;
+      }),
+    );
+    vi.spyOn(api, "relinkFile").mockReturnValue(
+      new Promise<CanvasFileNode | null>((_resolve, reject) => {
+        rejectRelink = reject;
+      }),
+    );
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    act(() => vi.advanceTimersByTime(0));
+    await act(async () => {
+      await result.current.refresh();
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    act(() => {
+      sendWorkspaceFrame(socket, "project_a");
+      sendFileFrame(socket, canvasFile("file_1", "original", 1));
+    });
+
+    const olderRefresh = result.current.fileActions.refresh("file_1");
+    const newerRelink = result.current.fileActions.relink("file_1");
+    const newerOutcome = newerRelink.catch((reason: unknown) => reason);
+    await act(async () => {
+      rejectRelink(new Error("picker unavailable"));
+      await newerOutcome;
+    });
+    const refreshed = canvasFile("file_1", "refreshed-after-error", 6);
+    await act(async () => {
+      resolveRefresh(refreshed);
+      await olderRefresh;
+    });
+
+    await expect(newerOutcome).resolves.toEqual(new Error("picker unavailable"));
+    expect(result.current.files).toEqual([refreshed]);
+    unmount();
+  });
+
+  it("drops an A1 file response after switching A to B and back to A", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+    let resolveCreate!: (file: CanvasFileNode) => void;
+    vi.spyOn(api, "createFile").mockReturnValue(
+      new Promise<CanvasFileNode>((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    act(() => vi.advanceTimersByTime(0));
+    await act(async () => {
+      await result.current.refresh();
+    });
+    const socket = FakeWebSocket.instances[0]!;
+    act(() => sendWorkspaceFrame(socket, "project_a", undefined, 1));
+    const pending = result.current.fileActions.create({ name: "from-a1", kind: "normal" });
+    const currentA2 = canvasFile("file_1", "from-a2", 3);
+    act(() => {
+      sendWorkspaceFrame(socket, "project_b", undefined, 1);
+      sendWorkspaceFrame(socket, "project_a", undefined, 2);
+      sendFileFrame(socket, currentA2);
+    });
+    await act(async () => {
+      resolveCreate(canvasFile("file_1", "from-a1", 99));
+      await pending;
+    });
+
+    expect(result.current.files).toEqual([currentA2]);
+    unmount();
+  });
+
+  it("invalidates file responses on close before the reconnect workspace frame", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+    let resolveUpdate!: (file: CanvasFileNode) => void;
+    vi.spyOn(api, "updateFile").mockReturnValue(
+      new Promise<CanvasFileNode>((resolve) => {
+        resolveUpdate = resolve;
+      }),
+    );
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    act(() => vi.advanceTimersByTime(0));
+    await act(async () => {
+      await result.current.refresh();
+    });
+    const firstSocket = FakeWebSocket.instances[0]!;
+    act(() => {
+      sendWorkspaceFrame(firstSocket, "project_a");
+      sendFileFrame(firstSocket, canvasFile("file_1", "original", 1));
+    });
+    const pending = result.current.fileActions.update("file_1", { name: "late" });
+    act(() => {
+      firstSocket.onclose?.call(firstSocket as unknown as WebSocket, {} as CloseEvent);
+      vi.advanceTimersByTime(1_000);
+    });
+    const reconnectingSocket = FakeWebSocket.instances[1]!;
+    act(() => {
+      sendFileFrame(reconnectingSocket, canvasFile("file_unscoped", "unscoped", 5));
+    });
+    await act(async () => {
+      resolveUpdate(canvasFile("file_1", "late", 99));
+      await pending;
+    });
+
+    expect(result.current.files).toEqual([]);
+    unmount();
+  });
+
   it("drops a late file mutation response after a workspace switch", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("WebSocket", FakeWebSocket);
@@ -1237,6 +1602,7 @@ describe("useAgentCanvas", () => {
         filename: "old.txt",
         path: "/old/file.txt",
         storage: "isolated",
+        availability: "available",
         kind: "normal",
         sharedRead: false,
         sharedWrite: false,
@@ -1249,6 +1615,147 @@ describe("useAgentCanvas", () => {
     });
 
     expect(result.current.files).toEqual([]);
+    unmount();
+  });
+
+  it("adds every file returned by a picked-file import", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+    const imported = ["brief.md", "photo.png"].map((filename, index) => ({
+      id: `file_${index + 1}`,
+      name: filename.slice(0, filename.lastIndexOf(".")),
+      extension: filename.slice(filename.lastIndexOf(".") + 1),
+      filename,
+      path: `/files/${filename}`,
+      storage: "isolated" as const,
+      availability: "available" as const,
+      kind: "normal" as const,
+      sharedRead: false,
+      sharedWrite: false,
+      previewKind: "none" as const,
+      mimeType: "application/octet-stream",
+      createdAt: index + 1,
+      updatedAt: index + 1,
+    }));
+    vi.spyOn(api, "importPickedFiles").mockResolvedValue(imported);
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    act(() => vi.runOnlyPendingTimers());
+    await act(async () => {
+      await result.current.fileActions.importPicked({
+        selectionId: "file_selection_1",
+        mode: "copy",
+        kind: "normal",
+      });
+    });
+
+    expect(result.current.files.map((file) => file.filename)).toEqual([
+      "brief.md",
+      "photo.png",
+    ]);
+    unmount();
+  });
+
+  it("keeps successful dropped files when a later upload fails", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+    const dropped = [new File(["ok"], "ok.txt"), new File(["bad"], "bad.txt")];
+    const created = {
+      id: "file_1",
+      name: "ok",
+      extension: "txt",
+      filename: "ok.txt",
+      path: "/files/ok.txt",
+      storage: "isolated" as const,
+      availability: "available" as const,
+      kind: "normal" as const,
+      sharedRead: false,
+      sharedWrite: false,
+      previewKind: "text" as const,
+      mimeType: "text/plain",
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    const upload = vi
+      .spyOn(api, "importUploadedFile")
+      .mockResolvedValueOnce(created)
+      .mockRejectedValueOnce(new Error("413 too large"));
+    const onImported = vi.fn();
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    act(() => vi.runOnlyPendingTimers());
+    act(() => sendWorkspaceFrame(FakeWebSocket.instances[0]!, "project_a", undefined, 7));
+    let outcome!: Awaited<ReturnType<typeof result.current.fileActions.importDropped>>;
+    await act(async () => {
+      outcome = await result.current.fileActions.importDropped(
+        dropped,
+        "normal",
+        onImported,
+      );
+    });
+
+    expect(result.current.files.map((file) => file.id)).toEqual(["file_1"]);
+    expect(onImported).toHaveBeenCalledWith(created, 0);
+    expect(outcome.imported).toEqual([created]);
+    expect(outcome.failures).toMatchObject([{ file: dropped[1], reason: "413 too large" }]);
+    expect(upload.mock.calls[0]?.[2]).toEqual({ canvasProjectId: "project_a", revision: 7 });
+    expect(upload.mock.calls[1]?.[2]).toEqual({ canvasProjectId: "project_a", revision: 7 });
+    unmount();
+  });
+
+  it("stops a dropped-file batch after a project switch", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    mockEmptyRefresh();
+    const dropped = [new File(["one"], "one.txt"), new File(["two"], "two.txt")];
+    const created = {
+      id: "file_1",
+      name: "one",
+      extension: "txt",
+      filename: "one.txt",
+      path: "/files/one.txt",
+      storage: "isolated" as const,
+      availability: "available" as const,
+      kind: "normal" as const,
+      sharedRead: false,
+      sharedWrite: false,
+      previewKind: "text" as const,
+      mimeType: "text/plain",
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    let resolveFirst!: (file: typeof created) => void;
+    const upload = vi.spyOn(api, "importUploadedFile").mockReturnValue(
+      new Promise((resolve) => {
+        resolveFirst = resolve;
+      }),
+    );
+    const onImported = vi.fn();
+
+    const { result, unmount } = renderHook(() => useAgentCanvas());
+    act(() => vi.runOnlyPendingTimers());
+    const socket = FakeWebSocket.instances[0]!;
+    act(() => sendWorkspaceFrame(socket, "project_a", undefined, 3));
+    let pending!: ReturnType<typeof result.current.fileActions.importDropped>;
+    act(() => {
+      pending = result.current.fileActions.importDropped(dropped, "normal", onImported);
+    });
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(upload.mock.calls[0]?.[2]).toEqual({ canvasProjectId: "project_a", revision: 3 });
+
+    act(() => sendWorkspaceFrame(socket, "project_b", undefined, 1));
+    let outcome!: Awaited<typeof pending>;
+    await act(async () => {
+      resolveFirst(created);
+      outcome = await pending;
+    });
+
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(onImported).not.toHaveBeenCalled();
+    expect(result.current.files).toEqual([]);
+    expect(outcome.failures.map((failure) => failure.file.name)).toEqual(["two.txt"]);
     unmount();
   });
 

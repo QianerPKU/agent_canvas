@@ -149,7 +149,7 @@ function createHandle(
         next = await promptIterator.next();
       }
     } finally {
-      client.close();
+      await client.close();
     }
   };
 
@@ -183,8 +183,23 @@ function createHandle(
       currentReasoningEffort = stringValue(reasoningEffort);
     },
     terminate: async () => {
-      client?.close();
-      await iterator.return(undefined).catch(() => undefined);
+      const closing = client?.close({ retry: true });
+      const errors: unknown[] = [];
+      try {
+        await iterator.return(undefined);
+      } catch (error) {
+        errors.push(error);
+      }
+      try {
+        await closing;
+      } catch (error) {
+        errors.push(error);
+      }
+      const uniqueErrors = [...new Set(errors)];
+      if (uniqueErrors.length === 1) throw uniqueErrors[0];
+      if (uniqueErrors.length > 1) {
+        throw new AggregateError(uniqueErrors, "Failed to terminate Codex app-server query");
+      }
     },
   };
 }
@@ -812,6 +827,9 @@ class CodexAppServerClient {
   private rl?: readline.Interface;
   private nextId = 0;
   private closed = false;
+  private processClosed = false;
+  private closePromise?: Promise<void>;
+  private closeFailed = false;
   private stderrTail = "";
 
   constructor(
@@ -832,6 +850,9 @@ class CodexAppServerClient {
     });
     this.proc.once("exit", (code, signal) => this.onExit(code, signal));
     this.proc.once("error", (err) => this.onProcessError(err));
+    this.proc.once("close", () => {
+      this.processClosed = true;
+    });
     this.proc.stderr.on("data", (chunk: Buffer) => this.rememberStderr(chunk.toString("utf-8")));
     this.rl = readline.createInterface({ input: this.proc.stdout });
     this.rl.on("line", (line) => this.onLine(line));
@@ -951,20 +972,83 @@ class CodexAppServerClient {
     }
   }
 
-  close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    this.rl?.close();
-    this.notifications.close();
-    this.rejectPending(new Error("Codex app-server closed"));
-    try {
-      this.proc?.stdin.end();
-    } catch {
-      // ignore
+  close(options: { retry?: boolean } = {}): Promise<void> {
+    if (options.retry && this.closeFailed) {
+      this.closePromise = undefined;
+      this.closeFailed = false;
     }
-    if (this.proc && this.proc.exitCode === null) {
-      this.proc.kill();
+    if (this.closePromise) return this.closePromise;
+    if (!this.closed) {
+      this.closed = true;
+      this.rl?.close();
+      this.notifications.close();
+      this.rejectPending(new Error("Codex app-server closed"));
+      try {
+        this.proc?.stdin.end();
+      } catch {
+        // The process termination below remains the authoritative close result.
+      }
     }
+
+    const proc = this.proc;
+    if (!proc || this.processClosed) return Promise.resolve();
+
+    let attempt!: Promise<void>;
+    attempt = this.terminateProcess(proc).catch((error: unknown) => {
+      // Preserve the process handle and failed promise so the generator's finally block observes
+      // the same failure. A later explicit QueryHandle.terminate() opts into a fresh attempt.
+      if (this.closePromise === attempt) this.closeFailed = true;
+      throw error;
+    });
+    this.closePromise = attempt;
+    return attempt;
+  }
+
+  private terminateProcess(proc: ChildProcessWithoutNullStreams): Promise<void> {
+    if (this.processClosed) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanup = (): void => {
+        proc.off("close", onClose);
+        proc.off("error", onError);
+      };
+      const onClose = (): void => {
+        if (settled) return;
+        settled = true;
+        this.processClosed = true;
+        cleanup();
+        resolve();
+      };
+      const onError = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+
+      proc.once("close", onClose);
+      proc.once("error", onError);
+      if (this.processClosed) {
+        onClose();
+        return;
+      }
+
+      const isRunning = proc.exitCode === null && (proc.signalCode ?? null) === null;
+      if (!isRunning) return;
+      try {
+        const signalled = proc.kill();
+        if (
+          !signalled &&
+          !this.processClosed &&
+          proc.exitCode === null &&
+          (proc.signalCode ?? null) === null
+        ) {
+          onError(new Error("Failed to terminate Codex app-server process"));
+        }
+      } catch (error) {
+        onError(asError(error));
+      }
+    });
   }
 
   private write(message: JsonRpcMessage): void {
@@ -1142,6 +1226,7 @@ class CodexAppServerClient {
   }
 
   private onProcessError(err: Error): void {
+    this.closed = true;
     this.rejectPending(err);
     this.notifications.close();
   }

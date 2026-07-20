@@ -8,7 +8,19 @@ import {
   type Node,
   type NodeProps,
 } from "@xyflow/react";
-import { Check, ExternalLink, Eye, File, FileText, Image, Minimize2, Pencil, X } from "lucide-react";
+import {
+  AlertTriangle,
+  Check,
+  ExternalLink,
+  Eye,
+  File,
+  FileText,
+  Image,
+  Minimize2,
+  Pencil,
+  RefreshCw,
+  X,
+} from "lucide-react";
 import type { AgentResultReportKind, CanvasFileNode } from "@agent-canvas/shared";
 import { api } from "../api.js";
 import type { FileActions } from "../useAgentCanvas.js";
@@ -28,6 +40,8 @@ export interface FileNodeData {
 }
 
 export type FileNodeType = Node<FileNodeData, "file">;
+
+const REFERENCE_REFRESH_INTERVAL_MS = 10_000;
 
 export function toggleFileNodeWindow(node: FileNodeType): Partial<FileNodeType> {
   const state = node.data.windowState;
@@ -66,10 +80,14 @@ export function FileNode({ id, data }: NodeProps<FileNodeType>): React.ReactElem
   const [imageVersion, setImageVersion] = useState(() => Date.now());
   const [imageError, setImageError] = useState(false);
   const [renaming, setRenaming] = useState(false);
+  const [relinking, setRelinking] = useState(false);
+  const [relinkError, setRelinkError] = useState("");
   const [name, setName] = useState(file.name);
   const [extension, setExtension] = useState(file.extension);
   const minimized = data.windowState?.minimized === true;
   const isAgentResult = file.origin?.kind === "agent_result";
+  const isReferenced = file.storage === "referenced";
+  const referenceMissing = isReferenced && file.availability === "missing";
 
   useEffect(() => {
     setName(file.name);
@@ -77,6 +95,7 @@ export function FileNode({ id, data }: NodeProps<FileNodeType>): React.ReactElem
   }, [file.name, file.extension]);
 
   useEffect(() => {
+    if (file.storage === "referenced" && file.availability === "missing") return;
     if (file.previewKind === "image" || file.previewKind === "none") return;
     let cancelled = false;
     const load = () => {
@@ -88,7 +107,10 @@ export function FileNode({ id, data }: NodeProps<FileNodeType>): React.ReactElem
           }
         },
         (error: Error) => {
-          if (!cancelled) setPreviewError(error.message);
+          if (!cancelled) {
+            setPreviewError(error.message);
+            if (isReferenced) void actions.refresh(file.id).catch(() => undefined);
+          }
         },
       );
     };
@@ -98,9 +120,41 @@ export function FileNode({ id, data }: NodeProps<FileNodeType>): React.ReactElem
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [file.id, file.previewKind, file.updatedAt]);
+  }, [
+    actions,
+    file.availability,
+    file.id,
+    file.previewKind,
+    file.storage,
+    file.updatedAt,
+    isReferenced,
+  ]);
 
   useEffect(() => {
+    if (file.storage !== "referenced") return;
+    if (file.availability !== "missing" && file.previewKind !== "none") return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const refreshAvailability = async () => {
+      try {
+        await actions.refresh(file.id);
+      } catch {
+        // Preview requests surface actionable errors; this probe only keeps availability fresh.
+      } finally {
+        if (!cancelled) {
+          timer = window.setTimeout(refreshAvailability, REFERENCE_REFRESH_INTERVAL_MS);
+        }
+      }
+    };
+    void refreshAvailability();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [actions, file.availability, file.id, file.previewKind, file.storage]);
+
+  useEffect(() => {
+    if (file.storage === "referenced" && file.availability === "missing") return;
     if (file.previewKind !== "image") return;
     setImageError(false);
     setImageVersion(Date.now());
@@ -109,11 +163,26 @@ export function FileNode({ id, data }: NodeProps<FileNodeType>): React.ReactElem
       setImageVersion(Date.now());
     }, 2000);
     return () => window.clearInterval(timer);
-  }, [file.id, file.previewKind, file.updatedAt]);
+  }, [file.availability, file.id, file.previewKind, file.storage, file.updatedAt]);
 
   const finishRename = async () => {
-    await actions.update(file.id, { name: name.trim(), extension });
+    await actions.update(
+      file.id,
+      isReferenced ? { name: name.trim() } : { name: name.trim(), extension },
+    );
     setRenaming(false);
+  };
+
+  const relink = async () => {
+    setRelinking(true);
+    setRelinkError("");
+    try {
+      await actions.relink(file.id);
+    } catch (error) {
+      setRelinkError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRelinking(false);
+    }
   };
 
   const toggleMinimized = (event: React.MouseEvent) => {
@@ -155,19 +224,27 @@ export function FileNode({ id, data }: NodeProps<FileNodeType>): React.ReactElem
       <div className="file-node__header drag-handle">
         <FileKindIcon file={file} />
         {renaming ? (
-          <div className="file-node__rename nodrag">
+          <div
+            className={
+              isReferenced
+                ? "file-node__rename file-node__rename--referenced nodrag"
+                : "file-node__rename nodrag"
+            }
+          >
             <input
               aria-label="文件名"
               value={name}
               autoFocus
               onChange={(event) => setName(event.target.value)}
             />
-            <input
-              aria-label="文件后缀"
-              value={extension}
-              placeholder="无后缀"
-              onChange={(event) => setExtension(event.target.value)}
-            />
+            {!isReferenced && (
+              <input
+                aria-label="文件后缀"
+                value={extension}
+                placeholder="无后缀"
+                onChange={(event) => setExtension(event.target.value)}
+              />
+            )}
             <button className="icon-button" title="确认重命名" onClick={() => void finishRename()}>
               <Check size={14} />
             </button>
@@ -211,29 +288,62 @@ export function FileNode({ id, data }: NodeProps<FileNodeType>): React.ReactElem
       </div>
 
       <div
-        className="file-node__preview nodrag nowheel"
-        role="button"
-        tabIndex={0}
-        aria-label={`用 VS Code 打开 ${file.filename}`}
-        onClick={() => onOpenEditor(file.id)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            onOpenEditor(file.id);
-          }
-        }}
+        className={`file-node__preview nodrag nowheel${referenceMissing ? " file-node__preview--missing" : ""}`}
+        role={referenceMissing ? undefined : "button"}
+        tabIndex={referenceMissing ? undefined : 0}
+        aria-label={referenceMissing ? undefined : `用 VS Code 打开 ${file.filename}`}
+        onClick={referenceMissing ? undefined : () => onOpenEditor(file.id)}
+        onKeyDown={
+          referenceMissing
+            ? undefined
+            : (event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  onOpenEditor(file.id);
+                }
+              }
+        }
       >
-        {file.previewKind === "image" ? (
+        {referenceMissing ? (
+          <div className="file-node__reference-error">
+            <AlertTriangle size={28} />
+            <strong>外部引用失效</strong>
+            <span>{relinkError || "原文件已移动、删除或暂时无法读取。"}</span>
+            <button
+              type="button"
+              disabled={relinking}
+              onClick={(event) => {
+                event.stopPropagation();
+                void relink();
+              }}
+            >
+              <RefreshCw size={13} />
+              {relinking ? "正在定位…" : "重新定位"}
+            </button>
+          </div>
+        ) : file.previewKind === "image" ? (
           imageError ? (
-            <div className="file-node__binary">
-              <Image size={32} />
-              <span>等待图片内容</span>
-            </div>
+            isReferenced ? (
+              <div className="file-node__binary file-node__binary--error">
+                <Image size={32} />
+                <strong>图片预览失败</strong>
+                <span>原文件仍可用，可点击此区域在 VS Code 中打开。</span>
+              </div>
+            ) : (
+              <div className="file-node__binary">
+                <Image size={32} />
+                <span>等待图片内容</span>
+              </div>
+            )
           ) : (
             <img
               src={api.fileRawUrl(file.id, imageVersion)}
               alt={file.filename}
-              onError={() => setImageError(true)}
+              onLoad={() => setImageError(false)}
+              onError={() => {
+                setImageError(true);
+                if (isReferenced) void actions.refresh(file.id).catch(() => undefined);
+              }}
             />
           )
         ) : file.previewKind === "none" ? (
@@ -249,7 +359,13 @@ export function FileNode({ id, data }: NodeProps<FileNodeType>): React.ReactElem
       </div>
 
       <div className="file-node__footer nodrag">
-        <span>{isAgentResult ? "Agent 汇报结果" : "隔离文件"}</span>
+        <span>
+          {isAgentResult
+            ? "Agent 汇报结果"
+            : isReferenced
+              ? "外部引用 · 只读"
+              : "项目文件"}
+        </span>
         {file.kind === "shared" ? (
           <div className="file-node__toggles">
             <label>
@@ -262,20 +378,22 @@ export function FileNode({ id, data }: NodeProps<FileNodeType>): React.ReactElem
               />
               全局读
             </label>
-            <label>
-              <input
-                type="checkbox"
-                checked={file.sharedWrite}
-                onChange={(event) =>
-                  void actions.update(file.id, { sharedWrite: event.target.checked })
-                }
-              />
-              全局写
-            </label>
+            {!isReferenced && (
+              <label>
+                <input
+                  type="checkbox"
+                  checked={file.sharedWrite}
+                  onChange={(event) =>
+                    void actions.update(file.id, { sharedWrite: event.target.checked })
+                  }
+                />
+                全局写
+              </label>
+            )}
           </div>
         ) : (
           <span className="file-node__badge">
-            {isAgentResult ? resultKindLabel(file.origin?.resultKind) : "普通"}
+            {isAgentResult ? resultKindLabel(file.origin?.resultKind) : "隔离"}
           </span>
         )}
       </div>
@@ -287,14 +405,18 @@ function FileNodeHandles({ file }: { file: CanvasFileNode }): React.ReactElement
   if (file.kind !== "normal") return null;
   return (
     <>
-      <Handle
-        id="write"
-        type="target"
-        position={Position.Left}
-        className="file-node__handle file-node__handle--write"
-        title="Agent 输出连接到这里：允许写入"
-      />
-      <span className="file-node__handle-label file-node__handle-label--write">写</span>
+      {file.storage !== "referenced" && (
+        <>
+          <Handle
+            id="write"
+            type="target"
+            position={Position.Left}
+            className="file-node__handle file-node__handle--write"
+            title="Agent 输出连接到这里：允许写入"
+          />
+          <span className="file-node__handle-label file-node__handle-label--write">写</span>
+        </>
+      )}
       <Handle
         id="read"
         type="source"

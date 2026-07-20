@@ -17,6 +17,7 @@ function file(partial: Partial<CanvasFileNode> = {}): CanvasFileNode {
     filename: "notes.txt",
     path: "C:/files/notes.txt",
     storage: "isolated",
+    availability: "available",
     kind: "normal",
     sharedRead: false,
     sharedWrite: false,

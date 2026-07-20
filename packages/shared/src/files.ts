@@ -1,7 +1,10 @@
 import type { AgentSharedResourceReference } from "./workspaces.js";
 
 export type CanvasFileKind = "normal" | "shared";
-export type CanvasFileStorage = "isolated";
+export type CanvasFileStorage = "isolated" | "referenced";
+export type CanvasFileAvailability = "available" | "missing";
+export type CanvasFileImportMode = "copy" | "reference";
+export const PICKED_FILE_SELECTION_EXPIRED_CODE = "picked_selection_expired" as const;
 export type FilePreviewKind = "text" | "markdown" | "csv" | "image" | "none";
 export type FileConnectionAccess = "read" | "write";
 export type AgentResultReportKind = "image" | "table" | "document" | "artifact";
@@ -23,6 +26,7 @@ export interface CanvasFileNode {
   filename: string;
   path: string;
   storage: CanvasFileStorage;
+  availability: CanvasFileAvailability;
   kind: CanvasFileKind;
   sharedRead: boolean;
   sharedWrite: boolean;
@@ -38,6 +42,24 @@ export interface CreateCanvasFileInput {
   extension?: string;
   /** 文件节点固定使用隔离目录；保留字段便于旧调用方显式传 isolated。 */
   storage?: CanvasFileStorage;
+  kind: CanvasFileKind;
+}
+
+export interface PickedCanvasFile {
+  name: string;
+  extension: string;
+  filename: string;
+  size: number;
+}
+
+export interface PickedCanvasFileSelection {
+  id: string;
+  files: PickedCanvasFile[];
+}
+
+export interface ImportPickedCanvasFilesInput {
+  selectionId: string;
+  mode: CanvasFileImportMode;
   kind: CanvasFileKind;
 }
 

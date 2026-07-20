@@ -1335,16 +1335,38 @@ function assertManagedTrustedRootBoundaryIdentitySync(
 }
 
 function samePath(left: string, right: string): boolean {
-  const resolvedLeft = path.resolve(left);
-  const resolvedRight = path.resolve(right);
-  return process.platform === "win32"
-    ? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
-    : resolvedLeft === resolvedRight;
+  return resolvedManagedPathKey(left) === resolvedManagedPathKey(right);
 }
 
 function isPathAtOrWithin(root: string, candidate: string): boolean {
-  const relative = path.relative(path.resolve(root), path.resolve(candidate));
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  return isManagedPathAtOrWithin(root, candidate);
+}
+
+/** Exact lexical key for a filesystem safety boundary. */
+export function resolvedManagedPathKey(
+  value: string,
+  pathApi: Pick<typeof path, "resolve"> = path,
+): string {
+  return pathApi.resolve(value);
+}
+
+/**
+ * Exact containment check that does not inherit win32's process-wide
+ * case-insensitive `path.relative` behavior. Case-insensitive volumes converge
+ * through realpath; case-sensitive Windows directories remain distinct.
+ */
+export function isManagedPathAtOrWithin(
+  root: string,
+  candidate: string,
+  pathApi: Pick<typeof path, "resolve" | "sep"> = path,
+): boolean {
+  const resolvedRoot = pathApi.resolve(root);
+  const resolvedCandidate = pathApi.resolve(candidate);
+  if (resolvedCandidate === resolvedRoot) return true;
+  const prefix = resolvedRoot.endsWith(pathApi.sep)
+    ? resolvedRoot
+    : `${resolvedRoot}${pathApi.sep}`;
+  return resolvedCandidate.startsWith(prefix);
 }
 
 function assertSingleLinkRegularFile(
