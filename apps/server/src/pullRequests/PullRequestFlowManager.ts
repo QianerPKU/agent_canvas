@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type {
   AgentEventEnvelope,
   AgentSnapshot,
@@ -18,11 +19,18 @@ import {
   type BranchReviewJob,
   type BranchReviewStartResult,
 } from "../reviews/BranchReviewQueue.js";
+import {
+  redactFlowCapabilities,
+  redactFlowCapabilityText,
+} from "../flowCapabilityRedaction.js";
 import { DEFAULT_BRANCH_REVIEW_TIMEOUT_MS } from "../reviews/reviewDefaults.js";
 
 type DeliverableRunner = {
   getStatus(): string;
-  deliver(text: string): Promise<void>;
+  deliver(
+    text: string,
+    options?: { automationKey?: string; replaceQueued?: boolean },
+  ): Promise<void>;
 };
 
 export interface PullRequestAgentHost {
@@ -62,6 +70,27 @@ export interface EnsurePullRequestBranchesReady {
   (context: ResolvePullRequestChangedFilesContext): Promise<void>;
 }
 
+export interface SubmitPullRequestReviewInput {
+  agentId: string;
+  reviewToken: string;
+  stage: PullRequestReviewStage;
+  decision: PullRequestReviewDecision;
+  summary: string;
+  risks?: string[];
+  filesReviewed?: string[];
+  requiredChanges?: string[];
+}
+
+export interface SubmitPullRequestCreatedInput extends PullRequestCreatedInput {
+  agentId: string;
+  completionToken: string;
+}
+
+export interface SubmitPullRequestMergedInput {
+  agentId: string;
+  completionToken: string;
+}
+
 interface ParsedReview {
   agentCanvasPrReview: true;
   flowId: string;
@@ -71,6 +100,38 @@ interface ParsedReview {
   risks?: string[];
   filesReviewed?: string[];
   requiredChanges?: string[];
+}
+
+interface NormalizedPullRequestReview {
+  agentId: string;
+  reviewToken: string;
+  stage: PullRequestReviewStage;
+  decision: PullRequestReviewDecision;
+  summary: string;
+  risks: string[];
+  filesReviewed: string[];
+  requiredChanges: string[];
+}
+
+interface ReviewCapability {
+  token: string;
+  flowId: string;
+  requestId: string;
+  stage: PullRequestReviewStage;
+  agentId: string;
+}
+
+type PullRequestCompletionAction = "pr_created" | "merged";
+
+interface CompletionCapability {
+  token: string;
+  flowId: string;
+  action: PullRequestCompletionAction;
+  agentId: string;
+}
+
+interface AcceptedCompletionCallback extends CompletionCapability {
+  payloadFingerprint: string;
 }
 
 interface ParsedAgentEvent {
@@ -86,6 +147,7 @@ interface ParsedAgentEvent {
 
 const DEFAULT_REVIEW_RETRY_LIMIT = 1;
 const REVIEW_QUEUE_OWNER = "pull_request";
+const CAPABILITY_TOKEN_PREFIX = "agent_canvas_cap_";
 const CLOSED_STATUSES: PullRequestFlowStatus[] = [
   "source_review_failed",
   "target_review_failed",
@@ -108,6 +170,12 @@ export class PullRequestFlowManager {
   private readonly timers = new Map<string, unknown>();
   private readonly listeners = new Set<FlowListener>();
   private readonly pendingOperations = new Set<symbol>();
+  private readonly pendingOperationsByFlow = new Map<string, Set<Promise<unknown>>>();
+  private readonly reviewCapabilities = new Map<string, ReviewCapability>();
+  private readonly completionCapabilities = new Map<string, CompletionCapability>();
+  private readonly acceptedCompletionCallbacks = new Map<string, AcceptedCompletionCallback>();
+  private readonly issuedCapabilityTokens = new Set<string>();
+  private readonly closureReleaseDeliveries = new Map<string, Promise<boolean>>();
   private counter = 0;
   private importedStateActivated = true;
   private stateGeneration = 0;
@@ -134,7 +202,7 @@ export class PullRequestFlowManager {
   }
 
   exportState(): PullRequestFlowSnapshot[] {
-    return this.list();
+    return redactFlowCapabilities(this.list());
   }
 
   hasOpenFlows(): boolean {
@@ -145,17 +213,57 @@ export class PullRequestFlowManager {
     return this.pendingOperations.size > 0;
   }
 
+  async retryClosureReleasesForAgent(agentId: string): Promise<void> {
+    const normalizedAgentId = agentId.trim();
+    if (!normalizedAgentId) return;
+    const generation = this.stateGeneration;
+    const closedParticipantFlows = this.list().filter(
+      (flow) =>
+        CLOSED_STATUSES.includes(flow.status) &&
+        closureReleaseAgentIds(flow).includes(normalizedAgentId),
+    );
+    await Promise.all(
+      closedParticipantFlows.map(async (flow) => {
+        const blockers = [...(this.pendingOperationsByFlow.get(flow.id) ?? [])];
+        await this.trackPendingOperation(async () => {
+          await Promise.allSettled(blockers);
+          await this.deliverReviewerReleases(
+            flow.id,
+            generation,
+            [normalizedAgentId],
+            reviewFreezeReleasePrompt(flow),
+          );
+        }, flow.id);
+      }),
+    );
+  }
+
+  forgetClosureReleasesForAgent(agentId: string): void {
+    const normalizedAgentId = agentId.trim();
+    if (!normalizedAgentId) return;
+    for (const flow of this.flows.values()) {
+      if (!closureReleaseAgentIds(flow).includes(normalizedAgentId)) continue;
+      this.closureReleaseDeliveries.delete(
+        closureReleaseDeliveryKey(flow.id, normalizedAgentId),
+      );
+    }
+  }
+
   importState(
     flows: PullRequestFlowSnapshot[] | undefined,
     options: { deferActivation?: boolean } = {},
   ): void {
     this.stateGeneration += 1;
+    this.pendingOperationsByFlow.clear();
+    this.closureReleaseDeliveries.clear();
     for (const flowId of this.timers.keys()) this.closeTimer(flowId);
+    this.clearAllCapabilities();
     // Retire old-project deliveries immediately. Replacement jobs are installed only after the
     // caller has restored the rest of the project state and explicitly activates this import.
     this.reviewQueue.replaceOwner(REVIEW_QUEUE_OWNER, []);
     this.flows.clear();
-    for (const flow of flows ?? []) {
+    for (const importedFlow of flows ?? []) {
+      const flow = redactFlowCapabilities(importedFlow);
       const collectingStage: PullRequestReviewStage | undefined =
         flow.status === "source_review_collecting"
           ? "source_preflight"
@@ -202,6 +310,15 @@ export class PullRequestFlowManager {
           this.resetTimer(flow.id, flow.deadlineAt, generation);
         }
       }
+      const current = this.flows.get(flow.id);
+      if (
+        current &&
+        !CLOSED_STATUSES.includes(current.status) &&
+        current.deadlineAt !== undefined &&
+        current.deadlineAt > this.now()
+      ) {
+        this.redeliverRestoredAuthorization(current, generation);
+      }
     }
   }
 
@@ -214,6 +331,7 @@ export class PullRequestFlowManager {
   }
 
   async create(input: CreatePullRequestFlowInput): Promise<PullRequestFlowSnapshot> {
+    input = redactFlowCapabilities(input);
     const generation = this.stateGeneration;
     if (!input.proposerAgentId) throw new Error("missing proposerAgentId");
     if (!input.targetBranch) throw new Error("missing targetBranch");
@@ -223,7 +341,9 @@ export class PullRequestFlowManager {
     if (!isActiveAgentStatus(proposer.status)) {
       throw new Error("proposer agent must be running or waiting_input");
     }
-    const sourceBranch = input.sourceBranch?.trim() || proposer.config.branch;
+    const sourceBranch = redactFlowCapabilityText(
+      input.sourceBranch?.trim() || proposer.config.branch || "",
+    );
     if (!sourceBranch) throw new Error("missing sourceBranch");
     const targetBranch = input.targetBranch.trim();
     await this.ensureBranchesReady?.({
@@ -264,11 +384,53 @@ export class PullRequestFlowManager {
       currentStage: "source_preflight",
       reviewRequests: [],
     };
-    this.flows.set(flow.id, flow);
     this.save(flow);
-    await this.reviewQueue.enqueue(this.reviewJob(flow, "source_preflight", "queued"));
-    this.assertCurrentGeneration(generation);
+    this.startBackgroundOperation(flow.id, async () => {
+      await this.reviewQueue.enqueue(this.reviewJob(flow, "source_preflight", "queued"));
+      this.assertCurrentGeneration(generation);
+    });
     return this.requireFlow(flow.id);
+  }
+
+  async submitPrCreated(
+    flowId: string,
+    input: SubmitPullRequestCreatedInput,
+  ): Promise<PullRequestFlowSnapshot> {
+    const flow = this.requireFlow(flowId);
+    const callback = normalizeCompletionSubmission(input);
+    const accepted = this.acceptedCompletionCallback(
+      flow,
+      "pr_created",
+      callback.agentId,
+      callback.completionToken,
+    );
+    if (!accepted) {
+      this.assertCompletionCapability(
+        flow,
+        "pr_created",
+        callback.agentId,
+        callback.completionToken,
+      );
+    }
+    const createdInput = canonicalPrCreatedInput(input);
+    const payloadFingerprint = prCreatedPayloadFingerprint(createdInput);
+    if (accepted) {
+      this.assertAcceptedCompletionPayload(accepted, payloadFingerprint);
+      return flow;
+    }
+    const receipt = this.rememberCompletionCallback(
+      flow,
+      "pr_created",
+      callback.agentId,
+      callback.completionToken,
+      payloadFingerprint,
+    );
+    try {
+      return await this.recordPrCreated(flowId, createdInput, callback.agentId);
+    } catch (error) {
+      this.forgetCompletionCallback(receipt);
+      throw error;
+    }
   }
 
   async recordPrCreated(
@@ -281,6 +443,10 @@ export class PullRequestFlowManager {
     if (flow.status !== "create_pr_authorized") {
       throw new Error("PR can only be recorded after create_pr authorization");
     }
+    input = canonicalPrCreatedInput(input);
+    reportedByAgentId = reportedByAgentId
+      ? redactFlowCapabilityText(reportedByAgentId).trim()
+      : undefined;
     const fileChanges = updatedFileChangesForPr(flow, input);
     const files = pathsFromFileChanges(fileChanges);
     const pr: PullRequestCreatedInfo = {
@@ -308,9 +474,49 @@ export class PullRequestFlowManager {
       reviewQueueSequence: this.reviewQueue.reserveSequence(),
     };
     this.save(queued);
-    await this.reviewQueue.enqueue(this.reviewJob(queued, "target_merge", "queued"));
-    this.assertCurrentGeneration(generation);
+    this.startBackgroundOperation(flowId, async () => {
+      await this.reviewQueue.enqueue(this.reviewJob(queued, "target_merge", "queued"));
+      this.assertCurrentGeneration(generation);
+    });
     return this.requireFlow(flowId);
+  }
+
+  submitMerged(
+    flowId: string,
+    input: SubmitPullRequestMergedInput,
+  ): PullRequestFlowSnapshot {
+    const flow = this.requireFlow(flowId);
+    const callback = normalizeCompletionSubmission(input);
+    const payloadFingerprint = "{}";
+    const accepted = this.acceptedCompletionCallback(
+      flow,
+      "merged",
+      callback.agentId,
+      callback.completionToken,
+    );
+    if (accepted) {
+      this.assertAcceptedCompletionPayload(accepted, payloadFingerprint);
+      return flow;
+    }
+    this.assertCompletionCapability(
+      flow,
+      "merged",
+      callback.agentId,
+      callback.completionToken,
+    );
+    const receipt = this.rememberCompletionCallback(
+      flow,
+      "merged",
+      callback.agentId,
+      callback.completionToken,
+      payloadFingerprint,
+    );
+    try {
+      return this.recordMerged(flowId);
+    } catch (error) {
+      this.forgetCompletionCallback(receipt);
+      throw error;
+    }
   }
 
   recordMerged(flowId: string): PullRequestFlowSnapshot {
@@ -353,7 +559,73 @@ export class PullRequestFlowManager {
       throw new Error("only queued PR flows can be retried");
     }
     if (!flow.currentStage) throw new Error("queued PR flow is missing its review stage");
-    await this.reviewQueue.retry(reviewJobId(flow.id, flow.currentStage));
+    const jobId = reviewJobId(flow.id, flow.currentStage);
+    this.startBackgroundOperation(flow.id, async () => {
+      await this.reviewQueue.retry(jobId);
+      this.assertCurrentGeneration(generation);
+    });
+    this.assertCurrentGeneration(generation);
+    return this.requireFlow(flowId);
+  }
+
+  async submitReview(
+    flowId: string,
+    input: SubmitPullRequestReviewInput,
+  ): Promise<PullRequestFlowSnapshot> {
+    const generation = this.stateGeneration;
+    const flow = this.requireFlow(flowId);
+    const submission = normalizeReviewSubmission(input);
+    const request = currentRequest(flow, submission.stage);
+    this.assertReviewCapability(flow, request, submission);
+    const existing = request?.responses.find(
+      (response) => response.agentId === submission.agentId,
+    );
+
+    if (existing) {
+      if (sameReviewSubmission(existing, submission)) return flow;
+      throw new Error(
+        `conflicting PR review submission for ${submission.agentId} on ${submission.stage}`,
+      );
+    }
+
+    const expectedStatus =
+      submission.stage === "source_preflight"
+        ? "source_review_collecting"
+        : "target_review_collecting";
+    if (flow.status !== expectedStatus || flow.currentStage !== submission.stage) {
+      throw new Error(
+        `PR flow ${flowId} is not collecting ${submission.stage} reviews`,
+      );
+    }
+    if (!request) {
+      throw new Error(`PR flow ${flowId} has no ${submission.stage} review request`);
+    }
+    if (!request.requestedAgentIds.includes(submission.agentId)) {
+      throw new Error(
+        `agent ${submission.agentId} was not requested to review PR flow ${flowId}`,
+      );
+    }
+    if (!request.pendingAgentIds.includes(submission.agentId)) {
+      throw new Error(
+        `agent ${submission.agentId} does not have a pending review for PR flow ${flowId}`,
+      );
+    }
+
+    this.recordReviewResponse(flowId, submission.stage, {
+      agentId: submission.agentId,
+      stage: submission.stage,
+      decision: submission.decision,
+      summary: submission.summary,
+      risks: submission.risks,
+      filesReviewed: submission.filesReviewed,
+      requiredChanges: submission.requiredChanges,
+      retryCount: request.retryCounts[submission.agentId] ?? 0,
+      receivedAt: this.now(),
+    });
+    this.startBackgroundOperation(
+      flowId,
+      async () => await this.finishStageIfComplete(flowId, generation),
+    );
     this.assertCurrentGeneration(generation);
     return this.requireFlow(flowId);
   }
@@ -388,8 +660,9 @@ export class PullRequestFlowManager {
       },
       state,
       start: async () =>
-        await this.trackPendingOperation(async () =>
-          await this.activateQueuedReviewStage(flow.id, stage, generation),
+        await this.trackPendingOperation(
+          async () => await this.activateQueuedReviewStage(flow.id, stage, generation),
+          flow.id,
         ),
     };
   }
@@ -471,6 +744,12 @@ export class PullRequestFlowManager {
       ),
       deadlineAt: this.now() + this.reviewTimeoutMs,
     };
+    const reviewTokens = new Map(
+      reviewers.map((reviewer) => [
+        reviewer.id,
+        this.issueReviewCapability(flow.id, request.id, stage, reviewer.id),
+      ]),
+    );
     this.save({
       ...flow,
       currentStage: stage,
@@ -488,8 +767,16 @@ export class PullRequestFlowManager {
           async () =>
             await this.deliverToAgent(
               reviewer.id,
-              reviewPrompt(this.requireFlow(flowId), stage),
-              { startIfIdle: true },
+              reviewPrompt(
+                this.requireFlow(flowId),
+                stage,
+                reviewer.id,
+                reviewTokens.get(reviewer.id)!,
+              ),
+              {
+                automationKey: prFlowAutomationKey(flow.id),
+                startIfIdle: true,
+              },
             ),
         );
         if (delivery.status === "invalidated") return;
@@ -517,8 +804,21 @@ export class PullRequestFlowManager {
     const openRequests = this.listOpenRequestsFor(agentId);
     if (openRequests.length === 0) return;
     for (const { flow, request } of openRequests) {
+      const history = this.host.historyOf(agentId);
+      if (
+        hasUndeliveredQueuedReviewPrompt(
+          history,
+          envelope.seq,
+          request.requestedAt,
+          request.requestedAfterSeqs?.[agentId],
+          flow.id,
+          request.stage,
+        )
+      ) {
+        continue;
+      }
       const reviewText = assistantTextForResult(
-        this.host.historyOf(agentId),
+        history,
         envelope.seq,
         request.requestedAt,
         request.requestedAfterSeqs?.[agentId],
@@ -601,9 +901,19 @@ export class PullRequestFlowManager {
       const delivery = await this.reviewQueue.runWhileReserved(
         reviewJobId(flowId, stage),
         async () =>
-          await this.deliverToAgent(agentId, retryPrompt(flow, stage), {
-            startIfIdle: true,
-          }),
+          await this.deliverToAgent(
+            agentId,
+            retryPrompt(
+              flow,
+              stage,
+              agentId,
+              this.requireReviewCapability(flow.id, request.id, stage, agentId).token,
+            ),
+            {
+              automationKey: prFlowAutomationKey(flow.id),
+              startIfIdle: true,
+            },
+          ),
       );
       if (delivery.status === "invalidated") return;
       return;
@@ -629,6 +939,12 @@ export class PullRequestFlowManager {
   ): Promise<void> {
     if (!this.isCurrentGeneration(generation)) return;
     const flow = this.requireFlow(flowId);
+    if (
+      flow.status !== "source_review_collecting" &&
+      flow.status !== "target_review_collecting"
+    ) {
+      return;
+    }
     const request = currentRequest(flow, flow.currentStage);
     if (!request || request.pendingAgentIds.length > 0) return;
     if (!hasCompleteReviewerCoverage(request)) return;
@@ -636,9 +952,8 @@ export class PullRequestFlowManager {
     const allApproved = request.responses.every((response) => response.decision === "approve");
     if (request.stage === "source_preflight") {
       if (!allApproved) {
-        const next = this.failFlow(flow, "source_review_failed", reviewSummary(request.responses));
+        this.failFlow(flow, "source_review_failed", reviewSummary(request.responses));
         this.reviewQueue.complete(reviewJobId(flowId, request.stage));
-        await this.notifyProposer(next, sourceFailurePrompt(next, request.responses), generation);
         return;
       }
       this.reviewQueue.complete(reviewJobId(flowId, request.stage));
@@ -646,9 +961,8 @@ export class PullRequestFlowManager {
       return;
     }
     if (!allApproved) {
-      const next = this.failFlow(flow, "target_review_failed", reviewSummary(request.responses));
+      this.failFlow(flow, "target_review_failed", reviewSummary(request.responses));
       this.reviewQueue.complete(reviewJobId(flowId, request.stage));
-      await this.notifyProposer(next, targetFailurePrompt(next, request.responses), generation);
       return;
     }
     this.reviewQueue.complete(reviewJobId(flowId, request.stage));
@@ -674,9 +988,18 @@ export class PullRequestFlowManager {
       createAuthorization: authorization,
       updatedAt: this.now(),
     };
+    const completionToken = this.issueCompletionCapability(
+      flow.id,
+      "pr_created",
+      flow.proposerAgentId,
+    );
     this.save(next);
     this.resetTimer(flow.id, authorization.expiresAt, generation);
-    await this.notifyProposer(next, createPrAuthorizationPrompt(next, responses), generation);
+    await this.notifyProposer(
+      next,
+      createPrAuthorizationPrompt(next, responses, completionToken),
+      generation,
+    );
   }
 
   private async authorizeMerge(
@@ -698,9 +1021,18 @@ export class PullRequestFlowManager {
       mergeAuthorization: authorization,
       updatedAt: this.now(),
     };
+    const completionToken = this.issueCompletionCapability(
+      flow.id,
+      "merged",
+      flow.proposerAgentId,
+    );
     this.save(next);
     this.resetTimer(flow.id, authorization.expiresAt, generation);
-    await this.notifyProposer(next, mergeAuthorizationPrompt(next, responses), generation);
+    await this.notifyProposer(
+      next,
+      mergeAuthorizationPrompt(next, responses, completionToken),
+      generation,
+    );
   }
 
   private failFlow(
@@ -728,7 +1060,9 @@ export class PullRequestFlowManager {
   ): Promise<void> {
     if (!this.isCurrentGeneration(generation)) return;
     try {
-      await this.deliverToAgent(flow.proposerAgentId, text);
+      await this.deliverToAgent(flow.proposerAgentId, text, {
+        automationKey: prFlowAutomationKey(flow.id),
+      });
     } catch (error) {
       if (
         this.isCurrentGeneration(generation) &&
@@ -754,14 +1088,41 @@ export class PullRequestFlowManager {
     return idleReviewers.slice(0, 1);
   }
 
-  private async trackPendingOperation<T>(operation: () => Promise<T>): Promise<T> {
+  private async trackPendingOperation<T>(
+    operation: () => Promise<T>,
+    flowId?: string,
+  ): Promise<T> {
     const token = Symbol("pr-review-operation");
     this.pendingOperations.add(token);
+    const pending = Promise.resolve().then(operation);
+    const flowOperations = flowId
+      ? (this.pendingOperationsByFlow.get(flowId) ?? new Set<Promise<unknown>>())
+      : undefined;
+    if (flowId && flowOperations) {
+      flowOperations.add(pending);
+      this.pendingOperationsByFlow.set(flowId, flowOperations);
+    }
     try {
-      return await operation();
+      return await pending;
     } finally {
       this.pendingOperations.delete(token);
+      if (flowId && flowOperations) {
+        flowOperations.delete(pending);
+        if (
+          flowOperations.size === 0 &&
+          this.pendingOperationsByFlow.get(flowId) === flowOperations
+        ) {
+          this.pendingOperationsByFlow.delete(flowId);
+        }
+      }
     }
+  }
+
+  private startBackgroundOperation(flowId: string, operation: () => Promise<void>): void {
+    void this.trackPendingOperation(operation, flowId).catch(() => {
+      // Flow operations update their own blocked/deferred state. The pending-operation guard
+      // keeps project switches serialized without making the originating HTTP callback wait.
+    });
   }
 
   private async changedFilesFor(
@@ -780,7 +1141,11 @@ export class PullRequestFlowManager {
   private async deliverToAgent(
     agentId: string,
     text: string,
-    options: { startIfIdle?: boolean } = {},
+    options: {
+      automationKey?: string;
+      replaceQueued?: boolean;
+      startIfIdle?: boolean;
+    } = {},
   ): Promise<void> {
     const runner = this.host.get(agentId);
     if (!runner) throw new Error(`unknown agent: ${agentId}`);
@@ -788,7 +1153,291 @@ export class PullRequestFlowManager {
       await this.host.startAgent(agentId, { prompt: text });
       return;
     }
-    await runner.deliver(text);
+    await runner.deliver(text, {
+      ...(options.automationKey !== undefined
+        ? { automationKey: options.automationKey }
+        : {}),
+      ...(options.replaceQueued !== undefined
+        ? { replaceQueued: options.replaceQueued }
+        : {}),
+    });
+  }
+
+  private issueReviewCapability(
+    flowId: string,
+    requestId: string,
+    stage: PullRequestReviewStage,
+    agentId: string,
+  ): string {
+    const key = reviewCapabilityKey(flowId, requestId, stage, agentId);
+    const existing = this.reviewCapabilities.get(key);
+    if (existing) return existing.token;
+    const token = this.issueCapabilityToken();
+    this.reviewCapabilities.set(key, { token, flowId, requestId, stage, agentId });
+    return token;
+  }
+
+  private requireReviewCapability(
+    flowId: string,
+    requestId: string,
+    stage: PullRequestReviewStage,
+    agentId: string,
+  ): ReviewCapability {
+    const capability = this.reviewCapabilities.get(
+      reviewCapabilityKey(flowId, requestId, stage, agentId),
+    );
+    if (!capability) throw new Error("invalid or expired PR reviewToken");
+    return capability;
+  }
+
+  private assertReviewCapability(
+    flow: PullRequestFlowSnapshot,
+    request: PullRequestReviewRequest | undefined,
+    submission: NormalizedPullRequestReview,
+  ): void {
+    if (!request) throw new Error("invalid or expired PR reviewToken");
+    const capability = this.reviewCapabilities.get(
+      reviewCapabilityKey(flow.id, request.id, submission.stage, submission.agentId),
+    );
+    if (!capability || capability.token !== submission.reviewToken) {
+      throw new Error("invalid or expired PR reviewToken");
+    }
+  }
+
+  private redeliverRestoredAuthorization(
+    flow: PullRequestFlowSnapshot,
+    generation: number,
+  ): void {
+    if (flow.status !== "create_pr_authorized" && flow.status !== "merge_authorized") return;
+    const action: PullRequestCompletionAction =
+      flow.status === "create_pr_authorized" ? "pr_created" : "merged";
+    const stage: PullRequestReviewStage =
+      action === "pr_created" ? "source_preflight" : "target_merge";
+    const completionToken = this.issueCompletionCapability(
+      flow.id,
+      action,
+      flow.proposerAgentId,
+    );
+    const responses = currentRequest(flow, stage)?.responses ?? [];
+    const prompt =
+      action === "pr_created"
+        ? createPrAuthorizationPrompt(flow, responses, completionToken)
+        : mergeAuthorizationPrompt(flow, responses, completionToken);
+    void this.trackPendingOperation(async () => {
+      if (
+        !this.isCurrentGeneration(generation) ||
+        this.flows.get(flow.id)?.status !== flow.status
+      ) {
+        return;
+      }
+      try {
+        await this.deliverToAgent(flow.proposerAgentId, prompt, {
+          automationKey: prFlowAutomationKey(flow.id),
+        });
+      } catch {
+        // Restoration redelivery is best effort and must not revoke persisted authorization.
+      }
+    }, flow.id);
+  }
+
+  private issueCompletionCapability(
+    flowId: string,
+    action: PullRequestCompletionAction,
+    agentId: string,
+  ): string {
+    const key = completionCapabilityKey(flowId, action, agentId);
+    const existing = this.completionCapabilities.get(key);
+    if (existing) return existing.token;
+    const token = this.issueCapabilityToken();
+    this.completionCapabilities.set(key, { token, flowId, action, agentId });
+    return token;
+  }
+
+  private assertCompletionCapability(
+    flow: PullRequestFlowSnapshot,
+    action: PullRequestCompletionAction,
+    agentId: string,
+    token: string,
+  ): void {
+    const capability = this.completionCapabilities.get(
+      completionCapabilityKey(flow.id, action, agentId),
+    );
+    if (
+      flow.proposerAgentId !== agentId ||
+      !capability ||
+      capability.token !== token
+    ) {
+      throw new Error(`invalid or expired PR ${action} completionToken`);
+    }
+  }
+
+  private acceptedCompletionCallback(
+    flow: PullRequestFlowSnapshot,
+    action: PullRequestCompletionAction,
+    agentId: string,
+    token: string,
+  ): AcceptedCompletionCallback | undefined {
+    const accepted = this.acceptedCompletionCallbacks.get(
+      completionCapabilityKey(flow.id, action, agentId),
+    );
+    if (!accepted) return undefined;
+    if (flow.proposerAgentId !== agentId || accepted.token !== token) {
+      throw new Error(`invalid or expired PR ${action} completionToken`);
+    }
+    return accepted;
+  }
+
+  private assertAcceptedCompletionPayload(
+    accepted: AcceptedCompletionCallback,
+    payloadFingerprint: string,
+  ): void {
+    if (accepted.payloadFingerprint !== payloadFingerprint) {
+      throw new Error(`conflicting PR ${accepted.action} completion submission`);
+    }
+  }
+
+  private rememberCompletionCallback(
+    flow: PullRequestFlowSnapshot,
+    action: PullRequestCompletionAction,
+    agentId: string,
+    token: string,
+    payloadFingerprint: string,
+  ): AcceptedCompletionCallback {
+    const accepted = { token, flowId: flow.id, action, agentId, payloadFingerprint };
+    this.acceptedCompletionCallbacks.set(
+      completionCapabilityKey(flow.id, action, agentId),
+      accepted,
+    );
+    return accepted;
+  }
+
+  private forgetCompletionCallback(accepted: AcceptedCompletionCallback): void {
+    const key = completionCapabilityKey(
+      accepted.flowId,
+      accepted.action,
+      accepted.agentId,
+    );
+    if (this.acceptedCompletionCallbacks.get(key) === accepted) {
+      this.acceptedCompletionCallbacks.delete(key);
+    }
+  }
+
+  private issueCapabilityToken(): string {
+    let token = `${CAPABILITY_TOKEN_PREFIX}${randomUUID()}`;
+    while (this.issuedCapabilityTokens.has(token)) {
+      token = `${CAPABILITY_TOKEN_PREFIX}${randomUUID()}`;
+    }
+    this.issuedCapabilityTokens.add(token);
+    return token;
+  }
+
+  private clearCapabilitiesForFlow(flowId: string): void {
+    for (const [key, capability] of this.reviewCapabilities) {
+      if (capability.flowId !== flowId) continue;
+      this.reviewCapabilities.delete(key);
+      if (!this.isAcceptedCapabilityToken(capability.token)) {
+        this.issuedCapabilityTokens.delete(capability.token);
+      }
+    }
+    for (const [key, capability] of this.completionCapabilities) {
+      if (capability.flowId !== flowId) continue;
+      this.completionCapabilities.delete(key);
+      if (!this.isAcceptedCapabilityToken(capability.token)) {
+        this.issuedCapabilityTokens.delete(capability.token);
+      }
+    }
+  }
+
+  private isAcceptedCapabilityToken(token: string): boolean {
+    return [...this.acceptedCompletionCallbacks.values()].some(
+      (accepted) => accepted.token === token,
+    );
+  }
+
+  private clearAllCapabilities(): void {
+    this.reviewCapabilities.clear();
+    this.completionCapabilities.clear();
+    this.acceptedCompletionCallbacks.clear();
+    this.issuedCapabilityTokens.clear();
+  }
+
+  private releaseReviewers(flow: PullRequestFlowSnapshot): void {
+    const generation = this.stateGeneration;
+    const reviewerIds = closureReleaseAgentIds(flow);
+    const prompt = reviewFreezeReleasePrompt(flow);
+    const blockers = [...(this.pendingOperationsByFlow.get(flow.id) ?? [])];
+    this.startBackgroundOperation(
+      flow.id,
+      async () => {
+        await Promise.allSettled(blockers);
+        await this.deliverReviewerReleases(flow.id, generation, reviewerIds, prompt);
+      },
+    );
+  }
+
+  private async deliverReviewerReleases(
+    flowId: string,
+    generation: number,
+    reviewerIds: string[],
+    prompt: string,
+  ): Promise<void> {
+    const flow = this.flows.get(flowId);
+    if (
+      !this.isCurrentGeneration(generation) ||
+      !flow ||
+      !CLOSED_STATUSES.includes(flow.status)
+    ) {
+      return;
+    }
+    await Promise.all(
+      reviewerIds.map(async (reviewerId) => {
+        await this.deliverReviewerRelease(flowId, generation, reviewerId, prompt);
+      }),
+    );
+  }
+
+  private async deliverReviewerRelease(
+    flowId: string,
+    generation: number,
+    reviewerId: string,
+    prompt: string,
+  ): Promise<void> {
+    const flow = this.flows.get(flowId);
+    if (
+      !this.isCurrentGeneration(generation) ||
+      !flow ||
+      !CLOSED_STATUSES.includes(flow.status)
+    ) {
+      return;
+    }
+    const deliveryKey = closureReleaseDeliveryKey(flowId, reviewerId);
+    const existing = this.closureReleaseDeliveries.get(deliveryKey);
+    if (existing) {
+      await existing;
+      return;
+    }
+    const delivery = (async (): Promise<boolean> => {
+      try {
+        await this.deliverToAgent(reviewerId, prompt, {
+          automationKey: prFlowAutomationKey(flowId),
+          replaceQueued: true,
+        });
+      } catch {
+        // Releasing a freeze is best effort; a failed attempt remains eligible for retry.
+        return false;
+      }
+      const current = this.flows.get(flowId);
+      return (
+        this.isCurrentGeneration(generation) &&
+        current !== undefined &&
+        CLOSED_STATUSES.includes(current.status)
+      );
+    })();
+    this.closureReleaseDeliveries.set(deliveryKey, delivery);
+    const delivered = await delivery;
+    if (!delivered && this.closureReleaseDeliveries.get(deliveryKey) === delivery) {
+      this.closureReleaseDeliveries.delete(deliveryKey);
+    }
   }
 
   private recordSyntheticResponse(
@@ -932,7 +1581,17 @@ export class PullRequestFlowManager {
   }
 
   private save(flow: PullRequestFlowSnapshot): void {
+    const canonical = redactFlowCapabilities(flow);
+    Object.assign(flow, canonical);
+    const previous = this.flows.get(flow.id);
     this.flows.set(flow.id, flow);
+    const becameClosed =
+      CLOSED_STATUSES.includes(flow.status) &&
+      (!previous || !CLOSED_STATUSES.includes(previous.status));
+    if (becameClosed) {
+      this.clearCapabilitiesForFlow(flow.id);
+      this.releaseReviewers(flow);
+    }
     for (const listener of this.listeners) {
       try {
         listener(flow);
@@ -953,6 +1612,38 @@ function queuedOrCollectingStage(
 
 function reviewJobId(flowId: string, stage: PullRequestReviewStage): string {
   return `${REVIEW_QUEUE_OWNER}:${flowId}:${stage}`;
+}
+
+function prFlowAutomationKey(flowId: string): string {
+  return `pr-flow:${flowId}`;
+}
+
+function closureReleaseAgentIds(flow: PullRequestFlowSnapshot): string[] {
+  return uniqueStrings([
+    flow.proposerAgentId,
+    ...flow.reviewRequests.flatMap((request) => request.requestedAgentIds),
+  ]);
+}
+
+function closureReleaseDeliveryKey(flowId: string, agentId: string): string {
+  return JSON.stringify([flowId, agentId]);
+}
+
+function reviewCapabilityKey(
+  flowId: string,
+  requestId: string,
+  stage: PullRequestReviewStage,
+  agentId: string,
+): string {
+  return JSON.stringify([flowId, requestId, stage, agentId]);
+}
+
+function completionCapabilityKey(
+  flowId: string,
+  action: PullRequestCompletionAction,
+  agentId: string,
+): string {
+  return JSON.stringify([flowId, action, agentId]);
 }
 
 function reviewJobOrder(flow: PullRequestFlowSnapshot, stage: PullRequestReviewStage): number {
@@ -1016,6 +1707,45 @@ function hasCompleteReviewerCoverage(request: PullRequestReviewRequest): boolean
 
 function lastHistorySeq(history: AgentEventEnvelope[]): number {
   return history.reduce((max, entry) => Math.max(max, entry.seq), 0);
+}
+
+function hasUndeliveredQueuedReviewPrompt(
+  history: AgentEventEnvelope[],
+  resultSeq: number,
+  requestedAt: number,
+  requestedAfterSeq: number | undefined,
+  flowId: string,
+  stage: PullRequestReviewStage,
+): boolean {
+  let queuedText: string | undefined;
+  for (const entry of history) {
+    if (
+      entry.seq <= (requestedAfterSeq ?? 0) ||
+      entry.seq >= resultSeq ||
+      entry.at < requestedAt ||
+      entry.event.kind !== "user_input" ||
+      !isReviewPromptFor(entry.event.text, flowId, stage)
+    ) {
+      continue;
+    }
+    if (entry.event.mode === "queued") {
+      queuedText = entry.event.text;
+      continue;
+    }
+    if (queuedText === entry.event.text) queuedText = undefined;
+  }
+  return queuedText !== undefined;
+}
+
+function isReviewPromptFor(
+  text: string,
+  flowId: string,
+  stage: PullRequestReviewStage,
+): boolean {
+  return (
+    text.includes(`/api/pr-flows/${flowId}/reviews`) &&
+    text.includes(`"stage": "${stage}"`)
+  );
 }
 
 function assistantTextForResult(
@@ -1227,6 +1957,29 @@ function updatedFileChangesForPr(
   return flow.fileChanges;
 }
 
+function canonicalPrCreatedInput(input: PullRequestCreatedInput): PullRequestCreatedInput {
+  return redactFlowCapabilities({
+    prNumber: input.prNumber,
+    prUrl: input.prUrl,
+    title: input.title,
+    summary: input.summary,
+    files: input.files,
+    fileChanges: input.fileChanges,
+  });
+}
+
+function prCreatedPayloadFingerprint(input: PullRequestCreatedInput): string {
+  return JSON.stringify({
+    prNumber: input.prNumber,
+    prUrl: input.prUrl?.trim() || undefined,
+    title: input.title?.trim() || undefined,
+    summary: input.summary?.trim() || undefined,
+    files: input.files === undefined ? undefined : uniqueStrings(input.files),
+    fileChanges:
+      input.fileChanges === undefined ? undefined : normalizeFileChanges(input.fileChanges),
+  });
+}
+
 function pathsFromFileChanges(files: PullRequestChangedFile[]): string[] {
   return uniqueStrings(files.map((file) => file.path));
 }
@@ -1235,33 +1988,143 @@ function uniqueStrings(items: string[]): string[] {
   return [...new Set(items.map((item) => item.trim()).filter(Boolean))];
 }
 
-function reviewPrompt(flow: PullRequestFlowSnapshot, stage: PullRequestReviewStage): string {
-  const files = formatFiles(flow.files);
-  const fileChanges = formatFileChanges(flow.fileChanges);
+function normalizeReviewSubmission(
+  input: SubmitPullRequestReviewInput,
+): NormalizedPullRequestReview {
+  if (!isRecord(input)) throw new Error("missing PR review submission");
+  if (typeof input.agentId !== "string" || !input.agentId.trim()) {
+    throw new Error("missing PR review agentId");
+  }
+  if (typeof input.reviewToken !== "string" || !input.reviewToken.trim()) {
+    throw new Error("missing PR reviewToken");
+  }
+  if (input.stage !== "source_preflight" && input.stage !== "target_merge") {
+    throw new Error("invalid PR review stage");
+  }
+  if (!isReviewDecision(input.decision)) {
+    throw new Error("invalid PR review decision");
+  }
+  if (typeof input.summary !== "string" || !input.summary.trim()) {
+    throw new Error("missing PR review summary");
+  }
+  return {
+    agentId: redactFlowCapabilityText(input.agentId).trim(),
+    reviewToken: input.reviewToken.trim(),
+    stage: input.stage,
+    decision: input.decision,
+    summary: redactFlowCapabilityText(input.summary).trim(),
+    risks: normalizeReviewStringArray(input.risks, "risks"),
+    filesReviewed: normalizeReviewStringArray(input.filesReviewed, "filesReviewed"),
+    requiredChanges: normalizeReviewStringArray(input.requiredChanges, "requiredChanges"),
+  };
+}
+
+function normalizeCompletionSubmission(
+  input: SubmitPullRequestCreatedInput | SubmitPullRequestMergedInput,
+): { agentId: string; completionToken: string } {
+  if (!isRecord(input)) throw new Error("missing PR completion submission");
+  if (typeof input.agentId !== "string" || !input.agentId.trim()) {
+    throw new Error("missing PR completion agentId");
+  }
+  if (typeof input.completionToken !== "string" || !input.completionToken.trim()) {
+    throw new Error("missing PR completionToken");
+  }
+  return {
+    agentId: redactFlowCapabilityText(input.agentId).trim(),
+    completionToken: input.completionToken.trim(),
+  };
+}
+
+function normalizeReviewStringArray(value: unknown, field: string): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new Error(`PR review ${field} must be an array of strings`);
+  }
+  return uniqueStrings(value.map((item) => redactFlowCapabilityText(item)));
+}
+
+function sameReviewSubmission(
+  existing: PullRequestReviewResponse,
+  submission: NormalizedPullRequestReview,
+): boolean {
+  return (
+    existing.agentId === submission.agentId &&
+    existing.stage === submission.stage &&
+    existing.decision === submission.decision &&
+    existing.summary === submission.summary &&
+    sameStrings(existing.risks, submission.risks) &&
+    sameStrings(existing.filesReviewed, submission.filesReviewed) &&
+    sameStrings(existing.requiredChanges, submission.requiredChanges)
+  );
+}
+
+function sameStrings(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((item, index) => item === right[index]);
+}
+
+function reviewPrompt(
+  flow: PullRequestFlowSnapshot,
+  stage: PullRequestReviewStage,
+  reviewerAgentId: string,
+  reviewToken: string,
+): string {
+  const isProposer = reviewerAgentId === flow.proposerAgentId;
+  const safeFlow = redactFlowCapabilities(flow);
+  const safeReviewerAgentId = redactFlowCapabilityText(reviewerAgentId);
+  const files = formatFiles(safeFlow.files);
+  const fileChanges = formatFileChanges(safeFlow.fileChanges);
   const label = stage === "source_preflight" ? "source branch preflight" : "target branch merge";
   const prInfo =
-    stage === "target_merge" && flow.pr
-      ? `\nPR: ${flow.pr.prUrl ?? flow.pr.prNumber ?? "(not provided)"}`
+    stage === "target_merge" && safeFlow.pr
+      ? `\nPR: ${safeFlow.pr.prUrl ?? safeFlow.pr.prNumber ?? "(not provided)"}`
       : "";
   return [
     `Agent Canvas PR review request (${label}).`,
-    `flowId: ${flow.id}`,
-    `sourceBranch: ${flow.sourceBranch}`,
-    `targetBranch: ${flow.targetBranch}`,
-    `title: ${flow.title ?? "(untitled)"}`,
-    `summary: ${flow.summary}`,
+    `flowId: ${safeFlow.id}`,
+    `sourceBranch: ${safeFlow.sourceBranch}`,
+    `targetBranch: ${safeFlow.targetBranch}`,
+    `title: ${safeFlow.title ?? "(untitled)"}`,
+    `summary: ${safeFlow.summary}`,
     "files:",
     files,
     "changedFiles (git diff --name-status):",
     fileChanges,
     prInfo,
-    "Review the current state. You may inspect the repository as needed.",
+    "Review the current state using read-only inspection only.",
     reviewImpactInstruction(stage),
-    "Return exactly one JSON object matching this schema, with no extra prose:",
-    reviewSchema(flow.id, stage),
+    "",
+    reviewReadOnlyInstruction(),
+    `When the review is ready, call POST /api/pr-flows/${safeFlow.id}/reviews as an intermediate tool call with this JSON body (set decision to exactly one of approve, reject, needs_changes, or blocked):`,
+    JSON.stringify(
+      {
+        agentId: safeReviewerAgentId,
+        reviewToken,
+        stage,
+        decision: "approve",
+        summary: "short review summary",
+        risks: ["risk or empty array"],
+        filesReviewed: ["path or empty array"],
+        requiredChanges: ["required change or empty array"],
+      },
+      null,
+      2,
+    ),
+    "Do not print or return the callback JSON as assistant text. The callback is an intermediate tool call, not the end of your reply.",
+    "Wait for the HTTP response, then continue the task you were doing in the same reply.",
+    "After the review callback succeeds, this flow's read-only freeze remains in force until Agent Canvas reports that the flow merged, failed, was cancelled, timed out, or became blocked.",
+    isProposer
+      ? "Because you are also this flow's proposer, only an explicit create or merge authorization grants the limited mutation exception described in that authorization."
+      : "Wait for an explicit flow-closed release before making any workspace, Git, remote branch, or PR mutation.",
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function reviewReadOnlyInstruction(): string {
+  return [
+    "READ-ONLY FLOW FREEZE: from receipt of this request until Agent Canvas explicitly reports that this flow is closed, do not edit or write files and do not run any command or action that mutates the workspace, Git state, a remote branch, or a PR.",
+    "Prohibited operations include commit, checkout/switch, reset, rebase, merge, cherry-pick, pull, push, and PR creation/update/merge. Read-only status, diff, log, show, and file inspection are allowed; the review callback itself is allowed.",
+  ].join("\n");
 }
 
 function reviewImpactInstruction(stage: PullRequestReviewStage): string {
@@ -1279,88 +2142,116 @@ function reviewImpactInstruction(stage: PullRequestReviewStage): string {
   ].join("\n");
 }
 
-function retryPrompt(flow: PullRequestFlowSnapshot, stage: PullRequestReviewStage): string {
+function retryPrompt(
+  flow: PullRequestFlowSnapshot,
+  stage: PullRequestReviewStage,
+  reviewerAgentId: string,
+  reviewToken: string,
+): string {
+  const isProposer = reviewerAgentId === flow.proposerAgentId;
+  const safeFlow = redactFlowCapabilities(flow);
+  const safeReviewerAgentId = redactFlowCapabilityText(reviewerAgentId);
   return [
     "Your previous PR review response was not valid JSON for Agent Canvas.",
-    "Return exactly one JSON object matching this schema, with no extra prose:",
-    reviewSchema(flow.id, stage),
+    reviewReadOnlyInstruction(),
+    `Submit the review by calling POST /api/pr-flows/${safeFlow.id}/reviews as an intermediate tool call with this JSON body (set decision to exactly one of approve, reject, needs_changes, or blocked):`,
+    JSON.stringify(
+      {
+        agentId: safeReviewerAgentId,
+        reviewToken,
+        stage,
+        decision: "approve",
+        summary: "short review summary",
+        risks: [],
+        filesReviewed: [],
+        requiredChanges: [],
+      },
+      null,
+      2,
+    ),
+    "Do not print or return the callback JSON as assistant text, and do not end your reply after submitting it.",
+    "Wait for the HTTP response, then continue the task you were doing in the same reply.",
+    "The flow's read-only freeze remains in force after the callback until Agent Canvas sends an explicit flow-closed release.",
+    isProposer
+      ? "Only an explicit create or merge authorization grants the limited mutation exception described in that authorization."
+      : "Continue read-only work while waiting for the flow-closed release.",
   ].join("\n");
-}
-
-function reviewSchema(flowId: string, stage: PullRequestReviewStage): string {
-  return JSON.stringify(
-    {
-      agentCanvasPrReview: true,
-      flowId,
-      stage,
-      decision: "approve | reject | needs_changes | blocked",
-      summary: "short review summary",
-      risks: ["risk or empty array"],
-      filesReviewed: ["path or empty array"],
-      requiredChanges: ["required change or empty array"],
-    },
-    null,
-    2,
-  );
 }
 
 function createPrAuthorizationPrompt(
   flow: PullRequestFlowSnapshot,
   responses: PullRequestReviewResponse[],
+  completionToken: string,
 ): string {
+  const safeFlow = redactFlowCapabilities(flow);
+  const safeResponses = redactFlowCapabilities(responses);
   return [
     "Agent Canvas PR authorization granted.",
-    "You are authorized to prepare and create the PR for this flow.",
-    `flowId: ${flow.id}`,
-    `sourceBranch: ${flow.sourceBranch}`,
-    `targetBranch: ${flow.targetBranch}`,
-    `title: ${flow.title ?? "(choose a suitable title)"}`,
-    `summary: ${flow.summary}`,
+    "You are authorized to create the PR for this flow from the reviewed source head.",
+    `flowId: ${safeFlow.id}`,
+    `sourceBranch: ${safeFlow.sourceBranch}`,
+    `targetBranch: ${safeFlow.targetBranch}`,
+    `title: ${safeFlow.title ?? "(choose a suitable title)"}`,
+    `summary: ${safeFlow.summary}`,
     "files:",
-    formatFiles(flow.files),
+    formatFiles(safeFlow.files),
     "changedFiles (git diff --name-status):",
-    formatFileChanges(flow.fileChanges),
+    formatFileChanges(safeFlow.fileChanges),
     "",
-    "You have full freedom to choose the git/GitHub commands, update the source branch, and resolve conflicts before opening the PR.",
-    "Do not merge the PR yet. After the PR exists, report exactly one JSON object:",
+    "This authorization lifts the proposer freeze only to create this PR from the exact reviewed and already-pushed source head. Unrelated workspace, Git, remote branch, and PR mutations remain prohibited.",
+    "Do not edit files, create commits, push, or sync/rewrite the source branch at this stage. If the PR cannot be created from the reviewed head, report the blocker instead of changing it. Do not merge the PR yet.",
+    `After the PR exists, call POST /api/pr-flows/${safeFlow.id}/pr-created as an intermediate tool call with this JSON body:`,
     JSON.stringify(
       {
-        agentCanvasPrEvent: "pr_created",
-        flowId: flow.id,
+        agentId: safeFlow.proposerAgentId,
+        completionToken,
         prNumber: 0,
         prUrl: "https://github.com/OWNER/REPO/pull/0",
-        title: flow.title ?? "",
-        summary: flow.summary,
-        files: flow.files,
-        fileChanges: flow.fileChanges,
+        title: safeFlow.title ?? "",
+        summary: safeFlow.summary,
+        files: safeFlow.files,
+        fileChanges: safeFlow.fileChanges,
       },
       null,
       2,
     ),
+    "Do not print or return the callback JSON as assistant text, and do not end your reply after submitting it.",
+    "Wait for the HTTP response, then continue the task you were doing in the same reply.",
+    "As soon as the pr-created callback succeeds, the entire workspace, Git state, remote branch, and PR state become read-only again until Agent Canvas grants merge authorization or reports failure for this flow.",
     "",
     "Source review summary:",
-    reviewSummary(responses),
+    reviewSummary(safeResponses),
   ].join("\n");
 }
 
 function mergeAuthorizationPrompt(
   flow: PullRequestFlowSnapshot,
   responses: PullRequestReviewResponse[],
+  completionToken: string,
 ): string {
+  const safeFlow = redactFlowCapabilities(flow);
+  const safeResponses = redactFlowCapabilities(responses);
   return [
     "Agent Canvas merge authorization granted.",
     "You are authorized to merge the PR for this flow.",
-    `flowId: ${flow.id}`,
-    `sourceBranch: ${flow.sourceBranch}`,
-    `targetBranch: ${flow.targetBranch}`,
-    `PR: ${flow.pr?.prUrl ?? flow.pr?.prNumber ?? "(not provided)"}`,
+    `flowId: ${safeFlow.id}`,
+    `sourceBranch: ${safeFlow.sourceBranch}`,
+    `targetBranch: ${safeFlow.targetBranch}`,
+    `PR: ${safeFlow.pr?.prUrl ?? safeFlow.pr?.prNumber ?? "(not provided)"}`,
     "",
-    "You have full freedom to choose the git/GitHub commands and handle merge-time details.",
-    "After the merge is complete, report exactly one JSON object:",
-    JSON.stringify({ agentCanvasPrEvent: "merged", flowId: flow.id }, null, 2),
+    "This authorization lifts the proposer freeze only to merge this exact, already-reviewed PR. Unrelated workspace, Git, remote branch, and PR mutations remain prohibited.",
+    "Do not edit files, create new source-branch or workspace commits, push, sync/rewrite branches, or update the PR contents. The authorized merge itself may update this PR and create its target-branch merge commit. If the reviewed PR cannot be merged as-is, report the blocker instead of changing it.",
+    `After the merge is complete, call POST /api/pr-flows/${safeFlow.id}/merged as an intermediate tool call with this JSON body:`,
+    JSON.stringify(
+      { agentId: safeFlow.proposerAgentId, completionToken },
+      null,
+      2,
+    ),
+    "Do not print or return callback JSON as assistant text, and do not end your reply after submitting it.",
+    "Wait for the HTTP response, then continue the task you were doing in the same reply. A successful merged callback closes this flow and releases its freeze.",
     "",
     "Target review summary:",
-    reviewSummary(responses),
+    reviewSummary(safeResponses),
   ].join("\n");
 }
 
@@ -1368,10 +2259,14 @@ function sourceFailurePrompt(
   flow: PullRequestFlowSnapshot,
   responses: PullRequestReviewResponse[],
 ): string {
+  const safeFlow = redactFlowCapabilities(flow);
+  const safeResponses = redactFlowCapabilities(responses);
   return [
     "Agent Canvas PR source preflight failed. Do not create the PR for this flow.",
-    `flowId: ${flow.id}`,
-    reviewSummary(responses),
+    "The workspace/Git/PR freeze imposed by this flow is now released.",
+    "This releases only this flow; continue to obey every freeze imposed by another active PR or sync flow.",
+    `flowId: ${safeFlow.id}`,
+    reviewSummary(safeResponses),
   ].join("\n");
 }
 
@@ -1379,16 +2274,44 @@ function targetFailurePrompt(
   flow: PullRequestFlowSnapshot,
   responses: PullRequestReviewResponse[],
 ): string {
+  const safeFlow = redactFlowCapabilities(flow);
+  const safeResponses = redactFlowCapabilities(responses);
   return [
     "Agent Canvas target branch review failed. Do not merge the PR for this flow.",
-    `flowId: ${flow.id}`,
-    reviewSummary(responses),
+    "The workspace/Git/PR freeze imposed by this flow is now released.",
+    "This releases only this flow; continue to obey every freeze imposed by another active PR or sync flow.",
+    `flowId: ${safeFlow.id}`,
+    reviewSummary(safeResponses),
+  ].join("\n");
+}
+
+function reviewFreezeReleasePrompt(flow: PullRequestFlowSnapshot): string {
+  const safeFlow = redactFlowCapabilities(flow);
+  if (safeFlow.status === "source_review_failed") {
+    const request = [...safeFlow.reviewRequests]
+      .reverse()
+      .find((candidate) => candidate.stage === "source_preflight");
+    return sourceFailurePrompt(safeFlow, request?.responses ?? []);
+  }
+  if (safeFlow.status === "target_review_failed") {
+    const request = [...safeFlow.reviewRequests]
+      .reverse()
+      .find((candidate) => candidate.stage === "target_merge");
+    return targetFailurePrompt(safeFlow, request?.responses ?? []);
+  }
+  return [
+    "Agent Canvas PR flow closed. The read-only workspace/Git/PR freeze imposed by this flow is now released.",
+    `flowId: ${safeFlow.id}`,
+    `status: ${safeFlow.status}`,
+    "This releases only the freeze imposed by this flow. If any other active PR or sync flow still imposes a freeze, you must continue to obey it.",
+    "Resume your prior task subject to every other active flow and normal workspace policy.",
   ].join("\n");
 }
 
 function reviewSummary(responses: PullRequestReviewResponse[]): string {
-  if (responses.length === 0) return "No active reviewers were available.";
-  return responses
+  const safeResponses = redactFlowCapabilities(responses);
+  if (safeResponses.length === 0) return "No active reviewers were available.";
+  return safeResponses
     .map(
       (response) =>
         `- ${response.agentId}: ${response.decision}; ${response.summary}` +

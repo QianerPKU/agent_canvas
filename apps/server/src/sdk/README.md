@@ -16,5 +16,10 @@ This folder adapts provider-specific CLI or SDK streams into the internal `Query
 - `QueryHandle.setModel(model)` switches the model used by later responses. Claude delegates to the
   SDK session handle's `setModel`; Codex stores the value locally and sends it on later `turn/start`
   requests because app-server exposes per-turn model overrides rather than a separate set-model RPC.
-- When a provider has no native `steer`, `AgentRunner` falls back to interrupting the active turn and
-  putting the guidance text at the front of the next queued input.
+- Automation delivery never interrupts an active provider turn. When native `steer` is unavailable,
+  `AgentRunner` queues the message for the next natural turn boundary. Explicit user-triggered
+  `steer` keeps its interrupt-and-prioritize fallback because it represents an intentional request
+  to redirect the current work.
+- Flow automation carries a stable per-flow queue key. A closure release atomically removes every
+  still-queued message with that key before it is sent or steered, including when replacement path
+  preparation later fails; other flows and ordinary user input retain their order.

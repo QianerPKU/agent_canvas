@@ -51,7 +51,7 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 - **手动 compact**：只允许在 `waiting_input` 执行。Claude 将内置 `/compact` 送入现有流式会话，并等待 manual `compact_boundary`；Codex 调用原生 `thread/compact/start`，等待 `contextCompaction` 完成。两者都投影成统一 `compact` 事件，前端把它记录为一轮完成的对话。
 - **自动 compact**：provider 在业务轮中途触发的 `compact_boundary/contextCompaction` 会投影成 `compact trigger=auto`。它不结束当前业务轮，只记录为当前轮系统事件，并标记下一条业务输入重新注入可读提示词。
 - **terminate**：调用 QueryHandle 的终止能力并关闭输入流。Claude adapter 会 interrupt 后结束 Query generator；Codex adapter 关闭并 kill 对应 app-server 子进程，状态进入 `terminated`。
-- **完整历史**：`AgentRunner` 把每次 start/send/steer/compact 输入记录为 `user_input`；Claude thinking block 与 Codex reasoning delta/summary 统一映射为 `thinking`。`GET /api/agents/:id/history` 因而可回放用户输入、思考、答复、工具调用/结果与轮次结果。
+- **完整历史**：`AgentRunner` 把每次 start/send/steer/compact 输入记录为 `user_input`；Claude thinking block 与 Codex reasoning delta/summary 统一映射为 `thinking`。`GET /api/agents/:id/history` 因而可回放用户输入、思考、答复、工具调用/结果与轮次结果。PR/sync capability token 仍供内部 manager 校验，但在公开 history、agent snapshot、WebSocket 帧和持久化 canvas agent state 中统一显示为 `[redacted]`。
 - **commit 上报**：Agent Canvas 不替 agent 执行 `git commit`，但内置工作区规则要求每次 commit 成功后调用 `POST /api/agents/:id/commits`。后端用该 agent 的 branch workspace 读取 commit hash、message、文件列表和 diff，并记录当时的 `sourceTurnIndex`，让前端 commit 节点始终连回触发它的那一轮对话。
 - **结果汇报**：agent 可以调用 `POST /api/agents/:id/report-result` 把 Markdown/CSV/图片等结果复制成隔离文件节点。记录会带来源 agent 与 `sourceTurnIndex`，前端把它放到对应对话轮旁边并保留连线。
 - **VS Code 工作区入口**：`POST /api/agents/:id/open-workspace` 会用 VS Code CLI 在新窗口打开该 agent 当前配置中的 branch worktree 目录，供前端节点标题栏的文件夹按钮调用，不会替换用户已有的工作区窗口。
@@ -102,27 +102,30 @@ idle ──start──▶ starting ──system_init──▶ running ──resu
 | `GET /api/commits` | 列出已上报 commit 节点快照 |
 | `GET /api/sync-flows` | 列出 cherry-pick / branch pull 同步流程 |
 | `POST /api/sync-flows` | body=`CreateSyncFlowInput`，发起同步前的一步审查 |
-| `POST /api/sync-flows/:id/applied` | 兜底登记同步已经由 proposer agent 执行完成 |
+| `POST /api/sync-flows/:id/reviews` | reviewer 直接提交审查结果的中间工具调用 |
+| `POST /api/sync-flows/:id/applied` | proposer 登记同步已完成的中间工具调用 |
 | `POST /api/sync-flows/:id/cancel` | 取消尚未关闭的同步流程 |
 
 ## PR 流程
 
-- `PullRequestFlowManager` 只控制流程状态：按 source/target branch 预留和 FIFO 排队、找出源/目标 branch 上的活跃 agent、发送审查请求、校验固定 JSON、重试、2 小时超时、聚合意见和发放授权信号。
-- 程序不限制 commit，也不执行具体 `git`/`gh` 命令。提 PR 的 agent 在收到 `create_pr` 授权后可自由处理冲突、更新源 branch 并创建 PR；目标审查通过后再收到 `merge_pr` 授权并自行合并。
-- Agent Canvas 内置工作区规则会注入 tool-style PR pipeline 使用协议，明确 `agent_canvas.create_pr_flow` 的触发条件、请求体、禁止事项和授权后的 JSON 回报；用户可以直接在某个 agent 的对话框里要求它提 PR，agent 应先 `POST /api/pr-flows` 发起流程，并在收到 `create_pr` / `merge_pr` 授权后再执行实际 `git`/`gh` 操作。
+- `PullRequestFlowManager` 只控制流程状态：按 source/target branch 预留和 FIFO 排队、找出源/目标 branch 上的活跃 agent、发送审查请求、校验直接 review 回调、重试、2 小时超时、聚合意见和发放授权信号；旧的最终 JSON 解析仅作为兼容路径保留。
+- 程序不执行具体 `git`/`gh` 命令。提 PR 的 agent 必须在创建 flow 前完成 source branch 同步、测试、commit 和 push；创建 flow 后冻结写操作，收到 `create_pr` 授权时只创建已审核的 PR，目标审查通过并收到 `merge_pr` 授权时只合并该 PR。
+- Agent Canvas 内置工作区规则会注入 tool-style PR pipeline 使用协议，明确 `agent_canvas.create_pr_flow` 的触发条件、请求体、等待期写入冻结和授权边界；用户可以直接在某个 agent 的对话框里要求它提 PR，agent 应先 `POST /api/pr-flows` 发起流程，并在收到 `create_pr` / `merge_pr` 授权后仅执行获准动作。PR 创建和合并完成后分别调用 `POST /api/pr-flows/:id/pr-created` 与 `POST /api/pr-flows/:id/merged` 登记；这些登记是中间工具调用，不能作为 agent 回复的结束。
+- Agent 发出的 review、PR created 和 merged 回调必须携带对应 review/authorization 提示中的 capability token；token 与 flow、agent、阶段或动作绑定且不写入 flow 快照。前端手动兜底登记不持有 agent token，只有同时携带受允许的非空浏览器 Origin 与已校验的 project id/revision 请求头时才能进入 UI 兼容路径；取消和重试也只允许 project-scoped UI 路径。该 Origin/header 检查是同一本机信任边界内的浏览器路由与陈旧请求保护，不是用户或进程身份认证；原始 agent callback 仍必须使用 capability token。
 - 发起 PR flow 时必须有具体变更文件列表。默认 server 会通过 `WorkspaceManager.diffPullRequestFiles()` 计算 `git diff --name-status <target>...<source>`，并把 `changedFiles` 写入发给审查 agent 的提示词；如果用户或 agent 指定了 `files`，则按该文件范围审查并补齐状态。
 - PR flow 创建时也会记录 `sourceTurnIndex`，因此前端 PR 节点会固定连回发起 PR pipeline 的那一轮对话；后续 agent 继续对话、旧节点成为历史轮也不会断线或漂移。
-- `GET /api/pr-flows` 列出流程；`POST /api/pr-flows` 发起源 branch preflight；`POST /api/pr-flows/:id/pr-created` 可兜底登记 PR 已创建并进入目标 branch 审查；`POST /api/pr-flows/:id/merged` 可兜底登记已合并；`POST /api/pr-flows/:id/cancel` 取消流程。
+- `GET /api/pr-flows` 列出流程；`POST /api/pr-flows` 发起源 branch preflight；`POST /api/pr-flows/:id/reviews` 直接提交审查；`POST /api/pr-flows/:id/pr-created` 登记 PR 已创建并进入目标 branch 审查；`POST /api/pr-flows/:id/merged` 登记已合并；`POST /api/pr-flows/:id/cancel` 取消流程。
 - WebSocket `hello` 帧会带上 `prFlows`、`syncFlows` 和 `commits` 快照，后续 PR 状态变化通过 `pr_flow` 帧推送，同步流程变化通过 `sync_flow` 帧推送，commit 上报通过 `commit` 帧推送。
 
 ## Sync 流程
 
 - `SyncFlowManager` 用于两类“把别处代码带入当前 branch”的操作：`cherry_pick` 表示拉取某个 commit，`branch_pull` 表示拉取/合并/变基某个 branch。
-- 流程只有一步审查：目标 branch 上所有活跃 agent 收到审查请求，运行中的 agent 通过 steer 插入，等待输入的 agent 通过 send 发送。审查目标是判断这次同步是否会影响 reviewer 自己当前正在进行的工作、实验或验证。
-- 全部审查通过后，proposer agent 收到 apply authorization；程序只发授权信号，不执行 git 命令。后续 fetch、cherry-pick、merge/rebase/pull、冲突处理、测试和 commit 都由 proposer agent 自己完成。
-- proposer agent 完成后可输出 `agentCanvasSyncEvent="applied"` JSON 自动关闭流程；前端 Sync 面板也提供 `Mark applied` 兜底按钮。
+- 流程只有一步审查：目标 branch 上所有活跃 agent 收到审查请求；有原生 steer 的运行中 provider 会原轮插入，无原生 steer 时在自然 turn 边界排队且不 interrupt，等待输入的 agent 直接进入下一轮。审查目标是判断这次同步是否会影响 reviewer 自己当前正在进行的工作、实验或验证。
+- 全部审查通过后，proposer agent 收到 apply authorization；程序只发授权信号，不执行 git 命令。后续仅由 proposer agent 在获准 flow 的范围内完成必要的 fetch、cherry-pick、merge/rebase/pull、冲突处理、测试、commit 和 push。
+- proposer agent 完成后调用 `POST /api/sync-flows/:id/applied` 登记并关闭流程；该登记是中间工具调用，agent 随后继续原任务。前端 Sync 面板也提供 `Mark applied` 兜底按钮。
+- Agent 的 review/applied 回调分别携带 reviewToken/callbackToken；前端 `Mark applied` 继续使用“受允许的非空浏览器 Origin + project id/revision”校验后的本机 UI 兼容路径。它不是身份认证；tokenless 的原始 agent callback 会被拒绝。
 - 同步流程创建时必须有具体文件范围。`cherry_pick` 默认通过 `git show --name-status` 解析 commit 文件；`branch_pull` 默认复用 `git diff --name-status <target>...<source>`。调用方显式传入 `files` 时，按该范围审查。
-- 内置 `agentCanvasPolicyPrompt` 已注入 tool-style sync pipeline 使用协议，明确 `agent_canvas.create_sync_flow` 的两类请求：`cherry_pick` 和 `branch_pull`。用户可以直接在 agent 对话框里要求“cherry-pick 某个 commit”或“pull main”，agent 应先调用 `/api/sync-flows`，收到授权后再实际执行 git 操作。
+- 内置 `agentCanvasPolicyPrompt` 已注入 tool-style sync pipeline 使用协议，明确 `agent_canvas.create_sync_flow` 的两类请求：`cherry_pick` 和 `branch_pull`。用户可以直接在 agent 对话框里要求“cherry-pick 某个 commit”或“pull main”，agent 应先调用 `/api/sync-flows`；从创建 flow 返回到收到授权或失败期间禁止修改文件、commit、更新 PR 或执行 git sync，收到授权后仅执行该 flow 获准的同步动作。
 
 ## 多轮对话与 fork（对话历史分叉）
 

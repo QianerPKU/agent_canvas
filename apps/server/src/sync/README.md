@@ -6,9 +6,20 @@
 - `branch_pull`: review and authorize pulling/merging another branch.
 
 The manager mirrors the PR flow delivery mechanics: active agents on the target branch review the
-request, running agents receive a steer message, waiting agents receive a normal send, invalid JSON
-is retried once, and a 2 hour timeout matching PR reviews closes stale flows. The manager only grants
-permission; the proposer agent still performs the actual git commands and reports completion.
+request, running agents receive a steer message, waiting agents receive a normal send, and a 2 hour
+timeout matching PR reviews closes stale flows. Reviews are normally submitted through the manager's
+`submitReview()` capability callback API, exposed by HTTP as `POST /api/sync-flows/:id/reviews`; legacy sessions
+that end a turn with the old review JSON remain supported and receive one callback-oriented retry if
+their output cannot be parsed. The manager only grants permission; the proposer agent still performs
+the actual git commands and reports completion through the capability-checked `submitApplied()` path
+at `POST /api/sync-flows/:id/applied`. `recordApplied()` is retained for trusted internal legacy and
+browser-origin-and-project-header-validated UI callers; it is not the raw agent callback entry point.
+
+Create, review, applied, cancel, and timeout transitions never keep the originating HTTP callback
+waiting for downstream queue advancement, authorization delivery, or closure delivery. They return
+the immediately persisted snapshot and run those deliveries as tracked background work, so a create
+response may still be `queued`. Closing delivery waits only for older work from the same flow; it
+cannot release the freeze ahead of a blocked prompt or wait on an unrelated sync.
 
 ## Shared Branch Review Queue
 
@@ -40,24 +51,89 @@ when the target branch has an active agent; otherwise it remains queued and is r
 when an agent becomes active or a waiting agent switches onto that branch. This prevents zero-reviewer
 auto-approval and premature prompt delivery during project reload.
 
+Review and apply callback tokens are private, in-memory capabilities. They are bound to the exact
+flow, review request/action, and agent, and are included only in that agent's prompt. Tokens never
+enter a flow snapshot. The entire `agent_canvas_cap_` namespace is reserved: create metadata,
+review text/arrays, applied completion metadata, legacy result payloads, and imported state are
+deep-canonicalized before they can be stored, exported, persisted, broadcast, or interpolated into
+another flow prompt. Dedicated `reviewToken` and `callbackToken` values are verified separately and
+remain private; canonicalization applies only to the surrounding payload. Export performs a second
+redacted deep copy as a defense against future storage bypasses. Every review, retry,
+authorization/restored-authorization, failure, and closure prompt also builds from a fresh redacted
+copy of its flow and review responses. The dedicated private token is injected only after that copy
+is made; the finished prompt is never passed through the redactor. This second prompt boundary
+prevents a mutable `get()`/`list()` reference or another future in-memory bypass from reflecting a
+reserved-prefix value while preserving the newly issued callback capability. Public REST/WebSocket
+history and agent snapshots, plus persisted canvas agent state, also redact named token fields and
+bare token echoes. Import clears all old capabilities. When an
+unexpired imported flow is already `apply_authorized`, activation issues a fresh apply token and
+best-effort redelivers the authorization prompt; deferred imports do not do so before activation.
+
 ## Review Contract
 
-Reviewers must return one JSON object with `agentCanvasSyncReview: true`, `flowId`, `decision`,
-`summary`, `risks`, `filesReviewed`, and `requiredChanges`. Any `reject`, `needs_changes`, or
-`blocked` decision closes the flow as `review_failed`.
+Reviewers submit an actual intermediate callback instead of ending their reply with JSON:
 
-When all reviewers approve, the target-branch review slot is released and the proposer receives
-apply authorization. After it performs the real git operation, it reports:
+```http
+POST /api/sync-flows/sync_flow_x/reviews
+Content-Type: application/json
+```
 
 ```json
 {
-  "agentCanvasSyncEvent": "applied",
-  "flowId": "sync_flow_x",
+  "agentId": "agent_1",
+  "reviewToken": "private token copied from this review prompt",
+  "decision": "approve",
+  "summary": "safe for my current work",
+  "risks": [],
+  "filesReviewed": ["src/example.ts"],
+  "requiredChanges": []
+}
+```
+
+The token must match the current flow/request/reviewer binding, the agent must be a pending reviewer,
+`decision` must be `approve`, `reject`, `needs_changes`, or `blocked`, and `summary` must be non-empty.
+An identical retry is idempotent while the review capability remains active; a conflicting retry is
+rejected. Review capabilities expire when the flow closes. Any non-approval decision closes the flow
+as `review_failed`. Result-boundary JSON with `agentCanvasSyncReview: true` is retained only as a
+trusted compatibility fallback. If a no-native-steer runner recorded the current review prompt only
+as `user_input mode=queued`, the preceding turn's result is ignored until the same prompt is actually
+delivered; it does not consume the malformed-response retry.
+
+Repository inspection and review callback submission are read-only. Every requested reviewer,
+including the proposer, must keep the entire workspace, Git state, and PR state read-only from receipt
+of the review request through `applied`, `review_failed`, `cancelled`, `timed_out`, or `blocked`.
+Submitting a callback does not release that freeze. Apply authorization grants only the proposer a
+limited write exception for the changes required by the authorized sync flow; all other reviewers and
+all unrelated state remain read-only. On closure the manager best-effort sends a release notice to the
+proposer plus every reviewer accumulated across review attempts and reloads. The flow-specific keyed
+release replaces any unconsumed review/retry/authorization from that flow; failed delivery is retried
+when the participant becomes active again and successful delivery is deduplicated. Delivery failure
+cannot reopen the flow, and the notice makes clear that it releases only this flow, not any concurrent
+PR/sync freeze.
+
+When all reviewers approve, the target-branch review slot is released and the proposer receives
+apply authorization in the active turn when steering is available. After it performs the real git
+operation, it records completion with another intermediate callback:
+
+```http
+POST /api/sync-flows/sync_flow_x/applied
+Content-Type: application/json
+```
+
+```json
+{
+  "callbackToken": "private token copied from the authorization prompt",
   "summary": "what was applied",
   "commitSha": "resulting commit if applicable",
   "files": ["src/example.ts"]
 }
 ```
+
+The callback token is bound to this flow, the proposer, and the `applied` action. An identical
+successful completion retry is idempotent; different data with the same accepted token is rejected.
+The callback does not itself end the agent reply. Legacy final JSON with
+`agentCanvasSyncEvent: "applied"` remains accepted through the manager's trusted internal path for
+restored/in-flight sessions.
 
 `sourceTurnIndex` is captured at creation time so the frontend can keep the sync node connected to
 the original proposer turn after the agent continues into later turns.

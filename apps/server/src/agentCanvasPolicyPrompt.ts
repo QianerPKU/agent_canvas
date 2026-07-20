@@ -58,7 +58,10 @@ ${documentationPolicy}
 - 调用后以后端返回的 flow id 或记录为准，不要猜测 id。
 - 如果必要参数不明确，先向用户确认；如果参数已经明确，可以直接调用。
 - Windows PowerShell 发送 JSON 时必须保留示例中的 charset=utf-8 参数；否则 PowerShell 5.1 会在请求发出前把中文替换成问号。
-- 回报完成事件时，只输出指定 JSON 对象，不要在同一条消息里附加解释文字。
+- 创建 flow、登记 PR created / merged 或登记 sync applied 的 REST 请求，全部是当前工作过程中的中间工具调用，不是面向用户的最终答复。
+- 每次中间工具调用完成后都要继续原任务；不得为了登记事件而结束回复，也不得把登记请求或其响应直接当作最终答复。
+- 创建 flow 的 HTTP 响应只表示后端已接收流程，不代表已经授权。只有后端随后明确交付的 create_pr、merge_pr 或 apply authorization 才能授权对应动作；失败、取消或超时绝不视为授权。
+- authorization 消息会提供仅适用于该 flow、agent 和动作的 completionToken 或 callbackToken。登记时必须逐字复制该 token；不得猜测、跨 flow/动作复用、泄露给其他 agent，或省略 token。
 
 ### tool: agent_canvas.create_pr_flow
 
@@ -72,7 +75,9 @@ ${documentationPolicy}
 - files 必须列出这次 PR 具体涉及的文件路径；不要用笼统描述代替文件列表。
 
 禁止事项：
+- POST 创建 PR flow 返回后，直到收到 create_pr authorization 或该 flow 明确失败、取消、超时之前，严禁修改文件、commit、push、创建或更新 PR，也严禁执行 git fetch/pull/merge/rebase/cherry-pick 等 git sync 操作。
 - 在收到 create_pr authorization 之前，不要运行 gh pr create，也不要执行会创建 PR 或绕过审查流程的命令。
+- PR created 登记请求返回后，直到收到 merge_pr authorization 或该 flow 明确失败、取消、超时之前，同样严禁修改文件、commit、push、创建或更新 PR，也严禁执行任何 git sync 或合并操作。
 - 在收到 merge_pr authorization 之前，不要执行 gh pr merge、git merge 到目标 branch，或其他会完成合并的命令。
 
 请求：
@@ -116,25 +121,60 @@ curl -sS -X POST "${apiBase}/pr-flows" \\
 ~~~
 
 授权后的行为：
-- 收到 create_pr authorization 后，你可以自由处理冲突、更新源 branch、运行测试、push、执行 gh pr create 等实际创建 PR 的操作。
-- 创建 PR 完成后，只输出一个 JSON 对象登记结果：
-~~~json
-{
-  "agentCanvasPrEvent": "pr_created",
-  "flowId": "pr_flow_x",
-  "prNumber": 0,
-  "prUrl": "https://github.com/OWNER/REPO/pull/0",
-  "files": ["src/example.ts"],
-  "fileChanges": [{ "status": "M", "path": "src/example.ts" }]
-}
+- 收到 create_pr authorization 后，只执行该授权允许的 PR 创建动作；不要借此修改文件、产生额外 commit、push、同步或改写 branch、更新其他 PR，或执行任何未获授权的附带动作。
+- 创建 PR 完成后，通过中间工具调用 POST ${apiBase}/pr-flows/<flowId>/pr-created 登记结果。必须使用后端返回的真实 flow id，不要输出 agentCanvasPrEvent JSON 作为最终答复。
+- 从 create_pr authorization 消息逐字复制 completionToken；该 token 只允许登记这一次 PR created 动作。
+
+PowerShell PR created 登记示例：
+~~~powershell
+Invoke-RestMethod -Method Post -Uri "${apiBase}/pr-flows/pr_flow_x/pr-created" -ContentType "application/json; charset=utf-8" -Body (@{
+  agentId = "${agentId}"
+  completionToken = "<copy exactly from create_pr authorization>"
+  prNumber = 12
+  prUrl = "https://github.com/OWNER/REPO/pull/12"
+  files = @("src/example.ts")
+  fileChanges = @(@{ status = "M"; path = "src/example.ts" })
+} | ConvertTo-Json -Depth 6)
 ~~~
-- 收到 merge_pr authorization 后，你可以执行合并。合并完成后，只输出一个 JSON 对象登记结果：
-~~~json
-{
-  "agentCanvasPrEvent": "merged",
-  "flowId": "pr_flow_x"
-}
+
+curl PR created 登记示例：
+~~~bash
+curl -sS -X POST "${apiBase}/pr-flows/pr_flow_x/pr-created" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agentId": "${agentId}",
+    "completionToken": "<copy exactly from create_pr authorization>",
+    "prNumber": 12,
+    "prUrl": "https://github.com/OWNER/REPO/pull/12",
+    "files": ["src/example.ts"],
+    "fileChanges": [{ "status": "M", "path": "src/example.ts" }]
+  }'
 ~~~
+
+- PR created 登记是中间动作；调用后继续原任务并等待 merge_pr authorization，不得为了登记而结束回复。登记接口的成功响应本身不是 merge_pr authorization。
+- 收到 merge_pr authorization 后，只执行该授权允许的当前 PR 合并动作；不要修改文件、产生新的源 branch/workspace commit、push、同步或改写 branch、创建或更新其他 PR，或执行任何未获授权的附带动作。授权合并本身产生的目标 branch merge commit 不属于额外修改。
+- 合并完成后，通过中间工具调用 POST ${apiBase}/pr-flows/<flowId>/merged 登记结果。必须使用真实 flow id，不要输出 agentCanvasPrEvent JSON 作为最终答复。
+- 从 merge_pr authorization 消息逐字复制 completionToken；不得沿用 PR created 的 token。
+
+PowerShell merged 登记示例：
+~~~powershell
+Invoke-RestMethod -Method Post -Uri "${apiBase}/pr-flows/pr_flow_x/merged" -ContentType "application/json; charset=utf-8" -Body (@{
+  agentId = "${agentId}"
+  completionToken = "<copy exactly from merge_pr authorization>"
+} | ConvertTo-Json -Depth 4)
+~~~
+
+curl merged 登记示例：
+~~~bash
+curl -sS -X POST "${apiBase}/pr-flows/pr_flow_x/merged" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agentId": "${agentId}",
+    "completionToken": "<copy exactly from merge_pr authorization>"
+  }'
+~~~
+
+- merged 登记是中间动作；调用后继续完成原任务，不得为了登记而结束回复。
 
 ### tool: agent_canvas.create_sync_flow
 
@@ -147,6 +187,7 @@ curl -sS -X POST "${apiBase}/pr-flows" \\
 - 如果无法可靠判断文件范围，说明阻塞点，不要猜测。
 
 禁止事项：
+- POST 创建 sync flow 返回后，直到收到 apply authorization 或该 flow 明确失败、取消、超时之前，严禁修改文件、commit、push、创建或更新 PR，也严禁为这次请求运行 git fetch/cherry-pick/pull/merge/rebase 等 git sync 操作。
 - 在收到 apply authorization 之前，不要为这次请求运行 git cherry-pick、git pull、git merge 或 git rebase。
 
 请求：
@@ -237,19 +278,36 @@ curl -sS -X POST "${apiBase}/sync-flows" \\
 ~~~
 
 授权后的行为：
-- 收到 apply authorization 后，你可以 fetch、cherry-pick、merge/rebase/pull、处理冲突、运行测试，并按需要 commit。
-- 同步完成后，只输出一个 JSON 对象登记结果：
-~~~json
-{
-  "agentCanvasSyncEvent": "applied",
-  "flowId": "sync_flow_x",
-  "summary": "what was applied",
-  "commitSha": "resulting commit sha if applicable",
-  "files": ["src/example.ts"],
-  "fileChanges": [{ "status": "M", "path": "src/example.ts" }]
-}
+- 收到 apply authorization 后，只执行该 flow 已授权的 cherry-pick 或 branch pull；仅可进行完成该授权动作所必需的 fetch、冲突处理、测试、commit 和 push，不要混入无关修改、其他 PR 或其他 sync 操作。
+- 同步完成后，通过中间工具调用 POST ${apiBase}/sync-flows/<flowId>/applied 登记结果。必须使用真实 flow id，不要输出 agentCanvasSyncEvent JSON 作为最终答复。
+- 从 apply authorization 消息逐字复制 callbackToken；该 token 只允许登记这一个 flow 的 applied 动作。
+
+PowerShell sync applied 登记示例：
+~~~powershell
+Invoke-RestMethod -Method Post -Uri "${apiBase}/sync-flows/sync_flow_x/applied" -ContentType "application/json; charset=utf-8" -Body (@{
+  callbackToken = "<copy exactly from apply authorization>"
+  summary = "what was applied"
+  commitSha = "resulting commit sha if applicable"
+  files = @("src/example.ts")
+  fileChanges = @(@{ status = "M"; path = "src/example.ts" })
+} | ConvertTo-Json -Depth 6)
 ~~~
-- 如果收到授权后仍然无法完成同步，说明阻塞原因，不要输出 applied 回报。
+
+curl sync applied 登记示例：
+~~~bash
+curl -sS -X POST "${apiBase}/sync-flows/sync_flow_x/applied" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "callbackToken": "<copy exactly from apply authorization>",
+    "summary": "what was applied",
+    "commitSha": "resulting commit sha if applicable",
+    "files": ["src/example.ts"],
+    "fileChanges": [{ "status": "M", "path": "src/example.ts" }]
+  }'
+~~~
+
+- sync applied 登记是中间动作；调用后继续完成原任务，不得为了登记而结束回复。
+- 如果收到授权后仍然无法完成同步，说明阻塞原因，不要调用 applied 登记接口，也不要把失败当成已授权的其他动作。
 
 ### tool: agent_canvas.report_commit
 

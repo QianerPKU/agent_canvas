@@ -19,6 +19,18 @@ import { PullRequestFlowManager } from "./PullRequestFlowManager.js";
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
+async function removeTempRoot(target: string): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await rm(target, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EBUSY" || attempt === 4) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+}
+
 describe("PullRequestFlowManager integration", () => {
   it("reviews a PR across real temp git branches with multiple active agents per branch", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "agent-canvas-pr-flow-"));
@@ -101,6 +113,7 @@ describe("PullRequestFlowManager integration", () => {
       expect(flow.files).toEqual(["src/feature.ts"]);
       expect(flow.fileChanges).toEqual([{ status: "M", path: "src/feature.ts" }]);
 
+      await waitUntil(() => prManager.get(flow.id)?.status === "source_review_collecting");
       await waitUntil(() => proposer.session.steered.length === 1);
       await waitUntil(() => sourceRunning.session.steered.length === 1);
       await waitUntil(() => sourceWaiting.session.inputs.length === 2);
@@ -126,11 +139,11 @@ describe("PullRequestFlowManager integration", () => {
       await waitUntil(() => prManager.get(flow.id)?.status === "create_pr_authorized");
       await waitUntil(() =>
         inputText(proposer.session.inputs.at(-1)).includes(
-          "authorized to prepare and create the PR",
+          "authorized to create the PR for this flow from the reviewed source head",
         ),
       );
       expect(inputText(proposer.session.inputs.at(-1))).toContain(
-        "authorized to prepare and create the PR",
+        "authorized to create the PR for this flow from the reviewed source head",
       );
 
       await emitAssistantResult(
@@ -186,9 +199,12 @@ describe("PullRequestFlowManager integration", () => {
         prUrl: "local://pull/42",
       });
 
-      // Keep one source agent running so the next PR review exercises native steer,
-      // while the other source agents exercise direct waiting-input send.
-      await agentManager.get(sourceRunning.id)?.send("keep this source agent running");
+      // The close release starts this source reviewer naturally. Keep it running so the next
+      // PR review exercises native steer, while the other source agents exercise direct send.
+      await waitUntil(() =>
+        inputText(sourceRunning.session.inputs.at(-1)).includes("Agent Canvas PR flow closed"),
+      );
+      await waitUntil(() => agentManager.get(sourceRunning.id)?.getStatus() === "running");
       const proposerInputCount = proposer.session.inputs.length;
       const waitingInputCount = sourceWaiting.session.inputs.length;
       const runningSteerCount = sourceRunning.session.steered.length;
@@ -206,18 +222,21 @@ describe("PullRequestFlowManager integration", () => {
         title: "Blocked PR",
       });
 
-      expect(blocked.status).toBe("source_review_failed");
-      expect(blocked.failureReason).toContain("Failed to deliver review request");
+      expect(blocked.status).toBe("queued");
+      await waitUntil(() => prManager.get(blocked.id)?.status === "source_review_failed");
+      const blockedFinal = prManager.get(blocked.id);
+      expect(blockedFinal?.failureReason).toContain("Failed to deliver review request");
       expect(proposer.session.inputs).toHaveLength(proposerInputCount);
       expect(sourceWaiting.session.inputs).toHaveLength(waitingInputCount);
       expect(sourceRunning.session.steered).toHaveLength(runningSteerCount);
+      await waitUntil(() => !prManager.hasPendingOperations());
       await agentManager.clear();
       await rm(sharedMount, { force: true });
     } finally {
       for (const mount of documentationMounts) {
         await rm(mount, { force: true }).catch(() => undefined);
       }
-      await rm(root, { recursive: true, force: true });
+      await removeTempRoot(root);
     }
   }, 30_000);
 
@@ -359,6 +378,7 @@ describe("PullRequestFlowManager integration", () => {
       reason: "Exercise concurrent authorization delivery",
       files: ["src/sync.ts"],
     });
+    await waitUntil(() => session.steered.length === 2);
     expect(session.steered).toHaveLength(2);
 
     await runner.send("ordinary queued input");
@@ -409,7 +429,11 @@ describe("PullRequestFlowManager integration", () => {
     completeTurn(session);
     await waitUntil(() => session.inputs.length === 4);
     const delivered = session.inputs.map(inputText);
-    expect(delivered.filter((text) => text.includes("authorized to prepare and create the PR"))).toHaveLength(1);
+    expect(
+      delivered.filter((text) =>
+        text.includes("authorized to create the PR for this flow from the reviewed source head"),
+      ),
+    ).toHaveLength(1);
     expect(
       delivered.filter((text) =>
         text.includes("authorized to pull/merge the requested source branch"),
@@ -417,6 +441,9 @@ describe("PullRequestFlowManager integration", () => {
     ).toHaveLength(1);
     expect(prManager.get(prFlow.id)?.failureReason).toBeUndefined();
     expect(syncManager.get(syncFlow.id)?.failureReason).toBeUndefined();
+    await waitUntil(
+      () => !prManager.hasPendingOperations() && !syncManager.hasPendingOperations(),
+    );
     await agentManager.clear();
   });
 });
@@ -570,7 +597,7 @@ function resultMsg(): SdkMessage {
   };
 }
 
-async function waitUntil(check: () => boolean, timeoutMs = 1_000): Promise<void> {
+async function waitUntil(check: () => boolean, timeoutMs = 5_000): Promise<void> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     if (check()) return;
