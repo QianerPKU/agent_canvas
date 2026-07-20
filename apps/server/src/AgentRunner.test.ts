@@ -438,6 +438,159 @@ describe("AgentRunner 生命周期", () => {
     ]);
   });
 
+  it("queues automation without interrupting a provider that has no native steer", async () => {
+    const ctl = makeControllableQuery({ nativeSteer: false });
+    const events: AgentEvent[] = [];
+    const runner = new AgentRunner("non-interrupting-automation-agent", { query: ctl.query });
+    runner.on((event) => events.push(event));
+
+    await runner.start({ prompt: "continue current work" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+
+    await runner.deliver("PR review request");
+
+    expect(ctl.wasInterrupted()).toBe(false);
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual(["continue current work"]);
+    expect(events).toContainEqual({
+      kind: "user_input",
+      text: "PR review request",
+      mode: "queued",
+    });
+
+    ctl.emit(resultMsg());
+    await flush();
+
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual([
+      "continue current work",
+      "PR review request",
+    ]);
+    expect(runner.getStatus()).toBe("running");
+  });
+
+  it("replaces every queued automation message with the same key", async () => {
+    const ctl = makeControllableQuery({ nativeSteer: false });
+    const runner = new AgentRunner("replace-keyed-automation-agent", {
+      query: ctl.query,
+    });
+
+    await runner.start({ prompt: "continue current work" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+
+    await runner.deliver("stale review request", { automationKey: "pr-flow:1" });
+    await runner.deliver("stale authorization", { automationKey: "pr-flow:1" });
+    await runner.deliver("flow released", {
+      automationKey: "pr-flow:1",
+      replaceQueued: true,
+    });
+
+    ctl.emit(resultMsg());
+    await flush();
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual([
+      "continue current work",
+      "flow released",
+    ]);
+
+    ctl.emit(resultMsg());
+    await flush();
+    expect(runner.getStatus()).toBe("waiting_input");
+  });
+
+  it("revokes same-key queued automation even when replacement preparation fails", async () => {
+    const ctl = makeControllableQuery({ nativeSteer: false });
+    let failPreparation = false;
+    const runner = new AgentRunner("failed-replacement-preparation-agent", {
+      query: ctl.query,
+      prepareFileAccess: async () => {
+        if (failPreparation) throw new Error("workspace unavailable");
+      },
+    });
+
+    await runner.start({ prompt: "continue current work" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+
+    await runner.deliver("stale authorization", { automationKey: "pr-flow:1" });
+    failPreparation = true;
+    await expect(
+      runner.deliver("flow released", {
+        automationKey: "pr-flow:1",
+        replaceQueued: true,
+      }),
+    ).rejects.toThrow("workspace unavailable");
+
+    ctl.emit(resultMsg());
+    await flush();
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual([
+      "continue current work",
+    ]);
+    expect(runner.getStatus()).toBe("waiting_input");
+  });
+
+  it("preserves other automation keys and ordinary queued user input during replacement", async () => {
+    const ctl = makeControllableQuery({ nativeSteer: false });
+    const runner = new AgentRunner("isolated-keyed-automation-agent", {
+      query: ctl.query,
+    });
+
+    await runner.start({ prompt: "continue current work" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+
+    await runner.deliver("stale flow one message", { automationKey: "pr-flow:1" });
+    await runner.deliver("flow two message", { automationKey: "pr-flow:2" });
+    await runner.send("ordinary queued input");
+    await runner.deliver("flow one released", {
+      automationKey: "pr-flow:1",
+      replaceQueued: true,
+    });
+
+    ctl.emit(resultMsg());
+    await flush();
+    ctl.emit(resultMsg());
+    await flush();
+    ctl.emit(resultMsg());
+    await flush();
+
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual([
+      "continue current work",
+      "flow two message",
+      "ordinary queued input",
+      "flow one released",
+    ]);
+  });
+
+  it("clears same-key queued automation before steering its replacement", async () => {
+    const ctl = makeControllableQuery();
+    const runner = new AgentRunner("steered-keyed-automation-agent", {
+      query: ctl.query,
+    });
+
+    await runner.start({ prompt: "continue current work" });
+    ctl.emit(SYSTEM_INIT);
+    await flush();
+    ctl.setSteerAvailable(false);
+
+    await runner.deliver("stale review request", { automationKey: "pr-flow:1" });
+    await runner.deliver("stale authorization", { automationKey: "pr-flow:1" });
+    ctl.setSteerAvailable(true);
+    await runner.deliver("flow released", {
+      automationKey: "pr-flow:1",
+      replaceQueued: true,
+    });
+
+    expect(ctl.steeredInputs.map((input) => input.message.content)).toEqual([
+      "flow released",
+    ]);
+    ctl.emit(resultMsg());
+    await flush();
+    expect(ctl.inputs.map((input) => input.message.content)).toEqual([
+      "continue current work",
+    ]);
+    expect(runner.getStatus()).toBe("waiting_input");
+  });
+
   it("serializes concurrent automation deliveries while resuming a restored session", async () => {
     const ctl = makeControllableQuery();
     const runner = new AgentRunner("restored-delivery-agent", { query: ctl.query });

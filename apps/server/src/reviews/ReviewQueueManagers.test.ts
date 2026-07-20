@@ -150,7 +150,9 @@ describe("shared branch review queue across flow managers", () => {
       summary: "Open the current branch PR",
       files: ["src/pr.ts"],
     });
-    expect(pr.status).toBe("source_review_collecting");
+    await waitUntil(() => prManager.get(pr.id)?.status === "source_review_collecting");
+    const collectingPr = prManager.get(pr.id)!;
+    expect(collectingPr.status).toBe("source_review_collecting");
 
     const deliveriesBeforePull = deliveries(currentAgent);
     const pull = await syncManager.create({
@@ -214,7 +216,9 @@ describe("shared branch review queue across flow managers", () => {
       reason: "Review the incoming branch before the PR",
       files: ["src/pull-first.ts"],
     });
-    expect(pull.status).toBe("review_collecting");
+    await waitUntil(() => syncManager.get(pull.id)?.status === "review_collecting");
+    const collectingPull = syncManager.get(pull.id)!;
+    expect(collectingPull.status).toBe("review_collecting");
 
     const deliveriesBeforePr = deliveries(currentAgent);
     const pr = await prManager.create({
@@ -277,6 +281,7 @@ describe("shared branch review queue across flow managers", () => {
       summary: "Review the PR before the pull",
       files: ["src/pr-review.ts"],
     });
+    await waitUntil(() => prManager.get(pr.id)?.status === "source_review_collecting");
     const pull = await syncManager.create({
       kind: "branch_pull",
       proposerAgentId: "agent_current",
@@ -321,10 +326,13 @@ describe("shared branch review queue across flow managers", () => {
       summary: "Review target before pulling into main",
       files: ["src/pr-target.ts"],
     });
+    await waitUntil(() => prManager.get(pr.id)?.status === "source_review_collecting");
     now += 1;
     host.assistant("agent_source", prReviewJson(pr), now);
     await dispatchResult(prManager, syncManager, host.result("agent_source", now));
+    await waitUntil(() => prManager.get(pr.id)?.status === "create_pr_authorized");
     await prManager.recordPrCreated(pr.id, { prNumber: 7 });
+    await waitUntil(() => prManager.get(pr.id)?.status === "target_review_collecting");
 
     expect(prManager.get(pr.id)?.status).toBe("target_review_collecting");
     const deliveriesBeforePull = deliveries(targetAgent);
@@ -372,10 +380,12 @@ describe("shared branch review queue across flow managers", () => {
       summary: "Move from source review to a separately admitted target review",
       files: ["src/pr-target-after-sync.ts"],
     });
-    const sourceSequence = pr.reviewQueueSequence!;
+    await waitUntil(() => prManager.get(pr.id)?.status === "source_review_collecting");
+    const sourceSequence = prManager.get(pr.id)!.reviewQueueSequence!;
     now += 1;
     host.assistant("agent_source", prReviewJson(pr), now);
     await dispatchResult(prManager, syncManager, host.result("agent_source", now));
+    await waitUntil(() => prManager.get(pr.id)?.status === "create_pr_authorized");
     expect(prManager.get(pr.id)?.status).toBe("create_pr_authorized");
 
     const pull = await syncManager.create({
@@ -387,12 +397,14 @@ describe("shared branch review queue across flow managers", () => {
       reason: "The PR target stage must receive a fresh later queue position",
       files: ["src/sync-before-pr-target.ts"],
     });
-    expect(pull.status).toBe("review_collecting");
+    await waitUntil(() => syncManager.get(pull.id)?.status === "review_collecting");
+    const collectingPull = syncManager.get(pull.id)!;
+    expect(collectingPull.status).toBe("review_collecting");
 
     const targetPr = await prManager.recordPrCreated(pr.id, { prNumber: 8 });
     expect(targetPr).toMatchObject({ status: "queued", currentStage: "target_merge" });
     expect(targetPr.reviewQueueSequence).toBeGreaterThan(sourceSequence);
-    expect(targetPr.reviewQueueSequence).toBeGreaterThan(pull.reviewQueueSequence!);
+    expect(targetPr.reviewQueueSequence).toBeGreaterThan(collectingPull.reviewQueueSequence!);
     expect(
       matchingDeliveries(targetAgent, "Agent Canvas PR review request", targetPr.id),
     ).toHaveLength(0);
@@ -422,6 +434,7 @@ describe("shared branch review queue across flow managers", () => {
       summary: "Persisted PR review",
       files: ["src/pr.ts"],
     });
+    await waitUntil(() => originalPr.get(pr.id)?.status === "source_review_collecting");
     now = 2000;
     const pull = await originalSync.create({
       kind: "branch_pull",
@@ -432,6 +445,7 @@ describe("shared branch review queue across flow managers", () => {
       reason: "Migrate a legacy conflicting state",
       files: ["src/pull.ts"],
     });
+    await waitUntil(() => originalSync.get(pull.id)?.status === "review_collecting");
     const prState = originalPr.exportState();
     const syncState = originalSync.exportState();
     const oldPrRequest = prState[0]?.reviewRequests[0];
@@ -516,17 +530,21 @@ describe("shared branch review queue across flow managers", () => {
       reason: "Prove the shared sequence survives reload",
       files: ["src/sync-first.ts"],
     });
+    await waitUntil(() => originalSync.get(sync.id)?.status === "review_collecting");
     const pr = await originalPr.create({
       proposerAgentId: "agent_current",
       targetBranch: "main",
       summary: "Persist the second equal-time review",
       files: ["src/pr-second.ts"],
     });
+    await waitUntil(() => !originalPr.hasPendingOperations());
+    const collectingSync = originalSync.get(sync.id)!;
+    const queuedPr = originalPr.get(pr.id)!;
 
     expect(sync.createdAt).toBe(pr.createdAt);
     expect(sync.reviewQueueSequence).toBeLessThan(pr.reviewQueueSequence!);
-    expect(sync.status).toBe("review_collecting");
-    expect(pr.status).toBe("queued");
+    expect(collectingSync.status).toBe("review_collecting");
+    expect(queuedPr.status).toBe("queued");
     const syncState = originalSync.exportState();
     const prState = originalPr.exportState();
     originalSync.cancel(sync.id);
@@ -605,6 +623,7 @@ describe("shared branch review queue across flow managers", () => {
       reason: "Its sequence was not persisted by the old snapshot format",
       files: ["src/legacy-sync.ts"],
     });
+    await waitUntil(() => originalSync.get(olderSync.id)?.status === "review_collecting");
     now = 2000;
     const youngerPr = await originalPr.create({
       proposerAgentId: "agent_current",
@@ -612,8 +631,9 @@ describe("shared branch review queue across flow managers", () => {
       summary: "Legacy PR admitted second",
       files: ["src/legacy-pr.ts"],
     });
-    expect(olderSync.status).toBe("review_collecting");
-    expect(youngerPr.status).toBe("queued");
+    await waitUntil(() => !originalPr.hasPendingOperations());
+    expect(originalSync.get(olderSync.id)?.status).toBe("review_collecting");
+    expect(originalPr.get(youngerPr.id)?.status).toBe("queued");
 
     const syncState = originalSync.exportState().map(({ reviewQueueSequence: _, ...flow }) => flow);
     const prState = originalPr.exportState().map(({ reviewQueueSequence: _, ...flow }) => flow);
@@ -736,8 +756,11 @@ describe("shared branch review queue across flow managers", () => {
       reason: "Its original admission must survive a later activation",
       files: ["src/older-sync.ts"],
     });
-    expect(olderSync.status).toBe("queued");
-    expect(olderSync.reviewRequest).toBeUndefined();
+    await waitUntil(
+      () => originalSync.get(olderSync.id)?.failureReason?.includes("waiting for an active reviewer") === true,
+    );
+    expect(originalSync.get(olderSync.id)?.status).toBe("queued");
+    expect(originalSync.get(olderSync.id)?.reviewRequest).toBeUndefined();
 
     now = 2000;
     const youngerPr = await originalPr.create({
@@ -747,14 +770,16 @@ describe("shared branch review queue across flow managers", () => {
       summary: "Younger PR waits behind the older sync review",
       files: ["src/younger-pr.ts"],
     });
+    await waitUntil(() => !originalPr.hasPendingOperations());
     expect(olderSync.createdAt).toBe(1000);
     expect(youngerPr.createdAt).toBe(2000);
-    expect(youngerPr.status).toBe("queued");
+    expect(originalPr.get(youngerPr.id)?.status).toBe("queued");
     expect(olderSync.reviewQueueSequence).toBeLessThan(youngerPr.reviewQueueSequence!);
 
     now = 3000;
     const originalReviewer = originalHost.addAgent("agent_shared", branch, "waiting_input");
     await originalQueue.retryBranch(branch);
+    await waitUntil(() => originalSync.get(olderSync.id)?.status === "review_collecting");
     expect(originalSync.get(olderSync.id)?.status).toBe("review_collecting");
     expect(originalSync.get(olderSync.id)?.reviewRequest?.requestedAt).toBe(3000);
     expect(originalSync.get(olderSync.id)?.reviewRequest?.requestedAt).toBeGreaterThan(
@@ -830,13 +855,15 @@ describe("shared branch review queue across flow managers", () => {
       summary: "Review with a slow authorization notification",
       files: ["src/first.ts"],
     });
+    await waitUntil(() => manager.get(first.id)?.status === "source_review_collecting");
     const second = await manager.create({
       proposerAgentId: "agent_proposer",
       targetBranch: "release",
       summary: "Review that must not wait for notification I/O",
       files: ["src/second.ts"],
     });
-    expect(second.status).toBe("queued");
+    await waitUntil(() => !manager.hasPendingOperations());
+    expect(manager.get(second.id)?.status).toBe("queued");
 
     now += 1;
     host.assistant("agent_proposer", prReviewJson(first), now);

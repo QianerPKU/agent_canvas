@@ -4,6 +4,8 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import type {
+  AgentEvent,
+  AgentEventEnvelope,
   AgentApprovalResponse,
   AgentCanvasSettings,
   AgentCanvasConfig,
@@ -11,6 +13,7 @@ import type {
   AgentQuestionResponse,
   AgentPromptReference,
   AgentSettings,
+  AgentSnapshot,
   AgentStartConfig,
   BranchDiffSummary,
   CanvasFileNode,
@@ -44,14 +47,27 @@ import { CommitManager } from "./commits/CommitManager.js";
 import { pickDirectory as defaultPickDirectory, type PickDirectory } from "./files/DirectoryPicker.js";
 import { FileManager } from "./files/FileManager.js";
 import {
+  redactFlowCapabilities,
+  redactFlowCapabilityText,
+} from "./flowCapabilityRedaction.js";
+import {
   openFileInVscode,
   type OpenInVscodeOptions,
 } from "./files/VscodeFileOpener.js";
 import { PromptManager } from "./prompts/PromptManager.js";
-import { PullRequestFlowManager } from "./pullRequests/PullRequestFlowManager.js";
+import {
+  PullRequestFlowManager,
+  type SubmitPullRequestCreatedInput,
+  type SubmitPullRequestMergedInput,
+  type SubmitPullRequestReviewInput,
+} from "./pullRequests/PullRequestFlowManager.js";
 import { BranchReviewQueue } from "./reviews/BranchReviewQueue.js";
 import { CodexAuthManager } from "./sdk/CodexAuthManager.js";
-import { SyncFlowManager } from "./sync/SyncFlowManager.js";
+import {
+  SyncFlowManager,
+  type SyncFlowAppliedSubmission,
+  type SyncFlowReviewSubmission,
+} from "./sync/SyncFlowManager.js";
 import {
   WorkspaceManager,
   WorkspaceProjectChangedError,
@@ -306,10 +322,10 @@ export function createServer(
   };
   const helloFrame = (): ServerFrame => ({
     type: "hello",
-    agents: manager.list(),
-    histories: manager.exportState().histories,
-    prFlows: pullRequestFlowManager.list(),
-    syncFlows: syncFlowManager.list(),
+    agents: manager.list().map(publicAgentSnapshot),
+    histories: publicAgentHistories(manager.exportState().histories),
+    prFlows: redactFlowCapabilities(pullRequestFlowManager.list()),
+    syncFlows: redactFlowCapabilities(syncFlowManager.list()),
     commits: commitManager.list(),
   });
   const broadcastHello = (): void => broadcastFrame(helloFrame());
@@ -337,43 +353,71 @@ export function createServer(
       );
   });
 
+  // Keep derived agent work ordered without holding the project transaction while it can deliver
+  // another agent input. The transaction protects the public event snapshot; the derived-event
+  // guard prevents a project replacement until all flow bookkeeping and deliveries settle.
+  let derivedAgentEventChain: Promise<void> = Promise.resolve();
   // 把 manager 的事件广播到所有 WS 客户端
   manager.onEvent((envelope) => {
     // Agent completion can asynchronously advance PR/sync flows. Keep that derived mutation
     // ordered with project switches so a late old-project result cannot update newly imported
     // flow state. Calls are enqueued in listener order.
     const finishDerivedEvent = canvasState.beginDerivedAgentEvent();
-    void canvasState
-      .runProjectTransaction(
-        async () => {
-          broadcastFrame({ type: "event", envelope });
-          if (
-            envelope.event.kind === "status" &&
-            (envelope.event.status === "running" ||
-              envelope.event.status === "waiting_input")
-          ) {
-            const branch = manager.configOf(envelope.agentId)?.branch?.trim();
-            if (branch) await reviewQueue.retryBranch(branch);
-          }
-          await Promise.all([
-            pullRequestFlowManager.handleAgentEvent(envelope),
-            syncFlowManager.handleAgentEvent(envelope),
-          ]);
-          canvasState.saveSoon();
-        },
-        { forceEnqueue: true },
-      )
-      .catch(() => undefined)
-      .finally(finishDerivedEvent);
+    const shouldRetryClosureReleases =
+      envelope.event.kind === "status" &&
+      (envelope.event.status === "running" ||
+        envelope.event.status === "waiting_input");
+    let branchToRetry: string | undefined;
+    const publicEventRecorded = canvasState.runProjectTransaction(
+      async () => {
+        broadcastFrame({ type: "event", envelope: publicAgentEventEnvelope(envelope) });
+        if (shouldRetryClosureReleases) {
+          branchToRetry = manager.configOf(envelope.agentId)?.branch?.trim() || undefined;
+        }
+      },
+      { forceEnqueue: true },
+    );
+    void publicEventRecorded.catch(() => undefined);
+    const derivedWork = derivedAgentEventChain.then(async () => {
+      await publicEventRecorded;
+      if (!shouldRetryClosureReleases && envelope.event.kind === "status") {
+        pullRequestFlowManager.forgetClosureReleasesForAgent(envelope.agentId);
+        syncFlowManager.forgetClosureReleasesForAgent(envelope.agentId);
+      }
+      await Promise.all([
+        pullRequestFlowManager.handleAgentEvent(envelope),
+        syncFlowManager.handleAgentEvent(envelope),
+      ]);
+      canvasState.saveSoon();
+      if (shouldRetryClosureReleases) {
+        const currentStatus = manager.snapshot(envelope.agentId)?.status;
+        if (currentStatus !== "running" && currentStatus !== "waiting_input") return;
+        const currentBranch = manager.configOf(envelope.agentId)?.branch?.trim();
+        if (!branchToRetry || currentBranch !== branchToRetry) return;
+        // Review activation and closure delivery can both need a queued project transaction to
+        // prepare file access. They can also serialize behind an earlier delivery already waiting
+        // for that transaction. Never await either one while holding the project queue.
+        await reviewQueue.retryBranch(branchToRetry);
+        await Promise.all([
+          pullRequestFlowManager.retryClosureReleasesForAgent(envelope.agentId),
+          syncFlowManager.retryClosureReleasesForAgent(envelope.agentId),
+        ]);
+      }
+    });
+    derivedAgentEventChain = derivedWork.then(
+      () => undefined,
+      () => undefined,
+    );
+    void derivedWork.catch(() => undefined).finally(finishDerivedEvent);
   });
 
   pullRequestFlowManager.onFlow((flow) => {
-    broadcastFrame({ type: "pr_flow", flow });
+    broadcastFrame({ type: "pr_flow", flow: redactFlowCapabilities(flow) });
     canvasState.saveSoon();
   });
 
   syncFlowManager.onFlow((flow) => {
-    broadcastFrame({ type: "sync_flow", flow });
+    broadcastFrame({ type: "sync_flow", flow: redactFlowCapabilities(flow) });
     canvasState.saveSoon();
   });
 
@@ -921,15 +965,15 @@ async function handleHttp(
   }
 
   if (method === "GET" && path === "/api/agents") {
-    return sendJson(res, 200, { agents: manager.list() });
+    return sendJson(res, 200, { agents: manager.list().map(publicAgentSnapshot) });
   }
 
   if (method === "GET" && path === "/api/pr-flows") {
-    return sendJson(res, 200, { flows: pullRequestFlowManager.list() });
+    return sendJson(res, 200, { flows: redactFlowCapabilities(pullRequestFlowManager.list()) });
   }
 
   if (method === "GET" && path === "/api/sync-flows") {
-    return sendJson(res, 200, { flows: syncFlowManager.list() });
+    return sendJson(res, 200, { flows: redactFlowCapabilities(syncFlowManager.list()) });
   }
 
   if (method === "GET" && path === "/api/commits") {
@@ -962,26 +1006,30 @@ async function handleHttp(
   if (method === "POST" && path === "/api/pr-flows") {
     const body = await readJson<CreatePullRequestFlowInput>(req);
     try {
-      const flow = await pullRequestFlowManager.create(body ?? ({} as CreatePullRequestFlowInput));
+      const flow = await pullRequestFlowManager.create(
+        redactFlowCapabilities(body ?? ({} as CreatePullRequestFlowInput)),
+      );
       canvasState.saveSoon();
       return sendJson(res, 201, {
-        flow,
+        flow: redactFlowCapabilities(flow),
       });
     } catch (error) {
-      return sendJson(res, 400, { error: errMsg(error) });
+      return sendJson(res, 400, { error: redactFlowCapabilityText(errMsg(error)) });
     }
   }
 
   if (method === "POST" && path === "/api/sync-flows") {
     const body = await readJson<CreateSyncFlowInput>(req);
     try {
-      const flow = await syncFlowManager.create(body ?? ({} as CreateSyncFlowInput));
+      const flow = await syncFlowManager.create(
+        redactFlowCapabilities(body ?? ({} as CreateSyncFlowInput)),
+      );
       canvasState.saveSoon();
       return sendJson(res, 201, {
-        flow,
+        flow: redactFlowCapabilities(flow),
       });
     } catch (error) {
-      return sendJson(res, 400, { error: errMsg(error) });
+      return sendJson(res, 400, { error: redactFlowCapabilityText(errMsg(error)) });
     }
   }
 
@@ -992,46 +1040,95 @@ async function handleHttp(
     if (method === "GET" && !action) {
       const flow = pullRequestFlowManager.get(id);
       return flow
-        ? sendJson(res, 200, { flow })
-        : sendJson(res, 404, { error: `unknown PR flow: ${id}` });
+        ? sendJson(res, 200, { flow: redactFlowCapabilities(flow) })
+        : sendJson(res, 404, {
+            error: redactFlowCapabilityText(`unknown PR flow: ${id}`),
+          });
     }
     if (method === "POST" && action === "pr-created") {
-      const body = await readJson<PullRequestCreatedInput>(req);
+      const body = await readJson<PullRequestCreatedInput | SubmitPullRequestCreatedInput>(req);
       try {
-        const flow = await pullRequestFlowManager.recordPrCreated(id, body ?? {});
+        let flow;
+        if (hasNonEmptyString(body, "completionToken")) {
+          const submission = redactFlowCapabilities(
+            body as unknown as SubmitPullRequestCreatedInput,
+          );
+          submission.completionToken = body.completionToken as string;
+          flow = await pullRequestFlowManager.submitPrCreated(
+            id,
+            submission,
+          );
+        } else if (isTrustedUiFlowCompletionRequest(req, allowedOrigins)) {
+          flow = await pullRequestFlowManager.recordPrCreated(
+            id,
+            redactFlowCapabilities(body ?? {}),
+          );
+        } else {
+          throw new Error("missing PR completionToken");
+        }
         canvasState.saveSoon();
         return sendJson(res, 200, {
-          flow,
+          flow: redactFlowCapabilities(flow),
         });
       } catch (error) {
-        return sendJson(res, 400, { error: errMsg(error) });
+        return sendJson(res, 400, { error: redactFlowCapabilityText(errMsg(error)) });
+      }
+    }
+    if (method === "POST" && action === "reviews") {
+      const body = await readJson<SubmitPullRequestReviewInput>(req);
+      try {
+        const submission = redactFlowCapabilities(
+          body ?? ({} as SubmitPullRequestReviewInput),
+        );
+        if (body) submission.reviewToken = body.reviewToken;
+        const flow = await pullRequestFlowManager.submitReview(
+          id,
+          submission,
+        );
+        canvasState.saveSoon();
+        return sendJson(res, 200, { flow: redactFlowCapabilities(flow) });
+      } catch (error) {
+        return sendJson(res, 400, { error: redactFlowCapabilityText(errMsg(error)) });
       }
     }
     if (method === "POST" && action === "merged") {
+      const body = await readJson<SubmitPullRequestMergedInput>(req);
       try {
-        const flow = pullRequestFlowManager.recordMerged(id);
+        let flow;
+        if (hasNonEmptyString(body, "completionToken")) {
+          const submission = redactFlowCapabilities(body as SubmitPullRequestMergedInput);
+          submission.completionToken = body.completionToken;
+          flow = pullRequestFlowManager.submitMerged(
+            id,
+            submission,
+          );
+        } else if (isTrustedUiFlowCompletionRequest(req, allowedOrigins)) {
+          flow = pullRequestFlowManager.recordMerged(id);
+        } else {
+          throw new Error("missing PR completionToken");
+        }
         canvasState.saveSoon();
-        return sendJson(res, 200, { flow });
+        return sendJson(res, 200, { flow: redactFlowCapabilities(flow) });
       } catch (error) {
-        return sendJson(res, 400, { error: errMsg(error) });
+        return sendJson(res, 400, { error: redactFlowCapabilityText(errMsg(error)) });
       }
     }
     if (method === "POST" && action === "cancel") {
       try {
         const flow = pullRequestFlowManager.cancel(id);
         canvasState.saveSoon();
-        return sendJson(res, 200, { flow });
+        return sendJson(res, 200, { flow: redactFlowCapabilities(flow) });
       } catch (error) {
-        return sendJson(res, 404, { error: errMsg(error) });
+        return sendJson(res, 404, { error: redactFlowCapabilityText(errMsg(error)) });
       }
     }
     if (method === "POST" && action === "retry") {
       try {
         const flow = await pullRequestFlowManager.retryQueued(id);
         canvasState.saveSoon();
-        return sendJson(res, 200, { flow });
+        return sendJson(res, 200, { flow: redactFlowCapabilities(flow) });
       } catch (error) {
-        return sendJson(res, 400, { error: errMsg(error) });
+        return sendJson(res, 400, { error: redactFlowCapabilityText(errMsg(error)) });
       }
     }
   }
@@ -1043,28 +1140,61 @@ async function handleHttp(
     if (method === "GET" && !action) {
       const flow = syncFlowManager.get(id);
       return flow
-        ? sendJson(res, 200, { flow })
-        : sendJson(res, 404, { error: `unknown sync flow: ${id}` });
+        ? sendJson(res, 200, { flow: redactFlowCapabilities(flow) })
+        : sendJson(res, 404, {
+            error: redactFlowCapabilityText(`unknown sync flow: ${id}`),
+          });
+    }
+    if (method === "POST" && action === "reviews") {
+      const body = await readJson<SyncFlowReviewSubmission>(req);
+      try {
+        const submission = redactFlowCapabilities(
+          body ?? ({} as SyncFlowReviewSubmission),
+        );
+        if (body) submission.reviewToken = body.reviewToken;
+        const flow = await syncFlowManager.submitReview(
+          id,
+          submission,
+        );
+        canvasState.saveSoon();
+        return sendJson(res, 200, { flow: redactFlowCapabilities(flow) });
+      } catch (error) {
+        return sendJson(res, 400, { error: redactFlowCapabilityText(errMsg(error)) });
+      }
     }
     if (method === "POST" && action === "applied") {
-      const body = await readJson<SyncFlowAppliedInput>(req);
+      const body = await readJson<SyncFlowAppliedInput | SyncFlowAppliedSubmission>(req);
       try {
-        const flow = syncFlowManager.recordApplied(id, body ?? {});
+        let flow;
+        if (hasNonEmptyString(body, "callbackToken")) {
+          const submission = redactFlowCapabilities(
+            body as unknown as SyncFlowAppliedSubmission,
+          );
+          submission.callbackToken = body.callbackToken as string;
+          flow = await syncFlowManager.submitApplied(
+            id,
+            submission,
+          );
+        } else if (isTrustedUiFlowCompletionRequest(req, allowedOrigins)) {
+          flow = syncFlowManager.recordApplied(id, redactFlowCapabilities(body ?? {}));
+        } else {
+          throw new Error("missing sync applied callbackToken");
+        }
         canvasState.saveSoon();
         return sendJson(res, 200, {
-          flow,
+          flow: redactFlowCapabilities(flow),
         });
       } catch (error) {
-        return sendJson(res, 400, { error: errMsg(error) });
+        return sendJson(res, 400, { error: redactFlowCapabilityText(errMsg(error)) });
       }
     }
     if (method === "POST" && action === "cancel") {
       try {
         const flow = syncFlowManager.cancel(id);
         canvasState.saveSoon();
-        return sendJson(res, 200, { flow });
+        return sendJson(res, 200, { flow: redactFlowCapabilities(flow) });
       } catch (error) {
-        return sendJson(res, 404, { error: errMsg(error) });
+        return sendJson(res, 404, { error: redactFlowCapabilityText(errMsg(error)) });
       }
     }
   }
@@ -1375,7 +1505,7 @@ async function handleHttp(
     if (!runner) return sendJson(res, 404, { error: `未知 agent: ${id}` });
 
     if (method === "GET" && !action) {
-      return sendJson(res, 200, manager.snapshot(id));
+      return sendJson(res, 200, publicAgentSnapshot(manager.snapshot(id)!));
     }
     if (method === "PATCH" && action === "settings") {
       const body = await readJson<unknown>(req);
@@ -1385,8 +1515,9 @@ async function handleHttp(
       } catch (error) {
         return sendJson(res, 400, { error: errMsg(error) });
       }
-      return await canvasState.runProjectTransaction(async () => {
-        try {
+      try {
+        let branchToRetry: string | undefined;
+        const snapshot = await canvasState.runProjectTransaction(async () => {
           manager.validateSettingsUpdate(id, requestedSettings);
           const currentConfig = manager.configOf(id);
           const branchChanged =
@@ -1424,20 +1555,30 @@ async function handleHttp(
             branchChanged &&
             (snapshot.status === "idle" || snapshot.status === "waiting_input")
           ) {
-            const destinationBranch = snapshot.config?.branch?.trim();
-            if (destinationBranch) {
-              await reviewQueue.retryBranch(destinationBranch);
-            }
+            branchToRetry = snapshot.config?.branch?.trim() || undefined;
           }
           canvasState.saveSoon();
-          return sendJson(res, 200, snapshot);
-        } catch (error) {
-          return sendJson(res, 400, { error: errMsg(error) });
+          return snapshot;
+        });
+        const currentSnapshot = manager.snapshot(id);
+        if (
+          branchToRetry &&
+          (currentSnapshot?.status === "idle" || currentSnapshot?.status === "waiting_input") &&
+          currentSnapshot.config?.branch?.trim() === branchToRetry
+        ) {
+          // Do not await activation from the project-scoped HTTP transaction. Its delivery can
+          // serialize behind an older input transition whose file preparation needs this queue.
+          void reviewQueue.retryBranch(branchToRetry).catch(() => undefined);
         }
-      });
+        return sendJson(res, 200, publicAgentSnapshot(snapshot));
+      } catch (error) {
+        return sendJson(res, 400, { error: errMsg(error) });
+      }
     }
     if (method === "GET" && action === "history") {
-      return sendJson(res, 200, { events: manager.historyOf(id) });
+      return sendJson(res, 200, {
+        events: manager.historyOf(id).map(publicAgentEventEnvelope),
+      });
     }
     if (method === "POST" && action === "open-workspace") {
       const cwd = manager.configOf(id)?.cwd?.trim();
@@ -1679,9 +1820,9 @@ function requiresExpectedProjectMutation(req: http.IncomingMessage): boolean {
   if (
     /^\/api\/agents\/[^/]+\/(?:commits|report-result)$/u.test(pathname) ||
     pathname === "/api/pr-flows" ||
-    /^\/api\/pr-flows\/[^/]+(?:\/[^/]+)?$/u.test(pathname) ||
+    /^\/api\/pr-flows\/[^/]+\/(?:reviews|pr-created|merged)$/u.test(pathname) ||
     pathname === "/api/sync-flows" ||
-    /^\/api\/sync-flows\/[^/]+(?:\/[^/]+)?$/u.test(pathname)
+    /^\/api\/sync-flows\/[^/]+\/(?:reviews|applied)$/u.test(pathname)
   ) {
     return false;
   }
@@ -1690,6 +1831,8 @@ function requiresExpectedProjectMutation(req: http.IncomingMessage): boolean {
     pathname === "/api/canvas-layout" ||
     pathname === "/api/workspace/connect" ||
     /^\/api\/workspace\/(?:branches|shared-resources)(?:\/[^/]+)?$/u.test(pathname) ||
+    /^\/api\/pr-flows\/[^/]+\/(?:cancel|retry)$/u.test(pathname) ||
+    /^\/api\/sync-flows\/[^/]+\/cancel$/u.test(pathname) ||
     pathname === "/api/agents" ||
     /^\/api\/agents\/[^/]+(?:\/[^/]+(?:\/[^/]+)?)?$/u.test(pathname) ||
     pathname === "/api/files" ||
@@ -1863,12 +2006,12 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
     const state: CanvasProjectState = {
       version: 1,
       updatedAt: Date.now(),
-      agents: deps.manager.exportState(),
+      agents: persistableAgentState(deps.manager.exportState()),
       files: deps.fileManager.exportState(),
       prompts: deps.promptManager.exportState(),
       commits: deps.commitManager.exportState(),
-      prFlows: deps.pullRequestFlowManager.exportState(),
-      syncFlows: deps.syncFlowManager.exportState(),
+      prFlows: redactFlowCapabilities(deps.pullRequestFlowManager.exportState()),
+      syncFlows: redactFlowCapabilities(deps.syncFlowManager.exportState()),
       layout,
     };
     const statePath = path.join(project.projectRoot, CANVAS_STATE_FILE);
@@ -1924,8 +2067,12 @@ function createCanvasStateController(deps: CanvasStateControllerDeps): CanvasSta
 
     // Both owners are imported without activation only after agents, prompts, commits, and layout
     // are complete. The route activates them together after broadcasting the restored snapshot.
-    deps.pullRequestFlowManager.importState(state?.prFlows, { deferActivation: true });
-    deps.syncFlowManager.importState(state?.syncFlows, { deferActivation: true });
+    deps.pullRequestFlowManager.importState(redactFlowCapabilities(state?.prFlows), {
+      deferActivation: true,
+    });
+    deps.syncFlowManager.importState(redactFlowCapabilities(state?.syncFlows), {
+      deferActivation: true,
+    });
     canvasStateWritable = true;
     if (deps.manager.appSettings().workDocumentationEnabled) {
       try {
@@ -2166,6 +2313,100 @@ function positiveNumber(value: unknown): number | undefined {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const AGENT_CAPABILITY_FIELDS = new Set([
+  "reviewToken",
+  "completionToken",
+  "callbackToken",
+]);
+const REDACTED_AGENT_CAPABILITY = "[redacted]";
+
+function publicAgentHistories(
+  histories: Record<string, AgentEventEnvelope[]>,
+): Record<string, AgentEventEnvelope[]> {
+  return Object.fromEntries(
+    Object.entries(histories).map(([agentId, events]) => [
+      agentId,
+      events.map(publicAgentEventEnvelope),
+    ]),
+  );
+}
+
+function persistableAgentState(
+  state: NonNullable<CanvasProjectState["agents"]>,
+): NonNullable<CanvasProjectState["agents"]> {
+  return {
+    ...state,
+    agents: state.agents.map(publicAgentSnapshot),
+    histories: publicAgentHistories(state.histories),
+  };
+}
+
+function publicAgentSnapshot(snapshot: AgentSnapshot): AgentSnapshot {
+  return redactAgentCapabilities(snapshot) as AgentSnapshot;
+}
+
+function publicAgentEventEnvelope(envelope: AgentEventEnvelope): AgentEventEnvelope {
+  return {
+    ...envelope,
+    event: redactAgentCapabilities(envelope.event) as AgentEvent,
+  };
+}
+
+function redactAgentCapabilities(value: unknown, field?: string): unknown {
+  if (field && AGENT_CAPABILITY_FIELDS.has(field)) return REDACTED_AGENT_CAPABILITY;
+  if (typeof value === "string") return redactAgentCapabilityText(value);
+  if (Array.isArray(value)) return value.map((item) => redactAgentCapabilities(item));
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      redactFlowCapabilityText(key),
+      redactAgentCapabilities(item, key),
+    ]),
+  );
+}
+
+function redactAgentCapabilityText(text: string): string {
+  return redactFlowCapabilityText(text)
+    .replace(
+      /("(?:reviewToken|completionToken|callbackToken)"\s*:\s*")[^"]*(")/giu,
+      `$1${REDACTED_AGENT_CAPABILITY}$2`,
+    )
+    .replace(
+      /(\b(?:reviewToken|completionToken|callbackToken)\s*=\s*")[^"]*(")/giu,
+      `$1${REDACTED_AGENT_CAPABILITY}$2`,
+    )
+    .replace(
+      /(\b(?:reviewToken|completionToken|callbackToken)\s*=\s*')[^']*(')/giu,
+      `$1${REDACTED_AGENT_CAPABILITY}$2`,
+    );
+}
+
+function hasNonEmptyString(
+  value: unknown,
+  key: string,
+): value is Record<string, unknown> {
+  return isRecord(value) && typeof value[key] === "string" && value[key].trim().length > 0;
+}
+
+function hasExpectedProjectMutationHeaders(req: http.IncomingMessage): boolean {
+  return (
+    singleHeader(req.headers["x-agent-canvas-project-id"]) !== undefined &&
+    singleHeader(req.headers["x-agent-canvas-project-revision"]) !== undefined
+  );
+}
+
+function isTrustedUiFlowCompletionRequest(
+  req: http.IncomingMessage,
+  allowedOrigins: Set<string>,
+): boolean {
+  const origin = singleHeader(req.headers.origin)?.trim();
+  return (
+    Boolean(origin) &&
+    hasExpectedProjectMutationHeaders(req) &&
+    isTrustedBrowserRequest(req, allowedOrigins)
+  );
 }
 
 async function resolveAgentWorkspaceSettings<T extends AgentSettings>(
